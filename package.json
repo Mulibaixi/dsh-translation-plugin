@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "license": "MIT",
   "description": "A DeepSeek Harness translation plugin framework (early development).",
@@ -31,6 +31,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
+    "test": "npm run build && node --test",
     "hooks:install": "node scripts/install-git-hooks.mjs",
     "check:commit": "node scripts/check-commit-message.mjs",
     "check:policy": "node scripts/check-staged-files.mjs"
@@ -45,7 +46,10 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-sidebar-right"
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller"
       ]
     }
   }

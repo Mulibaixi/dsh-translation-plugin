@@ -1,105 +1,82 @@
-declare function require(moduleName: string): unknown
+import { h } from './react.js'
+import { PanelRouter, SettingsView } from './components.js'
+import { createSessionStore } from './session-store.js'
+import { ModelCatalog, type ModelCatalogPort } from './models.js'
 
 type Disposer = () => void
 type ClientComponent = (props?: Readonly<Record<string, unknown>>) => unknown
-
-interface ReactApi {
-  createElement(
-    type: string,
-    props: Readonly<Record<string, unknown>> | null,
-    ...children: unknown[]
-  ): unknown
-}
 
 interface SidebarRightTabDefinition {
   readonly id: string
   readonly kind: string
   readonly title: (address: string) => string
-  readonly guide: readonly SidebarRightGuideEntry[]
-}
-
-interface SidebarRightGuideEntry {
-  readonly order: number
-  readonly title: () => string
-  readonly description: () => string
+  readonly guide: readonly {
+    readonly id: string
+    readonly order: number
+    readonly title: () => string
+    readonly description: () => string
+  }[]
 }
 
 interface ClientPluginContext {
-  readonly sidebarRightTabs: {
-    register(definition: SidebarRightTabDefinition): Disposer
+  readonly remote: {
+    readonly session: ModelCatalogPort
+    $on(event: string, listener: () => void): Disposer
   }
+  on(event: string, listener: () => void): Disposer
+  readonly sidebarRightTabs: { register(definition: SidebarRightTabDefinition): Disposer }
   readonly slots: {
     register(
-      target: { readonly name: string; readonly key: string },
+      target: { readonly name: string; readonly key?: string; readonly id?: string; readonly order?: number; readonly label?: string },
       component: ClientComponent,
     ): Disposer
+    inject(name: string, register: () => Disposer): Disposer
   }
   effect(effect: () => void | Disposer, name?: string): unknown
 }
 
-const react = require('react') as ReactApi
 const CLIENT_ID = 'dsh-translation-plugin'
-
-export const name = 'deepseek-translation-client'
-export const inject = ['sidebarRightTabs', 'slots'] as const
+export const name = 'dsh-translation-client'
+export const inject = ['sidebarRightTabs', 'slots', 'remote', 'remote.session'] as const
 
 function withClientDiagnostics<T>(stage: string, action: () => T): T {
-  try {
-    return action()
-  } catch (error) {
-    const detail =
-      error instanceof Error
-        ? `${error.name}: ${error.message}\n${error.stack ?? ''}`
-        : String(error)
+  try { return action() } catch (error) {
+    const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ''}` : String(error)
     console.error(`[${CLIENT_ID}] Client ${stage} failed: ${detail}`)
     throw error
   }
 }
 
-function TranslationPanel(): unknown {
-  return react.createElement(
-    'section',
-    {
-      className: 'dsh-translation-panel',
-      'aria-labelledby': 'dsh-translation-panel-title',
-    },
-    react.createElement('h2', { id: 'dsh-translation-panel-title' }, '翻译工作区'),
-    react.createElement(
-      'p',
-      null,
-      '翻译面板框架已加载；输入、模型调用和译文保存功能将在后续步骤实现。',
-    ),
-  )
-}
-
 export function apply(ctx: ClientPluginContext): void {
   withClientDiagnostics('apply', () => {
-    ctx.effect(
-      () =>
-        withClientDiagnostics('sidebarRightTabs.register', () =>
-          ctx.sidebarRightTabs.register({
-            id: CLIENT_ID,
-            kind: 'translation-workspace',
-            title: () => '翻译',
-            guide: [{
-              order: 40,
-              title: () => '翻译工作区',
-              description: () => '打开独立的翻译面板。',
-            }],
-          }),
-        ),
-      'translation tab type',
-    )
+    const store = createSessionStore()
+    const models = new ModelCatalog(ctx.remote.session)
+    ctx.effect(() => () => store.dispose(), 'translation client store')
+    ctx.effect(() => () => models.dispose(), 'translation model catalog')
+    ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
+    ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
+    ctx.effect(() => ctx.on('connection/reset', () => models.invalidate(true)), 'translation catalog connection')
 
-    ctx.effect(
-      () =>
-        withClientDiagnostics('sidebar.right.pane.tab register', () =>
-          ctx.slots.register(
-            { name: 'sidebar.right.pane.tab', key: CLIENT_ID },
-            TranslationPanel,
-          ),
-        ),
-      'translation tab body',
-    )
+    const TranslationPanel: ClientComponent = (props = {}) => h(PanelRouter, {
+      store, models, sessionId: typeof props.sessionId === 'string' ? props.sessionId : undefined,
+    })
+    const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {
+      store, onClose: typeof props.close === 'function' ? props.close : undefined,
+    })
+
+    ctx.effect(() => withClientDiagnostics('sidebarRightTabs.register', () => ctx.sidebarRightTabs.register({
+      id: CLIENT_ID,
+      kind: 'translation-workspace',
+      title: () => '翻译',
+      guide: [{ id: 'translation-workspace', order: 40, title: () => '翻译', description: () => '打开翻译会话。' }],
+    })), 'translation tab type')
+
+    ctx.effect(() => withClientDiagnostics('sidebar.right.pane.tab register', () => ctx.slots.register(
+      { name: 'sidebar.right.pane.tab', key: CLIENT_ID }, TranslationPanel,
+    )), 'translation tab body')
+
+    ctx.effect(() => withClientDiagnostics('settings.section register', () => ctx.slots.inject('settings.section', () => ctx.slots.register(
+      { name: 'settings.section', id: CLIENT_ID, order: 40, label: '翻译' }, TranslationSettings,
+    ))), 'translation settings page')
   })
 }
