@@ -1,0 +1,31 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+.pnpm-store/
+*.tgz
+*.log
+.env
+.env.*
+!.env.example
+
+# 内部开发资料保存在仓库外；公开用户文档可以提交。
+/docs/design/
+/docs/specs/
+/docs/internal/
+/docs/plans/
+/docs/notes/
+/docs/p0-upstream-contracts.md
+/docs/translation-plugin-framework-phase-1.md
+/design/
+/specs/
+/notes/
+/plans/
+/internal/
+
+# 本机运行状态与用户数据。
+/profiles/
+/logs/
+/data/
+cordis.patch.yml.bak*

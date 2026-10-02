@@ -1,0 +1,52 @@
+{
+  "name": "dsh-translation-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "A DeepSeek Harness translation plugin framework (early development).",
+  "type": "module",
+  "main": "./dist/host/index.js",
+  "types": "./dist/host/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/host/index.d.ts",
+      "default": "./dist/host/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
+    "check:commit": "node scripts/check-commit-message.mjs",
+    "check:policy": "node scripts/check-staged-files.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

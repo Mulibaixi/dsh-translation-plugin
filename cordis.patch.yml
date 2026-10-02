@@ -1,0 +1,4 @@
+- insert:
+    - id: translation-framework
+      name: dsh-translation-plugin
+
