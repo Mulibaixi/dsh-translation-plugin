@@ -1,8 +1,13 @@
 import {
   DEFAULT_SESSION_SETTINGS, HISTORY_PREFIX, LEGACY_DRAFT_PREFIX, LEGACY_SETTINGS_KEY, SETTINGS_KEY,
-  decodeSession, historyKey, legacySession, newSession, parseSettings, validateSessionSettings,
+  decodeSession, historyKey, legacySession, newSession, parseSettings, sessionName, validateSessionSettings,
   type LocalSession, type SessionSettings,
 } from './sessions.js'
+import {
+  DELETED_SESSION_PREFIX, TOPIC_IDENTITY_PREFIX, TOPIC_NAME_PREFIX, TOPIC_LOCK_NAME,
+  decodeDeletion, decodeTopicIdentity, decodeTopicName, deletedSessionKey, topicIdentityKey, topicNameKey,
+  type TopicIdentity,
+} from './topics.js'
 export interface LocalStoragePort {
   readonly length: number
   key(index: number): string | null
@@ -14,26 +19,38 @@ export interface LocalStoragePort {
 type Disposer = () => void
 export type HistoryStatus = 'memory' | 'saved' | 'conflict' | 'error'
 interface Seat { session: LocalSession; savedSession: LocalSession | undefined; stored: string | null; legacyRaw: string | null; status: HistoryStatus }
+interface TopicSeat { identity: TopicIdentity; name: string; persistedName: string | undefined; stored: string | null; durable: boolean; nameDirty: boolean }
 interface Workspace { active: string | undefined }
 export interface HistoryVersion { readonly id: string; readonly stored: string | null; readonly legacyRaw: string | null; readonly current: string }
+export interface StructureLockPort { request<T>(name: string, action: () => T | Promise<T>): Promise<T> }
+
+function browserLocks(): StructureLockPort | undefined {
+  if (typeof navigator === 'undefined' || !navigator.locks) return undefined
+  return { request: async <T>(name: string, action: () => T | Promise<T>): Promise<T> => await navigator.locks.request(name, async () => await action()) }
+}
 
 function readHistory(raw: string): LocalSession | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    return value?.schemaVersion === 2 && typeof value.token === 'string' ? decodeSession(value.session) : undefined
+    return (value?.schemaVersion === 2 || value?.schemaVersion === 3) && typeof value.token === 'string' ? decodeSession(value.session) : undefined
   } catch { return undefined }
 }
 
 export class SessionStore {
   private settings: SessionSettings = DEFAULT_SESSION_SETTINGS
   private readonly seats = new Map<string, Seat>()
+  private readonly topics = new Map<string, TopicSeat>()
+  private readonly migrationSources = new Map<string, LocalSession>()
+  private readonly deleted = new Set<string>()
+  private readonly corruptTopics = new Set<string>()
+  private readonly pendingSaves = new Map<string, Promise<boolean>>()
   private readonly workspaces = new Map<string, Workspace>()
   private readonly listeners = new Set<Disposer>()
   private notice: string | undefined
   private readonly stop: Disposer | undefined
   private disposed = false
 
-  constructor(private readonly storage?: LocalStoragePort, listen?: (onChange: (key: string | null) => void) => Disposer) {
+  constructor(private readonly storage?: LocalStoragePort, listen?: (onChange: (key: string | null) => void) => Disposer, private readonly locks: StructureLockPort | undefined = browserLocks()) {
     this.readSettings(); this.loadHistory()
     this.stop = listen?.(key => this.externalChange(key))
   }
@@ -42,9 +59,14 @@ export class SessionStore {
   getNotice(): string | undefined { return this.notice }
   getSession(id: string): LocalSession | undefined { return this.seats.get(id)?.session }
   getStatus(id: string): HistoryStatus { return this.seats.get(id)?.status ?? 'memory' }
+  getStructureCapability(): 'web-locks' | 'runtime-only' { return this.storage && this.locks ? 'web-locks' : 'runtime-only' }
+  getTopics(ownerId?: string): readonly { readonly id: string; readonly name: string; readonly nextSequence: number }[] {
+    return [...this.topics.values()].filter(topic => ownerId === undefined || topic.identity.ownerId === ownerId)
+      .map(topic => ({ id: topic.identity.id, name: topic.name, nextSequence: topic.identity.nextSequence }))
+  }
   subscribe(listener: Disposer): Disposer { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const fn of this.listeners) fn() }
-  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); this.workspaces.clear(); this.seats.clear() }
+  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); this.workspaces.clear(); this.seats.clear(); this.topics.clear(); this.migrationSources.clear() }
 
   private readSettings(): boolean {
     try {
@@ -56,17 +78,33 @@ export class SessionStore {
   }
 
   patchSettings(patch: Partial<Omit<SessionSettings, 'schemaVersion'>>, restore = false): boolean {
+    if (this.locks) {
+      this.notice = '设置保存需与会话写入协调，请使用异步设置操作。'; this.emit(); return false
+    }
+    return this.patchSettingsLocked(patch, restore)
+  }
+
+  async patchSettingsAsync(patch: Partial<Omit<SessionSettings, 'schemaVersion'>>, restore = false): Promise<boolean> {
+    const edits = { ...patch }
+    if (!this.locks) return this.patchSettingsLocked(edits, restore)
+    return this.withStructureLock(false, () => this.patchSettingsLocked(edits, restore))
+  }
+
+  private patchSettingsLocked(patch: Partial<Omit<SessionSettings, 'schemaVersion'>>, restore = false): boolean {
     if (!this.readSettings() && !restore) { this.emit(); return false }
     const next = { ...(restore ? DEFAULT_SESSION_SETTINGS : this.settings), ...patch, schemaVersion: 2 as const }
     const errors = validateSessionSettings(next)
     if (errors.length) { this.notice = errors.join(' '); this.emit(); return false }
     if (!this.storage) { this.notice = '本地存储不可用，设置尚未保存。'; this.emit(); return false }
+    if (!this.locks && !this.settings.rememberHistory && next.rememberHistory) {
+      this.notice = '当前环境无法协调历史保存，暂不能开启；现有内容仍保留在当前窗口。'; this.emit(); return false
+    }
     try {
       const wasEnabled = this.settings.rememberHistory
       this.storage.setItem(SETTINGS_KEY, JSON.stringify(next))
       this.settings = next; this.notice = undefined
       if (!wasEnabled && next.rememberHistory) {
-        for (const [id, seat] of this.seats) if (seat.status !== 'saved') this.persist(id)
+        for (const [id, seat] of this.seats) if (seat.status !== 'saved' || !this.topics.get(seat.session.topicId)?.stored || this.topics.get(seat.session.topicId)?.nameDirty) this.persist(id)
       }
       this.emit(); return true
     } catch { this.notice = '设置保存失败，编辑值仍保留，请检查本地存储后重试修改。'; this.emit(); return false }
@@ -77,20 +115,169 @@ export class SessionStore {
     try {
       const keys: string[] = []
       for (let i = 0; i < this.storage.length; i++) { const key = this.storage.key(i); if (key) keys.push(key) }
+      this.loadTopics(keys)
       for (const key of keys.filter(key => key.startsWith(HISTORY_PREFIX))) {
         const raw = this.storage.getItem(key)
         const session = raw === null ? undefined : readHistory(raw)
         if (!session || historyKey(session.id) !== key) { this.notice = '部分会话历史无法读取，原存储副本已保留。'; continue }
+        if (this.isDeleted(session.id)) continue
         const old = this.seats.get(session.id)
-        if (!old) this.seats.set(session.id, { session, savedSession: session, stored: raw, legacyRaw: session.legacyKey ? this.storage.getItem(session.legacyKey) : null, status: 'saved' })
+        if (!old) {
+          this.seats.set(session.id, { session, savedSession: session, stored: raw, legacyRaw: session.legacyKey ? this.storage.getItem(session.legacyKey) : null, status: 'saved' })
+          if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(session.id, session)
+        }
       }
       for (const key of keys.filter(key => key.startsWith(LEGACY_DRAFT_PREFIX))) {
         const raw = this.storage.getItem(key)
         const session = raw === null ? undefined : legacySession(key, raw)
-        if (session && !this.seats.has(session.id)) this.seats.set(session.id, { session, savedSession: session, stored: null, legacyRaw: raw, status: 'saved' })
+        if (session && !this.isDeleted(session.id) && !this.seats.has(session.id)) {
+          this.seats.set(session.id, { session, savedSession: session, stored: null, legacyRaw: raw, status: 'saved' })
+          this.migrationSources.set(session.id, session)
+        }
         else if (!session) this.notice = '部分旧版草稿无法读取，原存储副本已保留。'
       }
+      this.migrateTopics()
+      for (const seat of this.seats.values()) this.adoptTopic(seat)
     } catch { this.notice = '会话历史读取失败，当前窗口仍可编辑。' }
+  }
+
+  private isDeleted(id: string): boolean {
+    if (this.deleted.has(id)) return true
+    const raw = this.storage?.getItem(deletedSessionKey(id))
+    if (raw === undefined || raw === null) return false
+    // 无法解码的删除屏障也保守阻止恢复；绝不把它当成不存在。
+    if (!decodeDeletion(raw, id)) this.notice = '部分删除屏障无法读取，相关旧副本未恢复。'
+    this.deleted.add(id); return true
+  }
+
+  private loadTopics(keys: readonly string[]): void {
+    for (const key of keys.filter(key => key.startsWith(TOPIC_IDENTITY_PREFIX))) {
+      const raw = this.storage?.getItem(key)
+      if (raw === undefined || raw === null) continue
+      const identity = decodeTopicIdentity(raw)
+      if (!identity || topicIdentityKey(identity.id) !== key) {
+        this.corruptTopics.add(key); this.notice = '部分主题编号记录无法读取，相关持久主题暂停新建会话。'; continue
+      }
+      const old = this.topics.get(identity.id)
+      if (old && (old.identity.ownerId !== identity.ownerId || old.identity.sequenceNamespaceId !== identity.sequenceNamespaceId)) {
+        this.corruptTopics.add(key); this.notice = '主题身份存在冲突，当前内容保留。'; continue
+      }
+      const nameRaw = this.storage?.getItem(topicNameKey(identity.id))
+      const nameRecord = nameRaw ? decodeTopicName(nameRaw, identity) : undefined
+      if (nameRaw && !nameRecord) { this.corruptTopics.add(key); this.notice = '主题名称记录无法读取，当前内容保留。' }
+      if (old?.nameDirty && nameRecord && old.persistedName !== undefined && old.persistedName !== nameRecord.name) {
+        this.notice = '主题已在其他窗口重命名，当前窗口名称仍保留；保存前请核对。'
+      }
+      this.topics.set(identity.id, {
+        identity, stored: raw, durable: true, persistedName: old?.nameDirty ? old.persistedName : nameRecord?.name ?? old?.persistedName,
+        name: old?.nameDirty ? old.name : nameRecord?.name ?? old?.name ?? '', nameDirty: old?.nameDirty ?? false,
+      })
+    }
+  }
+
+  private migrateTopics(): void {
+    const assigned = new Map<string, { topic: TopicSeat; sequence: number }>()
+    for (const topic of this.topics.values()) {
+      if (!topic.name) {
+        const candidates = [...topic.identity.allocations].sort((a, b) => a.sequence - b.sequence)
+        const rootId = topic.identity.sequenceNamespaceId.startsWith('migration:') ? topic.identity.sequenceNamespaceId.slice('migration:'.length) : undefined
+        const root = rootId ? this.migrationSources.get(rootId) : undefined
+        const saved = candidates.map(entry => this.seats.get(entry.sessionId)?.savedSession).find((session): session is LocalSession => !!session)
+        topic.name = root?.legacyName ?? root?.name ?? saved?.topicName ?? '新翻译会话'
+        topic.persistedName ??= root?.legacyName ?? root?.name ?? saved?.topicName
+      }
+      for (const allocation of topic.identity.allocations) {
+        const previous = assigned.get(allocation.sessionId)
+        if (previous && previous.topic.identity.id !== topic.identity.id) {
+          this.corruptTopics.add(topicIdentityKey(topic.identity.id)); this.corruptTopics.add(topicIdentityKey(previous.topic.identity.id))
+        } else assigned.set(allocation.sessionId, { topic, sequence: allocation.sequence })
+      }
+    }
+    const groups = new Map<string, LocalSession[]>()
+    for (const source of this.migrationSources.values()) {
+      if (!this.seats.has(source.id)) continue
+      const known = assigned.get(source.id)
+      if (known && known.topic.identity.ownerId === source.ownerId) {
+        this.applyMigration(source.id, known.topic, known.sequence); continue
+      }
+      let root = source
+      const path = new Set([source.id])
+      while (root.parentId) {
+        const parent = this.migrationSources.get(root.parentId)
+        if (!parent || !this.seats.has(parent.id) || parent.ownerId !== source.ownerId) break
+        if (path.has(parent.id)) { root = source; break }
+        path.add(parent.id); root = parent
+      }
+      const id = `topic:migration:${root.id}`
+      const group = groups.get(id) ?? []; group.push(source); groups.set(id, group)
+    }
+    for (const [id, sources] of groups) {
+      sources.sort((a, b) => (a.id === id.slice('topic:migration:'.length) ? -1 : b.id === id.slice('topic:migration:'.length) ? 1 : a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)))
+      const root = sources[0]!
+      let topic = this.topics.get(id)
+      if (!topic) {
+        topic = {
+          identity: { schemaVersion: 1, id, ownerId: root.ownerId, sequenceNamespaceId: `migration:${root.id}`, nextSequence: 0, version: 0, allocations: [] },
+          name: root.legacyName ?? root.name, persistedName: root.legacyName ?? root.name, stored: null, durable: true, nameDirty: false,
+        }
+        this.topics.set(id, topic)
+      }
+      const allocations = [...topic.identity.allocations]
+      let nextSequence = topic.identity.nextSequence
+      for (const source of sources) {
+        let allocation = allocations.find(entry => entry.sessionId === source.id)
+        if (!allocation) {
+          if (!Number.isSafeInteger(nextSequence + 1)) { this.corruptTopics.add(topicIdentityKey(id)); this.notice = '主题编号已达到安全上限，相关会话无法继续发号。'; continue }
+          allocation = { sessionId: source.id, sequence: nextSequence++ }; allocations.push(allocation)
+        }
+        this.applyMigration(source.id, topic, allocation.sequence)
+      }
+      // 旧计数只用于保守抬高新空间；不解析名称，也不声称恢复已丢失的删除历史。
+      nextSequence = sources.reduce((highest, source) => Math.max(highest, source.childSequence < Number.MAX_SAFE_INTEGER ? source.childSequence + 1 : Number.MAX_SAFE_INTEGER), nextSequence)
+      topic.identity = { ...topic.identity, allocations, nextSequence }
+    }
+  }
+
+  private applyMigration(id: string, topic: TopicSeat, sequence: number): void {
+    const seat = this.seats.get(id)
+    if (!seat) return
+    const apply = (session: LocalSession): LocalSession => ({
+      ...session, topicId: topic.identity.id, sequenceNamespaceId: topic.identity.sequenceNamespaceId, topicName: topic.name,
+      sequence, name: sessionName(topic.name, sequence),
+    })
+    seat.session = apply(seat.session)
+    if (seat.savedSession) {
+      const savedName = topic.persistedName ?? topic.name
+      seat.savedSession = { ...apply(seat.savedSession), topicName: savedName, name: sessionName(savedName, sequence) }
+    }
+  }
+
+  private adoptTopic(seat: Seat): void {
+    const session = seat.session
+    let topic = this.topics.get(session.topicId)
+    if (!topic) {
+      topic = {
+        identity: { schemaVersion: 1, id: session.topicId, ownerId: session.ownerId, sequenceNamespaceId: session.sequenceNamespaceId, nextSequence: session.sequence + 1, version: 0, allocations: [{ sessionId: session.id, sequence: session.sequence }] },
+        name: session.topicName, persistedName: seat.savedSession?.topicName, stored: null, durable: !!seat.savedSession, nameDirty: false,
+      }
+      this.topics.set(session.topicId, topic)
+    }
+    if (topic.identity.ownerId !== session.ownerId || topic.identity.sequenceNamespaceId !== session.sequenceNamespaceId) {
+      this.corruptTopics.add(topicIdentityKey(session.topicId)); seat.status = 'conflict'; return
+    }
+    const allocation = topic.identity.allocations.find(entry => entry.sessionId === session.id)
+    if (!allocation || allocation.sequence !== session.sequence) {
+      // 已持久的身份记录具有唯一权威；缺失或重复号不能从正文猜测补回。
+      if (topic.stored !== null) { seat.status = 'conflict'; this.notice = '会话编号与主题身份记录不一致，当前内容保留。'; return }
+      if (!allocation) {
+        if (!Number.isSafeInteger(session.sequence + 1) || topic.identity.allocations.some(entry => entry.sequence === session.sequence)) {
+          this.corruptTopics.add(topicIdentityKey(session.topicId)); seat.status = 'conflict'; this.notice = '主题编号存在冲突或已达到上限，当前内容保留。'; return
+        }
+        topic.identity = { ...topic.identity, nextSequence: Math.max(topic.identity.nextSequence, session.sequence + 1), allocations: [...topic.identity.allocations, { sessionId: session.id, sequence: session.sequence }] }
+      }
+    }
+    seat.session = { ...session, topicName: topic.name, name: sessionName(topic.name, session.sequence) }
+    if (seat.savedSession && topic.persistedName) seat.savedSession = { ...seat.savedSession, topicName: topic.persistedName, name: sessionName(topic.persistedName, seat.savedSession.sequence) }
   }
 
   getHistory(ownerId?: string): readonly LocalSession[] {
@@ -118,23 +305,108 @@ export class SessionStore {
   }
   createSession(ownerId: string, parentId?: string): LocalSession | undefined {
     if (!ownerId.trim()) return undefined
+    this.readSettings()
     this.loadHistory()
     const parent = parentId ? this.getSession(parentId) : undefined
     if (parentId && (!parent || parent.ownerId !== ownerId)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
-    let name = '新翻译会话'
-    if (parent) {
-      let sequence = parent.childSequence + 1
-      const names = new Set([...this.seats.values()].map(seat => seat.session.name))
-      do { name = `${Array.from(parent.name).slice(0, 110).join('')}-${String(sequence++).padStart(2, '0')}` } while (names.has(name))
-      this.updateSession(parent.id, { childSequence: sequence - 1 })
+    const topic = parent ? this.topics.get(parent.topicId) : undefined
+    if (topic?.durable || (parent && this.settings.rememberHistory)) {
+      this.notice = '持久主题的新编号需要异步主题锁，请使用新建子会话操作。'; this.emit(); return undefined
     }
-    let id: string
-    do { id = `tr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}` } while (this.seats.has(id))
-    const session = newSession(this.settings, ownerId, id, name, parent?.id ?? null)
-    this.seats.set(id, { session, savedSession: undefined, stored: null, legacyRaw: null, status: 'memory' })
-    this.openSession(ownerId, id)
-    if (this.settings.rememberHistory) this.persist(id)
+    const session = this.addSession(ownerId, parent, topic)
+    if (this.settings.rememberHistory) this.persist(session.id)
     this.emit(); return session
+  }
+
+  private freshId(): string {
+    let id: string
+    do {
+      id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? `tr-${crypto.randomUUID()}` : `tr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+    } while (this.seats.has(id) || this.isDeleted(id) || [...this.topics.values()].some(topic => topic.identity.allocations.some(entry => entry.sessionId === id)))
+    return id
+  }
+
+  private addSession(ownerId: string, parent?: LocalSession, topic?: TopicSeat, reserved?: { readonly id: string; readonly sequence: number }): LocalSession {
+    const id = reserved?.id ?? this.freshId()
+    const sequence = reserved?.sequence ?? topic?.identity.nextSequence ?? 0
+    if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
+    const settings = parent ? { ...this.settings, defaultMode: parent.mode, targetLanguage: parent.targetLanguage, defaultInstruction: parent.instruction, maxInputChars: parent.maxInputChars } : this.settings
+    const initial = newSession(settings, ownerId, id, topic?.name ?? '新翻译会话', parent?.id ?? null, topic?.identity.id, topic?.identity.sequenceNamespaceId, sequence)
+    const session = { ...initial, model: parent?.model ? { ...parent.model } : null }
+    if (topic && !reserved) topic.identity = { ...topic.identity, nextSequence: sequence + 1, allocations: [...topic.identity.allocations, { sessionId: id, sequence }] }
+    this.seats.set(id, { session, savedSession: undefined, stored: null, legacyRaw: null, status: 'memory' })
+    this.adoptTopic(this.seats.get(id)!)
+    this.openSession(ownerId, id)
+    return session
+  }
+
+  private async withStructureLock<T>(failure: T, action: () => T | Promise<T>): Promise<T> {
+    if (!this.storage || !this.locks) {
+      this.notice = '当前环境缺少 Web Locks 或本地存储。持久主题的新建、重命名与迁移保存已暂停；当前输入仍保留。'; this.emit(); return failure
+    }
+    try { return await this.locks.request(TOPIC_LOCK_NAME, () => this.disposed ? failure : action()) }
+    catch { this.notice = '主题编号或名称保存失败，当前输入仍保留；请检查本地存储后重试。'; this.emit(); return failure }
+  }
+
+  /** 有历史保存或既有持久身份时，先可靠发号；正文保存失败可留下空号。 */
+  async createSessionAsync(ownerId: string, parentId?: string): Promise<LocalSession | undefined> {
+    if (!ownerId.trim()) return undefined
+    if (!this.readSettings()) { this.emit(); return undefined }
+    this.loadHistory()
+    const parent = parentId ? this.getSession(parentId) : undefined
+    if (parentId && (!parent || parent.ownerId !== ownerId)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
+    if (!this.settings.rememberHistory && (!parent || !this.topics.get(parent.topicId)?.durable)) return this.createSession(ownerId, parentId)
+    return this.withStructureLock(undefined, () => {
+      if (!this.readSettings()) return undefined
+      this.loadHistory()
+      const currentParent = parentId ? this.getSession(parentId) : undefined
+      if (parentId && (!currentParent || currentParent.ownerId !== ownerId || this.isDeleted(parentId))) {
+        this.notice = '原会话已变化或删除，新建未执行。'; this.emit(); return undefined
+      }
+      let topic = currentParent ? this.topics.get(currentParent.topicId) : undefined
+      const id = this.freshId()
+      if (!topic) {
+        topic = {
+          identity: { schemaVersion: 1, id: `topic:${id}`, ownerId, sequenceNamespaceId: `sequence:${id}`, nextSequence: 0, version: 0, allocations: [] },
+          name: '新翻译会话', persistedName: undefined, stored: null, durable: false, nameDirty: false,
+        }
+        this.topics.set(topic.identity.id, topic)
+      }
+      if (!this.settings.rememberHistory && !topic.durable) return this.addSession(ownerId, currentParent, topic)
+      this.writeIdentity(topic)
+      const sequence = topic.identity.nextSequence
+      if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
+      this.writeIdentity(topic, { sessionId: id, sequence })
+      if (this.settings.rememberHistory) this.writeTopicName(topic)
+      const session = this.addSession(ownerId, currentParent, topic, { id, sequence })
+      this.notice = undefined
+      if (this.settings.rememberHistory) this.persistLocked(id)
+      this.emit(); return session
+    })
+  }
+
+  async createSessionForTopicAsync(ownerId: string, topicId: string): Promise<LocalSession | undefined> {
+    this.loadHistory()
+    const topic = this.topics.get(topicId)
+    if (!topic || topic.identity.ownerId !== ownerId) return undefined
+    const parent = this.getAvailableSessions(ownerId).find(session => session.topicId === topicId)
+    if (parent) return this.createSessionAsync(ownerId, parent.id)
+    if (!this.readSettings()) return undefined
+    if (!topic.durable && !this.settings.rememberHistory) { const session = this.addSession(ownerId, undefined, topic); this.emit(); return session }
+    return this.withStructureLock(undefined, () => {
+      this.loadHistory()
+      if (!this.readSettings()) return undefined
+      const latest = this.topics.get(topicId)
+      if (!latest || latest.identity.ownerId !== ownerId) return undefined
+      this.writeIdentity(latest)
+      const id = this.freshId(), sequence = latest.identity.nextSequence
+      if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
+      this.writeIdentity(latest, { sessionId: id, sequence })
+      if (this.settings.rememberHistory) this.writeTopicName(latest)
+      const session = this.addSession(ownerId, undefined, latest, { id, sequence })
+      this.notice = undefined; if (this.settings.rememberHistory) this.persistLocked(id)
+      this.emit(); return session
+    })
   }
   openSession(ownerId: string, id: string): void {
     const session = this.getSession(id)
@@ -155,9 +427,12 @@ export class SessionStore {
     if (!archived) this.openSession(ownerId, id)
     this.emit(); return true
   }
-  updateSession(id: string, patch: Partial<Pick<LocalSession, 'mode' | 'targetLanguage' | 'input' | 'instruction' | 'model' | 'childSequence'>>): boolean {
+  updateSession(id: string, patch: Partial<Pick<LocalSession, 'mode' | 'targetLanguage' | 'input' | 'instruction' | 'model' | 'maxInputChars' | 'remark'>>): boolean {
     const seat = this.seats.get(id)
     if (!seat) return false
+    if (seat.session.mode === 'normal' && patch.mode === 'quick') {
+      this.notice = '普通会话不能降为快译。需要快译时请新建主题。'; this.emit(); return false
+    }
     const next = decodeSession({ ...seat.session, ...patch, updatedAt: new Date().toISOString() })
     if (!next) { this.notice = '输入无效或过长，之前的会话内容仍保留。'; this.emit(); return false }
     seat.session = next
@@ -169,38 +444,163 @@ export class SessionStore {
   renameSession(id: string, name: string): boolean {
     const seat = this.seats.get(id)
     if (!seat) return false
-    const next = decodeSession({ ...seat.session, name: name.trim(), updatedAt: new Date().toISOString() })
-    if (!next) { this.notice = '名称不能为空，且最多 120 个字符。'; this.emit(); return false }
-    seat.session = next; if (seat.status !== 'conflict') seat.status = 'memory'
-    this.notice = undefined; if (this.settings.rememberHistory) this.persist(id)
+    if (!this.readSettings()) { this.emit(); return false }
+    if (this.settings.rememberHistory) { this.notice = '已开启历史保存，请使用异步主题重命名操作。'; this.emit(); return false }
+    const topic = this.topics.get(seat.session.topicId)
+    if (!topic || !this.validTopicName(name)) return false
+    this.projectName(topic, name.trim(), false)
+    this.notice = undefined
     this.emit(); return true
   }
 
+  private validTopicName(name: string): boolean {
+    if (!name.trim() || Array.from(name.trim()).length > 120) { this.notice = '主题名称不能为空，且最多 120 个字符。'; this.emit(); return false }
+    return true
+  }
+
+  private projectName(topic: TopicSeat, name: string, saved: boolean): void {
+    topic.name = name; topic.nameDirty = !saved
+    if (saved) topic.persistedName = name
+    const time = new Date().toISOString()
+    for (const seat of this.seats.values()) if (seat.session.topicId === topic.identity.id) {
+      seat.session = { ...seat.session, topicName: name, name: sessionName(name, seat.session.sequence), updatedAt: time }
+      if (saved && seat.savedSession) seat.savedSession = { ...seat.savedSession, topicName: name, name: sessionName(name, seat.savedSession.sequence) }
+      else if (seat.status !== 'conflict') seat.status = 'memory'
+    }
+  }
+
+  async renameSessionAsync(id: string, name: string): Promise<boolean> {
+    if (!this.validTopicName(name) || !this.readSettings()) return false
+    if (!this.settings.rememberHistory) return this.renameSession(id, name)
+    const seat = this.seats.get(id), topic = seat && this.topics.get(seat.session.topicId)
+    if (!seat || !topic) return false
+    let expectedName: string | null
+    try { expectedName = this.storage?.getItem(topicNameKey(topic.identity.id)) ?? null }
+    catch { this.notice = '主题名称读取失败，当前名称保留。'; this.emit(); return false }
+    const expectedRecord = expectedName === null ? undefined : decodeTopicName(expectedName, topic.identity)
+    if (expectedName !== null && (!expectedRecord || (topic.persistedName !== undefined && expectedRecord.name !== topic.persistedName))) {
+      this.notice = '主题已在其他窗口重命名，请核对最新名称后重试。'; this.emit(); return false
+    }
+    return this.withStructureLock(false, () => {
+      if (!this.readSettings()) return false
+      if (!this.settings.rememberHistory) return this.renameSession(id, name)
+      if (this.isDeleted(id) || this.storage?.getItem(topicNameKey(topic.identity.id)) !== expectedName) {
+        this.notice = '会话或主题名称已在其他窗口变化，请核对后重试。'; this.emit(); return false
+      }
+      this.writeIdentity(topic)
+      const version = (expectedRecord?.version ?? 0) + 1
+      if (!Number.isSafeInteger(version)) throw new Error('version exhausted')
+      const nameRecord = { schemaVersion: 1, topicId: topic.identity.id, sequenceNamespaceId: topic.identity.sequenceNamespaceId, name: name.trim(), version }
+      this.storage!.setItem(topicNameKey(topic.identity.id), JSON.stringify(nameRecord))
+      this.projectName(topic, name.trim(), true)
+      this.notice = undefined; this.emit(); return true
+    })
+  }
+
+  private writeIdentity(topic: TopicSeat, allocation?: { readonly sessionId: string; readonly sequence: number }): void {
+    if (!this.storage || this.corruptTopics.has(topicIdentityKey(topic.identity.id))) throw new Error('topic unavailable')
+    const key = topicIdentityKey(topic.identity.id), raw = this.storage.getItem(key)
+    const latest = raw === null ? undefined : decodeTopicIdentity(raw)
+    if ((raw !== null && !latest) || (raw === null && topic.stored !== null) ||
+      (latest && (latest.ownerId !== topic.identity.ownerId || latest.sequenceNamespaceId !== topic.identity.sequenceNamespaceId))) throw new Error('topic conflict')
+    const allocations = [...(latest?.allocations ?? [])]
+    for (const item of [...topic.identity.allocations, ...(allocation ? [allocation] : [])]) {
+      const known = allocations.find(entry => entry.sessionId === item.sessionId)
+      if (known && known.sequence !== item.sequence) throw new Error('allocation conflict')
+      if (!known) {
+        if (allocations.some(entry => entry.sequence === item.sequence)) throw new Error('sequence conflict')
+        allocations.push(item)
+      }
+    }
+    const nextSequence = allocations.reduce((highest, entry) => Math.max(highest, entry.sequence + 1), Math.max(latest?.nextSequence ?? 0, topic.identity.nextSequence))
+    if (!Number.isSafeInteger(nextSequence)) throw new Error('sequence exhausted')
+    const changed = !latest || latest.nextSequence !== nextSequence || latest.allocations.length !== allocations.length
+    const identity: TopicIdentity = { ...topic.identity, nextSequence, allocations, version: changed ? (latest?.version ?? 0) + 1 : latest.version }
+    if (!Number.isSafeInteger(identity.version)) throw new Error('version exhausted')
+    const serialized = changed ? JSON.stringify(identity) : raw!
+    if (changed) this.storage.setItem(key, serialized)
+    topic.identity = identity; topic.stored = serialized; topic.durable = true
+  }
+
+  private writeTopicName(topic: TopicSeat): void {
+    if (!this.storage || !this.readSettings() || !this.settings.rememberHistory) return
+    const key = topicNameKey(topic.identity.id), raw = this.storage.getItem(key)
+    const old = raw === null ? undefined : decodeTopicName(raw, topic.identity)
+    if (raw !== null && !old) throw new Error('topic name unavailable')
+    if (old && !topic.nameDirty) { topic.name = old.name; topic.persistedName = old.name; return }
+    if (old && topic.persistedName !== undefined && old.name !== topic.persistedName) throw new Error('topic name conflict')
+    const version = (old?.version ?? 0) + 1
+    if (!Number.isSafeInteger(version)) throw new Error('version exhausted')
+    this.storage.setItem(key, JSON.stringify({ schemaVersion: 1, topicId: topic.identity.id, sequenceNamespaceId: topic.identity.sequenceNamespaceId, name: topic.name, version }))
+    this.projectName(topic, topic.name, true)
+  }
+
   private persist(id: string, overwrite = false): boolean {
+    void this.saveSessionAsync(id, overwrite)
+    return false
+  }
+
+  private saveSessionAsync(id: string, overwrite = false): Promise<boolean> {
+    const pending = this.pendingSaves.get(id)
+    if (pending && !overwrite) return pending
+    const seat = this.seats.get(id)
+    if (!seat) return Promise.resolve(false)
+    const promise = this.withStructureLock(false, () => {
+      if (!this.readSettings() || !this.settings.rememberHistory) return false
+      const current = this.seats.get(id), topic = current && this.topics.get(current.session.topicId)
+      if (!current || !topic || this.isDeleted(id)) {
+        if (current) current.status = 'conflict'
+        this.notice = '会话已删除或主题身份不可用，当前输入保留。'; this.emit(); return false
+      }
+      try {
+        this.writeIdentity(topic)
+        this.writeTopicName(topic)
+        this.adoptTopic(current)
+        const result = this.persistLocked(id, overwrite)
+        this.emit(); return result
+      } catch {
+        current.status = 'error'; this.notice = '主题或会话历史保存失败，当前输入仍保留。'; this.emit(); return false
+      }
+    }).then(result => {
+      if (!result && !this.locks && this.seats.get(id)?.status !== 'conflict') { seat.status = 'error'; this.emit() }
+      return result
+    }).finally(() => { if (this.pendingSaves.get(id) === promise) this.pendingSaves.delete(id) })
+    this.pendingSaves.set(id, promise)
+    return promise
+  }
+
+  private persistLocked(id: string, overwrite = false): boolean {
     const seat = this.seats.get(id)
     if (!seat || !this.storage) { this.notice = '会话历史保存不可用，内容仍保留在当前窗口。'; return false }
     try {
       if (!this.readSettings()) throw new Error('invalid settings')
       if (!this.settings.rememberHistory) return false
+      if (this.isDeleted(id)) { seat.status = 'conflict'; this.notice = '会话已在其他窗口删除，当前输入保留，不能覆盖恢复已删除身份。'; return false }
       const raw = this.storage.getItem(historyKey(id))
       if (!overwrite && (raw !== seat.stored || seat.status === 'conflict')) {
         seat.status = 'conflict'; this.notice = '会话历史已在其他窗口修改或删除，当前输入保留。请选择读取本地副本或明确覆盖。'; return false
       }
-      const serialized = JSON.stringify({ schemaVersion: 2, token: `${Date.now()}-${Math.random()}`, session: seat.session })
+      const serialized = JSON.stringify({ schemaVersion: 3, token: `${Date.now()}-${Math.random()}`, session: seat.session })
       this.storage.setItem(historyKey(id), serialized)
       seat.stored = serialized; seat.savedSession = seat.session; seat.status = 'saved'
       return true
     } catch { seat.status = 'error'; this.notice = '会话历史保存失败，当前输入仍保留在窗口内存中。'; return false }
   }
-  overwriteSession(id: string): boolean { this.notice = undefined; const result = this.persist(id, true); this.emit(); return result }
+  overwriteSession(id: string): boolean { this.notice = '覆盖保存需要等待主题锁，请使用异步覆盖操作。'; this.emit(); return false }
+  async overwriteSessionAsync(id: string): Promise<boolean> { this.notice = undefined; return this.saveSessionAsync(id, true) }
   reloadSession(id: string): boolean {
     const seat = this.seats.get(id)
     if (!seat || !this.storage) return false
     try {
       const raw = this.storage.getItem(historyKey(id))
       const session = raw === null ? undefined : readHistory(raw)
-      if (!session || session.id !== id || session.ownerId !== seat.session.ownerId) throw new Error('invalid history')
+      if (!session || session.id !== id || session.ownerId !== seat.session.ownerId || this.isDeleted(id)) throw new Error('invalid history')
       seat.session = session; seat.savedSession = session; seat.stored = raw; seat.status = 'saved'; this.notice = undefined
+      const topic = this.topics.get(session.topicId)
+      if (topic) { topic.nameDirty = false; topic.name = topic.persistedName ?? session.topicName }
+      if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(id, session)
+      else this.migrationSources.delete(id)
+      this.loadHistory(); this.adoptTopic(seat)
       this.reconcileWorkspace(session.ownerId); this.emit(); return true
     } catch { this.notice = '本地副本不存在或无法读取，当前输入保持不变。'; this.emit(); return false }
   }
@@ -215,7 +615,7 @@ export class SessionStore {
         const raw = this.storage.getItem(key)
         if (raw === null) continue
         const session = key.startsWith(HISTORY_PREFIX) ? readHistory(raw) : legacySession(key, raw)
-        if (!session || (key.startsWith(HISTORY_PREFIX) && historyKey(session.id) !== key)) result.push({ key, raw })
+        if (!session || this.isDeleted(session.id) || (key.startsWith(HISTORY_PREFIX) && historyKey(session.id) !== key)) result.push({ key, raw })
       }
     } catch { this.notice = '部分历史存储无法检查，清理范围可能不完整。' }
     return result
@@ -225,7 +625,35 @@ export class SessionStore {
     return ids.flatMap(id => { const seat = this.seats.get(id); return seat ? [{ id, stored: seat.stored, legacyRaw: seat.legacyRaw, current: JSON.stringify(seat.session) }] : [] })
   }
 
+  async deleteHistoryAsync(ids: readonly string[], deleteMemory = false, unreadable: readonly { readonly key: string; readonly raw: string }[] = [], expected?: readonly HistoryVersion[]): Promise<boolean> {
+    if (deleteMemory) return this.deleteHistory(ids, true, unreadable, expected)
+    const frozen = expected ?? this.captureHistoryVersions(ids)
+    const requiresStorage = unreadable.length > 0 || ids.some(id => {
+      const seat = this.seats.get(id)
+      return seat && (seat.stored !== null || seat.legacyRaw !== null || this.topics.get(seat.session.topicId)?.durable)
+    })
+    if (!requiresStorage) return this.deleteHistory(ids, false, unreadable, frozen)
+    return this.withStructureLock(false, () => {
+      // 只保存身份与既有发号记录，不把关闭保存期间的新名称/正文写入磁盘。
+      for (const id of ids) {
+        const seat = this.seats.get(id), topic = seat && this.topics.get(seat.session.topicId)
+        if (topic?.durable) this.writeIdentity(topic)
+      }
+      return this.deleteHistoryLocked(ids, false, unreadable, frozen)
+    })
+  }
+
   deleteHistory(ids: readonly string[], deleteMemory = false, unreadable: readonly { readonly key: string; readonly raw: string }[] = [], expected?: readonly HistoryVersion[]): boolean {
+    if (!deleteMemory && (unreadable.length || ids.some(id => {
+      const seat = this.seats.get(id)
+      return seat && (seat.stored !== null || seat.legacyRaw !== null || this.topics.get(seat.session.topicId)?.durable)
+    }))) {
+      this.notice = '已保存历史的删除需要等待主题锁，请使用异步删除操作。'; this.emit(); return false
+    }
+    return this.deleteHistoryLocked(ids, deleteMemory, unreadable, expected)
+  }
+
+  private deleteHistoryLocked(ids: readonly string[], deleteMemory: boolean, unreadable: readonly { readonly key: string; readonly raw: string }[], expected?: readonly HistoryVersion[]): boolean {
     if (deleteMemory) { this.notice = '关联记忆档案尚未接入，此操作未执行。'; this.emit(); return false }
     try {
       const seats = [...new Set(ids)].map(id => this.seats.get(id)).filter((seat): seat is Seat => !!seat)
@@ -239,6 +667,10 @@ export class SessionStore {
       }
       // 删除前检查已保存版本，避免清理另一个窗口刚刚更新的会话。
       for (const seat of seats) {
+        const topic = this.topics.get(seat.session.topicId)
+        if (topic?.durable && !topic.stored) {
+          this.notice = '删除前需要可靠保存主题编号，请使用异步删除操作。'; this.emit(); return false
+        }
         const version = expected ? expected.find(item => item.id === seat.session.id) : seat
         if (!version || (expected && JSON.stringify(seat.session) !== expected.find(item => item.id === seat.session.id)?.current) ||
           (this.storage?.getItem(historyKey(seat.session.id)) ?? null) !== version.stored ||
@@ -246,12 +678,26 @@ export class SessionStore {
           this.notice = '待删除会话或历史已变化，请核对最新内容后重新确认。'; this.emit(); return false
         }
       }
-      for (const item of unreadable) this.storage?.removeItem(item.key)
+      for (const item of unreadable) {
+        const legacyKey = item.key.startsWith(LEGACY_DRAFT_PREFIX) ? item.key : null
+        let id: string | undefined
+        try { id = legacyKey ? `legacy:${legacyKey}` : decodeURIComponent(item.key.slice(HISTORY_PREFIX.length)) } catch { /* 无可解码 ID 时仅删除确认过的原键。 */ }
+        if (id?.trim()) {
+          this.storage!.setItem(deletedSessionKey(id), JSON.stringify({ schemaVersion: 1, sessionId: id, legacyKey }))
+          this.deleted.add(id)
+        }
+        this.storage?.removeItem(item.key)
+      }
       for (const seat of seats) {
+        if (seat.stored !== null || seat.legacyRaw !== null || this.topics.get(seat.session.topicId)?.durable) {
+          this.storage!.setItem(deletedSessionKey(seat.session.id), JSON.stringify({ schemaVersion: 1, sessionId: seat.session.id, legacyKey: seat.session.legacyKey }))
+          this.deleted.add(seat.session.id); seat.status = 'conflict'; seat.savedSession = undefined
+        }
         this.storage?.removeItem(historyKey(seat.session.id))
         seat.stored = null
         if (seat.session.legacyKey) { this.storage?.removeItem(seat.session.legacyKey); seat.legacyRaw = null }
         this.seats.delete(seat.session.id)
+        this.migrationSources.delete(seat.session.id)
         this.reconcileWorkspace(seat.session.ownerId)
       }
       this.notice = undefined; this.emit(); return true
@@ -260,15 +706,26 @@ export class SessionStore {
 
   private externalChange(key: string | null): void {
     if (key === null || key === SETTINGS_KEY || key === LEGACY_SETTINGS_KEY) this.readSettings()
-    if (key === null || key?.startsWith(HISTORY_PREFIX) || key?.startsWith(LEGACY_DRAFT_PREFIX)) {
+    if (key === null || key?.startsWith(HISTORY_PREFIX) || key?.startsWith(LEGACY_DRAFT_PREFIX) ||
+      key?.startsWith(TOPIC_IDENTITY_PREFIX) || key?.startsWith(TOPIC_NAME_PREFIX) || key?.startsWith(DELETED_SESSION_PREFIX)) {
       for (const seat of this.seats.values()) {
-        if (key !== null && key !== historyKey(seat.session.id) && key !== seat.session.legacyKey) continue
+        if (key !== null && key !== historyKey(seat.session.id) && key !== seat.session.legacyKey && key !== deletedSessionKey(seat.session.id)) continue
         try {
+          if (this.isDeleted(seat.session.id)) {
+            seat.savedSession = undefined; seat.status = 'conflict'; this.notice = '会话已在其他窗口删除，当前草稿仅保留在本窗口，不能覆盖恢复。'; continue
+          }
           const raw = this.storage?.getItem(historyKey(seat.session.id)) ?? null
+          const legacyRaw = seat.session.legacyKey ? this.storage?.getItem(seat.session.legacyKey) ?? null : null
+          if (legacyRaw !== seat.legacyRaw && raw === seat.stored) {
+            if (legacyRaw === null && raw === null) seat.savedSession = undefined
+            seat.status = 'conflict'; this.notice = '旧版草稿在其他窗口变化，当前输入保留。'; continue
+          }
           if (raw !== seat.stored) {
             const latest = raw === null ? undefined : readHistory(raw)
             if (seat.status === 'saved' && latest && latest.id === seat.session.id && latest.ownerId === seat.session.ownerId) {
               seat.session = latest; seat.savedSession = latest; seat.stored = raw
+              if (latest.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(latest.id, latest)
+              else this.migrationSources.delete(latest.id)
             } else {
               if (raw === null) seat.savedSession = undefined
               seat.status = 'conflict'

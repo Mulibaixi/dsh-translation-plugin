@@ -1,3 +1,5 @@
+import type { TranslationRuntimePort } from './domain-contracts.js'
+
 export type EntityId<T extends string> = string & { readonly __entity: T }
 
 export type ProjectId = EntityId<'ProjectId'>
@@ -22,6 +24,7 @@ export interface ModelSelection {
   readonly providerId: string
   readonly modelId: string
   readonly configVersion: number
+  readonly reasoningEffort?: string
 }
 
 export interface TranslationSession {
@@ -157,4 +160,6 @@ export interface TranslationAppPort {
 export interface TranslationFrameworkServices {
   readonly contractVersion: 1
   readonly memory: MemoryPort
+  readonly domainVersion: 1
+  readonly runtime: TranslationRuntimePort
 }

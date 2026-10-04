@@ -513,3 +513,36 @@ test('模型菜单文字与原生目标语言紧凑菜单使用相同字号和�
   assert.ok(ui.nodes().some(node => node.props.role === 'menu' && node.props.className.includes('dsh-tp-model-menu') && node.props['data-compact'] === true))
   ui.click('选择模型'); assert.ok(ui.button('Model 1')); app.dispose()
 })
+
+test('自定义目标语言标签和输入继承紧凑菜单字号，修改语言仍只作用于当前会话', () => {
+  const app = mount(); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' }); ui.click('选择目标语言')
+  const custom = ui.nodes().find(node => node.props.className === 'dsh-tp dsh-tp-menu-content dsh-tp-language-custom')
+  assert.ok(custom); assert.match(ui.text(custom), /自定义目标语言/)
+  const css = ui.nodes().find(node => node.type === 'style').children.join('')
+  assert.match(css, /\.dsh-tp-popup \.dsh-tp-language-custom \{ font-size: 11px; line-height: 17px;/)
+  ui.input('目标语言', '简体中文，保留原文人名'); assert.equal(ui.control('目标语言').props.value, '简体中文，保留原文人名')
+  app.dispose()
+})
+
+test('模型及推理等级列表不提供返回项，关闭重开后恢复入口且等级选择仍可用', async () => {
+  const catalog = { ok: true, value: { default: null, groups: [{ id: 'p', name: 'Provider', models: [{ id: 'reasoner', name: 'Reasoner', reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }], failures: [] } }
+  const app = mount({ catalog }); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' })
+  ui.click('模型：选择模型'); await tick(); ui.render(); ui.click('选择模型')
+  assert.equal(ui.text().includes('返回模型与推理等级'), false); ui.click('Reasoner'); ui.click('选择推理等级')
+  assert.equal(ui.text().includes('返回模型与推理等级'), false); assert.ok(ui.button('High'))
+  const menu = ui.nodes().find(node => node.props.role === 'menu' && node.props.className.includes('dsh-tp-model-menu'))
+  menu.props.onClose(); ui.render(); ui.click('模型：Reasoner · Default'); assert.ok(ui.button('选择模型')); assert.ok(ui.button('选择推理等级'))
+  ui.click('选择推理等级'); ui.click('High'); assert.ok(ui.button('模型：Reasoner · High'))
+  app.dispose()
+})
+
+test('模型搜索取消蓝色聚焦外框，筛选与清空搜索仍正常', async () => {
+  const app = mount(); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' })
+  ui.click('模型：选择模型'); await tick(); ui.render(); ui.click('选择模型')
+  const search = ui.control('搜索模型')
+  assert.equal(search.props.className, 'dsh-tp-model-search'); assert.equal(search.props.style.outline, 'none'); assert.equal(search.props.style.boxShadow, 'none')
+  const css = ui.nodes().find(node => node.type === 'style').children.join('')
+  assert.match(css, /\.dsh-tp-model-search:focus, \.dsh-tp-model-search:focus-visible \{ outline: none !important; box-shadow: none !important; border-color: var\(--dsw-alias-border-l2, #8884\) !important/)
+  ui.input('搜索模型', 'Model 2'); assert.ok(ui.button('Model 2')); assert.equal(ui.nodes().some(node => node.type === 'button' && ui.text(node) === 'Model 1'), false)
+  ui.input('搜索模型', ''); assert.ok(ui.button('Model 1')); app.dispose()
+})

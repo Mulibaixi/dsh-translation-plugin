@@ -23,6 +23,8 @@ const styles = `
 .dsh-tp-session-sidebar[hidden] { display: none; }
 .dsh-tp-session-list { display: flex; flex-direction: column; gap: 3px; }
 .dsh-tp-session-item { display: block; width: 100%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsh-tp-session-name, .dsh-tp-session-remark { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-tp-session-remark { color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
 .dsh-tp-session-item[aria-current=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
 .dsh-tp-session-add { display: flex; align-items: center; justify-content: center; width: 100%; align-self: stretch; text-align: center; margin-top: 2px; }
 .dsh-tp-session-divider { border-top: 1px solid var(--dsw-alias-border-l2, #8883); margin: 4px 0; }
@@ -34,7 +36,7 @@ const styles = `
 .dsh-tp-current-title { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; text-align: left; }
 .dsh-tp-current-title-text { min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .dsh-tp-session-choice { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; }
-.dsh-tp-session-choice-name { min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+.dsh-tp-session-choice-name { display: block; min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .dsh-tp-session-choice[aria-current=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
 .dsh-tp-header-options { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: none; margin-left: auto; }
 .dsh-tp-compact-trigger { display: flex; align-items: center; gap: 4px; font-weight: 400; white-space: nowrap; max-width: 110px; }
@@ -79,7 +81,9 @@ const styles = `
 /* 与 DSH 原生紧凑菜单（目标语言）的文字规格一致。 */
 .dsh-tp-model-menu .dsh-tp-menu-content { font-size: 11px; line-height: 17px; }
 .dsh-tp-model-menu .dsh-tp-muted { font-size: inherit; line-height: inherit; }
+.dsh-tp-popup .dsh-tp-language-custom { font-size: 11px; line-height: 17px; }
 .dsh-tp-model-menu input { width: 100%; margin-bottom: 6px; }
+.dsh-tp-model-search:focus, .dsh-tp-model-search:focus-visible { outline: none !important; box-shadow: none !important; border-color: var(--dsw-alias-border-l2, #8884) !important; }
 .dsh-tp-model-list { max-height: 260px; overflow-y: auto; }
 .dsh-tp-model-row { display: block; text-align: left; width: 100%; font-weight: 400; }
 .dsh-tp-model-cell { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; }
@@ -89,6 +93,33 @@ const styles = `
 function useStore(store: SessionStore): void {
   const [, update] = react.useState(0)
   react.useEffect(() => { const off = store.subscribe(() => update(value => value + 1)); update(value => value + 1); return off }, [store])
+}
+function useAsyncAction(): { readonly pending: boolean; readonly failure: string | undefined; readonly run: (action: () => Promise<boolean>, onSuccess?: () => void) => Promise<void> } {
+  const [pending, setPending] = react.useState(false)
+  const [failure, setFailure] = react.useState<string | undefined>(undefined)
+  const lifetime = react.useRef({ mounted: false, generation: 0, busy: false })
+  react.useEffect(() => {
+    lifetime.current.mounted = true
+    lifetime.current.busy = false
+    setPending(false)
+    return () => { lifetime.current.mounted = false; lifetime.current.busy = false; lifetime.current.generation += 1 }
+  }, [])
+  async function run(action: () => Promise<boolean>, onSuccess?: () => void): Promise<void> {
+    if (!lifetime.current.mounted || lifetime.current.busy) return
+    const generation = lifetime.current.generation
+    const active = (): boolean => lifetime.current.mounted && lifetime.current.generation === generation
+    lifetime.current.busy = true
+    setPending(true); setFailure(undefined)
+    try {
+      const success = await action()
+      if (active() && success) onSuccess?.()
+    } catch {
+      if (active()) setFailure('操作未完成，请重试。')
+    } finally {
+      if (active()) { lifetime.current.busy = false; setPending(false) }
+    }
+  }
+  return { pending, failure, run }
 }
 function button(label: string, action: () => void, disabled = false): unknown { return h('button', { type: 'button', onClick: action, disabled }, label) }
 function field(label: string, control: unknown, hint?: string): unknown { return h('label', { className: 'dsh-tp-field' }, h('span', null, label), control, hint ? h('small', { className: 'dsh-tp-muted' }, hint) : null) }
@@ -107,21 +138,32 @@ export function PanelRouter({ store, models, sessionId }: StoreProps & { readonl
 }
 
 interface ContextRequest { readonly id: string; readonly x: number; readonly y: number; readonly trigger?: HTMLElement | undefined }
-type WorkspaceDialog = { readonly kind: 'rename' | 'reload'; readonly id: string }
+type WorkspaceDialog = { readonly kind: 'rename' | 'remark' | 'reload'; readonly id: string }
 type ContextEvent = { preventDefault(): void; stopPropagation(): void; readonly clientX: number; readonly clientY: number; readonly currentTarget?: HTMLElement }
 
-function CompactChoices({ label, value, options, onChange }: {
-  readonly label: string; readonly value: string; readonly options: readonly { readonly value: string; readonly label: string }[]
-  readonly onChange: (value: string) => void
-}): unknown {
+function sessionTitle(session: LocalSession): string {
+  const label = session.remark ? `${session.name} · ${session.remark}` : session.name
+  return session.legacyName ? `${label}\n旧名称：${session.legacyName}` : label
+}
+function sessionLabel(session: LocalSession): unknown {
+  return h('span', { className: 'dsh-tp-session-choice-name' },
+    h('span', { className: 'dsh-tp-session-name' }, session.name),
+    session.remark ? h('span', { className: 'dsh-tp-session-remark' }, session.remark) : null,
+  )
+}
+
+function ModePicker({ session, store }: StoreProps & { readonly session: LocalSession }): unknown {
   const [open, setOpen] = react.useState(false)
   return h(Menu, {
     open, onClose: () => setOpen(false), portal: true, align: 'end', compact: true, listClassName: 'dsh-tp-popup',
-    anchor: h('button', { type: 'button', className: 'dsh-tp-compact-trigger', 'aria-label': `选择${label}`, 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => setOpen(value => !value) },
-      h('span', { className: 'dsh-tp-compact-label' }, options.find(option => option.value === value)?.label ?? value),
+    anchor: h('button', { type: 'button', className: 'dsh-tp-compact-trigger', 'aria-label': '选择翻译模式', 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => setOpen(value => !value) },
+      h('span', { className: 'dsh-tp-compact-label' }, session.mode === 'quick' ? '快译' : '普通'),
       h(IconChevronDownOutlineRegular, { size: 14, className: `dsh-tp-chevron${open ? ' dsh-tp-chevron-open' : ''}` }),
     ),
-  }, ...options.map(option => h(MenuItemButton, { key: option.value, onSelect: () => { onChange(option.value); setOpen(false) } }, option.label)))
+  },
+    h(MenuItemButton, { disabled: true }, session.mode === 'quick' ? '快译（当前）' : '快译（普通会话不可降档）'),
+    h(MenuItemButton, { disabled: session.mode === 'normal', onSelect: () => { if (store.updateSession(session.id, { mode: 'normal' })) setOpen(false) } }, session.mode === 'normal' ? '普通（当前）' : '升为普通'),
+  )
 }
 
 function LanguagePicker({ session, store }: StoreProps & { readonly session: LocalSession }): unknown {
@@ -134,36 +176,37 @@ function LanguagePicker({ session, store }: StoreProps & { readonly session: Loc
     ),
   }, ...['中文', 'English', '日本語', '한국어', 'Français', 'Deutsch', 'Español', 'Русский'].map(language => h(MenuItemButton, {
     key: language, onSelect: () => { store.updateSession(session.id, { targetLanguage: language }); setOpen(false) },
-  }, language)), h('div', { className: 'dsh-tp dsh-tp-menu-content' }, field('自定义目标语言', h('input', {
+  }, language)), h('div', { className: 'dsh-tp dsh-tp-menu-content dsh-tp-language-custom' }, field('自定义目标语言', h('input', {
     value: session.targetLanguage, 'aria-label': '目标语言', onChange: (event: TextEvent) => { store.updateSession(session.id, { targetLanguage: event.currentTarget.value }) },
   }))))
 }
 
-function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys }: StoreProps & {
+function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate }: StoreProps & {
   readonly ownerId: string; readonly current: LocalSession | undefined
   readonly open: boolean; readonly onOpenChange: (open: boolean) => void
   readonly contextOpen: boolean; readonly onDismissContext: () => void
   readonly onContext: (session: LocalSession, event: ContextEvent) => void
   readonly onContextKeys: (session: LocalSession, event: KeyboardEvent & { currentTarget: HTMLElement }) => void
+  readonly creating: boolean; readonly onCreate: () => void
 }): unknown {
   const sessions = store.getActiveSessions(ownerId)
   const archived = store.getArchivedSessions(ownerId)
   function row(session: LocalSession, restore = false): unknown {
     return h('button', {
-      type: 'button', role: 'menuitem', key: session.id, className: 'dsh-tp-session-choice', title: session.name,
-      'aria-label': `${restore ? '恢复归档会话' : '切换翻译会话'}：${session.name}`, 'aria-current': current?.id === session.id,
-      onClick: () => { onDismissContext(); if (restore) store.archiveSession(ownerId, session.id, false); else store.openSession(ownerId, session.id); setOpen(false) },
+      type: 'button', role: 'menuitem', key: session.id, className: 'dsh-tp-session-choice', title: sessionTitle(session),
+      'aria-label': `${restore ? '恢复归档会话' : '切换翻译会话'}：${sessionTitle(session)}`, 'aria-current': current?.id === session.id,
+      onClick: () => { if (restore && !store.archiveSession(ownerId, session.id, false)) return; if (!restore) store.openSession(ownerId, session.id); onDismissContext(); setOpen(false) },
       onContextMenu: (event: ContextEvent) => onContext(session, event),
       onKeyDown: (event: KeyboardEvent & { currentTarget: HTMLElement }) => {
         if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) onContextKeys(session, event)
       },
-    }, h('span', { className: 'dsh-tp-session-choice-name' }, session.name), current?.id === session.id ? h('span', { 'aria-hidden': true }, '✓') : null)
+    }, sessionLabel(session), current?.id === session.id ? h('span', { 'aria-hidden': true }, '✓') : null)
   }
   return h('div', { className: 'dsh-tp-title-select' }, h(Menu, {
     open, onClose: () => { if (!contextOpen) setOpen(false) }, portal: true, compact: true, className: 'dsh-tp-title-anchor', listClassName: 'dsh-tp-popup',
     anchor: h('button', {
       type: 'button', className: 'dsh-tp-current-title', 'aria-label': current ? `当前翻译会话：${current.name}` : '选择翻译会话',
-      title: current?.name ?? '选择翻译会话', 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => { onDismissContext(); setOpen(!open) },
+      title: current ? sessionTitle(current) : '选择翻译会话', 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => { onDismissContext(); setOpen(!open) },
       onPointerDown: (event: { stopPropagation(): void }) => { if (contextOpen) event.stopPropagation() },
       onContextMenu: current ? (event: ContextEvent) => onContext(current, event) : undefined,
       onKeyDown: current ? (event: KeyboardEvent & { currentTarget: HTMLElement }) => {
@@ -179,8 +222,8 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
     archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
     h('button', {
-      type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建翻译会话', 'aria-label': '新建翻译会话',
-      onClick: () => { onDismissContext(); store.createSession(ownerId); setOpen(false) },
+      type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,
+      onClick: onCreate,
     }, '+'),
   )))
 }
@@ -194,6 +237,8 @@ function WorkspaceView({ store, models, ownerId }: StoreProps & { readonly model
   const [dialog, setDialog] = react.useState<WorkspaceDialog | undefined>(undefined)
   const [deletion, setDeletion] = react.useState<DeleteRequest | undefined>(undefined)
   const [name, setName] = react.useState('')
+  const [remark, setRemark] = react.useState('')
+  const action = useAsyncAction()
   react.useEffect(() => { store.ensureWorkspace(ownerId) }, [store, ownerId])
   const sessions = store.getActiveSessions(ownerId)
   const archived = store.getArchivedSessions(ownerId)
@@ -210,59 +255,68 @@ function WorkspaceView({ store, models, ownerId }: StoreProps & { readonly model
     const rect = event.currentTarget.getBoundingClientRect()
     contextMenu(session, { preventDefault: () => event.preventDefault(), stopPropagation: () => event.stopPropagation(), clientX: rect.left, clientY: rect.bottom, currentTarget: event.currentTarget })
   }
+  function create(parentId?: string): void {
+    void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)), () => { setContext(undefined); setSessionPickerOpen(false) })
+  }
   function sessionItem(session: LocalSession): unknown {
     return h('button', {
-      key: session.id, type: 'button', className: 'dsh-tp-session-item', title: session.name,
+      key: session.id, type: 'button', className: 'dsh-tp-session-item', title: sessionTitle(session),
       'aria-current': session.id === current?.id, 'aria-haspopup': 'menu',
       onClick: () => { store.openSession(ownerId, session.id); setContext(undefined) },
       onContextMenu: (event: ContextEvent) => contextMenu(session, event),
       onKeyDown: (event: KeyboardEvent & { currentTarget: HTMLElement }) => contextKeys(session, event),
-    }, session.name)
+    }, sessionLabel(session))
   }
   return h('div', { className: 'dsh-tp-workspace' },
     h('aside', { className: 'dsh-tp-session-sidebar', hidden: !sidebar, 'aria-label': '翻译会话侧栏' },
       h('div', { className: 'dsh-tp-session-list', 'aria-label': '使用中的翻译会话' },
         ...sessions.map(sessionItem),
-        h('button', { type: 'button', className: 'dsh-tp-session-add', title: '新建翻译会话', 'aria-label': '新建翻译会话', onClick: () => { store.createSession(ownerId); setContext(undefined) } }, '+'),
+        h('button', { type: 'button', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: action.pending, onClick: () => create() }, '+'),
       ),
       h('button', { type: 'button', className: 'dsh-tp-archive-toggle', 'aria-expanded': archives, onClick: () => setArchives(value => !value) }, `已归档（${archived.length}）`),
       archives ? h('div', { className: 'dsh-tp-session-list', 'aria-label': '已归档翻译会话' },
-        ...archived.map(session => h('button', { type: 'button', className: 'dsh-tp-session-item', key: session.id, title: session.name, 'aria-haspopup': 'menu',
+        ...archived.map(session => h('button', { type: 'button', className: 'dsh-tp-session-item', key: session.id, title: sessionTitle(session), 'aria-haspopup': 'menu',
           onContextMenu: (event: ContextEvent) => contextMenu(session, event),
           onKeyDown: (event: KeyboardEvent & { currentTarget: HTMLElement }) => contextKeys(session, event),
-          onClick: () => { store.archiveSession(ownerId, session.id, false); setContext(undefined) },
-        }, session.name)),
+          onClick: () => { if (store.archiveSession(ownerId, session.id, false)) setContext(undefined) },
+        }, sessionLabel(session))),
         archived.length === 0 ? h('small', { className: 'dsh-tp-muted' }, '暂无归档会话。') : null,
       ) : null,
     ),
     h('div', { className: 'dsh-tp-main' },
       h('header', { className: 'dsh-tp-workspace-header' },
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
-        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys }),
+        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create() }),
         current ? h('div', { className: 'dsh-tp-header-options' },
-          h(CompactChoices, { label: '翻译模式', value: current.mode, options: [{ value: 'quick', label: '快译' }, { value: 'normal', label: '普通' }], onChange: (mode: LocalSession['mode']) => { store.updateSession(current.id, { mode }) } }),
+          h(ModePicker, { store, session: current, key: current.id }),
           h(LanguagePicker, { store, session: current, key: current.id }),
         ) : null,
       ),
-      dialog?.kind === 'rename' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '重命名翻译会话' },
-        field('会话名称', h('input', { type: 'text', value: name, autoFocus: true, onChange: (event: TextEvent) => setName(event.currentTarget.value) })),
-        h('div', { className: 'dsh-tp-actions' }, button('确认重命名', () => { if (store.renameSession(dialog.id, name)) setDialog(undefined) }), button('取消', () => setDialog(undefined))),
+      dialog?.kind === 'rename' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '重命名主题', 'aria-busy': action.pending },
+        field('主题名称', h('input', { type: 'text', value: name, autoFocus: true, disabled: action.pending, onChange: (event: TextEvent) => setName(event.currentTarget.value) })),
+        h('p', { className: 'dsh-tp-muted' }, '同主题的全部会话（含归档会话）一起更名，编号与单会话备注保持不变。'),
+        h('div', { className: 'dsh-tp-actions' }, button(action.pending ? '正在保存…' : '确认重命名主题', () => { void action.run(() => store.renameSessionAsync(dialog.id, name), () => setDialog(currentDialog => currentDialog === dialog ? undefined : currentDialog)) }, action.pending), button('取消', () => setDialog(undefined), action.pending)),
       ) : null,
-      deletion ? h(DeleteDialog, { request: deletion, sessionDeletion: true, onCancel: () => setDeletion(undefined), onConfirm: () => {
-        if (store.deleteHistory(deletion.ids, false, deletion.unreadable, deletion.versions)) setDeletion(undefined)
+      dialog?.kind === 'remark' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '编辑会话备注' },
+        field('会话备注', h('input', { type: 'text', value: remark, autoFocus: true, onChange: (event: TextEvent) => setRemark(event.currentTarget.value) }), '仅用于区分此会话，可留空，也可与其他会话重复。'),
+        h('div', { className: 'dsh-tp-actions' }, button('保存备注', () => { if (store.updateSession(dialog.id, { remark })) setDialog(undefined) }), button('取消', () => setDialog(undefined))),
+      ) : null,
+      deletion ? h(DeleteDialog, { request: deletion, sessionDeletion: true, pending: action.pending, onCancel: () => setDeletion(undefined), onConfirm: () => {
+        void action.run(() => store.deleteHistoryAsync(deletion.ids, false, deletion.unreadable, deletion.versions), () => setDeletion(currentRequest => currentRequest === deletion ? undefined : currentRequest))
       } }) : null,
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText))
-          : h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容。翻译执行尚未接入。' : '新建一个会话，或从已归档列表恢复。'),
+          : h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容。翻译执行、主模型协作与记忆尚未接入。' : '用“+”新建主题及首会话，或从已归档列表恢复。'),
       ),
       storeNotice(store),
+      action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
       current && status === 'conflict' ? h('div', { className: 'dsh-tp-actions dsh-tp-message' },
-        button('读取本地副本', () => setDialog({ kind: 'reload', id: current.id })),
-        button('用当前会话覆盖本地副本', () => { store.overwriteSession(current.id) }, !store.getSettings().rememberHistory),
+        button('读取本地副本', () => setDialog({ kind: 'reload', id: current.id }), action.pending),
+        button('用当前会话覆盖本地副本', () => { void action.run(() => store.overwriteSessionAsync(current.id)) }, action.pending || !store.getSettings().rememberHistory),
       ) : null,
       dialog?.kind === 'reload' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '读取会话历史确认' },
         h('p', null, '读取本地副本会替换本窗口该会话内容。确认继续？'),
-        button('确认读取', () => { store.reloadSession(dialog.id); setDialog(undefined) }), button('取消', () => setDialog(undefined)),
+        button('确认读取', () => { if (store.reloadSession(dialog.id)) setDialog(undefined) }, action.pending), button('取消', () => setDialog(undefined), action.pending),
       ) : null,
       current ? h('div', { className: 'dsh-tp-composer' },
         h('textarea', { value: current.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(current.id, { input: event.currentTarget.value }) } }),
@@ -282,35 +336,37 @@ function WorkspaceView({ store, models, ownerId }: StoreProps & { readonly model
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setContext(undefined); context.trigger?.focus() }
       },
     },
-      h(MenuItemButton, { onSelect: () => { store.createSession(ownerId, target.id); setContext(undefined) } }, '新建会话'),
-      h(MenuItemButton, { onSelect: () => { setName(target.name); setDialog({ kind: 'rename', id: target.id }); setContext(undefined) } }, '重命名'),
-      h(MenuItemButton, { danger: true, onSelect: () => {
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建同主题子会话'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { setName(target.topicName); setDialog({ kind: 'rename', id: target.id }); setContext(undefined) } }, '重命名主题'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }); setContext(undefined) } }, '编辑会话备注'),
+      h(MenuItemButton, { disabled: action.pending, danger: true, onSelect: () => {
         setDeletion({ title: `删除「${target.name}」`, ids: [target.id], unreadable: [], versions: store.captureHistoryVersions([target.id]) }); setContext(undefined)
       } }, '删除'),
-      h(MenuItemButton, { onSelect: () => { store.archiveSession(ownerId, target.id, target.archivedAt === null); setContext(undefined) } }, target.archivedAt === null ? '归档' : '恢复归档'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { if (store.archiveSession(ownerId, target.id, target.archivedAt === null)) setContext(undefined) } }, target.archivedAt === null ? '归档' : '恢复归档'),
     )) : null,
   )
 }
 
 interface DeleteRequest { readonly title: string; readonly ids: readonly string[]; readonly unreadable: readonly { readonly key: string; readonly raw: string }[]; readonly versions: readonly HistoryVersion[] }
-function DeleteDialog({ request, onCancel, onConfirm, sessionDeletion = false }: {
-  readonly request: DeleteRequest; readonly onCancel: () => void; readonly onConfirm: () => void; readonly sessionDeletion?: boolean
+function DeleteDialog({ request, onCancel, onConfirm, sessionDeletion = false, pending = false }: {
+  readonly request: DeleteRequest; readonly onCancel: () => void; readonly onConfirm: () => void; readonly sessionDeletion?: boolean; readonly pending?: boolean
 }): unknown {
-  return h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': sessionDeletion ? '删除翻译会话确认' : '删除会话历史确认' },
+  return h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': sessionDeletion ? '删除翻译会话确认' : '删除会话历史确认', 'aria-busy': pending },
     h('h3', null, request.title),
     h('p', null, sessionDeletion ? '将删除该会话的当前内容与已保存历史，并从列表移除。'
       : `将删除 ${request.ids.length} 条会话历史${request.unreadable.length ? `及 ${request.unreadable.length} 份无法读取的历史副本` : ''}，并从会话列表移除。`),
     h('p', null, '是否联动删除关联记忆档案？'),
     h('label', { className: 'dsh-tp-history-row' }, h('input', { type: 'radio', name: 'translation-memory-deletion', checked: true, readOnly: true }), '保留关联记忆档案'),
     h('label', { className: 'dsh-tp-history-row' }, h('input', { type: 'radio', name: 'translation-memory-deletion', disabled: true, checked: false, readOnly: true }), '同时删除关联记忆档案（尚未接入）'),
-    h('p', { className: 'dsh-tp-muted' }, '记忆系统尚未接入；本次保留关联记忆。共享记忆的删除范围将在记忆设计中确定。'),
-    h('div', { className: 'dsh-tp-actions' }, button(sessionDeletion ? '确认删除会话' : '确认删除历史', onConfirm), button('取消', onCancel)),
+    h('p', { className: 'dsh-tp-muted' }, '记忆系统尚未接入；本次保留关联记忆。'),
+    h('div', { className: 'dsh-tp-actions' }, button(pending ? '正在删除…' : sessionDeletion ? '确认删除会话' : '确认删除历史', onConfirm, pending), button('取消', onCancel, pending)),
   )
 }
 function HistorySection({ store }: StoreProps): unknown {
   useStore(store)
   const [selected, setSelected] = react.useState<readonly string[]>([])
   const [request, setRequest] = react.useState<DeleteRequest | undefined>(undefined)
+  const action = useAsyncAction()
   const history = store.getHistory()
   const selectedIds = selected.filter(id => history.some(session => session.id === id))
   function choose(title: string, ids: readonly string[], all = false): void {
@@ -318,22 +374,25 @@ function HistorySection({ store }: StoreProps): unknown {
   }
   return h('div', null,
     h('div', { className: 'dsh-tp-actions' },
-      button('清除历史快译', () => choose('清除历史快译', history.filter(session => session.mode === 'quick').map(session => session.id)), !history.some(session => session.mode === 'quick')),
-      button('清除所有会话历史', () => choose('清除所有会话历史', history.map(session => session.id), true)),
+      button('清除历史快译', () => choose('清除历史快译', history.filter(session => session.mode === 'quick').map(session => session.id)), action.pending || !history.some(session => session.mode === 'quick')),
+      button('清除所有会话历史', () => choose('清除所有会话历史', history.map(session => session.id), true), action.pending),
     ),
     h('div', { className: 'dsh-tp-history-list', 'aria-label': '已保存会话历史' },
       history.length === 0 ? h('p', { className: 'dsh-tp-muted' }, '尚无已保存的会话历史。') : null,
-      ...history.map(session => h('label', { key: session.id, className: 'dsh-tp-history-row' },
-        h('input', { type: 'checkbox', checked: selectedIds.includes(session.id), 'aria-label': `选择会话 ${session.name}`, onChange: (event: CheckEvent) => {
+      ...history.map(session => h('label', { key: session.id, className: 'dsh-tp-history-row', title: sessionTitle(session) },
+        h('input', { type: 'checkbox', checked: selectedIds.includes(session.id), disabled: action.pending, 'aria-label': `选择会话 ${session.name}`, onChange: (event: CheckEvent) => {
           setSelected(current => event.currentTarget.checked ? [...new Set([...current, session.id])] : current.filter(id => id !== session.id))
         } }),
-      h('span', null, session.name, h('div', { className: 'dsh-tp-muted' }, `${session.mode === 'quick' ? '快译' : '普通'} · ${session.targetLanguage} · ${session.updatedAt.slice(0, 10)}${session.archivedAt ? ' · 已归档' : ''}`)),
+      h('span', null, session.name,
+        session.remark ? h('div', { className: 'dsh-tp-muted' }, session.remark) : null,
+        h('div', { className: 'dsh-tp-muted' }, `${session.mode === 'quick' ? '快译' : '普通'} · ${session.targetLanguage} · ${session.updatedAt.slice(0, 10)}${session.archivedAt ? ' · 已归档' : ''}`)),
       )),
     ),
-    button(`删除所选历史（${selectedIds.length}）`, () => choose('删除所选历史', selectedIds), selectedIds.length === 0),
-    request ? h(DeleteDialog, { request, onCancel: () => setRequest(undefined), onConfirm: () => {
-        if (store.deleteHistory(request.ids, false, request.unreadable, request.versions)) { setSelected([]); setRequest(undefined) }
+    button(`删除所选历史（${selectedIds.length}）`, () => choose('删除所选历史', selectedIds), action.pending || selectedIds.length === 0),
+    request ? h(DeleteDialog, { request, pending: action.pending, onCancel: () => setRequest(undefined), onConfirm: () => {
+        void action.run(() => store.deleteHistoryAsync(request.ids, false, request.unreadable, request.versions), () => { setSelected([]); setRequest(currentRequest => currentRequest === request ? undefined : currentRequest) })
       } }) : null,
+    action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
   )
 }
 
@@ -341,26 +400,48 @@ export function SettingsView({ store, onClose }: StoreProps & { readonly onClose
   useStore(store)
   const [pending, setPending] = react.useState<Partial<Omit<SessionSettings, 'schemaVersion'>>>({})
   const [errors, setErrors] = react.useState<readonly string[]>([])
+  const [saving, setSaving] = react.useState(false)
+  const lifecycle = react.useRef(0)
+  const editVersion = react.useRef(0)
+  const inFlight = react.useRef(0)
+  const editsRef = react.useRef<Partial<Omit<SessionSettings, 'schemaVersion'>>>({})
+  react.useEffect(() => {
+    const generation = ++lifecycle.current
+    inFlight.current = 0; setSaving(false)
+    return () => { if (lifecycle.current === generation) lifecycle.current++ }
+  }, [])
   const form = { ...store.getSettings(), ...pending }
-  function change(patch: Partial<Omit<SessionSettings, 'schemaVersion'>>): void {
-    const edits = { ...pending, ...patch }
+  function save(edits: Partial<Omit<SessionSettings, 'schemaVersion'>>, restore = false): void {
+    const version = ++editVersion.current
+    const generation = lifecycle.current
+    editsRef.current = edits; setPending(edits)
     const problems = validateSessionSettings({ ...store.getSettings(), ...edits })
     setErrors(problems)
-    if (!problems.length && store.patchSettings(edits)) setPending({})
-    else setPending(edits)
+    if (problems.length) return
+    inFlight.current++; setSaving(true)
+    void store.patchSettingsAsync(edits, restore).then(success => {
+      if (lifecycle.current !== generation || editVersion.current !== version) return
+      if (success) { editsRef.current = {}; setPending({}) }
+    }).catch(() => {
+      if (lifecycle.current === generation && editVersion.current === version) setErrors(['设置保存失败，编辑值仍保留。'])
+    }).finally(() => {
+      if (lifecycle.current === generation) { inFlight.current--; setSaving(inFlight.current > 0) }
+    })
+  }
+  function change(patch: Partial<Omit<SessionSettings, 'schemaVersion'>>): void {
+    save({ ...editsRef.current, ...patch })
   }
   function reset(): void {
     const { schemaVersion: _, ...defaults } = DEFAULT_SESSION_SETTINGS
-    setPending({}); setErrors([])
-    if (!store.patchSettings(defaults, true)) setPending(defaults)
+    save(defaults, true)
   }
 
   return h('section', { className: 'dsh-tp dsh-tp-settings', 'aria-label': '翻译设置' },
     h('style', null, styles),
     h('header', { className: 'dsh-tp-settings-header' }, h('h2', null, '翻译设置'),
-      h('div', { className: 'dsh-tp-actions' }, button('恢复默认设置', reset), onClose ? button('返回工作区', onClose) : null),
+      h('div', { className: 'dsh-tp-actions' }, button('恢复默认设置', reset, saving), onClose ? button('返回工作区', onClose) : null),
     ),
-    h('p', { className: 'dsh-tp-muted' }, '有效修改即时保存到此设备。新会话采用默认设置；已有会话保持原有设置。'),
+    h('p', { className: 'dsh-tp-muted' }, '有效修改即时保存到此设备。“+”新建主题采用默认设置；同主题子会话继承起点会话的配置。'),
     h('div', { className: 'dsh-tp-settings-section' },
       h('h3', null, '新会话默认值'),
       field('翻译模式', modeSelect(form.defaultMode, defaultMode => change({ defaultMode }))),
@@ -371,15 +452,17 @@ export function SettingsView({ store, onClose }: StoreProps & { readonly onClose
     h('div', { className: 'dsh-tp-settings-section' },
       h('h3', null, '会话历史保存'),
       h('label', { className: 'dsh-tp-history-row' }, h('input', {
-        type: 'checkbox', checked: form.rememberHistory, 'aria-label': '允许保存会话历史到本地',
+        type: 'checkbox', checked: form.rememberHistory, disabled: saving, 'aria-label': '允许保存会话历史到本地',
         onChange: (event: CheckEvent) => change({ rememberHistory: event.currentTarget.checked }),
       }), '允许保存会话历史到本地'),
-      h('p', { className: 'dsh-tp-muted' }, '开启后自动保存会话与输入，数据以明文保存在此设备。关闭后保留已有历史，停止继续写入。'),
+      h('p', { className: 'dsh-tp-muted' }, '开启后自动保存会话与输入，数据以明文保存在此设备。关闭后保留已有历史，停止写入新的会话内容。'),
+      h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
+      store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
       h('p', { className: 'dsh-tp-muted' }, '当前版本保存会话信息、模型选择和未发送输入；模型执行和译文消息历史尚未接入。'),
       h(HistorySection, { store }),
     ),
     errors.length ? h('div', { role: 'alert', className: 'dsh-tp-message' }, ...errors.map(error => h('p', { key: error }, error))) : null,
     storeNotice(store),
-    Object.keys(pending).length && !errors.length ? button('重试保存失败的修改', () => change({})) : null,
+    Object.keys(pending).length && !errors.length && !saving ? button('重试保存失败的修改', () => change({})) : null,
   )
 }
