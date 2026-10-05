@@ -2,6 +2,9 @@ import { h } from './react.js'
 import { PanelRouter, SettingsView } from './components.js'
 import { createSessionStore } from './session-store.js'
 import { ModelCatalog, type ModelCatalogPort } from './models.js'
+import { QuickTranslationClient } from './quick-translation.js'
+import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
+import { QUICK_TRANSLATION_REMOTE } from '../shared/quick-translation.js'
 
 type Disposer = () => void
 type ClientComponent = (props?: Readonly<Record<string, unknown>>) => unknown
@@ -21,6 +24,8 @@ interface SidebarRightTabDefinition {
 interface ClientPluginContext {
   readonly remote: {
     readonly session: ModelCatalogPort
+    readonly translationQuick?: QuickRemotePort
+    $mount?(contribution: typeof QUICK_TRANSLATION_REMOTE): Disposer
     $on(event: string, listener: () => void): Disposer
   }
   on(event: string, listener: () => void): Disposer
@@ -51,14 +56,18 @@ export function apply(ctx: ClientPluginContext): void {
   withClientDiagnostics('apply', () => {
     const store = createSessionStore()
     const models = new ModelCatalog(ctx.remote.session)
+    let unmountQuick: Disposer | undefined
+    try { unmountQuick = ctx.remote.$mount?.(QUICK_TRANSLATION_REMOTE) } catch { /* Capability check keeps sending disabled. */ }
+    const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.translationQuick), store, models)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
+    ctx.effect(() => () => { quick.dispose(); unmountQuick?.() }, 'translation quick client')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
-    ctx.effect(() => ctx.on('connection/reset', () => models.invalidate(true)), 'translation catalog connection')
+    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset() }), 'translation catalog connection')
 
     const TranslationPanel: ClientComponent = (props = {}) => h(PanelRouter, {
-      store, models, sessionId: typeof props.sessionId === 'string' ? props.sessionId : undefined,
+      store, models, quick, sessionId: typeof props.sessionId === 'string' ? props.sessionId : undefined,
     })
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {
       store, onClose: typeof props.close === 'function' ? props.close : undefined,

@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A translation session panel for DeepSeek Harness (DSH). This early development build provides session management, model selection and a dedicated settings page. Translation execution is not connected yet.
+A lightweight translation session panel for DeepSeek Harness (DSH). Quick mode supports plain-text translation with a model already configured in DSH. Each submitted round of source and translated text appears only in the current runtime session. History retention saves session details and the current source draft.
 
 ## Current features
 
@@ -11,9 +11,12 @@ A translation session panel for DeepSeek Harness (DSH). This early development b
 - Rename changes the topic name for all its sessions while keeping IDs and sequence numbers. Each session also has an independent remark, which may be duplicated or cleared.
 - A left-aligned current title dropdown with context actions and right-aligned mode/language controls, a scrollable conversation area and a simple composer with a circular Send button and no blue focus outline on its text area.
 - Model selection sits at the composer's lower right, immediately left of Send. It uses DSH's native menus and icons and the same `session.modelCatalog()` directory API as the main composer. Its model/effort menu supports provider groups and search; selection applies only to the current translation session.
+- Quick mode sends the current plain-text draft, target language and explicit translation requirements through a selected DSH Host model, then displays the source and translated result in the conversation area. Only models and reasoning efforts exposed by the Host catalog are selectable.
 - **DSH Settings → 翻译** provides new-session defaults, history retention and history cleanup. Valid changes save immediately.
 
-Sending is disabled. Catalog requests read model metadata, without sending translation text or changing the main chat's model. The Host now provides runtime foundations for units, attempts, revisions and final selections, but the panel's business RPC and a real execution adapter are not connected. Memory archives and formal export are also not connected. The previous manual translation editor and export controls have been removed; previously saved manual text remains viewable.
+Quick execution is limited to plain text in Quick mode; Normal mode remains unavailable. A provider and model must already be configured in DSH. The plugin does not add provider or credential settings. The translation context contains the built-in prompt, current source text, target language, explicit requirements and selected catalog route; it excludes tools, main-chat messages or history, files, and memory. History retention saves session details and the current source draft; submitted rounds of source and translated text remain only in runtime memory and are lost on restart. If an operation's outcome is unknown, the client keeps its identity and queries that same operation; if Host confirms cancellation, it settles as cancelled. It will not automatically submit the request again.
+
+The panel keeps a simple composer and transcript. Memory archives and formal export are not connected. The previous manual translation editor and export controls have been removed; previously saved manual text remains viewable.
 
 ## Sessions and defaults
 
@@ -42,7 +45,7 @@ A new topic's first session snapshots mode, target language, translation require
 
 ## History and deletion
 
-History uses the current device and Web origin's `localStorage`. Records are plaintext, are not synchronized between devices, do not modify the Host profile patch, and contain no API keys. They store topic/session identities, fixed sequences, names, remarks, archive status, input, default snapshots and model selection. Model message history is not connected.
+History uses the current device and Web origin's `localStorage`. Records are plaintext, are not synchronized between devices, do not modify the Host profile patch, and contain no API keys. They store topic/session identities, fixed sequences, names, remarks, archive status, the current source draft, default snapshots and model selection. Each submitted round of source and translated text stays only in runtime state and is not written to local history. DSH model message history is not connected.
 
 Disabling retention preserves existing history while new session content and edits remain in the current runtime. Previously saved topics retain identity and sequence metadata without source or result content, so issued numbers are not reused after restart. Entirely temporary new topics do not become persistent for this purpose. Re-enabling retention saves the current content still in memory. Settings provides:
 
@@ -62,7 +65,7 @@ The old manual-save preference does not automatically enable new automatic histo
 
 ## Compatibility and installation
 
-The previously inspected Windows DSH Desktop runtime was `0.2.0-rc.2`; the user had confirmed framework installation, removal and loading, and provided screenshots of the preceding session bar and main composer. On 2026-10-05, the v0.2.1 isolated baseline completed `npm test`: the build succeeded and all 100 automated tests passed using synthetic data and simulated storage/RPC. This did not run the plugin in DSH Desktop. The v0.2.1 session persistence fixes and the v0.2.0 topic numbering, migration, remarks, asynchronous storage and Host foundations still need Desktop verification. Other versions, operating systems and standalone Web profiles are unverified.
+The previously inspected Windows DSH Desktop runtime was `0.2.0-rc.2`; the user had confirmed framework installation, removal and loading, and provided screenshots of the preceding session bar and main composer. Independent v0.3.0 acceptance on 2026-10-05 passed all 132 `npm test` cases and all 22 `npm run test:native` cases (17 Host and 5 Client), with zero failures or skips; the build succeeded. Native integration uses actual DSH `0.2.0-rc.2` component packages in a disposable synthetic profile with a synthetic provider. This checks Host/Client component and RPC integration. Quick translation has not been verified in the user's Desktop or against a real remote model. Other versions, operating systems and standalone Web profiles are unverified.
 
 Requirements: Node.js 22 or later, pnpm and DSH with local bundle support.
 
@@ -81,8 +84,8 @@ If previously installed as `dsh-deepseek-translation-plugin`, remove that old bu
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Commit messages use Conventional Commits with Chinese descriptions and bodies. Internal design materials are maintained outside this repository.
 
-`pnpm test` builds first and checks sessions, history, legacy compatibility, the model directory and Client interactions. React hooks, native menus and RPCs are simulated; these checks do not replace Desktop verification.
+`pnpm test` builds first and checks sessions, history, legacy compatibility, the model directory and Client interactions. The separate native integration command and its DSH component requirement are described in [CONTRIBUTING.md](CONTRIBUTING.md). Synthetic providers do not verify a real remote model or the user's Desktop runtime.
 
-See [CHANGELOG.md](CHANGELOG.md). The current local plugin version is `v0.2.1`, fixing two session persistence regressions; `v0.2.0` added topic sessions and Host execution foundations, `v0.1.1` provided the interactive panel, and `v0.1.0` was the framework baseline. The current version has not been published to npm or a remote release page. `private: true` prevents accidental npm publishing.
+See [CHANGELOG.md](CHANGELOG.md). The current local plugin version is `v0.3.0`, adding plain-text Quick translation through DSH catalog models and reasoning efforts, with sending, result display and cancellation. Normal mode, file translation and memory are not connected. This version has not been published remotely. `private: true` prevents accidental npm publishing.
 
 License: [MIT](LICENSE).

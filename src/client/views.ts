@@ -1,6 +1,7 @@
 import { h, react } from './react.js'
 import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
+import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
 import { type HistoryVersion, type SessionStore } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
@@ -61,6 +62,8 @@ const styles = `
 .dsh-tp-dialog p { margin: 6px 0; }
 .dsh-tp-dialog input[type=text] { width: 100%; }
 .dsh-tp-legacy { white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 8px; background: var(--dsw-alias-interactive-bg-hover, #8881); }
+.dsh-tp-translation { margin: 0 0 20px; }
+.dsh-tp-translation-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 12px; }
 .dsh-tp-settings { padding: 16px 20px; height: 100%; max-height: 100%; min-height: 0; overflow-y: auto; }
 .dsh-tp-settings-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dsh-tp h2 { font-size: 18px; margin: 0; }
@@ -130,9 +133,9 @@ function modeSelect(value: LocalSession['mode'], action: (mode: LocalSession['mo
 }
 function storeNotice(store: SessionStore): unknown { return store.getNotice() ? h('div', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null }
 
-export function PanelRouter({ store, models, sessionId }: StoreProps & { readonly models: ModelCatalog; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, sessionId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    sessionId?.trim() ? h(WorkspaceView, { store, models, ownerId: sessionId, key: sessionId })
+    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, ownerId: sessionId, key: sessionId })
       : h('p', { role: 'alert' }, '请在主窗口会话中打开翻译面板。'),
   )
 }
@@ -228,8 +231,27 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
   )))
 }
 
-function WorkspaceView({ store, models, ownerId }: StoreProps & { readonly models: ModelCatalog; readonly ownerId: string }): unknown {
+function TranslationRecord({ record, quick, canRestore }: { readonly record: QuickRecord; readonly quick: QuickTranslationClient; readonly canRestore: boolean }): unknown {
+  const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知' }[record.status]
+  return h('article', { className: 'dsh-tp-translation', 'aria-label': `翻译记录：${status}` },
+    h('div', { className: 'dsh-tp-muted' }, '原文'),
+    h('div', { className: 'dsh-tp-translation-text' }, record.source),
+    h('div', { className: 'dsh-tp-muted', role: 'status' }, record.status === 'completed' ? `${status} · ${record.targetLanguage}` : status),
+    record.text && record.status !== 'completed' ? h('div', { className: 'dsh-tp-muted' }, '未完成输出') : null,
+    record.text ? h('div', { className: 'dsh-tp-translation-text' }, record.text) : null,
+    record.message ? h('p', { role: record.status === 'failed' || record.status === 'unknown' ? 'alert' : 'status', className: 'dsh-tp-muted' }, record.message) : null,
+    record.status !== 'completed' && record.status !== 'submitting' && record.status !== 'running'
+      ? button('恢复原文到输入框', () => quick.restoreSource(record), !canRestore) : null,
+    record.status === 'unknown' ? button('查询本轮结果', () => quick.query(record)) : null,
+  )
+}
+
+function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly ownerId: string }): unknown {
   useStore(store)
+  const [, refreshQuick] = react.useState(0)
+  react.useEffect(() => quick.subscribe(() => refreshQuick(value => value + 1)), [quick])
+  react.useEffect(() => models.subscribe(() => refreshQuick(value => value + 1)), [models])
+  react.useEffect(() => { void quick.load() }, [quick])
   const [sidebar, setSidebar] = react.useState(false)
   const [sessionPickerOpen, setSessionPickerOpen] = react.useState(false)
   const [archives, setArchives] = react.useState(false)
@@ -246,6 +268,10 @@ function WorkspaceView({ store, models, ownerId }: StoreProps & { readonly model
   const target = context ? store.getSession(context.id) : undefined
   const dialogSession = dialog ? store.getSession(dialog.id) : undefined
   const status = current ? store.getStatus(current.id) : 'memory'
+  const records = current ? quick.getRecords(current.id) : []
+  const blocked = current ? quick.blockedReason(current) : undefined
+  const busy = current ? quick.isBusy(current.id) : false
+  const unavailable = quick.getReadiness().status !== 'ready'
   function contextMenu(session: LocalSession, event: ContextEvent): void {
     event.preventDefault(); event.stopPropagation()
     setContext({ id: session.id, x: event.clientX, y: event.clientY, trigger: event.currentTarget })
@@ -305,8 +331,10 @@ function WorkspaceView({ store, models, ownerId }: StoreProps & { readonly model
         void action.run(() => store.deleteHistoryAsync(deletion.ids, false, deletion.unreadable, deletion.versions), () => setDeletion(currentRequest => currentRequest === deletion ? undefined : currentRequest))
       } }) : null,
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
-        current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText))
-          : h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容。翻译执行、主模型协作与记忆尚未接入。' : '用“+”新建主题及首会话，或从已归档列表恢复。'),
+        current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
+        ...records.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
+        records.length === 0 ? h('div', { className: 'dsh-tp-empty' }, current ? (current.mode === 'quick' ? '在下方输入待翻译内容，选择模型后发送。' : '普通模式需主模型协作，尚未接入。') : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
+        current ? h('p', { className: 'dsh-tp-muted' }, '译文仅保留在本次运行中，重启后不恢复。') : null,
       ),
       storeNotice(store),
       action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
@@ -323,10 +351,14 @@ function WorkspaceView({ store, models, ownerId }: StoreProps & { readonly model
         Array.from(current.input).length > current.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${current.maxInputChars} 个字符；内容保持完整。`) : null,
         h('div', { className: 'dsh-tp-composer-toolbar' },
           h(ModelPicker, { key: current.id, catalog: models, current: current.model, onSelect: (model: LocalSession['model']) => { store.updateSession(current.id, { model }) } }),
-          h('button', { type: 'button', className: 'dsh-tp-send', disabled: true, title: '翻译执行尚未接入', 'aria-label': '发送（翻译执行尚未接入）',
+          h('button', { type: 'button', className: 'dsh-tp-send', disabled: !busy && !!blocked, title: busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': busy ? '取消翻译' : unavailable ? '发送（翻译执行尚未接入）' : '发送快译',
+            onClick: () => { if (busy) quick.cancel(current.id); else void quick.send(current.id) },
             style: { width: 38, height: 38, minWidth: 38, maxWidth: 38, minHeight: 38, maxHeight: 38, padding: 0, borderRadius: '50%', cornerShape: 'round', aspectRatio: '1 / 1', flex: '0 0 38px' },
-          }, h(IconSendOutlineMedium, { size: 20 })),
+          }, busy ? h('span', { 'aria-hidden': true, style: { fontSize: 18, lineHeight: 1 } }, '■') : h(IconSendOutlineMedium, { size: 20 })),
         ),
+        current.mode === 'normal' && records.length ? h('small', { className: 'dsh-tp-muted' }, '普通模式需主模型协作，尚未接入。') : null,
+        current.mode === 'quick' && quick.getReadiness().status === 'unavailable' ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, quick.getReadiness().reason) : null,
+        unavailable && quick.getReadiness().status !== 'loading' ? button('重新检查快译能力', () => { void quick.load() }) : null,
       ) : null,
     ),
     context && target ? h(Menu, { open: true, anchor: null, onClose: () => { setContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup',
@@ -458,7 +490,7 @@ export function SettingsView({ store, onClose }: StoreProps & { readonly onClose
       h('p', { className: 'dsh-tp-muted' }, '开启后自动保存会话与输入，数据以明文保存在此设备。关闭后保留已有历史，停止写入新的会话内容。'),
       h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
       store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
-      h('p', { className: 'dsh-tp-muted' }, '当前版本保存会话信息、模型选择和未发送输入；模型执行和译文消息历史尚未接入。'),
+      h('p', { className: 'dsh-tp-muted' }, '当前版本保存会话信息、模型选择和未发送输入；快译原文与译文记录仅在本次运行中保留，不写入历史。'),
       h(HistorySection, { store }),
     ),
     errors.length ? h('div', { role: 'alert', className: 'dsh-tp-message' }, ...errors.map(error => h('p', { key: error }, error))) : null,

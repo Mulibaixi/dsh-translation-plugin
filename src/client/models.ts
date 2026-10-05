@@ -10,6 +10,14 @@ export interface CatalogState {
 }
 export interface ModelCatalogPort { modelCatalog(): Promise<unknown> }
 
+/** A directory entry alone does not grant execution; Host separately checks its route. */
+export function catalogAllowsRoute(state: CatalogState, route: ModelRoute | null): boolean {
+  if (state.status !== 'ready' || !route) return false
+  const model = state.groups.find(group => group.id === route.provider)?.models.find(model => model.id === route.model)
+  if (!model) return false
+  return route.reasoningEffort === undefined || !!model.reasoning?.efforts.some(effort => effort.id === route.reasoningEffort)
+}
+
 function object(value: unknown): value is Record<string, unknown> { return !!value && typeof value === 'object' && !Array.isArray(value) }
 function parseCatalog(response: unknown): Omit<CatalogState, 'status'> | undefined {
   if (!object(response) || response.ok !== true || !object(response.value)) return undefined
