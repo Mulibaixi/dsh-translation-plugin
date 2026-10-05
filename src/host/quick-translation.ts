@@ -19,6 +19,8 @@ interface ContextRecord {
   readonly topic: RuntimeTopic
   session: RuntimeSession
   readonly jobs: Map<string, JobRecord>
+  /** Browser unit identities map only to this Host lifetime's execution units. */
+  readonly units: Map<string, { readonly internalId: string; readonly source: string; readonly targetLanguage: string; readonly instruction: string }>
   active: string | undefined
 }
 interface JobRecord {
@@ -39,7 +41,7 @@ function unwrap<T>(result: DomainResult<T>): T {
   return result.value
 }
 function signature(request: QuickTranslationSubmit): string {
-  return JSON.stringify([request.sessionKey, request.operationId, request.draftVersion, request.sourceText, request.targetLanguage, request.instruction,
+  return JSON.stringify([request.sessionKey, request.operationId, request.unitId ?? null, request.draftVersion, request.sourceText, request.targetLanguage, request.instruction,
     request.model.providerId, request.model.modelId, request.model.configVersion, request.model.reasoningEffort ?? null])
 }
 
@@ -86,7 +88,7 @@ export class QuickTranslationService {
     const session = unwrap(this.runtime.createSession({ operation_id: `open-session:${crypto.randomUUID()}`, topic_id: topic.topic_id,
       expected_topic_version: topic.topic_version, mode: 'quick', max_source_code_points: request.maxSourceCodePoints }))
     const binding = { sessionKey: `quick:${crypto.randomUUID()}`, ...request }
-    this.contexts.set(binding.sessionKey, { binding, owner, topic, session, jobs: new Map(), active: undefined })
+    this.contexts.set(binding.sessionKey, { binding, owner, topic, session, jobs: new Map(), units: new Map(), active: undefined })
     this.localContexts.set(local, binding.sessionKey)
     return ok(binding)
   }
@@ -108,6 +110,10 @@ export class QuickTranslationService {
     }
     this.refreshActive(context)
     if (context.active) return bad('busy', '当前快译尚未结算，请等待完成或取消确认。')
+    const existing = request.unitId === undefined ? undefined : context.units.get(request.unitId)
+    if (existing && (existing.source !== request.sourceText || existing.targetLanguage !== request.targetLanguage || existing.instruction !== request.instruction)) {
+      return bad('invalid_input', '同一处理单元的原文、目标语言和要求已冻结。')
+    }
     if (Array.from(request.sourceText).length > context.binding.maxSourceCodePoints) return bad('invalid_input', '原文超过当前会话的单次上限。')
     if (context.jobs.size >= 500) return bad('busy', '运行期请求已达到上限，请重新加载插件后继续。')
     const job: JobRecord = {
@@ -122,15 +128,21 @@ export class QuickTranslationService {
       await this.adapter.prepareOperation(job.internalId, request.model, job.controller.signal)
       if (job.controller.signal.aborted || this.disposed) { job.preparation = 'cancelled'; return ok(this.view(context, job)) }
       const before = unwrap(this.runtime.getSnapshot({ translation_session_id: context.session.translation_session_id }))
+      const target = existing ? before.units.find(unit => unit.unit_id === existing.internalId) : undefined
+      if (existing && !target) throw new Error('Execution unit unavailable')
       const material = unwrap(this.runtime.receive({
         operation_id: job.internalId, topic_id: context.topic.topic_id, translation_session_id: context.session.translation_session_id,
-        trigger: 'quick_send', expected_session_version: before.session.session_version, draft_version: request.draftVersion,
+        trigger: target ? 'explicit_revision' : 'quick_send', expected_session_version: before.session.session_version, draft_version: request.draftVersion,
         source_text: request.sourceText, instruction: request.instruction, target_language: request.targetLanguage,
         task_type: 'translation', model: request.model, max_attempts: 1,
+        ...(target ? { target: { unit_id: target.unit_id, unit_version: target.unit_version, source_version: target.source_version,
+          instruction_version: target.instruction_version, final_pointer_version: target.final_pointer_version } } : {}),
       }))
       const accepted = unwrap(this.runtime.accept({ operation_id: job.internalId, expected_operation_version: material.operation_version,
-        expected_session_version: before.session.session_version, ...this.advance(before) }))
+        expected_session_version: before.session.session_version, ...(target ? {} : this.advance(before)) }))
       job.accepted = true
+      if (request.unitId !== undefined && !existing) context.units.set(request.unitId, { internalId: accepted.unit_id,
+        source: request.sourceText, targetLanguage: request.targetLanguage, instruction: request.instruction })
       context.session = { ...before.session, session_version: accepted.session_version }
       const prepared = unwrap(this.runtime.prepare({ operation_id: job.internalId, expected_operation_version: accepted.operation_version }))
       unwrap(this.runtime.dispatch({ operation_id: job.internalId, attempt_request_id: `quick-dispatch:${crypto.randomUUID()}`,
@@ -149,11 +161,9 @@ export class QuickTranslationService {
   private advance(snapshot: RuntimeSnapshot): { advance?: FinalizePlan } {
     const previous = snapshot.units.at(-1)
     if (!previous) return {}
-    const latest = snapshot.revisions.filter(revision => revision.unit_id === previous.unit_id).at(-1)
     const basis = { unit_id: previous.unit_id, unit_version: previous.unit_version, source_version: previous.source_version,
       instruction_version: previous.instruction_version, final_pointer_version: previous.final_pointer_version }
-    if (previous.final_pointer?.selection === 'user_fixed') return { advance: { ...basis, action: 'keep_final', revision_id: previous.final_pointer.revision_id } }
-    if (latest?.completeness === 'complete' && latest.checks_passed && !latest.late) return { advance: { ...basis, action: 'automatic', revision_id: latest.revision_id } }
+    // The browser's saved facts own the user's final choice. Internal execution never selects a second final.
     return { advance: { ...basis, action: 'keep_unfinished' } }
   }
 

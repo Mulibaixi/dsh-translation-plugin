@@ -91,7 +91,7 @@ test('切换所属主会话和关闭面板后不串所选文件', async () => {
     ui.render(app.settingsPage, {}); await ui.flush()
     assert.match(ui.text(), /主题名称、会话配置和当前原文草稿/)
     assert.match(ui.text(), /模型与推理等级选择独立保存在此设备，不受此开关影响/)
-    assert.match(ui.text(), /不保存已提交的快译原文和译文记录/)
+    assert.match(ui.text(), /已受理的原文、各版译文与定稿选择/)
     ui.render(app.panel, { sessionId: 'synthetic-main' }); await ui.flush(); assert.ok(!ui.text().includes('synthetic-reopened.txt'))
   } finally { await app.dispose() }
 })

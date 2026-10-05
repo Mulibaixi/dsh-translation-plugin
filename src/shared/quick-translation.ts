@@ -23,6 +23,8 @@ export interface QuickTranslationBinding {
 export interface QuickTranslationSubmit {
   readonly sessionKey: string
   readonly operationId: string
+  /** Stable browser-owned unit identity; never a Host capability or persisted execution handle. */
+  readonly unitId?: string
   readonly draftVersion: number
   readonly sourceText: string
   readonly targetLanguage: string
@@ -78,10 +80,11 @@ export function parseQuickRequest(method: 'open' | 'submit' | 'status' | 'cancel
     integer(value.maxSourceCodePoints, 1, 1_000_000)
   } else {
     exact(value, method === 'submit'
-      ? ['sessionKey', 'operationId', 'draftVersion', 'sourceText', 'targetLanguage', 'instruction', 'model']
+      ? ['sessionKey', 'operationId', 'unitId', 'draftVersion', 'sourceText', 'targetLanguage', 'instruction', 'model']
       : ['sessionKey', 'operationId'])
     identity(value.sessionKey); identity(value.operationId)
     if (method === 'submit') {
+      if (value.unitId !== undefined) bounded(value.unitId, 2048)
       integer(value.draftVersion, 1, Number.MAX_SAFE_INTEGER)
       bounded(value.sourceText, 2_000_000)
       bounded(value.targetLanguage, 200)

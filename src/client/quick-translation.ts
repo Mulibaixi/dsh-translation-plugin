@@ -2,11 +2,16 @@ import { parseQuickResult, type QuickTranslationPort, type QuickTranslationJob }
 import { catalogAllowsRoute, type ModelCatalog } from './models.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession, ModelRoute } from './sessions.js'
+import { appendTextUnit, appendTextRevision, acceptTextRevision, updateTextRevision, selectFinalRevision,
+  type NewTextRevision, type TextUnit } from './translation-history.js'
 
 export type QuickStatus = 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown'
 export interface QuickRecord {
   readonly id: string
   readonly localSessionId: string
+  readonly unitId: string
+  readonly kind: 'new_unit' | 'revision'
+  readonly createdAt: string
   readonly source: string
   readonly targetLanguage: string
   readonly instruction: string
@@ -27,6 +32,7 @@ interface Pending {
   dispatched: boolean
   cancelRequested: boolean
   timer: ReturnType<typeof setTimeout> | undefined
+  historyAttached: boolean
 }
 interface Binding { readonly ownerId: string; readonly topicId: string; readonly max: number; readonly sessionKey: string }
 const active = (status: QuickStatus): boolean => status === 'submitting' || status === 'running'
@@ -64,10 +70,12 @@ export class QuickTranslationClient {
     this.drafts.set(session.id, next); return next.stamp
   }
   getRecords(id: string): readonly QuickRecord[] { return this.records.get(id) ?? [] }
+  getUnits(id: string): readonly TextUnit[] { return this.store.getTranslationHistory(id)?.units ?? [] }
   getReadiness(): { readonly status: 'idle' | 'loading' | 'ready' | 'unavailable'; readonly reason: string } { return { status: this.readiness, reason: this.reason } }
   isBusy(id: string): boolean { return this.getRecords(id).some(record => active(record.status) || record.status === 'unknown') }
   blockedReason(session: LocalSession): string | undefined {
     if (session.mode !== 'quick') return '普通模式需主模型协作，尚未接入。'
+    if (session.archivedAt !== null) return '归档会话需恢复后才能翻译。'
     if (this.isBusy(session.id)) return '当前会话仍有未结束或结果未知的翻译，请先查询或取消。'
     if (this.readiness !== 'ready') return this.reason
     if (!session.input.trim()) return '请输入待翻译内容。'
@@ -75,6 +83,16 @@ export class QuickTranslationClient {
     if (!session.targetLanguage.trim()) return '请设置目标语言。'
     if (!catalogAllowsRoute(this.models.getSnapshot(), session.model)) return '请选择当前目录中的模型与可用推理等级。'
     return undefined
+  }
+  retranslateBlockedReason(session: LocalSession, unitId: string): string | undefined {
+    const unit = this.getUnits(session.id).find(unit => unit.id === unitId)
+    if (!unit) return '该处理单元已不存在。'
+    return this.blockedReason({ ...session, input: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction })
+  }
+  selectFinal(id: string, unitId: string, revisionId: string): boolean {
+    const session = this.store.getSession(id)
+    if (this.disposed || !session || session.archivedAt !== null) return false
+    return this.store.updateTranslationHistory(id, history => selectFinalRevision(history, unitId, revisionId, new Date().toISOString()))
   }
   load(): Promise<void> {
     if (this.disposed || this.readiness === 'ready') return Promise.resolve()
@@ -114,13 +132,26 @@ export class QuickTranslationClient {
   async send(id: string): Promise<void> {
     const draft = this.store.getSession(id)
     if (!draft || this.disposed || !this.port || this.blockedReason(draft) || !draft.model) return
+    await this.start(draft)
+  }
+  async retranslate(id: string, unitId: string): Promise<void> {
+    const draft = this.store.getSession(id)
+    if (!draft || this.disposed || !this.port || this.retranslateBlockedReason(draft, unitId) || !draft.model) return
+    const unit = this.getUnits(id).find(unit => unit.id === unitId)
+    if (unit) await this.start(draft, unit)
+  }
+  private async start(draft: LocalSession, unit?: TextUnit): Promise<void> {
+    if (!this.port || !draft.model) return
+    const id = draft.id
     const choice = this.models.getSnapshot().groups.find(group => group.id === draft.model?.provider)?.models.find(model => model.id === draft.model?.model)
     const effort = draft.model.reasoningEffort ?? choice?.reasoning?.defaultEffort
     const model = { ...draft.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
     const operationId = this.options.makeId?.() ?? `quick:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}:${++this.sequence}:${Math.random().toString(36).slice(2)}`}`
-    const record: QuickRecord = { id: operationId, localSessionId: id, source: draft.input, targetLanguage: draft.targetLanguage, instruction: draft.instruction, model,
+    const record: QuickRecord = { id: operationId, localSessionId: id, unitId: unit?.id ?? `unit:${operationId}`, kind: unit ? 'revision' : 'new_unit', createdAt: new Date().toISOString(),
+      source: unit?.source ?? draft.input, targetLanguage: unit?.targetLanguage ?? draft.targetLanguage, instruction: unit?.instruction ?? draft.instruction, model,
       draftVersion: ++this.sequence, status: 'submitting', text: '', message: undefined, accepted: false }
-    const pending: Pending = { record, draftStamp: this.draftStamp(draft), sessionKey: undefined, consumedStamp: undefined, stopped: false, suspended: false, dispatched: false, cancelRequested: false, timer: undefined }
+    const pending: Pending = { record, draftStamp: this.draftStamp(draft), sessionKey: undefined, consumedStamp: undefined, stopped: false, suspended: false, dispatched: false, cancelRequested: false, timer: undefined, historyAttached: !!unit }
+    if (unit && !this.store.updateTranslationHistory(id, history => appendTextRevision(history, unit.id, this.revision(record)))) return
     this.records.set(id, [...this.getRecords(id), record]); this.pending.set(operationId, pending); this.emit()
     try {
       let binding = this.bindings.get(id)
@@ -135,7 +166,7 @@ export class QuickTranslationClient {
       pending.sessionKey = binding.sessionKey
       if (pending.stopped || pending.suspended) return
       pending.dispatched = true
-      const submitted = await this.request(this.port.submit({ sessionKey: binding.sessionKey, operationId, draftVersion: record.draftVersion,
+      const submitted = await this.request(this.port.submit({ sessionKey: binding.sessionKey, operationId, unitId: record.unitId, draftVersion: record.draftVersion,
         sourceText: record.source, targetLanguage: record.targetLanguage, instruction: record.instruction,
         model: { providerId: model.provider, modelId: model.model, configVersion: 0, ...(effort === undefined ? {} : { reasoningEffort: effort }) },
       }))
@@ -144,24 +175,48 @@ export class QuickTranslationClient {
       this.receive(pending, submitted.value)
     } catch { if (!pending.stopped && !pending.suspended) this.fail(pending, pending.dispatched ? '连接中断或回执超时，执行结果未知；未自动重发。' : '无法建立快译会话；原文仍保留。', pending.dispatched ? 'unknown' : 'failed') }
   }
+  private revision(record: QuickRecord): NewTextRevision {
+    return { id: record.id, operationId: record.id, model: record.model, draftVersion: record.draftVersion,
+      createdAt: record.createdAt, updatedAt: new Date().toISOString(), accepted: record.accepted, status: record.status,
+      text: record.text, message: record.message ?? null }
+  }
+  private publish(pending: Pending): boolean {
+    const record = pending.record
+    if (!pending.historyAttached && !record.accepted) return false
+    const old = this.getUnits(record.localSessionId).find(unit => unit.id === record.unitId)?.revisions.find(revision => revision.id === record.id)
+    if (pending.historyAttached && !old) return false
+    if (old && old.accepted === record.accepted && old.status === record.status && old.text === record.text && old.message === (record.message ?? null)) return true
+    const revision = this.revision(record)
+    const updated = this.store.updateTranslationHistory(record.localSessionId, history => {
+      if (!pending.historyAttached) return appendTextUnit(history, { id: record.unitId, source: record.source, targetLanguage: record.targetLanguage,
+        instruction: record.instruction, createdAt: record.createdAt }, revision)
+      const accepted = record.accepted ? acceptTextRevision(history, record.unitId, record.id, revision.updatedAt) : history
+      return updateTextRevision(accepted, record.unitId, record.id, { status: record.status, text: record.text, message: revision.message, updatedAt: revision.updatedAt })
+    })
+    if (updated) pending.historyAttached = true
+    return updated
+  }
   private receive(pending: Pending, job: QuickTranslationJob): void {
     const record = pending.record
     if (this.disposed || pending.stopped || pending.suspended || !this.store.getSession(record.localSessionId)) return
     if (!validJob(job)) { this.fail(pending, '快译回执格式无效，执行结果未知。', 'unknown'); return }
     const cancelledBeforeSubmit = pending.cancelRequested && job.draftVersion === 0 && job.status === 'cancelled' && job.accepted === false && job.text === ''
-    if (job.operationId !== record.id || job.sessionKey !== pending.sessionKey || (job.draftVersion !== record.draftVersion && !cancelledBeforeSubmit)) {
+    if (job.operationId !== record.id || job.sessionKey !== pending.sessionKey || (job.draftVersion !== record.draftVersion && !cancelledBeforeSubmit) || (record.accepted && !job.accepted && !cancelledBeforeSubmit)) {
       this.fail(pending, '快译回执身份不匹配，结果未采用。', 'unknown'); return
     }
-    if (job.accepted && !record.accepted) {
-      record.accepted = true
-      // Track semantic draft edits, including edit→undo, independently of store object rebuilding.
+    const firstAccepted = job.accepted && !record.accepted
+    if (firstAccepted) record.accepted = true
+    record.status = job.status; record.text = job.text; record.message = job.error?.message ?? (job.status === 'unknown' ? '执行结果未知，请查询本轮结果；未自动重发。' : undefined)
+    const published = this.publish(pending)
+    // Adopt the admitted unit before consuming its unchanged draft. A rejected history update keeps the input.
+    if (firstAccepted && published && record.kind === 'new_unit' && !pending.cancelRequested) {
       const current = this.store.getSession(record.localSessionId)
-      if (!pending.cancelRequested && current && this.draftStamp(current) === pending.draftStamp && this.store.updateSession(record.localSessionId, { input: '' })) {
+      // Track semantic draft edits, including edit→undo, independently of store object rebuilding.
+      if (current && this.draftStamp(current) === pending.draftStamp && this.store.updateSession(record.localSessionId, { input: '' })) {
         const consumed = this.store.getSession(record.localSessionId)
         if (consumed) pending.consumedStamp = this.draftStamp(consumed)
       }
     }
-    record.status = job.status; record.text = job.text; record.message = job.error?.message ?? (job.status === 'unknown' ? '执行结果未知，请查询本轮结果；未自动重发。' : undefined)
     if (active(record.status)) {
       if (pending.timer) clearTimeout(pending.timer)
       pending.timer = setTimeout(() => { pending.timer = undefined; void this.poll(pending) }, this.options.pollMs ?? 300)
@@ -182,6 +237,7 @@ export class QuickTranslationClient {
     } catch { if (!pending.stopped) this.fail(pending, '快译状态查询失败，执行结果未知；未自动重发。', 'unknown') }
   }
   private restore(pending: Pending): void {
+    if (pending.record.kind === 'revision') return
     const current = this.store.getSession(pending.record.localSessionId)
     if (pending.consumedStamp !== undefined && current && this.draftStamp(current) === pending.consumedStamp) {
       if (this.store.updateSession(current.id, { input: pending.record.source })) pending.consumedStamp = undefined
@@ -196,6 +252,7 @@ export class QuickTranslationClient {
     pending.record.status = status; pending.record.message = message
     if (pending.timer) clearTimeout(pending.timer)
     this.restore(pending)
+    this.publish(pending)
     if (status !== 'unknown') { pending.stopped = true; this.pending.delete(pending.record.id) }
     this.emit()
   }
@@ -217,8 +274,8 @@ export class QuickTranslationClient {
           return
         }
       }
-      pending.record.message = '已请求取消；Host 停止尚未确认，请查询本轮结果。'; this.emit()
-    }).catch(() => { if (!pending.stopped && !this.disposed) { pending.record.message = '已请求取消；连接中断，Host 停止尚未确认。'; this.emit() } })
+      pending.record.message = '已请求取消；Host 停止尚未确认，请查询本轮结果。'; this.publish(pending); this.emit()
+    }).catch(() => { if (!pending.stopped && !this.disposed) { pending.record.message = '已请求取消；连接中断，Host 停止尚未确认。'; this.publish(pending); this.emit() } })
   }
   private stop(operationId: string, restore: boolean): void {
     const pending = this.pending.get(operationId)
@@ -228,6 +285,7 @@ export class QuickTranslationClient {
     pending.cancelRequested = true
     pending.record.status = pending.dispatched ? 'unknown' : 'cancelled'; pending.record.message = pending.dispatched ? '正在请求取消，等待 Host 确认…' : '已取消。'
     if (restore) this.restore(pending)
+    this.publish(pending)
     this.cancelRemote(pending)
     if (!restore || !pending.dispatched) { pending.stopped = true; this.pending.delete(operationId) }
     this.emit()

@@ -2,6 +2,7 @@ import { h, react } from './react.js'
 import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
+import { type TextUnit, type TextRevision } from './translation-history.js'
 import { type HistoryVersion, type SessionStore } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
@@ -77,6 +78,12 @@ const styles = `
 .dsh-tp-legacy { white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 8px; background: var(--dsw-alias-interactive-bg-hover, #8881); }
 .dsh-tp-translation { margin: 0 0 20px; }
 .dsh-tp-translation-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 12px; }
+.dsh-tp-unit-header, .dsh-tp-version-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
+.dsh-tp-version { padding: 6px 0; }
+.dsh-tp-version-actions { gap: 4px; font-size: 12px; }
+.dsh-tp-version-details { font-size: 11px; overflow-wrap: anywhere; margin: 4px 0 8px; }
+.dsh-tp-old-versions { margin-top: 6px; padding-left: 10px; border-left: 1px solid var(--dsw-alias-border-l2, #8883); }
+.dsh-tp-history-note { margin: 0 0 14px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }
 .dsh-tp-settings { padding: 16px 20px; height: 100%; max-height: 100%; min-height: 0; overflow-y: auto; }
 .dsh-tp-settings-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dsh-tp h2 { font-size: 18px; margin: 0; }
@@ -259,6 +266,62 @@ function TranslationRecord({ record, quick, canRestore }: { readonly record: Qui
   )
 }
 
+function TranslationRevision({ unit, revision, quick, session }: { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession }): unknown {
+  const [details, setDetails] = react.useState(false)
+  const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
+  const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断' }[revision.status]
+  const record = quick.getRecords(session.id).find(record => record.id === revision.operationId)
+  const eligible = revision.accepted && revision.status === 'completed' && !!revision.text.trim()
+  const fixed = unit.final?.revisionId === revision.id && unit.final.selection === 'user_fixed'
+  const label = `文本 ${unit.order} 版本 ${revision.order}`
+  async function copy(): Promise<void> {
+    try { await navigator.clipboard.writeText(revision.text); setCopyState('copied') }
+    catch { setCopyState('failed') }
+  }
+  return h('section', { className: 'dsh-tp-version', 'aria-label': label },
+    h('div', { className: 'dsh-tp-version-header' },
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${status} · ${unit.targetLanguage}`),
+      h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
+        h('button', { type: 'button', 'aria-label': `复制${label}`, disabled: !revision.text, onClick: () => { void copy() } }, copyState === 'copied' ? '已复制' : '复制'),
+        h('button', { type: 'button', 'aria-label': `${label}设为最终`, disabled: !eligible || fixed, onClick: () => { quick.selectFinal(session.id, unit.id, revision.id) } }, fixed ? '已固定' : '设为最终'),
+        h('button', { type: 'button', 'aria-label': `${label}详情`, 'aria-expanded': details, onClick: () => setDetails(value => !value) }, '详情'),
+      ),
+    ),
+    details ? h('div', { className: 'dsh-tp-muted dsh-tp-version-details' },
+      h('div', null, `模型：${revision.model.provider}/${revision.model.model} · 推理：${revision.model.reasoningEffort ?? 'Default'}`),
+      h('time', { dateTime: revision.createdAt }, `开始：${new Date(revision.createdAt).toLocaleString()}`),
+      h('div', null, h('time', { dateTime: revision.updatedAt }, `更新：${new Date(revision.updatedAt).toLocaleString()}`)),
+    ) : null,
+    revision.text && revision.status !== 'completed' ? h('div', { className: 'dsh-tp-muted' }, '未完成输出') : null,
+    revision.text ? h('div', { className: 'dsh-tp-translation-text' }, revision.text) : null,
+    revision.message ? h('p', { role: revision.status === 'failed' || revision.status === 'unknown' ? 'alert' : 'status', className: 'dsh-tp-muted' }, revision.message) : null,
+    copyState === 'failed' ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '复制失败，请重试。') : null,
+    revision.status === 'unknown' && record?.status === 'unknown' ? button('查询本轮结果', () => quick.query(record)) : null,
+  )
+}
+
+function TranslationUnit({ unit, quick, session }: { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession }): unknown {
+  const [expanded, setExpanded] = react.useState(false)
+  const latest = unit.revisions.at(-1)
+  if (!latest) return null
+  const final = unit.final ? unit.revisions.find(revision => revision.id === unit.final?.revisionId) : undefined
+  const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : '待定稿'
+  const blocked = quick.retranslateBlockedReason(session, unit.id)
+  return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
+    h('div', { className: 'dsh-tp-muted' }, '原文'),
+    h('div', { className: 'dsh-tp-translation-text' }, unit.source),
+    h('div', { className: 'dsh-tp-unit-header' },
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, finalLabel),
+      h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { void quick.retranslate(session.id, unit.id) } }, '重译'),
+    ),
+    h(TranslationRevision, { key: latest.id, unit, revision: latest, quick, session }),
+    unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, onClick: () => setExpanded(value => !value) }, `${expanded ? '收起' : '展开'}旧版本（${unit.revisions.length - 1}）`) : null,
+    expanded ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
+      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, unit, revision, quick, session })),
+    ) : null,
+  )
+}
+
 function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
@@ -288,6 +351,11 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
   const dialogSession = dialog ? store.getSession(dialog.id) : undefined
   const status = current ? store.getStatus(current.id) : 'memory'
   const records = current ? quick.getRecords(current.id) : []
+  const units = current ? quick.getUnits(current.id) : []
+  const represented = new Set(units.flatMap(unit => unit.revisions.map(revision => revision.operationId)))
+  const transient = records.filter(record => !represented.has(record.id))
+  const historyNote = store.getSettings().rememberHistory ? '已开启历史保存；原文和各版译文会保存在此设备。'
+    : store.getHistory().length ? '已保存的历史保留；后续内容仅保留在本次运行。' : '本次内容仅保留在本次运行。'
   const blocked = current ? quick.blockedReason(current) : undefined
   const busy = current ? quick.isBusy(current.id) : false
   const readiness = quick.getReadiness()
@@ -355,9 +423,11 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
         void action.run(() => store.deleteHistoryAsync(deletion.ids, false, deletion.unreadable, deletion.versions), () => setDeletion(currentRequest => currentRequest === deletion ? undefined : currentRequest))
       } }) : null,
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
+        units.length || records.length ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
-        ...records.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
-        records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
+        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current! })),
+        ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
+        units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),
       storeNotice(store),
       action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
@@ -409,7 +479,6 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
           }, busy ? h('span', { 'aria-hidden': true, style: { fontSize: 18, lineHeight: 1 } }, '■') : h(IconSendOutlineMedium, { size: 20 })),
         ),
         ),
-        records.length ? h('small', { className: 'dsh-tp-runtime-note' }, '译文仅保留在本次运行中，重启后不恢复。') : null,
       ) : null,
     ),
     context && target ? h(Menu, { open: true, anchor: null, onClose: () => { setContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup',
@@ -539,7 +608,7 @@ export function SettingsView({ store, onClose }: StoreProps & { readonly onClose
         type: 'checkbox', checked: form.rememberHistory, disabled: saving, 'aria-label': '允许保存会话历史到本地',
         onChange: (event: CheckEvent) => change({ rememberHistory: event.currentTarget.checked }),
       }), '允许保存会话历史到本地'),
-      h('p', { className: 'dsh-tp-muted' }, '模型与推理等级选择独立保存在此设备，不受此开关影响。开启后自动保存主题名称、会话配置和当前原文草稿，数据以明文保存在此设备；不保存已提交的快译原文和译文记录。关闭后保留已有历史，停止写入新的会话内容。'),
+      h('p', { className: 'dsh-tp-muted' }, '模型与推理等级选择独立保存在此设备，不受此开关影响。开启后自动保存主题名称、会话配置和当前原文草稿，以及已受理的原文、各版译文与定稿选择，数据以明文保存在此设备。已保存的历史保留；关闭后的后续内容仅保留在本次运行。'),
       h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
       store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
       h(HistorySection, { store }),

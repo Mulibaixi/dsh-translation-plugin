@@ -93,3 +93,37 @@ test('Host准备错误只输出允许分类与阶段，provider正文/任意code
     assert.equal(app.dispatches, 0)
   } finally { app.service.dispose() }
 })
+test('submit可选稳定unitId兼容旧载体，额外字段及空/过长unitId拒绝', () => {
+  const body = { ...query, draftVersion: 1, sourceText: 'x', targetLanguage: 'en', instruction: '', model: route }
+  assert.deepEqual(parseQuickRequest('submit', body), body)
+  assert.deepEqual(parseQuickRequest('submit', { ...body, unitId: 'stable:%opaque/unit' }), { ...body, unitId: 'stable:%opaque/unit' })
+  assert.throws(() => parseQuickRequest('submit', { ...body, unitId: '' }))
+  assert.throws(() => parseQuickRequest('submit', { ...body, unitId: 'a'.repeat(2049) }))
+  assert.throws(() => parseQuickRequest('submit', { ...body, unitId: 'stable-unit', history: ['private'] }))
+})
+
+test('Host稳定unit映射用于targeted新operation，冻结材料、幂等单位身份且没有第二最终指针', async () => {
+  let prepares = 0
+  const app = fixture(async config => { prepares++; return { config, adapterDefaults: {}, async *stream() { throw new Error('Synthetic incomplete output') } } })
+  app.service.adapter.execute = async function* () {
+    yield { type: 'text', text: 'Synthetic translation' }
+    yield { type: 'terminal', reason: 'stop', completeness: 'complete', checks_passed: true, provider_state: 'finished' }
+  }
+  const received = [], acceptances = []
+  const receive = app.service.runtime.receive.bind(app.service.runtime), accept = app.service.runtime.accept.bind(app.service.runtime)
+  app.service.runtime.receive = value => { received.push(structuredClone(value)); return receive(value) }
+  app.service.runtime.accept = value => { const result = accept(value); if (result.ok) acceptances.push(result.value); return result }
+  try {
+    const initial = { ...await request(app.service), unitId: 'stable-user-unit' }
+    assert.equal((await app.service.submit(initial)).value.accepted, true); await tick()
+    assert.equal((await app.service.status({ sessionKey: initial.sessionKey, operationId: initial.operationId })).value.status, 'completed')
+    assert.equal((await app.service.submit({ ...initial, operationId: 'synthetic-retranslation' })).value.accepted, true); await tick()
+    assert.equal(received[1].trigger, 'explicit_revision'); assert.equal(received[1].target.unit_id, acceptances[0].unit_id)
+    assert.equal(acceptances[1].unit_id, acceptances[0].unit_id); assert.equal(acceptances[1].candidate_order, 2)
+    const snapshot = app.service.runtime.getSnapshot({ translation_session_id: received[0].translation_session_id })
+    assert.equal(snapshot.value.units.length, 1); assert.equal(snapshot.value.units[0].final_pointer, null)
+    assert.equal((await app.service.submit({ ...initial, operationId: 'synthetic-mismatch', sourceText: 'other' })).error.code, 'invalid_input')
+    assert.equal((await app.service.submit({ ...initial, unitId: 'changed-unit' })).error.code, 'idempotency_conflict')
+    assert.equal(prepares, 2)
+  } finally { app.service.dispose() }
+})

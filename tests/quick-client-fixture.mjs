@@ -230,7 +230,9 @@ export function mount(overrides = {}) {
   const catalogResponse = overrides.catalog ?? { ok: true, value: { default: { provider: 'provider-a', model: 'm1' }, routableProviders: ['provider-a'], groups: [{ id: 'provider-a', name: 'Provider A', models: Array.from({ length: 6 }, (_, i) => ({ id: 'm' + (i + 1), name: 'Model ' + (i + 1) })) }], failures: [] } }
   const window = { localStorage: storage, __ModuleLoader__: { load(entry) { entries.push(entry) } }, addEventListener(_name, listener) { listeners.add(listener) }, removeEventListener(_name, listener) { listeners.delete(listener) } }
   const locks = overrides.locks ?? new Locks()
-  const context = vm.createContext({ window, navigator: { locks }, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
+  const copies = []
+  const clipboard = overrides.clipboard ?? { async writeText(text) { copies.push(text) } }
+  const context = vm.createContext({ window, navigator: { locks, clipboard }, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
   vm.runInContext(bundleSource, context)
   const exported = entries[0].factory(specifier => {
     if (specifier === 'react') return renderer.react
@@ -266,7 +268,7 @@ export function mount(overrides = {}) {
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
   }
   const applied = overrides.applyClient ? overrides.applyClient(exported, clientContext) : exported.apply(clientContext)
-  return { renderer, storage, remote, applied,
+  return { renderer, storage, remote, applied, copies,
     get panel() { return slots.get('sidebar.right.pane.tab') },
     get settingsPage() { return slots.get('settings.section') },
     get catalogCalls() { return catalogCalls },
