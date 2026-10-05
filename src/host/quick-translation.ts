@@ -210,7 +210,9 @@ export class QuickTranslationService {
     const content = revision ? this.runtime.readContent({ topic_id: context.topic.topic_id, content_ref: revision.content_ref }) : undefined
     const state = attempt.status === 'queued' ? 'running' : attempt.status === 'interrupted' ? 'unknown' : attempt.status
     const diagnostic = this.adapter.diagnostic(job.internalId)
+    const call = this.adapter.callMetadata(job.internalId)
     return { ...base, status: state, text: content?.ok ? content.value : '',
+      ...(call ? { metadata: { ...call, usage: { inputTokens: attempt.usage?.input_tokens ?? null, outputTokens: attempt.usage?.output_tokens ?? null } } } : {}),
       ...(['failed', 'unknown'].includes(state) ? { error: diagnostic ?? { code: state === 'unknown' ? 'OUTCOME_UNKNOWN' : 'INCOMPLETE_RESULT',
         message: state === 'unknown' ? '请求尚未确认结算，请勿自动重新发送。' : '译文未完整完成，请检查模型设置。', stage: attempt.failure_stage ?? 'stream' } } : {}) }
   }

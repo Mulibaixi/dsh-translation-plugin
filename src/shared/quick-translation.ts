@@ -1,5 +1,6 @@
 import type { ModelSelection } from './contracts.js'
 import type { DomainResult } from './domain-contracts.js'
+import { parseTranslationCallMetadata, type TranslationCallMetadata } from './translation-call.js'
 
 export interface QuickTranslationCapability {
   readonly ready: boolean
@@ -43,6 +44,7 @@ export interface QuickTranslationJob extends QuickTranslationQuery {
   readonly status: 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown'
   /** Translation or incomplete output only. Source material is not returned. */
   readonly text: string
+  readonly metadata?: TranslationCallMetadata
   readonly error?: { readonly code: string; readonly message: string; readonly stage?: string }
 }
 
@@ -120,13 +122,17 @@ export function parseQuickResult(method: typeof methods[number], value: unknown)
     exact(result, ['sessionKey', 'localSessionId', 'maxSourceCodePoints'])
     identity(result.sessionKey); bounded(result.localSessionId, 2048); integer(result.maxSourceCodePoints, 1, 1_000_000)
   } else {
-    exact(result, ['sessionKey', 'operationId', 'draftVersion', 'accepted', 'status', 'text', 'error'])
+    exact(result, ['sessionKey', 'operationId', 'draftVersion', 'accepted', 'status', 'text', 'metadata', 'error'])
     identity(result.sessionKey); identity(result.operationId); integer(result.draftVersion, 0, Number.MAX_SAFE_INTEGER)
     if (typeof result.accepted !== 'boolean' || typeof result.status !== 'string' || !['running', 'completed', 'failed', 'cancelled', 'unknown'].includes(result.status)) throw new TypeError('Invalid job state')
     bounded(result.text, 2_000_000, true)
     if (result.draftVersion === 0 && (result.accepted || result.status !== 'cancelled')) throw new TypeError('Invalid cancellation intent')
     if (!result.accepted && (result.text !== '' || result.status === 'completed' || result.status === 'unknown')) throw new TypeError('Invalid unaccepted state')
     if (result.status === 'completed' && (result.accepted !== true || !result.text.trim())) throw new TypeError('Invalid completion')
+    if (result.metadata !== undefined) {
+      if (!result.accepted) throw new TypeError('Unaccepted translation cannot have call metadata')
+      parseTranslationCallMetadata(result.metadata)
+    }
     if (result.error !== undefined) {
       record(result.error); exact(result.error, ['code', 'message', 'stage'])
       bounded(result.error.code, 80); bounded(result.error.message, 1000)

@@ -83,7 +83,7 @@ export async function createQuickHostFixture({ runtimeRoot, pluginPath = fileURL
         else options.signal?.addEventListener('abort', resolve, { once: true })
       })])
       if (mode !== 'delta-only') yield { type: 'block-end', index: 0, block: { type: 'text', text: mode === 'mismatched-block' ? '不同正文' : '合成译文' } }
-      yield { type: 'usage', usage: { inputTokens: 7, outputTokens: 4 } }
+      if (mode !== 'no-usage') yield { type: 'usage', usage: mode === 'zero-usage' ? { inputTokens: 0, outputTokens: 0 } : { inputTokens: 7, outputTokens: 4 } }
       if (mode !== 'missing-terminal') yield { type: 'finish', reason: { kind: options.signal?.aborted ? 'aborted' : mode === 'truncated' ? 'max-tokens' : 'stop' } }
     }
   }

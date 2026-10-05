@@ -3,6 +3,7 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { sep } from 'node:path'
 import { createQuickHostFixture, unwrapQuickRemote, waitForQuick } from '../tests/quick-host-fixture.mjs'
+import { TRANSLATION_PROMPT_VERSION, reconstructTranslationContext } from '../dist/shared/translation-call.js'
 
 const runtimeRoot = process.env.DSH_RUNTIME_ROOT
 if (!runtimeRoot) throw new Error('DSH_RUNTIME_ROOT is required: provide a directory containing the target DSH dsh/node_modules runtime. No native integration was run.')
@@ -61,6 +62,13 @@ test('真实LLM/Session日志保持两条独立模型消息、注册配置与默
     const session = f.sessions[0]
     assert.deepEqual(session.log.map(event => event.type), ['system/message', 'user/message', 'request/header', 'assistant/message'])
     assert.deepEqual(session.log[2].data.header.adapterDefaults, { reasoningEffort: true, maxTokens: true })
+    assert.deepEqual(final.value.metadata, { promptVersion: TRANSLATION_PROMPT_VERSION,
+      model: { provider: sent.provider, model: sent.model, reasoningEffort: sent.reasoningEffort },
+      configVersion: null, maxOutputTokens: sent.maxTokens, usage: { inputTokens: 7, outputTokens: 4 } })
+    assert.deepEqual(final.value.metadata.model, { provider: session.log[2].data.header.config.provider,
+      model: session.log[2].data.header.config.model, reasoningEffort: session.log[2].data.header.config.reasoningEffort })
+    const context = reconstructTranslationContext({ source: body.sourceText, targetLanguage: body.targetLanguage, instruction: body.instruction })
+    assert.equal(context.systemPrompt, sent.messages[0].content[0].text); assert.equal(context.userMessage, sent.messages[1].content[0].text)
     assert.deepEqual(session.deriveMessages().map(message => message.role), ['system', 'user', 'assistant'])
     assert.equal(session.deriveMessages()[2].content[0].text, '合成译文')
     const replay = f.ctx.sessions.prepare('synthetic-replay', { seed: session.log })
@@ -77,8 +85,33 @@ test('真实Host在prepare前校验目录模型和effort；不会受理/推进�
       ['missing-effort', { providerId: 'synthetic', modelId: 'model-a', configVersion: 0, reasoningEffort: 'unsafe' }]]) {
       const result = unwrapQuickRemote(await f.call('submit', request(binding, id, { model })))
       assert.equal(result.value.status, 'failed'); assert.equal(result.value.accepted, false); assert.equal(result.value.error.stage, 'prepare')
+      assert.equal(result.value.metadata, undefined)
     }
     assert.equal(f.provider.preparations, 0); assert.equal(f.provider.calls.length, 0); assert.equal(f.sessions.length, 0)
+  } finally { await f.dispose() }
+})
+
+test('真实Host调用metadata区分未提供和零用量；不完整结果仍保留实际已报告计数', async () => {
+  const f = await createQuickHostFixture({ runtimeRoot })
+  try {
+    const binding = await open(f)
+    for (const [mode, expectedStatus, expectedUsage] of [
+      ['no-usage', 'completed', { inputTokens: null, outputTokens: null }],
+      ['zero-usage', 'completed', { inputTokens: 0, outputTokens: 0 }],
+      ['truncated', 'failed', { inputTokens: 7, outputTokens: 4 }],
+    ]) {
+      f.provider.mode = mode
+      const body = request(binding, `native-metadata:${mode}`, { model: { providerId: 'synthetic', modelId: 'model-a', configVersion: 0, reasoningEffort: 'low' } })
+      await f.call('submit', body)
+      const result = await waitForQuick(f, query(body))
+      assert.equal(result.value.status, expectedStatus)
+      assert.deepEqual(result.value.metadata.usage, expectedUsage)
+      assert.equal(result.value.metadata.model.reasoningEffort, 'low')
+      assert.equal(result.value.metadata.configVersion, null); assert.equal(result.value.metadata.maxOutputTokens, 1024)
+      assert.equal(Object.hasOwn(result.value.metadata, 'sessionKey'), false)
+      assert.equal(Object.hasOwn(result.value.metadata, 'profile'), false)
+    }
+    assert.equal(f.provider.calls.length, 3); assert.equal(f.nativeEvents, 0)
   } finally { await f.dispose() }
 })
 
@@ -102,6 +135,7 @@ test('真实Gateway取消先到/准备中取消，迟到submit保持正确草稿
     const binding = await open(f); const body = request(binding, 'cancel-before-submit', { draftVersion: 9 })
     const cancelled = unwrapQuickRemote(await f.call('cancel', query(body)))
     assert.equal(cancelled.value.status, 'cancelled'); assert.equal(cancelled.value.draftVersion, 0)
+    assert.equal(cancelled.value.metadata, undefined)
     const late = unwrapQuickRemote(await f.call('submit', body))
     assert.equal(late.value.status, 'cancelled'); assert.equal(late.value.draftVersion, 9); assert.equal(late.value.accepted, false)
     assert.equal(unwrapQuickRemote(await f.call('status', query(body))).value.draftVersion, 9)

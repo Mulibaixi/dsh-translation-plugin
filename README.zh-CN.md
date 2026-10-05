@@ -84,7 +84,7 @@
 
 ## 兼容性与安装
 
-此前核对的本机 Windows DSH Desktop 为 `0.2.0-rc.2`，用户当前 DSH 版本未重新确认。v0.4.0 于 2026-10-06 根代理独立验收：`npm test` 187 项、三个 Native 集成入口 26 项及另行执行的独立检查 7 项全部通过，均为 0 失败、0 跳过，构建成功。UI 检查使用轻量 hook renderer、合成事件和存储 fixture，不属于实际 DOM 或桌面验证。`npm run test:native` 包含这三个入口，加载真实 DSH `0.2.0-rc.2` 组件包，在一次性合成 profile 中使用 synthetic provider，验证 Host/Client 组件与 RPC 集成。挂载入口使用真实 `ClientRemoteService`、Cordis 与当前 Client bundle 检查自主能力查询、合成翻译及卸载。快译尚未经过用户桌面实测或真实远端模型验证。其他版本、操作系统和独立 Web profile 未验证。
+此前核对的本机 Windows DSH Desktop 为 `0.2.0-rc.2`，用户当前 DSH 版本未重新确认。v0.4.1 于 2026-10-06 根代理独立验收：`npm test` 190 项、三个 Native 集成入口 27 项及另行执行的独立检查 7 项全部通过，均为 0 失败、0 跳过，构建成功。UI 检查使用轻量 hook renderer、合成事件和存储 fixture，不属于实际 DOM 或桌面验证。`npm run test:native` 包含这三个入口，加载真实 DSH `0.2.0-rc.2` 组件包，在一次性合成 profile 中使用 synthetic provider，验证 Host/Client 组件与 RPC 集成。挂载入口使用真实 `ClientRemoteService`、Cordis 与当前 Client bundle 检查自主能力查询、合成翻译及卸载。快译尚未经过用户桌面实测或真实远端模型验证。其他版本、操作系统和独立 Web profile 未验证。
 
 需要 Node.js 22 或更高版本、pnpm，以及支持本地 bundle 的 DSH。
 
@@ -105,6 +105,8 @@ pnpm build
 
 `pnpm test` 会先构建，再验证会话、历史、旧格式兼容、目录及 Client 交互。Native 集成命令及 DSH 组件前提见 [CONTRIBUTING.md](CONTRIBUTING.md)。Synthetic provider 不代表真实远端模型，也不能代替用户桌面运行验证。
 
-变化见 [CHANGELOG.md](CHANGELOG.md)。当前本地版本为 `v0.4.0`，在纯文本快译发送、结果显示与取消基础上，增加同单元重译、全部版本、每单元唯一最终选择及可选的重启恢复；模型偏好独立保存。普通模式执行、文件翻译、记忆、人工编辑和导出尚未接通；本版本未远程发布。`private: true` 防止意外 npm 发布。
+共享调用记录模块准备 RPC 的可选字段，包含实际模型、推理等级、输出上限、提示词版本及已报告 token 使用量；未取得的配置版本与计数保持 `null`。Client 尚未展示或持久化此 metadata，历史仍使用 schema4。
+
+变化见 [CHANGELOG.md](CHANGELOG.md)。当前本地版本为 `v0.4.1`，保留纯文本快译发送、结果显示与取消、同单元重译、全部版本、每单元唯一最终选择及可选重启恢复；模型偏好独立保存。普通模式执行、文件翻译、记忆、人工编辑和导出尚未接通；本版本未远程发布。`private: true` 防止意外 npm 发布。
 
 许可证：[MIT](LICENSE)。
