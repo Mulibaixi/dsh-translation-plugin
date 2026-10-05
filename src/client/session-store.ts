@@ -35,11 +35,13 @@ interface SessionSnapshot { readonly session: LocalSession; readonly translation
 function readSnapshot(raw: string): SessionSnapshot | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    if (!value || ![2, 3, 4].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
-    const fields = value.schemaVersion === 4 ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
+    if (!value || ![2, 3, 4, 5].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    const hasTranslations = value.schemaVersion === 4 || value.schemaVersion === 5
+    const fields = hasTranslations ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
     if (Object.keys(value).length !== fields.length || fields.some(key => !Object.hasOwn(value, key))) return undefined
+    if (hasTranslations && (value.translationHistory as { schemaVersion?: unknown } | null)?.schemaVersion !== (value.schemaVersion === 4 ? 1 : 2)) return undefined
     const session = decodeSession(value.session)
-    const translationHistory = value.schemaVersion === 4 ? decodeTranslationHistory(value.translationHistory) : emptyTranslationHistory()
+    const translationHistory = hasTranslations ? decodeTranslationHistory(value.translationHistory) : emptyTranslationHistory()
     return session && translationHistory ? { session, translationHistory } : undefined
   } catch { return undefined }
 }
@@ -651,7 +653,7 @@ export class SessionStore {
         seat.status = 'conflict'; this.notice = '会话历史已在其他窗口修改或删除，当前输入保留。请选择读取本地副本或明确覆盖。'; return false
       }
       const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
-      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 4 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
+      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 5 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
         ...(hasTranslations ? { translationHistory: seat.translationHistory } : {}) })
       this.storage.setItem(historyKey(id), serialized)
       seat.stored = serialized; seat.savedSession = seat.session; seat.savedTranslationHistory = seat.translationHistory; seat.status = 'saved'

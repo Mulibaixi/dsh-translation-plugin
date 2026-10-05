@@ -304,3 +304,148 @@ test('发布bundle复制失败保留版本并显示可重试提示', async () =>
     assert.equal(ui.text(ui.button('复制文本 1 版本 1')), '已复制')
   } finally { await app.dispose() }
 })
+
+const currentTitle = ui => ui.nodes().find(node => node.props.className === 'dsh-tp-current-title')
+async function exportFromTitle(ui, label) {
+  const model = ui.nodes().find(node => node.props.className === 'dsh-tp-model-trigger' && node.props['aria-expanded'])
+  if (model) await ui.click(model.props['aria-label'])
+  ui.context(currentTitle(ui)); await ui.click(label)
+}
+function callMetadata(request, inputTokens = 7, outputTokens = 4) {
+  return { promptVersion: 'text-runtime-v1', model: { provider: request.model.providerId, model: request.model.modelId, reasoningEffort: request.model.reasoningEffort ?? null }, configVersion: null, maxOutputTokens: 1024, usage: { inputTokens, outputTokens } }
+}
+
+test('发布bundle人工编辑：跨会话保留草稿、新机器版到达仍基于原版追加，保存候选不调用模型', async () => {
+  const rpc = remote()
+  rpc.domain.submit = async request => { rpc.calls.submit.push(structuredClone(request)); return ok(rpc.job(request, { text: `Synthetic machine ${rpc.calls.submit.length}` })) }
+  const app = mount({ quick: rpc.port, deferFunctionalUpdates: true })
+  try {
+    const ui = await start(app); await ui.input('待翻译内容', 'Synthetic immutable source'); await ui.click('发送快译')
+    await ui.click('编辑文本 1 版本 1'); await ui.input('编辑文本 1 版本 1译文', 'Synthetic manual draft')
+    ui.render(app.panel, { sessionId: 'synthetic-other-main' }); await ui.flush()
+    assert.ok(!ui.nodes().some(node => node.props['aria-label'] === '编辑文本 1 版本 1译文'))
+    await ui.input('待翻译内容', 'Synthetic other input')
+    ui.render(app.panel, { sessionId: 'synthetic-main' }); await ui.flush()
+    assert.equal(ui.control('编辑文本 1 版本 1译文').props.value, 'Synthetic manual draft')
+    await ui.input('待翻译内容', 'Synthetic next composer draft'); await ui.click('重译文本 1')
+    assert.equal(ui.control('编辑文本 1 版本 1译文').props.value, 'Synthetic manual draft')
+    assert.match(ui.text(), /基于版本 1保存为新版本/)
+    await ui.click('保存文本 1 版本 1编辑')
+    assert.match(ui.text(), /版本 3 · 人工修订 · 中文 · 基于版本 1/)
+    assert.match(ui.text(), /待定稿/); assert.equal(rpc.calls.submit.length, 2)
+    assert.equal(ui.control('待翻译内容').props.value, 'Synthetic next composer draft')
+    await ui.click('文本 1 版本 3详情'); assert.match(ui.text(), /人工修订，未调用模型/)
+    await ui.click('复制文本 1 版本 3'); assert.deepEqual(app.copies, ['Synthetic manual draft'])
+    await ui.click('文本 1 版本 3设为最终'); assert.match(ui.text(), /用户固定：版本 3/)
+    await exportFromTitle(ui, '导出完整记录 JSON')
+    const result = JSON.parse(await app.downloads[0].blob.text())
+    assert.equal(result.history.units[0].source, 'Synthetic immutable source')
+    assert.equal(result.history.units[0].revisions[2].baseRevisionId, result.history.units[0].revisions[0].id)
+    assert.equal(result.history.units[0].revisions[2].model, null); assert.equal(result.history.units[0].revisions[2].callRecord, null)
+    assert.equal(result.history.units[0].final.selection, 'user_fixed')
+    assert.equal(rpc.calls.submit.length, 2)
+  } finally { await app.dispose() }
+})
+
+test('发布bundle调用详情：Host metadata照实显示prompt与用量，未知不填零，真实零保留', async () => {
+  const rpc = remote()
+  rpc.domain.submit = async request => {
+    rpc.calls.submit.push(structuredClone(request)); const count = rpc.calls.submit.length
+    return ok(rpc.job(request, { ...(count === 2 ? {} : { metadata: callMetadata(request, count === 3 ? 0 : 7, count === 3 ? 0 : 4) }) }))
+  }
+  const app = mount({ quick: rpc.port })
+  try {
+    const ui = await start(app); await ui.input('待翻译内容', 'Synthetic usage source'); await ui.click('发送快译')
+    await ui.click('文本 1 版本 1详情')
+    assert.match(ui.text(), /提示词版本：text-runtime-v1/); assert.match(ui.text(), /用量：输入 7 · 输出 4 token/)
+    await ui.click('重译文本 1'); await ui.click('文本 1 版本 2详情')
+    assert.match(ui.text(), /提示词版本：未提供/); assert.match(ui.text(), /用量：输入 未提供 · 输出 未提供 token/)
+    await ui.click('重译文本 1'); await ui.click('文本 1 版本 3详情')
+    assert.match(ui.text(), /用量：输入 0 · 输出 0 token/)
+  } finally { await app.dispose() }
+})
+
+test('发布bundle导出：JSON不收尾，TXT只收尾最后单元，缺项一层选择且冻结确认范围', async () => {
+  const rpc = remote()
+  rpc.domain.submit = async request => {
+    rpc.calls.submit.push(structuredClone(request)); const count = rpc.calls.submit.length
+    return ok(rpc.job(request, { status: count === 2 ? 'failed' : 'completed', text: count === 2 ? 'Synthetic incomplete' : `Synthetic export result ${count}`, metadata: callMetadata(request), ...(count === 2 ? { error: { code: 'EXECUTION_FAILED', message: 'Synthetic truncation', stage: 'stream' } } : {}) }))
+  }
+  const app = mount({ quick: rpc.port })
+  try {
+    const ui = await start(app); await ui.input('待翻译内容', 'Synthetic old source'); await ui.click('发送快译'); await ui.click('重译文本 1')
+    await ui.input('待翻译内容', 'Synthetic last source'); await ui.click('发送快译')
+    await exportFromTitle(ui, '导出完整记录 JSON')
+    assert.ok(!ui.text().includes('自动最终'))
+    const json = JSON.parse(await app.downloads[0].blob.text())
+    assert.equal(json.history.units[0].final, null); assert.equal(json.history.units[1].final, null)
+    assert.equal(json.history.units[0].revisions[1].status, 'failed')
+    assert.equal(json.history.units[1].revisions[0].callRecord.usage.inputTokens, 7)
+    assert.equal(rpc.calls.submit.length, 3)
+    await exportFromTitle(ui, '导出最终译文 TXT')
+    assert.match(ui.text(), /尚无最终译文：文本 1/); assert.match(ui.text(), /自动最终：版本 1/)
+    assert.equal(app.downloads.length, 1); assert.ok(!ui.nodes().some(node => node.props.role === 'menu'))
+    await ui.click('重译文本 2'); await ui.click('文本 2 版本 2设为最终')
+    await ui.click('仅导出已定稿')
+    const text = await app.downloads[1].blob.text()
+    assert.match(text, /Synthetic export result 3/); assert.ok(!text.includes('Synthetic export result 4'))
+    assert.ok(!text.includes('Synthetic export result 1')); assert.match(app.downloads[1].fileName, /partial/)
+    assert.equal(rpc.calls.submit.length, 4)
+    await new Promise(resolve => setTimeout(resolve, 0)); await ui.flush()
+    assert.equal(app.downloadAnchorCount, 0); assert.equal(app.revokedUrls.length, 2)
+    assert.ok(!ui.nodes().some(node => node.props.role === 'dialog' || node.props.role === 'menu'))
+  } finally { await app.dispose() }
+})
+
+test('发布bundle人工修正失败输出并导出，取消编辑保留原版本，TXT候选本地自动收尾', async () => {
+  const rpc = remote()
+  rpc.domain.submit = async request => { rpc.calls.submit.push(structuredClone(request)); return ok(rpc.job(request, { status: 'failed', text: 'Synthetic half translation', error: { code: 'EXECUTION_FAILED', message: 'Synthetic stream failure', stage: 'stream' } })) }
+  const app = mount({ quick: rpc.port })
+  try {
+    const ui = await start(app); await ui.input('待翻译内容', 'Synthetic failed source'); await ui.click('发送快译')
+    await ui.click('编辑文本 1 版本 1'); await ui.input('编辑文本 1 版本 1译文', 'Synthetic cancelled edit')
+    await ui.click('取消文本 1 版本 1编辑'); assert.match(ui.text(), /Synthetic half translation/)
+    assert.ok(!ui.text().includes('Synthetic cancelled edit'))
+    await ui.click('编辑文本 1 版本 1'); await ui.input('编辑文本 1 版本 1译文', 'Synthetic human complete')
+    await ui.click('保存文本 1 版本 1编辑'); assert.match(ui.text(), /待定稿/)
+    await exportFromTitle(ui, '导出完整记录 JSON')
+    assert.equal(JSON.parse(await app.downloads[0].blob.text()).history.units[0].final, null)
+    await exportFromTitle(ui, '导出最终译文 TXT')
+    assert.match(ui.text(), /自动最终：版本 2/)
+    assert.equal((await app.downloads[1].blob.text()).trim(), 'Synthetic human complete')
+    assert.equal(rpc.calls.submit.length, 1)
+    await ui.click('文本 1旧版本'); assert.equal(ui.button('文本 1 版本 1设为最终').props.disabled, true)
+  } finally { await app.dispose() }
+})
+
+test('发布bundle下载失败保留正文与编辑草稿，菜单收起后可重新导出', async () => {
+  const app = mount({ quick: remote().port, downloadError: true })
+  try {
+    const ui = await start(app); await ui.input('待翻译内容', 'Synthetic download source'); await ui.click('发送快译')
+    await ui.click('编辑文本 1 版本 1'); await ui.input('编辑文本 1 版本 1译文', 'Synthetic preserved edit')
+    await exportFromTitle(ui, '导出完整记录 JSON')
+    assert.match(ui.text(), /无法启动下载，请重试/)
+    assert.equal(ui.control('编辑文本 1 版本 1译文').props.value, 'Synthetic preserved edit')
+    assert.equal(app.downloads.length, 0); assert.equal(app.downloadAnchorCount, 0)
+    assert.ok(!ui.nodes().some(node => node.props.role === 'menu'))
+  } finally { await app.dispose() }
+})
+
+test('发布bundle普通升档后仍可编辑导出既有记录，删除会话清除私有编辑草稿', async () => {
+  const rpc = remote(); const app = mount({ quick: rpc.port, deferFunctionalUpdates: true })
+  try {
+    const ui = await start(app); await ui.input('待翻译内容', 'Synthetic upgrade source'); await ui.click('发送快译')
+    await ui.input('翻译模式', 'normal')
+    assert.equal(ui.button('发送快译').props.disabled, true)
+    await ui.click('编辑文本 1 版本 1'); await ui.input('编辑文本 1 版本 1译文', 'Synthetic normal manual')
+    await ui.click('保存文本 1 版本 1编辑'); assert.match(ui.text(), /版本 2 · 人工修订/)
+    await exportFromTitle(ui, '导出最终译文 TXT')
+    assert.equal((await app.downloads[0].blob.text()).trim(), 'Synthetic normal manual')
+    assert.equal(rpc.calls.submit.length, 1)
+    await ui.click('编辑文本 1 版本 2'); await ui.input('编辑文本 1 版本 2译文', 'Synthetic private edit to delete')
+    assert.equal(ui.hasStateText('Synthetic private edit to delete'), true)
+    ui.context(currentTitle(ui)); await ui.click('删除'); await ui.click('确认删除会话')
+    assert.equal(ui.hasStateText('Synthetic private edit to delete'), false)
+    assert.ok(!ui.text().includes('Synthetic normal manual'))
+  } finally { await app.dispose() }
+})

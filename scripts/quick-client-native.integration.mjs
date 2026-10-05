@@ -6,6 +6,8 @@ import { adaptQuickRemote } from '../dist/client/quick-transport.js'
 import { ModelCatalog } from '../dist/client/models.js'
 import { SessionStore } from '../dist/client/session-store.js'
 import { DEFAULT_SESSION_SETTINGS, SETTINGS_KEY, historyKey } from '../dist/client/sessions.js'
+import { buildFinalTextExport, buildFullRecordExport } from '../dist/client/translation-export.js'
+import { TRANSLATION_PROMPT_VERSION, reconstructTranslationContext } from '../dist/shared/translation-call.js'
 
 // Run after building the workspace plugin:
 // node --expose-internals --test scripts/quick-client-native.integration.mjs
@@ -202,4 +204,123 @@ test('真实DSH同单元targeted revision与重启新调用：保留用户unit/f
     assert.equal(restarted.host.nativeEvents, 0)
     await tick(); assert.ok(!storage.getItem(historyKey(localSessionId)).includes('sessionKey'))
   } finally { await restarted.close() }
+})
+
+test('真实Gateway/LLM/Session + Client：调用证据落盘，旧base人工修订及固定最终/TXT/JSON导出不增加模型调用，重启完整恢复', async () => {
+  const storage = new NativeStorage()
+  storage.setItem(SETTINGS_KEY, JSON.stringify({ ...DEFAULT_SESSION_SETTINGS, rememberHistory: true }))
+  const app = await fixture({ storage }), gate = deferred()
+  let id, unitId, firstRevisionId, fixedRevisionId, latestManualId
+  try {
+    await app.quick.send(app.id)
+    await wait(() => app.quick.getRecords(app.id)[0]?.status === 'completed', 'first recorded call completed')
+    id = app.id
+    const initial = app.quick.getUnits(id)[0], original = initial.revisions[0]
+    unitId = initial.id; firstRevisionId = original.id
+    const sent = app.host.provider.calls[0], config = app.host.sessions[0].log.find(event => event.type === 'request/header').data.header.config
+    assert.equal(original.kind, 'machine'); assert.equal(original.baseRevisionId, null)
+    assert.deepEqual(original.callRecord, { promptVersion: TRANSLATION_PROMPT_VERSION,
+      model: { provider: config.provider, model: config.model, reasoningEffort: config.reasoningEffort },
+      configVersion: null, maxOutputTokens: config.maxTokens, usage: { inputTokens: 7, outputTokens: 4 } })
+    const context = reconstructTranslationContext(initial)
+    assert.equal(context.systemPrompt, sent.messages[0].content[0].text); assert.equal(context.userMessage, sent.messages[1].content[0].text)
+    app.store.updateSession(id, { input: 'Synthetic independent draft' })
+    assert.equal(app.quick.saveManualRevision(id, unitId, original.id, 'Synthetic first manual final'), true)
+    const manual = app.quick.getUnits(id)[0].revisions.at(-1)
+    fixedRevisionId = manual.id
+    assert.equal(manual.kind, 'manual'); assert.equal(manual.model, null); assert.equal(manual.callRecord, null)
+    assert.equal(manual.baseRevisionId, original.id); assert.equal(app.quick.getUnits(id)[0].final, null)
+    assert.equal(app.quick.selectFinal(id, unitId, manual.id), true)
+    assert.equal(app.host.provider.calls.length, 1)
+    app.host.provider.mode = 'zero-usage'; app.host.provider.gate = gate.promise
+    app.store.updateSession(id, { model: { provider: 'synthetic', model: 'model-a', reasoningEffort: 'low' } })
+    await app.quick.retranslate(id, unitId)
+    await wait(() => app.host.provider.calls.length === 2, 'second actual stream entered')
+    // Saving the selected old base remains legal while a later model version is arriving.
+    assert.equal(app.quick.saveManualRevision(id, unitId, original.id, 'Synthetic second manual candidate'), true)
+    latestManualId = app.quick.getUnits(id)[0].revisions.at(-1).id
+    gate.resolve()
+    await wait(() => app.quick.getRecords(id)[1]?.status === 'completed', 'later model version settled')
+    const updated = app.quick.getUnits(id)[0], laterCall = updated.revisions.find(revision => revision.operationId === app.calls.submit[1].operationId)
+    assert.deepEqual(laterCall.callRecord.usage, { inputTokens: 0, outputTokens: 0 })
+    assert.equal(laterCall.callRecord.model.reasoningEffort, 'low')
+    assert.equal(updated.revisions.at(-1).baseRevisionId, original.id)
+    assert.equal(updated.revisions.at(-1).id, latestManualId)
+    assert.equal(updated.revisions[0].text, '合成译文'); assert.equal(updated.final.revisionId, fixedRevisionId); assert.equal(updated.final.selection, 'user_fixed')
+    assert.equal(app.store.getSession(id).input, 'Synthetic independent draft')
+    const beforeExportCalls = app.host.provider.calls.length
+    assert.equal(app.quick.finalizeForExport(id), true)
+    const at = '2026-10-06T12:00:00.000Z', history = app.store.getTranslationHistory(id), session = app.store.getSession(id)
+    const finalText = buildFinalTextExport(session, history, at)
+    assert.equal(finalText.complete, true); assert.equal(finalText.content.trim(), 'Synthetic first manual final')
+    const full = buildFullRecordExport(session, history, at), json = JSON.parse(full.content)
+    assert.deepEqual(json.history, history)
+    assert.deepEqual(json.history.units[0].revisions[0].callRecord, original.callRecord)
+    assert.equal(json.history.units[0].revisions.at(-1).baseRevisionId, firstRevisionId)
+    assert.equal(json.promptDefinitions.length, 1)
+    assert.equal(json.promptDefinitions[0].promptVersion, TRANSLATION_PROMPT_VERSION)
+    assert.equal(json.promptDefinitions[0].systemPrompt, sent.messages[0].content[0].text)
+    assert.deepEqual(json.promptDefinitions[0].userMessageFields, {
+      target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source',
+    })
+    assert.equal(reconstructTranslationContext(json.history.units[0]).userMessage, sent.messages[1].content[0].text)
+    assert.ok(!full.content.includes('sessionKey')); assert.ok(!full.content.includes('apiKey')); assert.ok(!full.content.includes('arbitraryProfile'))
+    assert.equal(app.host.provider.calls.length, beforeExportCalls)
+    await tick()
+    const disk = JSON.parse(storage.getItem(historyKey(id)))
+    assert.equal(disk.schemaVersion, 5); assert.equal(disk.translationHistory.schemaVersion, 2)
+    assert.equal(disk.translationHistory.units[0].revisions.at(-1).kind, 'manual')
+    assert.deepEqual(disk.translationHistory.units[0].revisions.find(revision => revision.id === laterCall.id).callRecord.usage, { inputTokens: 0, outputTokens: 0 })
+  } finally { gate.resolve(); await app.close() }
+  const restored = await fixture({ storage, restoredId: id })
+  try {
+    const history = restored.store.getTranslationHistory(id), unit = restored.quick.getUnits(id)[0]
+    assert.equal(unit.id, unitId); assert.equal(unit.final.revisionId, fixedRevisionId); assert.equal(unit.revisions.at(-1).id, latestManualId)
+    assert.deepEqual(unit.revisions[0].callRecord.usage, { inputTokens: 7, outputTokens: 4 })
+    assert.equal(unit.revisions.at(-1).baseRevisionId, firstRevisionId); assert.equal(unit.revisions.at(-1).callRecord, null)
+    assert.equal(restored.host.provider.calls.length, 0); assert.equal(restored.calls.submit.length, 0); assert.equal(restored.calls.status.length, 0)
+    assert.equal(buildFinalTextExport(restored.store.getSession(id), history, '2026-10-06T12:00:01.000Z').content.trim(), 'Synthetic first manual final')
+    assert.equal(restored.host.provider.calls.length, 0)
+  } finally { await restored.close() }
+})
+
+test('真实Gateway调用缺失用量保持null，执行中关历史与导出不改旧副本；重启中断不回放或伪造零用量', async () => {
+  const storage = new NativeStorage()
+  storage.setItem(SETTINGS_KEY, JSON.stringify({ ...DEFAULT_SESSION_SETTINGS, rememberHistory: true }))
+  const app = await fixture({ storage }), gate = deferred()
+  let id, unitId, saved
+  try {
+    id = app.id; app.host.provider.mode = 'no-usage'
+    await app.quick.send(id); await wait(() => app.quick.getRecords(id)[0]?.status === 'completed', 'call without usage completed')
+    const unit = app.quick.getUnits(id)[0]; unitId = unit.id
+    assert.deepEqual(unit.revisions[0].callRecord.usage, { inputTokens: null, outputTokens: null })
+    app.host.provider.mode = 'zero-usage'; app.host.provider.gate = gate.promise
+    await app.quick.retranslate(id, unitId); await wait(() => app.host.provider.calls.length === 2, 'second call started')
+    await tick(); assert.equal(await app.store.patchSettingsAsync({ rememberHistory: false }), true); await tick()
+    saved = storage.getItem(historyKey(id))
+    gate.resolve(); await wait(() => app.quick.getRecords(id)[1]?.status === 'completed', 'private zero-token call completed')
+    assert.deepEqual(app.quick.getUnits(id)[0].revisions[1].callRecord.usage, { inputTokens: 0, outputTokens: 0 })
+    assert.equal(app.quick.finalizeForExport(id), true)
+    const exported = buildFinalTextExport(app.store.getSession(id), app.store.getTranslationHistory(id), '2026-10-06T12:00:00.000Z')
+    assert.equal(exported.complete, true); assert.equal(exported.content.trim(), '合成译文')
+    assert.equal(app.store.getSettings().rememberHistory, false); assert.equal(storage.getItem(historyKey(id)), saved)
+    assert.equal(app.host.provider.calls.length, 2)
+  } finally { gate.resolve(); await app.close() }
+  const restored = await fixture({ storage, restoredId: id })
+  try {
+    const unit = restored.quick.getUnits(id)[0]
+    assert.equal(unit.id, unitId); assert.equal(unit.revisions[1].status, 'interrupted')
+    assert.deepEqual(unit.revisions[0].callRecord.usage, { inputTokens: null, outputTokens: null })
+    assert.equal(unit.revisions[1].callRecord?.usage.inputTokens ?? null, null)
+    assert.equal(unit.revisions[1].callRecord?.usage.outputTokens ?? null, null)
+    assert.equal(unit.final, null)
+    assert.equal(restored.host.provider.calls.length, 0); assert.equal(restored.calls.submit.length, 0); assert.equal(restored.quick.isBusy(id), false)
+    assert.equal(restored.quick.finalizeForExport(id), true)
+    const incomplete = buildFinalTextExport(restored.store.getSession(id), restored.store.getTranslationHistory(id), '2026-10-06T12:00:01.000Z')
+    assert.equal(incomplete.content, null); assert.equal(incomplete.missingUnits[0].unitId, unitId)
+    assert.equal(storage.getItem(historyKey(id)), saved)
+    assert.equal(await restored.store.patchSettingsAsync({ rememberHistory: true }), true); await tick()
+    assert.equal(JSON.parse(storage.getItem(historyKey(id))).translationHistory.units[0].revisions[1].status, 'interrupted')
+    assert.equal(restored.host.provider.calls.length, 0)
+  } finally { await restored.close() }
 })

@@ -365,7 +365,7 @@ test('侧栏取代页签，标题左侧与右侧模式/语言分组，末尾 + �
   assert.equal(toolbar.children.at(-1).props.className, 'dsh-tp-send')
   assert.ok(ui.nodes(toolbar).some(node => node.props['data-native-icon'] === 'send'))
   assert.ok(ui.nodes(header).some(node => node.props['data-native-icon'] === 'chevron-down'))
-  ui.context(currentTitle(ui)); assert.deepEqual(ui.nodes().filter(node => node.props.role === 'menuitem').map(node => ui.text(node)), ['新建同主题子会话', '重命名主题', '编辑会话备注', '删除', '归档'])
+  ui.context(currentTitle(ui)); assert.deepEqual(ui.nodes().filter(node => node.props.role === 'menuitem').map(node => ui.text(node)), ['新建同主题子会话', '重命名主题', '编辑会话备注', '导出最终译文 TXT', '导出完整记录 JSON', '删除', '归档'])
   assert.equal(ui.text().includes('关闭当前页签'), false)
   app.dispose()
 })

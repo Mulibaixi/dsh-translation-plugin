@@ -176,6 +176,10 @@ function createRenderer({ deferFunctionalUpdates = false } = {}) {
 
   return {
     react, render, text, control, button, nodes,
+    hasStateText(value) {
+      return [...seats.values()].some(seat => seat.hooks.some(cell => cell.value === value ||
+        (typeof cell.value?.values === 'function' && [...cell.value.values()].some(item => item?.text === value))))
+    },
     get deferredUpdateCount() { return deferredUpdateCount },
     async check(label, checked) {
       const target = control(label); assert.ok(!target.props.disabled)
@@ -232,7 +236,29 @@ export function mount(overrides = {}) {
   const locks = overrides.locks ?? new Locks()
   const copies = []
   const clipboard = overrides.clipboard ?? { async writeText(text) { copies.push(text) } }
-  const context = vm.createContext({ window, navigator: { locks, clipboard }, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
+  const downloads = [], revokedUrls = [], anchors = new Set(), blobUrls = new Map()
+  let urlSequence = 0
+  const document = {
+    addEventListener() {}, removeEventListener() {},
+    body: { appendChild(anchor) { anchors.add(anchor) } },
+    createElement(tag) {
+      assert.equal(tag, 'a', 'the browser download uses an anchor')
+      return { href: '', download: '', hidden: false,
+        click() {
+          if (overrides.downloadError) throw new Error('Synthetic browser download failure')
+          assert.ok(anchors.has(this)); assert.ok(blobUrls.has(this.href))
+          const blob = blobUrls.get(this.href)
+          downloads.push({ fileName: this.download, mimeType: blob.type, blob })
+        },
+        remove() { anchors.delete(this) },
+      }
+    },
+  }
+  const URL = {
+    createObjectURL(blob) { const url = `blob:synthetic-${++urlSequence}`; blobUrls.set(url, blob); return url },
+    revokeObjectURL(url) { revokedUrls.push(url); blobUrls.delete(url) },
+  }
+  const context = vm.createContext({ window, navigator: { locks, clipboard }, Blob: globalThis.Blob, URL, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console, document, Node: class {} })
   vm.runInContext(bundleSource, context)
   const exported = entries[0].factory(specifier => {
     if (specifier === 'react') return renderer.react
@@ -268,7 +294,8 @@ export function mount(overrides = {}) {
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
   }
   const applied = overrides.applyClient ? overrides.applyClient(exported, clientContext) : exported.apply(clientContext)
-  return { renderer, storage, remote, applied, copies,
+  return { renderer, storage, remote, applied, copies, downloads, revokedUrls,
+    get downloadAnchorCount() { return anchors.size },
     get panel() { return slots.get('sidebar.right.pane.tab') },
     get settingsPage() { return slots.get('settings.section') },
     get catalogCalls() { return catalogCalls },

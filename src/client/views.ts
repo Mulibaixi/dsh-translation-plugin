@@ -3,6 +3,7 @@ import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
 import { type TextUnit, type TextRevision } from './translation-history.js'
+import { buildFinalTextExport, buildFullRecordExport, type TranslationExport } from './translation-export.js'
 import { type HistoryVersion, type SessionStore } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
@@ -82,6 +83,8 @@ const styles = `
 .dsh-tp-version { padding: 6px 0; }
 .dsh-tp-version-actions { gap: 4px; font-size: 12px; }
 .dsh-tp-version-details { font-size: 11px; overflow-wrap: anywhere; margin: 4px 0 8px; }
+.dsh-tp-version-editor { margin: 6px 0; }
+.dsh-tp-version-editor textarea { display: block; width: 100%; min-height: 90px; max-height: 240px; resize: vertical; overflow-y: auto; margin: 4px 0; }
 .dsh-tp-old-versions { margin-top: 6px; padding-left: 10px; border-left: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-history-note { margin: 0 0 14px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }
 .dsh-tp-settings { padding: 16px 20px; height: 100%; max-height: 100%; min-height: 0; overflow-y: auto; }
@@ -153,9 +156,53 @@ function modeSelect(value: LocalSession['mode'], action: (mode: LocalSession['mo
 }
 function storeNotice(store: SessionStore): unknown { return store.getNotice() ? h('div', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null }
 
+interface RevisionEdit { readonly sessionId: string; readonly unitId: string; readonly baseRevisionId: string; readonly text: string; readonly failure: string | null }
+interface RevisionEditor {
+  readonly drafts: ReadonlyMap<string, RevisionEdit>
+  start(sessionId: string, unitId: string, baseRevisionId: string, text: string): void
+  change(key: string, text: string): void
+  save(key: string): void
+  cancel(key: string): void
+}
+function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
+
 export function PanelRouter({ store, models, quick, sessionId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+  const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
+  react.useEffect(() => {
+    const reconcile = (): void => setDrafts(current => {
+      const kept = [...current].filter(([, edit]) => store.getSession(edit.sessionId) && store.getTranslationHistory(edit.sessionId)?.units
+        .some(unit => unit.id === edit.unitId && unit.revisions.some(revision => revision.id === edit.baseRevisionId)))
+      return kept.length === current.size ? current : new Map(kept)
+    })
+    const stop = store.subscribe(reconcile)
+    reconcile()
+    return stop
+  }, [store])
+  const editor: RevisionEditor = {
+    drafts,
+    start(sessionId, unitId, baseRevisionId, text) {
+      if (!store.getSession(sessionId) || !store.getTranslationHistory(sessionId)?.units.some(unit => unit.id === unitId && unit.revisions.some(revision => revision.id === baseRevisionId))) return
+      const key = editKey(sessionId, unitId, baseRevisionId)
+      setDrafts(current => current.has(key) ? current : new Map(current).set(key, { sessionId, unitId, baseRevisionId, text, failure: null }))
+    },
+    change(key, text) { setDrafts(current => { const draft = current.get(key); return draft ? new Map(current).set(key, { ...draft, text, failure: null }) : current }) },
+    cancel(key) { setDrafts(current => { const next = new Map(current); next.delete(key); return next }) },
+    save(key) {
+      const draft = drafts.get(key)
+      if (!draft) return
+      let saved = false
+      try { saved = quick.saveManualRevision(draft.sessionId, draft.unitId, draft.baseRevisionId, draft.text) } catch { /* Keep the local edit available for retry. */ }
+      setDrafts(current => {
+        if (current.get(key) !== draft) return current
+        const next = new Map(current)
+        if (saved) next.delete(key)
+        else next.set(key, { ...draft, failure: '保存失败，编辑内容仍保留。' })
+        return next
+      })
+    },
+  }
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, ownerId: sessionId, key: sessionId })
+    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, ownerId: sessionId, key: sessionId })
       : h('p', { role: 'alert' }, '请在主窗口会话中打开翻译面板。'),
   )
 }
@@ -266,7 +313,7 @@ function TranslationRecord({ record, quick, canRestore }: { readonly record: Qui
   )
 }
 
-function TranslationRevision({ unit, revision, quick, session }: { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession }): unknown {
+function TranslationRevision({ unit, revision, quick, session, editor }: { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor }): unknown {
   const [details, setDetails] = react.useState(false)
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断' }[revision.status]
@@ -274,35 +321,58 @@ function TranslationRevision({ unit, revision, quick, session }: { readonly unit
   const eligible = revision.accepted && revision.status === 'completed' && !!revision.text.trim()
   const fixed = unit.final?.revisionId === revision.id && unit.final.selection === 'user_fixed'
   const label = `文本 ${unit.order} 版本 ${revision.order}`
+  const key = editKey(session.id, unit.id, revision.id)
+  const draft = editor.drafts.get(key)
+  const otherEdit = [...editor.drafts.values()].some(edit => edit.sessionId === session.id && edit.unitId === unit.id && edit.baseRevisionId !== revision.id)
+  const canEdit = !!revision.text.trim() && ['completed', 'failed', 'cancelled', 'interrupted'].includes(revision.status) && session.archivedAt === null
+  const base = unit.revisions.find(base => base.id === revision.baseRevisionId)
+  const metadata = revision.callRecord
+  const model = metadata?.model ?? revision.model
+  const usage = (count: number | null | undefined): string => count === null || count === undefined ? '未提供' : String(count)
   async function copy(): Promise<void> {
     try { await navigator.clipboard.writeText(revision.text); setCopyState('copied') }
     catch { setCopyState('failed') }
   }
   return h('section', { className: 'dsh-tp-version', 'aria-label': label },
     h('div', { className: 'dsh-tp-version-header' },
-      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${status} · ${unit.targetLanguage}`),
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.kind === 'manual' ? '人工修订' : status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}`),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
         h('button', { type: 'button', 'aria-label': `复制${label}`, disabled: !revision.text, onClick: () => { void copy() } }, copyState === 'copied' ? '已复制' : '复制'),
         h('button', { type: 'button', 'aria-label': `${label}设为最终`, disabled: !eligible || fixed, onClick: () => { quick.selectFinal(session.id, unit.id, revision.id) } }, fixed ? '已固定' : '设为最终'),
+        h('button', { type: 'button', 'aria-label': `编辑${label}`, disabled: !canEdit || !!draft || otherEdit, title: otherEdit ? '请先保存或取消此段的当前编辑。' : undefined, onClick: () => editor.start(session.id, unit.id, revision.id, revision.text) }, draft ? '编辑中' : '编辑'),
         h('button', { type: 'button', 'aria-label': `${label}详情`, 'aria-expanded': details, onClick: () => setDetails(value => !value) }, '详情'),
       ),
     ),
     details ? h('div', { className: 'dsh-tp-muted dsh-tp-version-details' },
-      h('div', null, `模型：${revision.model.provider}/${revision.model.model} · 推理：${revision.model.reasoningEffort ?? 'Default'}`),
-      h('time', { dateTime: revision.createdAt }, `开始：${new Date(revision.createdAt).toLocaleString()}`),
-      h('div', null, h('time', { dateTime: revision.updatedAt }, `更新：${new Date(revision.updatedAt).toLocaleString()}`)),
+      revision.kind === 'manual' ? h('div', null, '人工修订，未调用模型。') : h('div', null,
+        h('div', null, model ? `${metadata ? '调用模型' : '选用模型'}：${model.provider}/${model.model} · 推理：${model.reasoningEffort ?? 'Default'}` : '选用模型：未提供'),
+        h('div', null, `提示词版本：${metadata?.promptVersion ?? '未提供'}`),
+        h('div', null, `用量：输入 ${usage(metadata?.usage.inputTokens)} · 输出 ${usage(metadata?.usage.outputTokens)} token`),
+      ),
+      h('time', { dateTime: revision.createdAt }, `${revision.kind === 'manual' ? '保存' : '开始'}：${new Date(revision.createdAt).toLocaleString()}`),
+      revision.kind === 'manual' ? null : h('div', null, h('time', { dateTime: revision.updatedAt }, `更新：${new Date(revision.updatedAt).toLocaleString()}`)),
     ) : null,
     revision.text && revision.status !== 'completed' ? h('div', { className: 'dsh-tp-muted' }, '未完成输出') : null,
-    revision.text ? h('div', { className: 'dsh-tp-translation-text' }, revision.text) : null,
+    draft ? h('div', { className: 'dsh-tp-version-editor' },
+      h('small', { className: 'dsh-tp-muted' }, `基于版本 ${revision.order}保存为新版本`),
+      h('textarea', { 'aria-label': `编辑${label}译文`, value: draft.text, rows: 4, onChange: (event: TextEvent) => { const text = event.currentTarget.value; editor.change(key, text) } }),
+      h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
+        h('button', { type: 'button', 'aria-label': `保存${label}编辑`, disabled: !draft.text.trim(), onClick: () => editor.save(key) }, '保存为新版本'),
+        h('button', { type: 'button', 'aria-label': `取消${label}编辑`, onClick: () => editor.cancel(key) }, '取消'),
+      ),
+      draft.failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, draft.failure) : null,
+    ) : revision.text ? h('div', { className: 'dsh-tp-translation-text' }, revision.text) : null,
     revision.message ? h('p', { role: revision.status === 'failed' || revision.status === 'unknown' ? 'alert' : 'status', className: 'dsh-tp-muted' }, revision.message) : null,
     copyState === 'failed' ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '复制失败，请重试。') : null,
     revision.status === 'unknown' && record?.status === 'unknown' ? button('查询本轮结果', () => quick.query(record)) : null,
   )
 }
 
-function TranslationUnit({ unit, quick, session }: { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession }): unknown {
+function TranslationUnit({ unit, quick, session, editor }: { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor }): unknown {
   const [expanded, setExpanded] = react.useState(false)
   const latest = unit.revisions.at(-1)
+  const edit = [...editor.drafts.values()].find(edit => edit.sessionId === session.id && edit.unitId === unit.id)
+  react.useEffect(() => { if (edit && edit.baseRevisionId !== latest?.id) setExpanded(true) }, [edit?.baseRevisionId, latest?.id])
   if (!latest) return null
   const final = unit.final ? unit.revisions.find(revision => revision.id === unit.final?.revisionId) : undefined
   const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : '待定稿'
@@ -314,15 +384,25 @@ function TranslationUnit({ unit, quick, session }: { readonly unit: TextUnit; re
       h('span', { className: 'dsh-tp-muted', role: 'status' }, finalLabel),
       h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { void quick.retranslate(session.id, unit.id) } }, '重译'),
     ),
-    h(TranslationRevision, { key: latest.id, unit, revision: latest, quick, session }),
+    h(TranslationRevision, { key: latest.id, unit, revision: latest, quick, session, editor }),
     unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, onClick: () => setExpanded(value => !value) }, `${expanded ? '收起' : '展开'}旧版本（${unit.revisions.length - 1}）`) : null,
     expanded ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
-      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, unit, revision, quick, session })),
+      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, unit, revision, quick, session, editor })),
     ) : null,
   )
 }
 
-function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly ownerId: string }): unknown {
+function downloadExport(result: TranslationExport): void {
+  if (result.content === null) throw new Error('No export content')
+  const anchor = document.createElement('a')
+  const url = URL.createObjectURL(new Blob([result.content], { type: result.mimeType }))
+  try {
+    anchor.href = url; anchor.download = result.fileName; anchor.hidden = true
+    document.body.appendChild(anchor); anchor.click()
+  } finally { anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 0) }
+}
+
+function WorkspaceView({ store, models, quick, editor, ownerId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   react.useEffect(() => quick.subscribe(() => refreshQuick(value => value + 1)), [quick])
@@ -336,6 +416,8 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
   const [deletion, setDeletion] = react.useState<DeleteRequest | undefined>(undefined)
   const [name, setName] = react.useState('')
   const [remark, setRemark] = react.useState('')
+  const [exportRequest, setExportRequest] = react.useState<{ readonly session: LocalSession; readonly history: NonNullable<ReturnType<SessionStore['getTranslationHistory']>>; readonly at: string; readonly result: TranslationExport } | undefined>(undefined)
+  const [exportNotice, setExportNotice] = react.useState<{ readonly message: string; readonly failure: boolean } | undefined>(undefined)
   const [files, setFiles] = react.useState(() => new Map<string, File>())
   const fileInput = react.useRef<HTMLInputElement | null>(null)
   react.useEffect(() => store.subscribe(() => setFiles(currentFiles => {
@@ -376,6 +458,22 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
     void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)))
   }
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined) }
+  function deliver(result: TranslationExport): void {
+    try { downloadExport(result); setExportNotice({ message: '已向浏览器发起下载。', failure: false }); setExportRequest(undefined) }
+    catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
+  }
+  function exportSession(id: string, format: 'txt' | 'json'): void {
+    closeSessionMenus(); setExportNotice(undefined); setExportRequest(undefined)
+    try {
+      if (format === 'txt' && !quick.finalizeForExport(id)) throw new Error('Cannot finalize export')
+      const session = store.getSession(id), history = store.getTranslationHistory(id)
+      if (!session || !history) throw new Error('Session no longer available')
+      const snapshot = structuredClone({ session, history }), at = new Date().toISOString()
+      const result = format === 'txt' ? buildFinalTextExport(snapshot.session, snapshot.history, at) : buildFullRecordExport(snapshot.session, snapshot.history, at)
+      if (format === 'txt' && !result.complete) setExportRequest({ ...snapshot, at, result })
+      else deliver(result)
+    } catch { setExportNotice({ message: '导出失败，当前内容仍保留。', failure: true }) }
+  }
   function sessionItem(session: LocalSession): unknown {
     return h('button', {
       key: session.id, type: 'button', className: 'dsh-tp-session-item', title: sessionTitle(session),
@@ -425,11 +523,20 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         units.length || records.length ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
-        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current! })),
+        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current!, editor })),
         ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
         units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),
       storeNotice(store),
+      exportNotice ? h('div', { role: exportNotice.failure ? 'alert' : 'status', className: exportNotice.failure ? 'dsh-tp-message' : 'dsh-tp-muted dsh-tp-message' }, exportNotice.message) : null,
+      exportRequest ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '导出最终译文确认' },
+        h('h3', null, `导出「${exportRequest.session.name}」`),
+        h('p', null, `尚无最终译文：${exportRequest.result.missingUnits.map(unit => `文本 ${unit.order}`).join('、')}。`),
+        h('div', { className: 'dsh-tp-actions' },
+          button('仅导出已定稿', () => deliver(buildFinalTextExport(exportRequest.session, exportRequest.history, exportRequest.at, { allowPartial: true })), exportRequest.result.exportedUnitIds.length === 0),
+          button('取消', () => { closeSessionMenus(); setExportRequest(undefined) }),
+        ),
+      ) : null,
       action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
       current && status === 'conflict' ? h('div', { className: 'dsh-tp-actions dsh-tp-message' },
         button('读取本地副本', () => setDialog({ kind: 'reload', id: current.id }), action.pending),
@@ -491,6 +598,8 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
       h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建同主题子会话'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名主题'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '编辑会话备注'),
+      h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'txt') }, '导出最终译文 TXT'),
+      h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'json') }, '导出完整记录 JSON'),
       h(MenuItemButton, { disabled: action.pending, danger: true, onSelect: () => {
         closeSessionMenus(); setDeletion({ title: `删除「${target.name}」`, ids: [target.id], unreadable: [], versions: store.captureHistoryVersions([target.id]) })
       } }, '删除'),

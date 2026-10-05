@@ -3,7 +3,8 @@ import { catalogAllowsRoute, type ModelCatalog } from './models.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession, ModelRoute } from './sessions.js'
 import { appendTextUnit, appendTextRevision, acceptTextRevision, updateTextRevision, selectFinalRevision,
-  type NewTextRevision, type TextUnit } from './translation-history.js'
+  appendManualRevision, finalizeLastUnit, type NewTextRevision, type TextUnit } from './translation-history.js'
+import type { TranslationCallMetadata } from '../shared/translation-call.js'
 
 export type QuickStatus = 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown'
 export interface QuickRecord {
@@ -21,6 +22,7 @@ export interface QuickRecord {
   text: string
   message: string | undefined
   accepted: boolean
+  callRecord: TranslationCallMetadata | null
 }
 interface Pending {
   readonly record: QuickRecord
@@ -94,6 +96,17 @@ export class QuickTranslationClient {
     if (this.disposed || !session || session.archivedAt !== null) return false
     return this.store.updateTranslationHistory(id, history => selectFinalRevision(history, unitId, revisionId, new Date().toISOString()))
   }
+  saveManualRevision(id: string, unitId: string, baseRevisionId: string, text: string): boolean {
+    const session = this.store.getSession(id)
+    if (this.disposed || !session || session.archivedAt !== null) return false
+    const revisionId = `manual-revision:${this.options.makeId?.() ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now()}:${++this.sequence}:${Math.random().toString(36).slice(2)}`}`
+    return this.store.updateTranslationHistory(id, history => appendManualRevision(history, unitId, { id: revisionId, baseRevisionId, text, at: new Date().toISOString() }))
+  }
+  finalizeForExport(id: string): boolean {
+    const session = this.store.getSession(id)
+    if (this.disposed || !session) return false
+    return this.store.updateTranslationHistory(id, history => finalizeLastUnit(history, new Date().toISOString()))
+  }
   load(): Promise<void> {
     if (this.disposed || this.readiness === 'ready') return Promise.resolve()
     if (this.loading) return this.loading
@@ -149,7 +162,7 @@ export class QuickTranslationClient {
     const operationId = this.options.makeId?.() ?? `quick:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}:${++this.sequence}:${Math.random().toString(36).slice(2)}`}`
     const record: QuickRecord = { id: operationId, localSessionId: id, unitId: unit?.id ?? `unit:${operationId}`, kind: unit ? 'revision' : 'new_unit', createdAt: new Date().toISOString(),
       source: unit?.source ?? draft.input, targetLanguage: unit?.targetLanguage ?? draft.targetLanguage, instruction: unit?.instruction ?? draft.instruction, model,
-      draftVersion: ++this.sequence, status: 'submitting', text: '', message: undefined, accepted: false }
+      draftVersion: ++this.sequence, status: 'submitting', text: '', message: undefined, accepted: false, callRecord: null }
     const pending: Pending = { record, draftStamp: this.draftStamp(draft), sessionKey: undefined, consumedStamp: undefined, stopped: false, suspended: false, dispatched: false, cancelRequested: false, timer: undefined, historyAttached: !!unit }
     if (unit && !this.store.updateTranslationHistory(id, history => appendTextRevision(history, unit.id, this.revision(record)))) return
     this.records.set(id, [...this.getRecords(id), record]); this.pending.set(operationId, pending); this.emit()
@@ -176,7 +189,7 @@ export class QuickTranslationClient {
     } catch { if (!pending.stopped && !pending.suspended) this.fail(pending, pending.dispatched ? '连接中断或回执超时，执行结果未知；未自动重发。' : '无法建立快译会话；原文仍保留。', pending.dispatched ? 'unknown' : 'failed') }
   }
   private revision(record: QuickRecord): NewTextRevision {
-    return { id: record.id, operationId: record.id, model: record.model, draftVersion: record.draftVersion,
+    return { id: record.id, operationId: record.id, kind: 'machine', model: record.model, draftVersion: record.draftVersion, baseRevisionId: null, callRecord: record.callRecord,
       createdAt: record.createdAt, updatedAt: new Date().toISOString(), accepted: record.accepted, status: record.status,
       text: record.text, message: record.message ?? null }
   }
@@ -185,13 +198,13 @@ export class QuickTranslationClient {
     if (!pending.historyAttached && !record.accepted) return false
     const old = this.getUnits(record.localSessionId).find(unit => unit.id === record.unitId)?.revisions.find(revision => revision.id === record.id)
     if (pending.historyAttached && !old) return false
-    if (old && old.accepted === record.accepted && old.status === record.status && old.text === record.text && old.message === (record.message ?? null)) return true
+    if (old && old.accepted === record.accepted && old.status === record.status && old.text === record.text && old.message === (record.message ?? null) && JSON.stringify(old.callRecord) === JSON.stringify(record.callRecord)) return true
     const revision = this.revision(record)
     const updated = this.store.updateTranslationHistory(record.localSessionId, history => {
       if (!pending.historyAttached) return appendTextUnit(history, { id: record.unitId, source: record.source, targetLanguage: record.targetLanguage,
         instruction: record.instruction, createdAt: record.createdAt }, revision)
       const accepted = record.accepted ? acceptTextRevision(history, record.unitId, record.id, revision.updatedAt) : history
-      return updateTextRevision(accepted, record.unitId, record.id, { status: record.status, text: record.text, message: revision.message, updatedAt: revision.updatedAt })
+      return updateTextRevision(accepted, record.unitId, record.id, { status: record.status, text: record.text, message: revision.message, updatedAt: revision.updatedAt, callRecord: record.callRecord })
     })
     if (updated) pending.historyAttached = true
     return updated
@@ -206,6 +219,7 @@ export class QuickTranslationClient {
     }
     const firstAccepted = job.accepted && !record.accepted
     if (firstAccepted) record.accepted = true
+    if (job.metadata) record.callRecord = job.metadata
     record.status = job.status; record.text = job.text; record.message = job.error?.message ?? (job.status === 'unknown' ? '执行结果未知，请查询本轮结果；未自动重发。' : undefined)
     const published = this.publish(pending)
     // Adopt the admitted unit before consuming its unchanged draft. A rejected history update keeps the input.

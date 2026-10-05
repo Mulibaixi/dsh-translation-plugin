@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   emptyTranslationHistory, decodeTranslationHistory, restoreTranslationHistory,
-  appendTextUnit, appendTextRevision, acceptTextRevision, updateTextRevision, selectFinalRevision,
+  appendTextUnit, appendTextRevision, acceptTextRevision, updateTextRevision, selectFinalRevision, appendManualRevision, finalizeLastUnit,
 } from '../dist/client/translation-history.js'
 import { SessionStore } from '../dist/client/session-store.js'
 import { DEFAULT_SESSION_SETTINGS, SETTINGS_KEY, historyKey, newSession } from '../dist/client/sessions.js'
@@ -17,6 +17,8 @@ function revision(id, patch = {}) {
 }
 function material(id) { return { id, source: `合成原文:${id}`, targetLanguage: '中文', instruction: '保留合成标记', createdAt: at } }
 function initial() { return appendTextUnit(emptyTranslationHistory(), material('unit:1'), revision('revision:1')) }
+const callRecord = { promptVersion: 'text-runtime-v1', model: { provider: 'synthetic', model: 'actual', reasoningEffort: null }, configVersion: null,
+  maxOutputTokens: null, usage: { inputTokens: 7, outputTokens: 4 } }
 function clone(value) { return structuredClone(value) }
 class Locks {
   tail = Promise.resolve()
@@ -40,6 +42,116 @@ function enabled() { const storage = new Storage(); storage.setItem(SETTINGS_KEY
 async function update(store, id, callback) { const result = store.updateTranslationHistory(id, callback); await settle(); return result }
 async function patch(store, edits) { const result = await store.patchSettingsAsync(edits); await settle(); return result }
 function events() { let fn; return { listen(callback) { fn = callback; return () => { fn = undefined } }, send(key) { fn?.(key) } } }
+
+test('人工保存追加不可变候选，保留旧基准、冻结材料及固定最终指针', () => {
+  const first = selectFinalRevision(initial(), 'unit:1', 'revision:1', at)
+  let history = appendTextRevision(first, 'unit:1', revision('revision:2', { status: 'running', text: '合成当前流' }))
+  history = appendManualRevision(history, 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: '人工合成新版本', at: later })
+  const unit = history.units[0], manual = unit.revisions.at(-1)
+  assert.equal(manual.kind, 'manual'); assert.equal(manual.baseRevisionId, 'revision:1')
+  assert.equal(manual.model, null); assert.equal(manual.callRecord, null); assert.equal(manual.draftVersion, null)
+  assert.equal(manual.status, 'completed'); assert.equal(manual.accepted, true); assert.equal(manual.order, 3)
+  assert.equal(unit.source, first.units[0].source); assert.equal(unit.targetLanguage, first.units[0].targetLanguage); assert.equal(unit.instruction, first.units[0].instruction)
+  assert.deepEqual(unit.final, first.units[0].final); assert.equal(first.units[0].revisions.length, 1)
+  assert.equal(history.events.at(-1).type, 'revision.manual_saved')
+  assert.throws(() => updateTextRevision(history, unit.id, manual.id, { text: '不能覆盖' }))
+  const finished = updateTextRevision(history, unit.id, 'revision:2', { status: 'completed', text: '迟到机器结果', updatedAt: later })
+  assert.equal(finished.units[0].revisions.at(-1).id, manual.id); assert.equal(finished.units[0].revisions[1].text, '迟到机器结果')
+  assert.ok(decodeTranslationHistory(finished))
+})
+
+test('人工基准允许非空已结束失败/取消/中断，拒绝执行中/unknown、空体和不存在基准', () => {
+  for (const status of ['completed', 'failed', 'cancelled', 'interrupted']) {
+    const history = appendTextRevision(initial(), 'unit:1', revision('revision:2', { status, text: '合成可修正文' }))
+    assert.equal(appendManualRevision(history, 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:2', text: '已修正合成正文', at }).units[0].revisions.at(-1).kind, 'manual')
+  }
+  for (const status of ['running', 'unknown', 'submitting', 'failed']) {
+    const history = appendTextRevision(initial(), 'unit:1', revision('revision:2', { status, text: status === 'failed' ? '' : '合成执行正文' }))
+    assert.throws(() => appendManualRevision(history, 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:2', text: '修正合成', at }))
+  }
+  assert.throws(() => appendManualRevision(initial(), 'unit:1', { id: 'manual:1', baseRevisionId: 'missing', text: '合成', at }))
+  assert.throws(() => appendManualRevision(initial(), 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: ' \n ', at }))
+})
+
+test('人工候选在下一受理或最后收尾按相同资格自动定稿，用户固定保持', () => {
+  const manual = appendManualRevision(initial(), 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: '合成人工终版', at })
+  assert.equal(manual.units[0].final, null)
+  const advanced = appendTextUnit(manual, material('unit:2'), revision('revision:2'))
+  assert.equal(advanced.units[0].final.revisionId, 'manual:1'); assert.equal(advanced.units[0].final.selection, 'automatic')
+  const exported = finalizeLastUnit(manual, later)
+  assert.equal(exported.units[0].final.revisionId, 'manual:1'); assert.equal(exported.events.at(-1).reason, 'export')
+  assert.equal(finalizeLastUnit(exported, later), exported)
+  const fixed = selectFinalRevision(manual, 'unit:1', 'revision:1', at)
+  assert.equal(finalizeLastUnit(fixed, later), fixed)
+})
+
+test('最后收尾不遍历旧段、不回退失败末版、不调用新请求', () => {
+  let history = appendTextRevision(initial(), 'unit:1', revision('revision:2', { status: 'failed', text: '合成半截' }))
+  history = appendTextUnit(history, material('unit:2'), revision('revision:3'))
+  const finalized = finalizeLastUnit(history, later)
+  assert.equal(finalized.units[0].final, null); assert.equal(finalized.units[1].final.revisionId, 'revision:3')
+  assert.equal(finalized.units[0].revisions.length, 2)
+  const failedLast = appendTextRevision(history, 'unit:2', revision('revision:4', { status: 'failed', text: '半截末版' }))
+  assert.equal(finalizeLastUnit(failedLast, later), failedLast)
+  const empty = emptyTranslationHistory(); assert.equal(finalizeLastUnit(empty, at), empty)
+})
+
+test('machine metadata变化即保存安全调用事实，相同轮询及单独时间不新增事件', () => {
+  let history = appendTextRevision(initial(), 'unit:1', revision('revision:2', { status: 'running', text: '合成流' }))
+  history = updateTextRevision(history, 'unit:1', 'revision:2', { callRecord, updatedAt: later })
+  assert.deepEqual(history.units[0].revisions[1].callRecord, callRecord)
+  assert.equal(updateTextRevision(history, 'unit:1', 'revision:2', { callRecord: clone(callRecord), updatedAt: at }), history)
+  history = updateTextRevision(history, 'unit:1', 'revision:2', { status: 'completed', text: '合成完成', updatedAt: later })
+  const usageUpdated = updateTextRevision(history, 'unit:1', 'revision:2', { callRecord: { ...callRecord, usage: { inputTokens: 0, outputTokens: null } } })
+  assert.equal(usageUpdated.units[0].revisions[1].callRecord.usage.inputTokens, 0)
+  assert.equal(usageUpdated.units[0].revisions[1].callRecord.usage.outputTokens, null)
+  assert.equal(usageUpdated.units[0].revisions[1].text, '合成完成')
+})
+
+test('schema2边界拒绝人工假调用/坏基准及敏感调用字段，旧history1规范化但不推断调用', () => {
+  const manual = appendManualRevision(initial(), 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: '合成人工', at })
+  for (const mutate of [
+    value => { value.units[0].revisions[1].baseRevisionId = 'missing' },
+    value => { value.units[0].revisions[1].model = model },
+    value => { value.units[0].revisions[1].callRecord = callRecord },
+    value => { value.units[0].revisions[0].callRecord = { ...callRecord, credentials: 'synthetic' } },
+  ]) { const value = clone(manual); mutate(value); assert.equal(decodeTranslationHistory(value), undefined) }
+  const old = clone(initial()); old.schemaVersion = 1
+  for (const unit of old.units) for (const revision of unit.revisions) for (const key of ['kind', 'baseRevisionId', 'callRecord']) delete revision[key]
+  const decoded = decodeTranslationHistory(old)
+  assert.equal(decoded.schemaVersion, 2); assert.equal(decoded.units[0].revisions[0].kind, 'machine')
+  assert.equal(decoded.units[0].revisions[0].callRecord, null); assert.equal(decoded.units[0].revisions[0].baseRevisionId, null)
+  assert.equal(old.schemaVersion, 1); assert.equal(old.units[0].revisions[0].kind, undefined)
+})
+
+test('旧schema4记录读取不改写，允许下一次保存才统一迁移schema5/history2', async () => {
+  const storage = enabled(), session = newSession(DEFAULT_SESSION_SETTINGS, 'owner', 'old:4')
+  const old = clone(initial()); old.schemaVersion = 1
+  for (const unit of old.units) for (const revision of unit.revisions) for (const key of ['kind', 'baseRevisionId', 'callRecord']) delete revision[key]
+  const raw = JSON.stringify({ schemaVersion: 4, token: 'synthetic', session, translationHistory: old })
+  storage.setItem(historyKey(session.id), raw)
+  const store = makeStore(storage)
+  assert.equal(store.getTranslationHistory(session.id).schemaVersion, 2)
+  assert.equal(storage.getItem(historyKey(session.id)), raw)
+  assert.equal(await update(store, session.id, history => appendManualRevision(history, 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: '合成新增人工', at })), true)
+  const snapshot = JSON.parse(storage.getItem(historyKey(session.id)))
+  assert.equal(snapshot.schemaVersion, 5); assert.equal(snapshot.translationHistory.schemaVersion, 2)
+  const restarted = makeStore(storage); assert.deepEqual(restarted.getTranslationHistory(session.id), store.getTranslationHistory(session.id))
+})
+
+test('history off人工保存和导出收尾只留内存，开启后同一快照纳入修订/final/metadata', async () => {
+  const storage = enabled(), store = makeStore(storage), session = await store.createSessionAsync('owner')
+  await update(store, session.id, () => appendTextUnit(emptyTranslationHistory(), material('unit:1'), revision('revision:1', { callRecord })))
+  await patch(store, { rememberHistory: false }); const saved = storage.getItem(historyKey(session.id))
+  await update(store, session.id, history => appendManualRevision(history, 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: '合成临时人工', at }))
+  await update(store, session.id, history => finalizeLastUnit(history, later))
+  assert.equal(storage.getItem(historyKey(session.id)), saved)
+  assert.equal(makeStore(storage).getTranslationHistory(session.id).units[0].revisions.length, 1)
+  await patch(store, { rememberHistory: true })
+  const snapshot = JSON.parse(storage.getItem(historyKey(session.id)))
+  assert.equal(snapshot.translationHistory.units[0].final.revisionId, 'manual:1')
+  assert.deepEqual(snapshot.translationHistory.units[0].revisions[0].callRecord, callRecord)
+})
 
 test('新单元受理与上一单元自动定稿一次转换，正文仅保存在修订中', () => {
   const first = initial(), second = appendTextUnit(first, material('unit:2'), revision('revision:2'))
@@ -153,7 +265,7 @@ test('翻译记录与草稿共用一个历史快照，重启恢复不写入或�
   assert.equal(await update(store, session.id, () => initial()), true)
   store.updateSession(session.id, { input: '合成下一段草稿' }); await settle()
   const snapshot = JSON.parse(storage.getItem(historyKey(session.id)))
-  assert.equal(snapshot.schemaVersion, 4)
+  assert.equal(snapshot.schemaVersion, 5)
   assert.equal(snapshot.session.input, '合成下一段草稿')
   assert.equal(snapshot.translationHistory.units[0].source, '合成原文:unit:1')
   const keys = [...storage.values.keys()], before = storage.getItem(historyKey(session.id))
