@@ -126,7 +126,7 @@ test('开启历史后自动保存；关闭保留旧历史并停止写入；恢�
   assert.equal(restarted.getActiveSession('main-a').input, '已保存输入')
 })
 
-test('历史开启后主题重命名与模型推理等级重启恢复，关闭后的改动不覆盖已保存资料', async () => {
+test('主题与正文仍受历史开关控制，模型推理等级关闭历史后独立恢复最新选择', async () => {
   const storage = enabled(); const store = makeStore(storage)
   const root = await store.createSessionAsync('main-a'); const child = await store.createSessionAsync('main-a', root.id)
   const model = { provider: 'synthetic', model: 'reasoner', reasoningEffort: 'high' }
@@ -147,7 +147,7 @@ test('历史开启后主题重命名与模型推理等级重启恢复，关闭�
   restarted.dispose()
   const reloaded = makeStore(storage)
   assert.equal(reloaded.getSession(root.id).name, '合成主题')
-  assert.deepEqual(reloaded.getSession(root.id).model, model)
+  assert.deepEqual(reloaded.getSession(root.id).model, { ...model, reasoningEffort: 'low' })
   assert.equal(reloaded.getSession(root.id).input, '合成草稿')
   reloaded.dispose()
 })

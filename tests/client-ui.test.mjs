@@ -330,11 +330,18 @@ test('设置外部变更自动同步，不需要重新读取按钮', async () =>
 })
 test('模型采用分组目录与原生菜单材质，仅修改翻译会话模型', async () => {
   const app = mount({ settings: settings({ rememberHistory: true }) }); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' })
+  await rename(ui, 'A')
   assert.equal(app.catalogCalls, 0); await ui.click('模型：选择模型'); await tick(); ui.render(); assert.equal(app.catalogCalls, 1)
   await ui.click('选择模型')
   assert.ok(ui.nodes().some(node => node.props['aria-label'] === 'Provider A')); await ui.input('搜索模型', 'md6'); await ui.click('Model 6')
   assert.equal(saved(app)[0].model.provider, 'provider-a'); assert.equal(saved(app)[0].model.model, 'm6'); assert.ok(ui.button('模型：Model 6'))
-  await newSession(ui); assert.ok(ui.button('模型：选择模型')); app.dispose()
+  const originalId = saved(app)[0].id
+  await newSession(ui); assert.ok(ui.button('模型：Model 6')); await rename(ui, 'B')
+  await ui.click('模型：Model 6'); await ui.click('选择模型'); await ui.click('Model 1')
+  assert.equal(saved(app).find(session => session.id === originalId).model.model, 'm6')
+  assert.equal(saved(app).find(session => session.id !== originalId).model.model, 'm1')
+  openSessionMenu(ui); await ui.click('切换翻译会话：A'); assert.ok(ui.button('模型：Model 6'))
+  app.dispose()
 })
 test('即时保存失败仍保留表单输入并提供错误重试操作', async () => {
   const app = mount({ failSet: true }); const ui = app.renderer; ui.render(app.settingsPage, {}); await ui.input('目标语言', 'English')
@@ -379,11 +386,18 @@ test('右键非当前会话的重命名、新建和删除始终绑定被点击�
 test('模型菜单提供推理等级及 Default，选择只写翻译会话，切换会话收起旧菜单', async () => {
   const catalog = { ok: true, value: { default: { provider: 'p', model: 'reasoner' }, groups: [{ id: 'p', name: 'Provider', models: [{ id: 'reasoner', name: 'Reasoner', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] } }] }], failures: [] } }
   const app = mount({ catalog, settings: settings({ rememberHistory: true }) }); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' })
+  await rename(ui, 'A')
   await ui.click('模型：选择模型'); await tick(); ui.render(); assert.ok(ui.button('选择推理等级').props.disabled)
   await ui.click('选择模型'); await ui.click('Reasoner'); assert.ok(ui.button('模型：Reasoner · Default'))
   await ui.click('选择推理等级'); await ui.click('High'); assert.equal(saved(app)[0].model.reasoningEffort, 'high')
   await ui.click('模型：Reasoner · High'); await ui.click('选择推理等级'); await ui.click('Default'); assert.equal(Object.hasOwn(saved(app)[0].model, 'reasoningEffort'), false)
-  await ui.click('模型：Reasoner · Default'); await newSession(ui); assert.ok(ui.button('模型：选择模型'))
+  const originalId = saved(app)[0].id
+  await ui.click('模型：Reasoner · Default'); await newSession(ui); assert.ok(ui.button('模型：Reasoner · Default'))
+  assert.equal(ui.nodes().some(node => node.props['aria-label'] === '模型与推理等级'), false)
+  await rename(ui, 'B'); await ui.click('模型：Reasoner · Default'); await ui.click('选择推理等级'); await ui.click('High')
+  assert.equal(Object.hasOwn(saved(app).find(session => session.id === originalId).model, 'reasoningEffort'), false)
+  assert.equal(saved(app).find(session => session.id !== originalId).model.reasoningEffort, 'high')
+  openSessionMenu(ui); await ui.click('切换翻译会话：A'); assert.ok(ui.button('模型：Reasoner · Default'))
   assert.equal(ui.nodes().some(node => node.props['aria-label'] === '模型与推理等级'), false)
   app.dispose()
 })
@@ -500,13 +514,50 @@ test('右键会话列表保持展开，菜单操作绑定目标，点击外部�
   let stopped = false
   ui.nodes().find(node => node.props['aria-label'] === '翻译会话右键操作').props.onPointerDown({ stopPropagation() { stopped = true } })
   assert.equal(stopped, true)
-  await ui.click('重命名主题'); assert.equal(currentTitle(ui).props['aria-expanded'], true); assert.equal(sessionContextMenu(ui), undefined)
-  await ui.input('主题名称', 'A改名'); await ui.click('确认重命名主题'); assert.ok(ui.button('切换翻译会话：A改名')); assert.equal(ui.text(currentTitle(ui)), 'B')
+  await ui.click('重命名主题'); assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
+  await ui.input('主题名称', 'A改名'); await ui.click('确认重命名主题'); assert.equal(ui.text(currentTitle(ui)), 'B')
+  openSessionMenu(ui); assert.ok(ui.button('切换翻译会话：A改名'))
   ui.context('切换翻译会话：A改名')
   sessionContextMenu(ui).props.onClose(); ui.render(); assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
   openSessionMenu(ui); ui.context('切换翻译会话：A改名')
   await ui.click('切换翻译会话：A改名'); assert.equal(ui.text(currentTitle(ui)), 'A改名'); assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
   app.dispose()
+})
+
+test('键盘打开非当前会话右键，删除动作收起列表且取消不改会话', async () => {
+  const app = mount(); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' }); await rename(ui, 'A'); await newSession(ui); await rename(ui, 'B')
+  openSessionMenu(ui)
+  ui.button('切换翻译会话：A').props.onKeyDown({ key: 'F10', shiftKey: true, currentTarget: { getBoundingClientRect() { return { left: 20, bottom: 40 } } }, preventDefault() {}, stopPropagation() {} }); ui.render()
+  assert.equal(currentTitle(ui).props['aria-expanded'], true); assert.ok(sessionContextMenu(ui))
+  await ui.click('删除')
+  assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
+  assert.match(ui.text(ui.nodes().find(node => node.props.role === 'dialog')), /删除「A」/)
+  assert.equal(ui.text(currentTitle(ui)), 'B')
+  await ui.click('取消'); openSessionMenu(ui)
+  assert.ok(ui.button('切换翻译会话：A')); assert.ok(ui.button('切换翻译会话：B'))
+  app.dispose()
+})
+
+test('新建、备注与归档动作都收起标题列表且绑定右键目标', async () => {
+  for (const action of ['新建同主题子会话', '编辑会话备注', '归档']) {
+    const app = mount(); const ui = app.renderer
+    try {
+      ui.render(app.panel, { sessionId: 'main-a' }); await rename(ui, 'A'); await newSession(ui); await rename(ui, 'B')
+      openSessionMenu(ui); ui.context('切换翻译会话：A'); await ui.click(action)
+      assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
+      if (action === '新建同主题子会话') assert.equal(ui.text(currentTitle(ui)), 'A-01')
+      else {
+        assert.equal(ui.text(currentTitle(ui)), 'B')
+        if (action === '编辑会话备注') {
+          await ui.input('会话备注', 'A备注'); await ui.click('保存备注'); openSessionMenu(ui)
+          assert.match(ui.text(ui.button('切换翻译会话：A · A备注')), /A备注/)
+          assert.equal(ui.button('切换翻译会话：B').props.title, 'B')
+          assert.ok(!ui.nodes(ui.button('切换翻译会话：B')).some(node => node.props.className === 'dsh-tp-session-remark'))
+        }
+        else { openSessionMenu(ui); assert.ok(!ui.nodes().some(node => node.props['aria-label'] === '切换翻译会话：A')) }
+      }
+    } finally { app.dispose() }
+  }
 })
 
 test('下拉内 Shift+F10 保持列表，Escape 只退出右键层并还原焦点', async () => {

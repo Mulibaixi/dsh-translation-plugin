@@ -46,7 +46,7 @@ function settings(overrides = {}) {
 }
 
 // 验证发布 bundle 中实际事件处理器；此轻量 hook 模拟器不替代 React 或桌面运行验证。
-function createRenderer() {
+function createRenderer({ deferFunctionalUpdates = false } = {}) {
   const seats = new Map()
   const typeIds = new Map()
   let nextType = 0
@@ -58,6 +58,8 @@ function createRenderer() {
   let tree
   let dirty = false
   let renderDepth = 0
+  const stateUpdates = []
+  let deferredUpdateCount = 0
 
   function hook(initial) {
     assert.ok(active, 'hooks run within a component')
@@ -76,7 +78,11 @@ function createRenderer() {
     },
     useState(initial) {
       const cell = hook(() => ({ value: typeof initial === 'function' ? initial() : initial }))
-      return [cell.value, next => { const value = typeof next === 'function' ? next(cell.value) : next; if (!Object.is(value, cell.value)) dirty = true; cell.value = value }]
+      return [cell.value, next => {
+        const update = () => { const value = typeof next === 'function' ? next(cell.value) : next; if (!Object.is(value, cell.value)) dirty = true; cell.value = value }
+        if (deferFunctionalUpdates && typeof next === 'function') { stateUpdates.push(update); deferredUpdateCount++ }
+        else update()
+      }]
     },
     useRef(initial) { return hook(() => ({ current: initial })) },
     useEffect(effect, dependencies) {
@@ -113,6 +119,7 @@ function createRenderer() {
 
   function render(component = rootComponent, props = rootProps) {
     assert.ok(renderDepth < 10, 'render settles')
+    while (stateUpdates.length) stateUpdates.shift()()
     dirty = false
     rootComponent = component
     rootProps = props
@@ -169,6 +176,14 @@ function createRenderer() {
 
   return {
     react, render, text, control, button, nodes,
+    get deferredUpdateCount() { return deferredUpdateCount },
+    async check(label, checked) {
+      const target = control(label); assert.ok(!target.props.disabled)
+      const event = { currentTarget: { checked } }
+      target.props.onChange(event)
+      event.currentTarget = null
+      render(); await tick(); render()
+    },
     async flush() { await tick(); render() },
     async input(label, value) {
       if (label === '翻译模式' && nodes().some(node => node.props['aria-label'] === '选择翻译模式')) {
@@ -209,7 +224,7 @@ export function mount(overrides = {}) {
   for (const session of overrides.history ?? []) storage.setItem(HISTORY_PREFIX + encodeURIComponent(session.id), JSON.stringify({ schemaVersion: 2, token: session.id, session }))
   storage.failSet = !!overrides.failSet
   if (storage.failSet) storage.setItem = () => { throw new Error('quota') }
-  const renderer = createRenderer()
+  const renderer = createRenderer({ deferFunctionalUpdates: overrides.deferFunctionalUpdates })
   const entries = []; const effects = []; const slots = new Map(); const listeners = new Set()
   let catalogCalls = 0
   const catalogResponse = overrides.catalog ?? { ok: true, value: { default: { provider: 'provider-a', model: 'm1' }, routableProviders: ['provider-a'], groups: [{ id: 'provider-a', name: 'Provider A', models: Array.from({ length: 6 }, (_, i) => ({ id: 'm' + (i + 1), name: 'Model ' + (i + 1) })) }], failures: [] } }

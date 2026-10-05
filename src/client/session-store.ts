@@ -1,8 +1,9 @@
 import {
   DEFAULT_SESSION_SETTINGS, HISTORY_PREFIX, LEGACY_DRAFT_PREFIX, LEGACY_SETTINGS_KEY, SETTINGS_KEY,
   decodeSession, historyKey, legacySession, newSession, parseSettings, sessionName, validateSessionSettings,
-  type LocalSession, type SessionSettings,
+  type LocalSession, type ModelRoute, type SessionSettings,
 } from './sessions.js'
+import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKey, encodeModelPreference, decodeModelPreference } from './model-preferences.js'
 import {
   DELETED_SESSION_PREFIX, TOPIC_IDENTITY_PREFIX, TOPIC_NAME_PREFIX, TOPIC_LOCK_NAME,
   decodeDeletion, decodeTopicIdentity, decodeTopicName, deletedSessionKey, topicIdentityKey, topicNameKey,
@@ -44,6 +45,7 @@ export class SessionStore {
   private readonly deleted = new Set<string>()
   private readonly corruptTopics = new Set<string>()
   private readonly pendingSaves = new Map<string, Promise<boolean>>()
+  private readonly lastModels = new Map<string, ModelRoute | null>()
   private readonly workspaces = new Map<string, Workspace>()
   private readonly listeners = new Set<Disposer>()
   private notice: string | undefined
@@ -66,7 +68,34 @@ export class SessionStore {
   }
   subscribe(listener: Disposer): Disposer { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const fn of this.listeners) fn() }
-  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); this.workspaces.clear(); this.seats.clear(); this.topics.clear(); this.migrationSources.clear() }
+  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); this.workspaces.clear(); this.seats.clear(); this.topics.clear(); this.migrationSources.clear(); this.lastModels.clear() }
+
+  private readModelPreference(key: string): ModelRoute | null | undefined {
+    try {
+      const raw = this.storage?.getItem(key)
+      if (raw === undefined || raw === null) return undefined
+      const model = decodeModelPreference(raw)
+      if (model === undefined) throw new Error('invalid model preference')
+      return model
+    } catch { this.notice = '模型偏好读取失败，当前模型选择仍保留。'; return undefined }
+  }
+
+  private restoreModel(session: LocalSession): LocalSession {
+    const model = this.readModelPreference(sessionModelKey(session.id))
+    return model === undefined ? session : { ...session, model }
+  }
+
+  private rememberModel(seat: Seat): void {
+    const { ownerId, id, model } = seat.session
+    this.lastModels.set(ownerId, model)
+    try {
+      if (!this.storage) throw new Error('storage unavailable')
+      const raw = encodeModelPreference(model)
+      // Temporary session IDs cannot be restored; retain only their owner's next-session preference.
+      if ((seat.stored !== null || seat.legacyRaw !== null) && !this.isDeleted(id)) this.storage.setItem(sessionModelKey(id), raw)
+      this.storage.setItem(ownerModelKey(ownerId), raw)
+    } catch { this.notice = '模型与推理等级偏好未完整保存，当前选择仍保留在本次运行中。' }
+  }
 
   private readSettings(): boolean {
     try {
@@ -128,7 +157,7 @@ export class SessionStore {
         if (this.isDeleted(session.id)) continue
         const old = this.seats.get(session.id)
         if (!old) {
-          this.seats.set(session.id, { session, savedSession: session, stored: raw, legacyRaw: session.legacyKey ? this.storage.getItem(session.legacyKey) : null, status: 'saved' })
+          this.seats.set(session.id, { session: this.restoreModel(session), savedSession: session, stored: raw, legacyRaw: session.legacyKey ? this.storage.getItem(session.legacyKey) : null, status: 'saved' })
           if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(session.id, session)
         }
       }
@@ -136,7 +165,7 @@ export class SessionStore {
         const raw = this.storage.getItem(key)
         const session = raw === null ? undefined : legacySession(key, raw)
         if (session && !this.isDeleted(session.id) && !this.seats.has(session.id)) {
-          this.seats.set(session.id, { session, savedSession: session, stored: null, legacyRaw: raw, status: 'saved' })
+          this.seats.set(session.id, { session: this.restoreModel(session), savedSession: session, stored: null, legacyRaw: raw, status: 'saved' })
           this.migrationSources.set(session.id, session)
         }
         else if (!session) this.notice = '部分旧版草稿无法读取，原存储副本已保留。'
@@ -337,7 +366,8 @@ export class SessionStore {
     if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
     const settings = parent ? { ...this.settings, defaultMode: parent.mode, targetLanguage: parent.targetLanguage, defaultInstruction: parent.instruction, maxInputChars: parent.maxInputChars } : this.settings
     const initial = newSession(settings, ownerId, id, topic?.name ?? '新翻译会话', parent?.id ?? null, topic?.identity.id, topic?.identity.sequenceNamespaceId, sequence)
-    const session = { ...initial, model: parent?.model ? { ...parent.model } : null }
+    const model = parent ? parent.model : this.lastModels.has(ownerId) ? this.lastModels.get(ownerId)! : this.readModelPreference(ownerModelKey(ownerId)) ?? null
+    const session = { ...initial, model: model ? { ...model } : null }
     if (topic && !reserved) topic.identity = { ...topic.identity, nextSequence: sequence + 1, allocations: [...topic.identity.allocations, { sessionId: id, sequence }] }
     this.seats.set(id, { session, savedSession: undefined, stored: null, legacyRaw: null, status: 'memory' })
     this.adoptTopic(this.seats.get(id)!)
@@ -443,6 +473,7 @@ export class SessionStore {
     seat.session = next
     if (seat.status !== 'conflict') seat.status = 'memory'
     this.notice = undefined
+    if (Object.hasOwn(patch, 'model')) this.rememberModel(seat)
     if (this.settings.rememberHistory) this.persist(id)
     this.emit(); return true
   }
@@ -614,7 +645,8 @@ export class SessionStore {
       const raw = this.storage.getItem(historyKey(id))
       const session = raw === null ? undefined : readHistory(raw)
       if (!session || session.id !== id || session.ownerId !== seat.session.ownerId || this.isDeleted(id) || !this.matchesHistoryIdentity(session, seat.session)) throw new Error('invalid history')
-      seat.session = session; seat.savedSession = session; seat.stored = raw; seat.status = 'saved'; this.notice = undefined
+      this.notice = undefined
+      seat.session = this.restoreModel(session); seat.savedSession = session; seat.stored = raw; seat.status = 'saved'
       const topic = this.topics.get(session.topicId)
       if (topic) { topic.nameDirty = false; topic.name = topic.persistedName ?? session.topicName }
       if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(id, session)
@@ -704,6 +736,7 @@ export class SessionStore {
         if (id?.trim()) {
           this.storage!.setItem(deletedSessionKey(id), JSON.stringify({ schemaVersion: 1, sessionId: id, legacyKey }))
           this.deleted.add(id)
+          this.storage!.removeItem(sessionModelKey(id))
         }
         this.storage?.removeItem(item.key)
       }
@@ -715,6 +748,7 @@ export class SessionStore {
         this.storage?.removeItem(historyKey(seat.session.id))
         seat.stored = null
         if (seat.session.legacyKey) { this.storage?.removeItem(seat.session.legacyKey); seat.legacyRaw = null }
+        this.storage?.removeItem(sessionModelKey(seat.session.id))
         this.seats.delete(seat.session.id)
         this.migrationSources.delete(seat.session.id)
         this.reconcileWorkspace(seat.session.ownerId)
@@ -724,6 +758,13 @@ export class SessionStore {
   }
 
   private externalChange(key: string | null): void {
+    if (key === null || key.startsWith(OWNER_MODEL_PREFIX)) this.lastModels.clear()
+    if (key === null || key.startsWith(SESSION_MODEL_PREFIX)) {
+      for (const seat of this.seats.values()) {
+        if (key !== null && key !== sessionModelKey(seat.session.id)) continue
+        seat.session = this.restoreModel(seat.session)
+      }
+    }
     if (key === null || key === SETTINGS_KEY || key === LEGACY_SETTINGS_KEY) {
       const wasEnabled = this.settings.rememberHistory
       if (this.readSettings() && !wasEnabled && this.settings.rememberHistory) this.queueHistorySaves()
@@ -745,7 +786,7 @@ export class SessionStore {
           if (raw !== seat.stored) {
             const latest = raw === null ? undefined : readHistory(raw)
             if (seat.status === 'saved' && latest && latest.id === seat.session.id && latest.ownerId === seat.session.ownerId && this.matchesHistoryIdentity(latest, seat.session)) {
-              seat.session = latest; seat.savedSession = latest; seat.stored = raw
+              seat.session = this.restoreModel(latest); seat.savedSession = latest; seat.stored = raw
               if (latest.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(latest.id, latest)
               else this.migrationSources.delete(latest.id)
             } else {

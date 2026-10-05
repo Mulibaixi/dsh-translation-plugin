@@ -304,8 +304,10 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
     contextMenu(session, { preventDefault: () => event.preventDefault(), stopPropagation: () => event.stopPropagation(), clientX: rect.left, clientY: rect.bottom, currentTarget: event.currentTarget })
   }
   function create(parentId?: string): void {
-    void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)), () => { setContext(undefined); setSessionPickerOpen(false) })
+    closeSessionMenus()
+    void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)))
   }
+  function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined) }
   function sessionItem(session: LocalSession): unknown {
     return h('button', {
       key: session.id, type: 'button', className: 'dsh-tp-session-item', title: sessionTitle(session),
@@ -418,12 +420,12 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
       },
     },
       h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建同主题子会话'),
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => { setName(target.topicName); setDialog({ kind: 'rename', id: target.id }); setContext(undefined) } }, '重命名主题'),
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => { setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }); setContext(undefined) } }, '编辑会话备注'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名主题'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '编辑会话备注'),
       h(MenuItemButton, { disabled: action.pending, danger: true, onSelect: () => {
-        setDeletion({ title: `删除「${target.name}」`, ids: [target.id], unreadable: [], versions: store.captureHistoryVersions([target.id]) }); setContext(undefined)
+        closeSessionMenus(); setDeletion({ title: `删除「${target.name}」`, ids: [target.id], unreadable: [], versions: store.captureHistoryVersions([target.id]) })
       } }, '删除'),
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => { if (store.archiveSession(ownerId, target.id, target.archivedAt === null)) setContext(undefined) } }, target.archivedAt === null ? '归档' : '恢复归档'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); store.archiveSession(ownerId, target.id, target.archivedAt === null) } }, target.archivedAt === null ? '归档' : '恢复归档'),
     )) : null,
   )
 }
@@ -462,7 +464,8 @@ function HistorySection({ store }: StoreProps): unknown {
       history.length === 0 ? h('p', { className: 'dsh-tp-muted' }, '尚无已保存的会话历史。') : null,
       ...history.map(session => h('label', { key: session.id, className: 'dsh-tp-history-row', title: sessionTitle(session) },
         h('input', { type: 'checkbox', checked: selectedIds.includes(session.id), disabled: action.pending, 'aria-label': `选择会话 ${session.name}`, onChange: (event: CheckEvent) => {
-          setSelected(current => event.currentTarget.checked ? [...new Set([...current, session.id])] : current.filter(id => id !== session.id))
+          const checked = event.currentTarget.checked
+          setSelected(current => checked ? [...new Set([...current, session.id])] : current.filter(id => id !== session.id))
         } }),
       h('span', null, session.name,
         session.remark ? h('div', { className: 'dsh-tp-muted' }, session.remark) : null,
@@ -536,7 +539,7 @@ export function SettingsView({ store, onClose }: StoreProps & { readonly onClose
         type: 'checkbox', checked: form.rememberHistory, disabled: saving, 'aria-label': '允许保存会话历史到本地',
         onChange: (event: CheckEvent) => change({ rememberHistory: event.currentTarget.checked }),
       }), '允许保存会话历史到本地'),
-      h('p', { className: 'dsh-tp-muted' }, '开启后自动保存主题名称、会话配置、模型选择和当前原文草稿，数据以明文保存在此设备；不保存已提交的快译原文和译文记录。关闭后保留已有历史，停止写入新的会话内容。'),
+      h('p', { className: 'dsh-tp-muted' }, '模型与推理等级选择独立保存在此设备，不受此开关影响。开启后自动保存主题名称、会话配置和当前原文草稿，数据以明文保存在此设备；不保存已提交的快译原文和译文记录。关闭后保留已有历史，停止写入新的会话内容。'),
       h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
       store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
       h(HistorySection, { store }),
