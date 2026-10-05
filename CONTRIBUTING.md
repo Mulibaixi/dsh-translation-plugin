@@ -21,7 +21,7 @@ $env:DSH_RUNTIME_ROOT = '<外部目录，内含 dsh/node_modules>'
 pnpm test:native
 ```
 
-`pnpm test:native` 会先构建，再通过 `node --expose-internals --test scripts/quick-host-native.integration.mjs scripts/quick-client-native.integration.mjs` 运行集成检查。缺少环境变量或必需组件时会明确失败；测试不会下载依赖，也不会跳过。测试使用 DSH `0.2.0-rc.2` 组件包、一次性 synthetic profile 和 synthetic provider，不读取用户 profile/凭据，也不调用真实远端模型。它检查 Host/Client 与实际组件接口的集成，不代替在用户 DSH Desktop 中运行。
+`pnpm test:native` 会先构建，再通过 `node --expose-internals --test scripts/quick-host-native.integration.mjs scripts/quick-client-native.integration.mjs scripts/quick-client-mount-native.integration.mjs` 运行三个集成入口。缺少环境变量或必需组件时会明确失败；测试不会下载依赖，也不会跳过。测试使用 DSH `0.2.0-rc.2` 组件包、一次性 synthetic profile 和 synthetic provider，不读取用户 profile/凭据，也不调用真实远端模型。除 Host/Client 组件与 RPC 集成外，挂载入口使用真实 `ClientRemoteService`、Cordis 与当前 Client bundle，检查异步挂载后的自主能力查询、合成翻译及卸载。它不代替在用户 DSH Desktop 中运行。
 
 `src/host/` 管理宿主服务，`src/client/` 管理 UI，`src/shared/` 管理共享契约，`src/memory/` 管理记忆接口实现。构建结果位于 `dist/`。在 DSH 桌面端验证前先构建，使用本地 bundle 安装后重启。若变更 `dsh.client.inject` 等 bundle 元信息，目录链接安装可能需要在插件管理器刷新或重新安装，再重启；不直接修改用户 profile。
 
@@ -97,7 +97,7 @@ refactor(host)!: 调整翻译会话事件协议
 
 ## 版本与发布
 
-使用 `MAJOR.MINOR.PATCH`，预发布使用 `-alpha.N`、`-beta.N` 或 `-rc.N`。`0.1.0` 为框架基线，`0.1.1` 为交互面板版本，`0.2.0` 为主题会话与 Host 执行基础版本，`0.2.1` 为会话保存回归修复版本，当前 `0.3.0` 为纯文本快译版本；这些均为本地版本，不代表已经公开发布。0.x 的不兼容接口变更提高 MINOR，并明确说明迁移方法；兼容修复提高 PATCH。暂不根据提交自动发布。
+使用 `MAJOR.MINOR.PATCH`，预发布使用 `-alpha.N`、`-beta.N` 或 `-rc.N`。`0.1.0` 为框架基线，`0.1.1` 为交互面板版本，`0.2.0` 为主题会话与 Host 执行基础版本，`0.2.1` 为会话保存回归修复版本，`0.3.0` 为纯文本快译版本，当前 `0.3.1` 修复快译服务挂载并调整状态提示；这些均为本地版本，不代表已经公开发布。0.x 的不兼容接口变更提高 MINOR，并明确说明迁移方法；兼容修复提高 PATCH。暂不根据提交自动发布。
 
 发布前：
 

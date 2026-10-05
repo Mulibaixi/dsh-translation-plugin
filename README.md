@@ -10,6 +10,7 @@ A lightweight translation session panel for DeepSeek Harness (DSH). Quick mode s
 - **+** creates a new topic and its first session, initially named “新翻译会话”. Creating from an existing session uses the next sequence in that same topic, such as “故事A-01” and “故事A-02”. Creating from a child does not nest suffixes or fill deleted sequence numbers.
 - Rename changes the topic name for all its sessions while keeping IDs and sequence numbers. Each session also has an independent remark, which may be duplicated or cleared.
 - A left-aligned current title dropdown with context actions and right-aligned mode/language controls, a scrollable conversation area and a simple composer with a circular Send button and no blue focus outline on its text area.
+- Service checking, unavailable status and the Normal mode limitation appear immediately above and outside the composer. Quick mode provides a compact check icon at the right of the status line, disabled while checking; the line disappears when the service is ready. The runtime retention note appears below the composer only after translation records exist.
 - Model selection sits at the composer's lower right, immediately left of Send. It uses DSH's native menus and icons and the same `session.modelCatalog()` directory API as the main composer. Its model/effort menu supports provider groups and search; selection applies only to the current translation session.
 - Quick mode sends the current plain-text draft, target language and explicit translation requirements through a selected DSH Host model, then displays the source and translated result in the conversation area. Only models and reasoning efforts exposed by the Host catalog are selectable.
 - **DSH Settings → 翻译** provides new-session defaults, history retention and history cleanup. Valid changes save immediately.
@@ -17,6 +18,8 @@ A lightweight translation session panel for DeepSeek Harness (DSH). Quick mode s
 Quick execution is limited to plain text in Quick mode; Normal mode remains unavailable. A provider and model must already be configured in DSH. The plugin does not add provider or credential settings. The translation context contains the built-in prompt, current source text, target language, explicit requirements and selected catalog route; it excludes tools, main-chat messages or history, files, and memory. History retention saves session details and the current source draft; submitted rounds of source and translated text remain only in runtime memory and are lost on restart. If an operation's outcome is unknown, the client keeps its identity and queries that same operation; if Host confirms cancellation, it settles as cancelled. It will not automatically submit the request again.
 
 The panel keeps a simple composer and transcript. Memory archives and formal export are not connected. The previous manual translation editor and export controls have been removed; previously saved manual text remains viewable.
+
+**重新检查翻译服务 (Check translation service again)** only queries whether the DSH Host translation service and runtime components are ready. It sends no source text or model translation request and does not test model credentials or remote responses. The Client waits for DSH's asynchronous service mount before querying capabilities, avoiding a false unavailable status while the service is still mounting.
 
 ## Sessions and defaults
 
@@ -65,7 +68,7 @@ The old manual-save preference does not automatically enable new automatic histo
 
 ## Compatibility and installation
 
-The previously inspected Windows DSH Desktop runtime was `0.2.0-rc.2`; the user had confirmed framework installation, removal and loading, and provided screenshots of the preceding session bar and main composer. Independent v0.3.0 acceptance on 2026-10-05 passed all 132 `npm test` cases and all 22 `npm run test:native` cases (17 Host and 5 Client), with zero failures or skips; the build succeeded. Native integration uses actual DSH `0.2.0-rc.2` component packages in a disposable synthetic profile with a synthetic provider. This checks Host/Client component and RPC integration. Quick translation has not been verified in the user's Desktop or against a real remote model. Other versions, operating systems and standalone Web profiles are unverified.
+The previously inspected Windows DSH Desktop runtime was `0.2.0-rc.2`; the user had confirmed framework installation, removal and loading, and provided screenshots of the preceding session bar and main composer. Independent v0.3.1 acceptance by the coordinating agent on 2026-10-05 passed all 136 `npm test` cases and all 24 cases across three native integration entry points, with zero failures or skips; the build succeeded. `npm run test:native` includes those three entry points. Native integration uses actual DSH `0.2.0-rc.2` component packages in a disposable synthetic profile with a synthetic provider. This checks Host/Client component and RPC integration. The new mount entry point uses actual `ClientRemoteService`, Cordis and the current Client bundle to check automatic capability queries, synthetic translation and disposal. Quick translation has not been verified in the user's Desktop or against a real remote model. Other versions, operating systems and standalone Web profiles are unverified.
 
 Requirements: Node.js 22 or later, pnpm and DSH with local bundle support.
 
@@ -86,6 +89,6 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Commit messa
 
 `pnpm test` builds first and checks sessions, history, legacy compatibility, the model directory and Client interactions. The separate native integration command and its DSH component requirement are described in [CONTRIBUTING.md](CONTRIBUTING.md). Synthetic providers do not verify a real remote model or the user's Desktop runtime.
 
-See [CHANGELOG.md](CHANGELOG.md). The current local plugin version is `v0.3.0`, adding plain-text Quick translation through DSH catalog models and reasoning efforts, with sending, result display and cancellation. Normal mode, file translation and memory are not connected. This version has not been published remotely. `private: true` prevents accidental npm publishing.
+See [CHANGELOG.md](CHANGELOG.md). The current local plugin version is `v0.3.1`, supporting plain-text Quick translation through DSH catalog models and reasoning efforts, with sending, result display and cancellation, and fixing service mounting and status presentation. Normal mode, file translation and memory are not connected. This version has not been published remotely. `private: true` prevents accidental npm publishing.
 
 License: [MIT](LICENSE).

@@ -255,7 +255,7 @@ test('面板没有大标题或设置入口，无主会话时不开放输入', as
   assert.match(ui.text(), /请在主窗口会话中打开/); assert.equal(ui.nodes().some(node => node.type === 'textarea'), false)
   ui.render(app.panel, { sessionId: 'main-a' }); assert.equal(ui.nodes().some(node => node.type === 'h2'), false)
   assert.equal(ui.nodes().some(node => node.type === 'button' && ui.text(node) === '翻译设置'), false)
-  assert.equal(ui.button('发送（翻译执行尚未接入）').props.disabled, true)
+  assert.equal(ui.button('发送快译').props.disabled, true)
   assert.ok(ui.nodes().some(node => node.props.className === 'dsh-tp-transcript'))
   app.dispose()
 })
@@ -437,7 +437,7 @@ test('标题下拉内的右键操作绑定具体会话，切换主窗口会话�
 
 test('发送明确覆盖宿主超椭圆、输入区无蓝色聚焦框，侧栏 + 与标题行同宽', async () => {
   const app = mount(); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' })
-  const shape = ui.button('发送（翻译执行尚未接入）').props.style
+  const shape = ui.button('发送快译').props.style
   assert.equal(shape.width, shape.height); assert.equal(shape.minWidth, shape.maxWidth); assert.equal(shape.minHeight, shape.maxHeight)
   assert.equal(shape.width, 38); assert.equal(shape.borderRadius, '50%'); assert.equal(shape.aspectRatio, '1 / 1')
   assert.equal(shape.cornerShape, 'round')

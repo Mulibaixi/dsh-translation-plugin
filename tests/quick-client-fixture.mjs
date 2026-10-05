@@ -225,16 +225,34 @@ export function mount(overrides = {}) {
       IconPanelLeftOutlineRegular: icon('panel-left'), IconSendOutlineMedium: icon('send'),
     }
   })
-  exported.apply({
-    remote: { translationQuick: overrides.quick, $mount() { return () => {} }, session: { async modelCatalog() { catalogCalls++; return catalogResponse }, selectModel() { throw new Error('main chat selection must remain independent') } }, $on() { return () => {} } },
+  let mountCalls = 0; let unmountCalls = 0
+  const remote = {
+    async $mount() {
+      mountCalls++
+      await overrides.mountGate
+      if (overrides.mountError) throw overrides.mountError
+      remote.translationQuick = overrides.quick
+      return async () => { unmountCalls++; delete remote.translationQuick }
+    },
+    session: { async modelCatalog() { catalogCalls++; return catalogResponse }, selectModel() { throw new Error('main chat selection must remain independent') } },
+    $on() { return () => {} },
+  }
+  const clientContext = {
+    remote,
+    get(name) { assert.equal(name, 'remote.translationQuick'); return remote.translationQuick },
     on() { return () => {} }, sidebarRightTabs: { register() { return () => {} } },
     slots: { register(target, component) { slots.set(target.name, component); return () => slots.delete(target.name) }, inject(_name, register) { return register() } },
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
-  })
-  return { renderer, storage, panel: slots.get('sidebar.right.pane.tab'), settingsPage: slots.get('settings.section'),
+  }
+  const applied = overrides.applyClient ? overrides.applyClient(exported, clientContext) : exported.apply(clientContext)
+  return { renderer, storage, remote, applied,
+    get panel() { return slots.get('sidebar.right.pane.tab') },
+    get settingsPage() { return slots.get('settings.section') },
     get catalogCalls() { return catalogCalls },
+    get mountCalls() { return mountCalls },
+    get unmountCalls() { return unmountCalls },
     changeStorage(key, raw) { storage.setItem(key, raw); for (const listener of listeners) listener({ key, storageArea: storage }); renderer.render() },
-    dispose() { renderer.dispose(); for (const effect of effects.toReversed()) effect?.() },
+    dispose() { renderer.dispose(); return Promise.all(effects.toReversed().map(effect => effect?.())) },
   }
 }
 

@@ -44,7 +44,7 @@ export class QuickTranslationClient {
   private readonly listeners = new Set<() => void>()
   private readonly stopStore: () => void
   private readiness: 'idle' | 'loading' | 'ready' | 'unavailable' = 'idle'
-  private reason = '翻译执行尚未接入'
+  private reason = '快译服务尚未就绪。'
   private generation = 0
   private sequence = 0
   private disposed = false
@@ -80,7 +80,7 @@ export class QuickTranslationClient {
     if (this.disposed || this.readiness === 'ready') return Promise.resolve()
     if (this.loading) return this.loading
     const generation = this.generation
-    if (!this.port) { this.readiness = 'unavailable'; this.emit(); return Promise.resolve() }
+    if (!this.port) { this.readiness = 'unavailable'; this.reason = '快译服务未就绪，请重新检查。'; this.emit(); return Promise.resolve() }
     this.readiness = 'loading'; this.reason = '正在检查快译能力…'; this.emit()
     this.loading = this.request(Promise.resolve().then(() => this.port!.capabilities())).then(result => {
       if (this.disposed || generation !== this.generation) return

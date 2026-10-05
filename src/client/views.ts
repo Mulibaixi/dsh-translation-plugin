@@ -49,7 +49,15 @@ const styles = `
 @container (max-width: 520px) { .dsh-tp-session-sidebar { flex-basis: 120px; } .dsh-tp-workspace-header { padding: 8px 6px; gap: 2px; } .dsh-tp-header-options { gap: 2px; } }
 .dsh-tp-transcript { flex: 1 1 0; min-height: 0; overflow-y: scroll; overflow-x: hidden; scrollbar-gutter: stable; padding: 12px 16px; overscroll-behavior: contain; }
 .dsh-tp-empty { color: var(--dsw-alias-label-caption, #888); text-align: center; padding: 28px 8px; font-size: 13px; }
-.dsh-tp-composer { flex: none; margin: 8px 12px 12px; padding: 10px; border-radius: var(--dsw-radius-panel, 14px); background: var(--dsw-specific-input-major, #8881); border: 1px solid var(--dsw-alias-border-l2, #8883); }
+.dsh-tp-composer-area { flex: none; margin: 8px 12px 12px; }
+.dsh-tp-service-status { display: flex; align-items: center; gap: 6px; margin: 0 3px 4px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
+.dsh-tp-service-status-text { min-width: 0; flex: 1; }
+.dsh-tp button.dsh-tp-service-recheck { display: flex; align-items: center; justify-content: center; flex: 0 0 24px; width: 24px; height: 24px; padding: 4px; }
+.dsh-tp-service-recheck[aria-busy=true] svg { animation: dsh-tp-checking 1s linear infinite; }
+@keyframes dsh-tp-checking { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .dsh-tp-service-recheck[aria-busy=true] svg { animation: none; } }
+.dsh-tp-runtime-note { display: block; margin: 4px 3px 0; color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
+.dsh-tp-composer { padding: 10px; border-radius: var(--dsw-radius-panel, 14px); background: var(--dsw-specific-input-major, #8881); border: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-composer textarea { display: block; resize: none; width: 100%; min-height: 70px; max-height: 180px; overflow-y: auto; padding: 4px; background: transparent; border: 0; }
 .dsh-tp-composer:focus-within, .dsh-tp-composer textarea:focus, .dsh-tp-composer textarea:focus-visible { outline: none !important; box-shadow: none !important; }
 .dsh-tp-composer-toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; }
@@ -271,7 +279,10 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
   const records = current ? quick.getRecords(current.id) : []
   const blocked = current ? quick.blockedReason(current) : undefined
   const busy = current ? quick.isBusy(current.id) : false
-  const unavailable = quick.getReadiness().status !== 'ready'
+  const readiness = quick.getReadiness()
+  const checking = readiness.status === 'loading' || readiness.status === 'idle'
+  const serviceStatus = current?.mode === 'normal' ? blocked : readiness.status !== 'ready'
+    ? checking ? '正在检查翻译服务…' : readiness.reason : undefined
   function contextMenu(session: LocalSession, event: ContextEvent): void {
     event.preventDefault(); event.stopPropagation()
     setContext({ id: session.id, x: event.clientX, y: event.clientY, trigger: event.currentTarget })
@@ -333,8 +344,7 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
         ...records.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
-        records.length === 0 ? h('div', { className: 'dsh-tp-empty' }, current ? (current.mode === 'quick' ? '在下方输入待翻译内容，选择模型后发送。' : '普通模式需主模型协作，尚未接入。') : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
-        current ? h('p', { className: 'dsh-tp-muted' }, '译文仅保留在本次运行中，重启后不恢复。') : null,
+        records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),
       storeNotice(store),
       action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
@@ -346,19 +356,28 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
         h('p', null, '读取本地副本会替换本窗口该会话内容。确认继续？'),
         button('确认读取', () => { if (store.reloadSession(dialog.id)) setDialog(undefined) }, action.pending), button('取消', () => setDialog(undefined), action.pending),
       ) : null,
-      current ? h('div', { className: 'dsh-tp-composer' },
+      current ? h('div', { className: 'dsh-tp-composer-area' },
+        serviceStatus ? h('div', { className: 'dsh-tp-service-status' },
+          h('span', { className: 'dsh-tp-service-status-text', role: 'status' }, serviceStatus),
+          current.mode === 'quick' ? h('button', { type: 'button', className: 'dsh-tp-service-recheck', disabled: checking, 'aria-busy': checking,
+            'aria-label': '重新检查翻译服务', title: checking ? '正在检查翻译服务…' : '重新检查翻译服务（仅检查服务，不发送翻译请求）',
+            onClick: () => { void quick.load() },
+          }, h('svg', { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+            h('path', { d: 'M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17' }),
+          )) : null,
+        ) : null,
+        h('div', { className: 'dsh-tp-composer' },
         h('textarea', { value: current.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(current.id, { input: event.currentTarget.value }) } }),
         Array.from(current.input).length > current.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${current.maxInputChars} 个字符；内容保持完整。`) : null,
         h('div', { className: 'dsh-tp-composer-toolbar' },
           h(ModelPicker, { key: current.id, catalog: models, current: current.model, onSelect: (model: LocalSession['model']) => { store.updateSession(current.id, { model }) } }),
-          h('button', { type: 'button', className: 'dsh-tp-send', disabled: !busy && !!blocked, title: busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': busy ? '取消翻译' : unavailable ? '发送（翻译执行尚未接入）' : '发送快译',
+          h('button', { type: 'button', className: 'dsh-tp-send', disabled: !busy && !!blocked, title: busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': busy ? '取消翻译' : '发送快译', 'aria-description': busy ? undefined : blocked,
             onClick: () => { if (busy) quick.cancel(current.id); else void quick.send(current.id) },
             style: { width: 38, height: 38, minWidth: 38, maxWidth: 38, minHeight: 38, maxHeight: 38, padding: 0, borderRadius: '50%', cornerShape: 'round', aspectRatio: '1 / 1', flex: '0 0 38px' },
           }, busy ? h('span', { 'aria-hidden': true, style: { fontSize: 18, lineHeight: 1 } }, '■') : h(IconSendOutlineMedium, { size: 20 })),
         ),
-        current.mode === 'normal' && records.length ? h('small', { className: 'dsh-tp-muted' }, '普通模式需主模型协作，尚未接入。') : null,
-        current.mode === 'quick' && quick.getReadiness().status === 'unavailable' ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, quick.getReadiness().reason) : null,
-        unavailable && quick.getReadiness().status !== 'loading' ? button('重新检查快译能力', () => { void quick.load() }) : null,
+        ),
+        records.length ? h('small', { className: 'dsh-tp-runtime-note' }, '译文仅保留在本次运行中，重启后不恢复。') : null,
       ) : null,
     ),
     context && target ? h(Menu, { open: true, anchor: null, onClose: () => { setContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup',

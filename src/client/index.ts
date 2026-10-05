@@ -7,6 +7,7 @@ import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
 import { QUICK_TRANSLATION_REMOTE } from '../shared/quick-translation.js'
 
 type Disposer = () => void
+type AsyncDisposer = () => void | Promise<void>
 type ClientComponent = (props?: Readonly<Record<string, unknown>>) => unknown
 
 interface SidebarRightTabDefinition {
@@ -22,10 +23,11 @@ interface SidebarRightTabDefinition {
 }
 
 interface ClientPluginContext {
+  get(name: 'remote.translationQuick'): QuickRemotePort | undefined
   readonly remote: {
     readonly session: ModelCatalogPort
     readonly translationQuick?: QuickRemotePort
-    $mount?(contribution: typeof QUICK_TRANSLATION_REMOTE): Disposer
+    $mount?(contribution: typeof QUICK_TRANSLATION_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
   on(event: string, listener: () => void): Disposer
@@ -37,7 +39,7 @@ interface ClientPluginContext {
     ): Disposer
     inject(name: string, register: () => Disposer): Disposer
   }
-  effect(effect: () => void | Disposer, name?: string): unknown
+  effect(effect: () => void | AsyncDisposer, name?: string): unknown
 }
 
 const CLIENT_ID = 'dsh-translation-plugin'
@@ -56,12 +58,25 @@ export function apply(ctx: ClientPluginContext): void {
   withClientDiagnostics('apply', () => {
     const store = createSessionStore()
     const models = new ModelCatalog(ctx.remote.session)
-    let unmountQuick: Disposer | undefined
-    try { unmountQuick = ctx.remote.$mount?.(QUICK_TRANSLATION_REMOTE) } catch { /* Capability check keeps sending disabled. */ }
-    const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.translationQuick), store, models)
+    let quickDisposed = false
+    // DSH installs remote.translationQuick asynchronously and returns its disposer only after mounting.
+    const mountedQuick = (async () => ctx.remote.$mount?.(QUICK_TRANSLATION_REMOTE))().catch(error => {
+      const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ''}` : String(error)
+      console.error(`[${CLIENT_ID}] Client translationQuick mount failed: ${detail}`)
+      return undefined
+    })
+    const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.$mount ? async () => {
+      const unmountQuick = await mountedQuick
+      return quickDisposed || !unmountQuick ? undefined : ctx.get('remote.translationQuick')
+    } : ctx.remote.translationQuick), store, models)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
-    ctx.effect(() => () => { quick.dispose(); unmountQuick?.() }, 'translation quick client')
+    ctx.effect(() => async () => {
+      quickDisposed = true
+      quick.dispose()
+      const unmountQuick = await mountedQuick
+      await unmountQuick?.()
+    }, 'translation quick client')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
     ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset() }), 'translation catalog connection')

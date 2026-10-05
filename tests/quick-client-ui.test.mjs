@@ -31,6 +31,7 @@ test('真实bundle顶部仅模式/语言，空原文和未选模型只在发送t
     assert.equal(ui.button('发送快译').props.disabled, true)
     assert.equal(ui.button('发送快译').props.title, '请输入待翻译内容。')
     assert.ok(!ui.text().includes('请输入待翻译内容。'))
+    assert.ok(!ui.nodes().some(node => node.props.className === 'dsh-tp-service-status' || node.props.className === 'dsh-tp-runtime-note'))
     assert.ok(!ui.nodes().some(node => node.props['aria-label'] === '翻译要求' || node.props['aria-label'] === '编辑翻译要求'))
     const options = ui.nodes().find(node => node.props.className === 'dsh-tp-header-options')
     assert.deepEqual(ui.nodes(options).filter(node => node.type === 'button').map(node => node.props['aria-label']), ['选择翻译模式', '选择目标语言'])
@@ -60,6 +61,9 @@ test('真实bundle发送使用会话默认要求，译文关联目标语且不�
     assert.equal(ui.text(record.children[0]), '原文')
     assert.equal(ui.text(record.children[2]), '译文 · English')
     assert.match(ui.text(), /译文仅保留在本次运行中/)
+    const composerArea = ui.nodes().find(node => node.props.className === 'dsh-tp-composer-area')
+    assert.equal(composerArea.children.at(-1).props.className, 'dsh-tp-runtime-note')
+    assert.ok(!ui.nodes(ui.nodes().find(node => node.props.className === 'dsh-tp-transcript')).some(node => node.props.className === 'dsh-tp-runtime-note'))
     assert.ok([...app.storage.values.values()].every(value => !value.includes('Synthetic translation')))
     const restored = mount({ quick: rpc.port })
     try { restored.renderer.render(restored.panel, { sessionId: 'synthetic-main' }); assert.ok(!restored.renderer.text().includes('Synthetic translation')) }
@@ -81,6 +85,45 @@ test('真实bundle取消未确认显示unknown并查询本轮，Host终态后恢
     await ui.input('翻译模式', 'normal')
     assert.equal(ui.button('发送快译').props.disabled, true)
     assert.match(ui.text(), /普通模式需主模型协作，尚未接入/)
+    const statusLine = ui.nodes().find(node => node.props.className === 'dsh-tp-service-status')
+    assert.match(ui.text(statusLine), /普通模式需主模型协作/)
+    assert.ok(!ui.nodes(ui.nodes().find(node => node.props.className === 'dsh-tp-composer')).includes(statusLine))
+    assert.equal(ui.button('发送快译').props['aria-description'], ui.button('发送快译').props.title)
+  } finally { app.dispose() }
+})
+
+test('服务状态紧贴输入框外，检查图标仅检查服务，检查中禁用且就绪后隐藏', async () => {
+  let release
+  let checks = 0
+  const held = new Promise(resolve => { release = resolve })
+  const rpc = remote({ async capabilities() {
+    checks++
+    return checks === 1 ? ok({ ready: false, mode: 'quick', storage: 'runtime_only', reason: 'Synthetic host unavailable' }) : held
+  } })
+  const app = mount({ quick: rpc.port })
+  try {
+    const ui = app.renderer; ui.render(app.panel, { sessionId: 'synthetic-main' }); await ui.flush()
+    await ui.input('待翻译内容', 'Synthetic draft')
+    const area = ui.nodes().find(node => node.props.className === 'dsh-tp-composer-area')
+    assert.equal(area.children[0].props.className, 'dsh-tp-service-status')
+    assert.equal(area.children[1].props.className, 'dsh-tp-composer')
+    assert.ok(!ui.nodes(area.children[1]).some(node => node.props.className === 'dsh-tp-service-status'))
+    assert.equal(ui.button('发送快译').props.title, 'Synthetic host unavailable')
+    const recheck = ui.button('重新检查翻译服务')
+    assert.equal(recheck.props.type, 'button')
+    assert.match(recheck.props.title, /不发送翻译请求/)
+    assert.equal(ui.text(recheck), '')
+    assert.equal(ui.nodes(recheck).filter(node => node.type === 'svg').length, 1)
+    await ui.click('重新检查翻译服务')
+    assert.equal(checks, 2)
+    assert.equal(ui.button('重新检查翻译服务').props.disabled, true)
+    assert.equal(ui.button('重新检查翻译服务').props['aria-busy'], true)
+    assert.match(ui.text(ui.nodes().find(node => node.props.className === 'dsh-tp-service-status')), /正在检查翻译服务/)
+    assert.equal(rpc.calls.open.length, 0); assert.equal(rpc.calls.submit.length, 0)
+    assert.equal(ui.control('待翻译内容').props.value, 'Synthetic draft')
+    release(ok({ ready: true, mode: 'quick', storage: 'runtime_only' })); await ui.flush()
+    assert.ok(!ui.nodes().some(node => node.props.className === 'dsh-tp-service-status'))
+    assert.equal(rpc.calls.submit.length, 0)
   } finally { app.dispose() }
 })
 
