@@ -4,6 +4,7 @@ import {
   type LocalSession, type ModelRoute, type SessionSettings,
 } from './sessions.js'
 import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKey, encodeModelPreference, decodeModelPreference } from './model-preferences.js'
+import { decodeTranslationHistory, emptyTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
 import {
   DELETED_SESSION_PREFIX, TOPIC_IDENTITY_PREFIX, TOPIC_NAME_PREFIX, TOPIC_LOCK_NAME,
   decodeDeletion, decodeTopicIdentity, decodeTopicName, deletedSessionKey, topicIdentityKey, topicNameKey,
@@ -19,7 +20,7 @@ export interface LocalStoragePort {
 
 type Disposer = () => void
 export type HistoryStatus = 'memory' | 'saved' | 'conflict' | 'error'
-interface Seat { session: LocalSession; savedSession: LocalSession | undefined; stored: string | null; legacyRaw: string | null; status: HistoryStatus }
+interface Seat { session: LocalSession; savedSession: LocalSession | undefined; translationHistory: TranslationHistory; savedTranslationHistory: TranslationHistory; stored: string | null; legacyRaw: string | null; status: HistoryStatus }
 interface TopicSeat { identity: TopicIdentity; name: string; persistedName: string | undefined; stored: string | null; durable: boolean; nameDirty: boolean }
 interface Workspace { active: string | undefined }
 export interface HistoryVersion { readonly id: string; readonly stored: string | null; readonly legacyRaw: string | null; readonly current: string }
@@ -30,12 +31,20 @@ function browserLocks(): StructureLockPort | undefined {
   return { request: async <T>(name: string, action: () => T | Promise<T>): Promise<T> => await navigator.locks.request(name, async () => await action()) }
 }
 
-function readHistory(raw: string): LocalSession | undefined {
+interface SessionSnapshot { readonly session: LocalSession; readonly translationHistory: TranslationHistory }
+function readSnapshot(raw: string): SessionSnapshot | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    return (value?.schemaVersion === 2 || value?.schemaVersion === 3) && typeof value.token === 'string' ? decodeSession(value.session) : undefined
+    if (!value || ![2, 3, 4].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    const fields = value.schemaVersion === 4 ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
+    if (Object.keys(value).length !== fields.length || fields.some(key => !Object.hasOwn(value, key))) return undefined
+    const session = decodeSession(value.session)
+    const translationHistory = value.schemaVersion === 4 ? decodeTranslationHistory(value.translationHistory) : emptyTranslationHistory()
+    return session && translationHistory ? { session, translationHistory } : undefined
   } catch { return undefined }
 }
+function readHistory(raw: string): LocalSession | undefined { return readSnapshot(raw)?.session }
+function currentVersion(seat: Seat): string { return JSON.stringify({ session: seat.session, translationHistory: seat.translationHistory }) }
 
 export class SessionStore {
   private settings: SessionSettings = DEFAULT_SESSION_SETTINGS
@@ -45,6 +54,7 @@ export class SessionStore {
   private readonly deleted = new Set<string>()
   private readonly corruptTopics = new Set<string>()
   private readonly pendingSaves = new Map<string, Promise<boolean>>()
+  private readonly dirtySaves = new Set<string>()
   private readonly lastModels = new Map<string, ModelRoute | null>()
   private readonly workspaces = new Map<string, Workspace>()
   private readonly listeners = new Set<Disposer>()
@@ -60,6 +70,7 @@ export class SessionStore {
   getSettings(): SessionSettings { return this.settings }
   getNotice(): string | undefined { return this.notice }
   getSession(id: string): LocalSession | undefined { return this.seats.get(id)?.session }
+  getTranslationHistory(id: string): TranslationHistory | undefined { return this.seats.get(id)?.translationHistory }
   getStatus(id: string): HistoryStatus { return this.seats.get(id)?.status ?? 'memory' }
   getStructureCapability(): 'web-locks' | 'runtime-only' { return this.storage && this.locks ? 'web-locks' : 'runtime-only' }
   getTopics(ownerId?: string): readonly { readonly id: string; readonly name: string; readonly nextSequence: number }[] {
@@ -140,7 +151,7 @@ export class SessionStore {
   private queueHistorySaves(): void {
     for (const [id, seat] of this.seats) {
       const topic = this.topics.get(seat.session.topicId)
-      if (seat.status !== 'saved' || !topic?.stored || topic.nameDirty) this.persist(id)
+      if (seat.status !== 'saved' || !topic?.stored || topic.nameDirty || JSON.stringify(seat.translationHistory) !== JSON.stringify(seat.savedTranslationHistory)) this.persist(id)
     }
   }
 
@@ -152,12 +163,12 @@ export class SessionStore {
       this.loadTopics(keys)
       for (const key of keys.filter(key => key.startsWith(HISTORY_PREFIX))) {
         const raw = this.storage.getItem(key)
-        const session = raw === null ? undefined : readHistory(raw)
+        const snapshot = raw === null ? undefined : readSnapshot(raw), session = snapshot?.session
         if (!session || historyKey(session.id) !== key) { this.notice = '部分会话历史无法读取，原存储副本已保留。'; continue }
         if (this.isDeleted(session.id)) continue
         const old = this.seats.get(session.id)
         if (!old) {
-          this.seats.set(session.id, { session: this.restoreModel(session), savedSession: session, stored: raw, legacyRaw: session.legacyKey ? this.storage.getItem(session.legacyKey) : null, status: 'saved' })
+          this.seats.set(session.id, { session: this.restoreModel(session), savedSession: session, translationHistory: restoreTranslationHistory(snapshot!.translationHistory), savedTranslationHistory: snapshot!.translationHistory, stored: raw, legacyRaw: session.legacyKey ? this.storage.getItem(session.legacyKey) : null, status: 'saved' })
           if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(session.id, session)
         }
       }
@@ -165,7 +176,7 @@ export class SessionStore {
         const raw = this.storage.getItem(key)
         const session = raw === null ? undefined : legacySession(key, raw)
         if (session && !this.isDeleted(session.id) && !this.seats.has(session.id)) {
-          this.seats.set(session.id, { session: this.restoreModel(session), savedSession: session, stored: null, legacyRaw: raw, status: 'saved' })
+          this.seats.set(session.id, { session: this.restoreModel(session), savedSession: session, translationHistory: emptyTranslationHistory(), savedTranslationHistory: emptyTranslationHistory(), stored: null, legacyRaw: raw, status: 'saved' })
           this.migrationSources.set(session.id, session)
         }
         else if (!session) this.notice = '部分旧版草稿无法读取，原存储副本已保留。'
@@ -369,7 +380,7 @@ export class SessionStore {
     const model = parent ? parent.model : this.lastModels.has(ownerId) ? this.lastModels.get(ownerId)! : this.readModelPreference(ownerModelKey(ownerId)) ?? null
     const session = { ...initial, model: model ? { ...model } : null }
     if (topic && !reserved) topic.identity = { ...topic.identity, nextSequence: sequence + 1, allocations: [...topic.identity.allocations, { sessionId: id, sequence }] }
-    this.seats.set(id, { session, savedSession: undefined, stored: null, legacyRaw: null, status: 'memory' })
+    this.seats.set(id, { session, savedSession: undefined, translationHistory: emptyTranslationHistory(), savedTranslationHistory: emptyTranslationHistory(), stored: null, legacyRaw: null, status: 'memory' })
     this.adoptTopic(this.seats.get(id)!)
     this.openSession(ownerId, id)
     return session
@@ -477,6 +488,23 @@ export class SessionStore {
     if (this.settings.rememberHistory) this.persist(id)
     this.emit(); return true
   }
+  /** The conversion runs against current memory; persistence shares the existing session lock and conflict checks. */
+  updateTranslationHistory(id: string, update: (history: TranslationHistory) => TranslationHistory): boolean {
+    const seat = this.seats.get(id)
+    if (!seat || this.disposed) return false
+    try {
+      if (this.isDeleted(id)) { this.notice = '会话已删除，迟到的翻译记录未采用。'; this.emit(); return false }
+      const next = decodeTranslationHistory(update(structuredClone(seat.translationHistory)))
+      if (!next) throw new Error('invalid translation history')
+      if (JSON.stringify(next) === JSON.stringify(seat.translationHistory)) return true
+      seat.translationHistory = next
+      seat.session = { ...seat.session, updatedAt: new Date().toISOString() }
+      if (seat.status !== 'conflict') seat.status = 'memory'
+      this.notice = undefined
+      if (this.settings.rememberHistory) this.persist(id)
+      this.emit(); return true
+    } catch { this.notice = '翻译记录更新失败，之前的材料与版本仍保留。'; this.emit(); return false }
+  }
   renameSession(id: string, name: string): boolean {
     const seat = this.seats.get(id)
     if (!seat) return false
@@ -578,7 +606,7 @@ export class SessionStore {
 
   private saveSessionAsync(id: string, overwrite = false): Promise<boolean> {
     const pending = this.pendingSaves.get(id)
-    if (pending && !overwrite) return pending
+    if (pending && !overwrite) { this.dirtySaves.add(id); return pending }
     const seat = this.seats.get(id)
     if (!seat) return Promise.resolve(false)
     const promise = this.withStructureLock(false, () => {
@@ -600,7 +628,13 @@ export class SessionStore {
     }).then(result => {
       if (!result && !this.locks && this.seats.get(id)?.status !== 'conflict') { seat.status = 'error'; this.emit() }
       return result
-    }).finally(() => { if (this.pendingSaves.get(id) === promise) this.pendingSaves.delete(id) })
+    }).finally(() => {
+      if (this.pendingSaves.get(id) !== promise) return
+      this.pendingSaves.delete(id)
+      // A mutation can arrive after the lock wrote its snapshot but before this promise settles.
+      // Schedule that new dirty state once; failed/conflicting writes await explicit user action.
+      if (this.dirtySaves.delete(id) && !this.disposed && this.settings.rememberHistory && this.seats.get(id)?.status === 'memory') this.persist(id)
+    })
     this.pendingSaves.set(id, promise)
     return promise
   }
@@ -616,9 +650,11 @@ export class SessionStore {
       if (!overwrite && (raw !== seat.stored || seat.status === 'conflict')) {
         seat.status = 'conflict'; this.notice = '会话历史已在其他窗口修改或删除，当前输入保留。请选择读取本地副本或明确覆盖。'; return false
       }
-      const serialized = JSON.stringify({ schemaVersion: 3, token: `${Date.now()}-${Math.random()}`, session: seat.session })
+      const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
+      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 4 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
+        ...(hasTranslations ? { translationHistory: seat.translationHistory } : {}) })
       this.storage.setItem(historyKey(id), serialized)
-      seat.stored = serialized; seat.savedSession = seat.session; seat.status = 'saved'
+      seat.stored = serialized; seat.savedSession = seat.session; seat.savedTranslationHistory = seat.translationHistory; seat.status = 'saved'
       return true
     } catch { seat.status = 'error'; this.notice = '会话历史保存失败，当前输入仍保留在窗口内存中。'; return false }
   }
@@ -643,10 +679,11 @@ export class SessionStore {
     if (!seat || !this.storage) return false
     try {
       const raw = this.storage.getItem(historyKey(id))
-      const session = raw === null ? undefined : readHistory(raw)
+      const snapshot = raw === null ? undefined : readSnapshot(raw), session = snapshot?.session
       if (!session || session.id !== id || session.ownerId !== seat.session.ownerId || this.isDeleted(id) || !this.matchesHistoryIdentity(session, seat.session)) throw new Error('invalid history')
       this.notice = undefined
-      seat.session = this.restoreModel(session); seat.savedSession = session; seat.stored = raw; seat.status = 'saved'
+      seat.session = this.restoreModel(session); seat.savedSession = session; seat.translationHistory = restoreTranslationHistory(snapshot!.translationHistory)
+      seat.savedTranslationHistory = snapshot!.translationHistory; seat.stored = raw; seat.status = 'saved'
       const topic = this.topics.get(session.topicId)
       if (topic) { topic.nameDirty = false; topic.name = topic.persistedName ?? session.topicName }
       if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(id, session)
@@ -673,7 +710,7 @@ export class SessionStore {
   }
 
   captureHistoryVersions(ids: readonly string[]): readonly HistoryVersion[] {
-    return ids.flatMap(id => { const seat = this.seats.get(id); return seat ? [{ id, stored: seat.stored, legacyRaw: seat.legacyRaw, current: JSON.stringify(seat.session) }] : [] })
+    return ids.flatMap(id => { const seat = this.seats.get(id); return seat ? [{ id, stored: seat.stored, legacyRaw: seat.legacyRaw, current: currentVersion(seat) }] : [] })
   }
 
   async deleteHistoryAsync(ids: readonly string[], deleteMemory = false, unreadable: readonly { readonly key: string; readonly raw: string }[] = [], expected?: readonly HistoryVersion[]): Promise<boolean> {
@@ -723,7 +760,7 @@ export class SessionStore {
           this.notice = '删除前需要可靠保存主题编号，请使用异步删除操作。'; this.emit(); return false
         }
         const version = expected ? expected.find(item => item.id === seat.session.id) : seat
-        if (!version || (expected && JSON.stringify(seat.session) !== expected.find(item => item.id === seat.session.id)?.current) ||
+        if (!version || (expected && currentVersion(seat) !== expected.find(item => item.id === seat.session.id)?.current) ||
           (this.storage?.getItem(historyKey(seat.session.id)) ?? null) !== version.stored ||
           (seat.session.legacyKey && (this.storage?.getItem(seat.session.legacyKey) ?? null) !== version.legacyRaw)) {
           this.notice = '待删除会话或历史已变化，请核对最新内容后重新确认。'; this.emit(); return false
@@ -784,9 +821,11 @@ export class SessionStore {
             seat.status = 'conflict'; this.notice = '旧版草稿在其他窗口变化，当前输入保留。'; continue
           }
           if (raw !== seat.stored) {
-            const latest = raw === null ? undefined : readHistory(raw)
+            const snapshot = raw === null ? undefined : readSnapshot(raw), latest = snapshot?.session
             if (seat.status === 'saved' && latest && latest.id === seat.session.id && latest.ownerId === seat.session.ownerId && this.matchesHistoryIdentity(latest, seat.session)) {
-              seat.session = this.restoreModel(latest); seat.savedSession = latest; seat.stored = raw
+              seat.session = this.restoreModel(latest); seat.savedSession = latest
+              // A storage notification is live synchronization, not a restart: keep remote running facts intact.
+              seat.translationHistory = snapshot!.translationHistory; seat.savedTranslationHistory = snapshot!.translationHistory; seat.stored = raw
               if (latest.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(latest.id, latest)
               else this.migrationSources.delete(latest.id)
             } else {
