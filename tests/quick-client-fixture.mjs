@@ -67,7 +67,13 @@ function createRenderer() {
   }
 
   const react = {
-    createElement(type, props, ...children) { return { type, props: props ?? {}, children } },
+    createElement(type, props, ...children) {
+      if (type === 'div' && props?.className === 'dsh-tp-header-options') {
+        const keys = children.map(child => child.props.key)
+        assert.equal(new Set(keys).size, keys.length, 'header picker siblings must have unique keys for React reconciliation')
+      }
+      return { type, props: props ?? {}, children }
+    },
     useState(initial) {
       const cell = hook(() => ({ value: typeof initial === 'function' ? initial() : initial }))
       return [cell.value, next => { const value = typeof next === 'function' ? next(cell.value) : next; if (!Object.is(value, cell.value)) dirty = true; cell.value = value }]
@@ -198,7 +204,7 @@ function createRenderer() {
 }
 
 export function mount(overrides = {}) {
-  const storage = new FakeStorage()
+  const storage = overrides.storage ?? new FakeStorage()
   if (overrides.settings) storage.setItem(SETTINGS_KEY, JSON.stringify(overrides.settings))
   for (const session of overrides.history ?? []) storage.setItem(HISTORY_PREFIX + encodeURIComponent(session.id), JSON.stringify({ schemaVersion: 2, token: session.id, session }))
   storage.failSet = !!overrides.failSet

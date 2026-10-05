@@ -8,6 +8,7 @@ import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPan
 
 type TextEvent = { currentTarget: { value: string } }
 type CheckEvent = { currentTarget: { checked: boolean } }
+type FileEvent = { currentTarget: { files: FileList | null; value: string } }
 interface StoreProps { readonly store: SessionStore }
 const styles = `
 .dsh-tp { box-sizing: border-box; color: var(--dsw-alias-label-primary, inherit); font: inherit; font-size: 14px; line-height: 1.6; }
@@ -61,6 +62,10 @@ const styles = `
 .dsh-tp-composer textarea { display: block; resize: none; width: 100%; min-height: 70px; max-height: 180px; overflow-y: auto; padding: 4px; background: transparent; border: 0; }
 .dsh-tp-composer:focus-within, .dsh-tp-composer textarea:focus, .dsh-tp-composer textarea:focus-visible { outline: none !important; box-shadow: none !important; }
 .dsh-tp-composer-toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; }
+.dsh-tp button.dsh-tp-attach { display: flex; align-items: center; justify-content: center; padding: 5px; margin-right: auto; }
+.dsh-tp-attachment { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 12px; }
+.dsh-tp-attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-tp-attachment-note { margin: 2px 0 5px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }
 /* DSH 主题全局使用 superellipse；普通圆形必须同时指定 corner-shape。 */
 .dsh-tp .dsh-tp-send { display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; flex: 0 0 38px; border-radius: 50% !important; corner-shape: round !important; background: var(--dsw-alias-interactive-bg-accent, #4d7df3); color: #fff; padding: 0; }
 .dsh-tp-muted { color: var(--dsw-alias-label-caption, #888); font-size: 12px; font-weight: 400; }
@@ -268,6 +273,12 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
   const [deletion, setDeletion] = react.useState<DeleteRequest | undefined>(undefined)
   const [name, setName] = react.useState('')
   const [remark, setRemark] = react.useState('')
+  const [files, setFiles] = react.useState(() => new Map<string, File>())
+  const fileInput = react.useRef<HTMLInputElement | null>(null)
+  react.useEffect(() => store.subscribe(() => setFiles(currentFiles => {
+    if ([...currentFiles.keys()].every(id => store.getSession(id))) return currentFiles
+    return new Map([...currentFiles].filter(([id]) => store.getSession(id)))
+  })), [store])
   const action = useAsyncAction()
   react.useEffect(() => { store.ensureWorkspace(ownerId) }, [store, ownerId])
   const sessions = store.getActiveSessions(ownerId)
@@ -325,8 +336,8 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
         h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create() }),
         current ? h('div', { className: 'dsh-tp-header-options' },
-          h(ModePicker, { store, session: current, key: current.id }),
-          h(LanguagePicker, { store, session: current, key: current.id }),
+          h(ModePicker, { store, session: current, key: `mode:${current.id}` }),
+          h(LanguagePicker, { store, session: current, key: `language:${current.id}` }),
         ) : null,
       ),
       dialog?.kind === 'rename' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '重命名主题', 'aria-busy': action.pending },
@@ -367,9 +378,28 @@ function WorkspaceView({ store, models, quick, ownerId }: StoreProps & { readonl
           )) : null,
         ) : null,
         h('div', { className: 'dsh-tp-composer' },
+        current.mode === 'normal' && files.has(current.id) ? h('div', null,
+          h('div', { className: 'dsh-tp-attachment' },
+            h('span', { className: 'dsh-tp-attachment-name', title: files.get(current.id)!.name }, files.get(current.id)!.name),
+            h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => setFiles(currentFiles => { const next = new Map(currentFiles); next.delete(current.id); return next }) }, '×'),
+          ),
+          h('p', { className: 'dsh-tp-attachment-note' }, '文件翻译尚未接入，所选文件仅暂存于本次打开的面板。'),
+        ) : null,
         h('textarea', { value: current.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(current.id, { input: event.currentTarget.value }) } }),
         Array.from(current.input).length > current.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${current.maxInputChars} 个字符；内容保持完整。`) : null,
         h('div', { className: 'dsh-tp-composer-toolbar' },
+          h('input', { type: 'file', hidden: true, ref: fileInput, key: `file:${current.id}`, 'aria-label': '待译文件', disabled: current.mode === 'quick',
+            onChange: (event: FileEvent) => {
+              const file = event.currentTarget.files?.[0]
+              if (file && current.mode === 'normal') setFiles(currentFiles => new Map(currentFiles).set(current.id, file))
+              event.currentTarget.value = ''
+            },
+          }),
+          h('button', { type: 'button', className: 'dsh-tp-attach', 'aria-label': '选择待译文件', disabled: current.mode === 'quick',
+            title: current.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择待译文件（文件翻译尚未接入）', onClick: () => fileInput.current?.click(),
+          }, h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+            h('path', { d: 'm8 12 7-7a4 4 0 0 1 6 6L10 22a6 6 0 0 1-8-8L13 3M6 15l9-9a2 2 0 0 1 3 3l-9 9' }),
+          )),
           h(ModelPicker, { key: current.id, catalog: models, current: current.model, onSelect: (model: LocalSession['model']) => { store.updateSession(current.id, { model }) } }),
           h('button', { type: 'button', className: 'dsh-tp-send', disabled: !busy && !!blocked, title: busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': busy ? '取消翻译' : '发送快译', 'aria-description': busy ? undefined : blocked,
             onClick: () => { if (busy) quick.cancel(current.id); else void quick.send(current.id) },
@@ -506,10 +536,9 @@ export function SettingsView({ store, onClose }: StoreProps & { readonly onClose
         type: 'checkbox', checked: form.rememberHistory, disabled: saving, 'aria-label': '允许保存会话历史到本地',
         onChange: (event: CheckEvent) => change({ rememberHistory: event.currentTarget.checked }),
       }), '允许保存会话历史到本地'),
-      h('p', { className: 'dsh-tp-muted' }, '开启后自动保存会话与输入，数据以明文保存在此设备。关闭后保留已有历史，停止写入新的会话内容。'),
+      h('p', { className: 'dsh-tp-muted' }, '开启后自动保存主题名称、会话配置、模型选择和当前原文草稿，数据以明文保存在此设备；不保存已提交的快译原文和译文记录。关闭后保留已有历史，停止写入新的会话内容。'),
       h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
       store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
-      h('p', { className: 'dsh-tp-muted' }, '当前版本保存会话信息、模型选择和未发送输入；快译原文与译文记录仅在本次运行中保留，不写入历史。'),
       h(HistorySection, { store }),
     ),
     errors.length ? h('div', { role: 'alert', className: 'dsh-tp-message' }, ...errors.map(error => h('p', { key: error }, error))) : null,
