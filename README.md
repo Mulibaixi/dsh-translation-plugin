@@ -62,7 +62,7 @@ The old manual-save preference does not automatically enable new automatic histo
 
 ## Compatibility and installation
 
-The locally inspected Windows DSH Desktop runtime is `0.2.0-rc.2`. The user previously confirmed framework installation, removal and loading, and provided screenshots of the preceding session bar and main composer. This revision's topic numbering, migration, remarks, asynchronous storage and Host foundations still need Desktop verification. Other versions, operating systems and standalone Web profiles are unverified.
+The previously inspected Windows DSH Desktop runtime was `0.2.0-rc.2`; the user had confirmed framework installation, removal and loading, and provided screenshots of the preceding session bar and main composer. On 2026-10-05, the v0.2.1 isolated baseline completed `npm test`: the build succeeded and all 100 automated tests passed using synthetic data and simulated storage/RPC. This did not run the plugin in DSH Desktop. The v0.2.1 session persistence fixes and the v0.2.0 topic numbering, migration, remarks, asynchronous storage and Host foundations still need Desktop verification. Other versions, operating systems and standalone Web profiles are unverified.
 
 Requirements: Node.js 22 or later, pnpm and DSH with local bundle support.
 
@@ -83,6 +83,6 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). Commit messa
 
 `pnpm test` builds first and checks sessions, history, legacy compatibility, the model directory and Client interactions. React hooks, native menus and RPCs are simulated; these checks do not replace Desktop verification.
 
-See [CHANGELOG.md](CHANGELOG.md). The current local plugin version is `v0.2.0`, adding topic sessions and Host execution foundations; `v0.1.1` provided the interactive panel and `v0.1.0` was the framework baseline. This version has not been published to npm or a remote release page. `private: true` prevents accidental npm publishing.
+See [CHANGELOG.md](CHANGELOG.md). The current local plugin version is `v0.2.1`, fixing two session persistence regressions; `v0.2.0` added topic sessions and Host execution foundations, `v0.1.1` provided the interactive panel, and `v0.1.0` was the framework baseline. The current version has not been published to npm or a remote release page. `private: true` prevents accidental npm publishing.
 
 License: [MIT](LICENSE).

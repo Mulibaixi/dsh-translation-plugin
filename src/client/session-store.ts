@@ -103,11 +103,16 @@ export class SessionStore {
       const wasEnabled = this.settings.rememberHistory
       this.storage.setItem(SETTINGS_KEY, JSON.stringify(next))
       this.settings = next; this.notice = undefined
-      if (!wasEnabled && next.rememberHistory) {
-        for (const [id, seat] of this.seats) if (seat.status !== 'saved' || !this.topics.get(seat.session.topicId)?.stored || this.topics.get(seat.session.topicId)?.nameDirty) this.persist(id)
-      }
+      if (!wasEnabled && next.rememberHistory) this.queueHistorySaves()
       this.emit(); return true
     } catch { this.notice = '设置保存失败，编辑值仍保留，请检查本地存储后重试修改。'; this.emit(); return false }
+  }
+
+  private queueHistorySaves(): void {
+    for (const [id, seat] of this.seats) {
+      const topic = this.topics.get(seat.session.topicId)
+      if (seat.status !== 'saved' || !topic?.stored || topic.nameDirty) this.persist(id)
+    }
   }
 
   private loadHistory(): void {
@@ -588,13 +593,27 @@ export class SessionStore {
   }
   overwriteSession(id: string): boolean { this.notice = '覆盖保存需要等待主题锁，请使用异步覆盖操作。'; this.emit(); return false }
   async overwriteSessionAsync(id: string): Promise<boolean> { this.notice = undefined; return this.saveSessionAsync(id, true) }
+  private matchesHistoryIdentity(session: LocalSession, previous: LocalSession): boolean {
+    // 旧副本在读完父边后再迁移；新格式必须符合已发放的主题身份。
+    if (session.sequenceNamespaceId.startsWith('legacy-pending:')) return true
+    if (session.topicId !== previous.topicId || session.sequenceNamespaceId !== previous.sequenceNamespaceId || session.sequence !== previous.sequence) return false
+    const key = topicIdentityKey(session.topicId)
+    if (this.corruptTopics.has(key)) return false
+    const topic = this.topics.get(session.topicId)
+    const raw = this.storage?.getItem(key) ?? null
+    if (raw === null && topic?.stored !== null) return false
+    const identity = raw === null ? topic?.identity : decodeTopicIdentity(raw)
+    return !!identity && identity.id === session.topicId && identity.ownerId === session.ownerId &&
+      identity.sequenceNamespaceId === session.sequenceNamespaceId &&
+      identity.allocations.some(allocation => allocation.sessionId === session.id && allocation.sequence === session.sequence)
+  }
   reloadSession(id: string): boolean {
     const seat = this.seats.get(id)
     if (!seat || !this.storage) return false
     try {
       const raw = this.storage.getItem(historyKey(id))
       const session = raw === null ? undefined : readHistory(raw)
-      if (!session || session.id !== id || session.ownerId !== seat.session.ownerId || this.isDeleted(id)) throw new Error('invalid history')
+      if (!session || session.id !== id || session.ownerId !== seat.session.ownerId || this.isDeleted(id) || !this.matchesHistoryIdentity(session, seat.session)) throw new Error('invalid history')
       seat.session = session; seat.savedSession = session; seat.stored = raw; seat.status = 'saved'; this.notice = undefined
       const topic = this.topics.get(session.topicId)
       if (topic) { topic.nameDirty = false; topic.name = topic.persistedName ?? session.topicName }
@@ -705,7 +724,10 @@ export class SessionStore {
   }
 
   private externalChange(key: string | null): void {
-    if (key === null || key === SETTINGS_KEY || key === LEGACY_SETTINGS_KEY) this.readSettings()
+    if (key === null || key === SETTINGS_KEY || key === LEGACY_SETTINGS_KEY) {
+      const wasEnabled = this.settings.rememberHistory
+      if (this.readSettings() && !wasEnabled && this.settings.rememberHistory) this.queueHistorySaves()
+    }
     if (key === null || key?.startsWith(HISTORY_PREFIX) || key?.startsWith(LEGACY_DRAFT_PREFIX) ||
       key?.startsWith(TOPIC_IDENTITY_PREFIX) || key?.startsWith(TOPIC_NAME_PREFIX) || key?.startsWith(DELETED_SESSION_PREFIX)) {
       for (const seat of this.seats.values()) {
@@ -722,7 +744,7 @@ export class SessionStore {
           }
           if (raw !== seat.stored) {
             const latest = raw === null ? undefined : readHistory(raw)
-            if (seat.status === 'saved' && latest && latest.id === seat.session.id && latest.ownerId === seat.session.ownerId) {
+            if (seat.status === 'saved' && latest && latest.id === seat.session.id && latest.ownerId === seat.session.ownerId && this.matchesHistoryIdentity(latest, seat.session)) {
               seat.session = latest; seat.savedSession = latest; seat.stored = raw
               if (latest.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(latest.id, latest)
               else this.migrationSources.delete(latest.id)
