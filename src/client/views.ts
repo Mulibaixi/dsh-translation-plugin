@@ -161,15 +161,14 @@ function LanguagePicker({ session, store }: StoreProps & { readonly session: Loc
   }))))
 }
 
-function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTerms, onTopicTerms }: StoreProps & {
+function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTopicAssets }: StoreProps & {
   readonly ownerId: string; readonly current: LocalSession | undefined
   readonly open: boolean; readonly onOpenChange: (open: boolean) => void
   readonly contextOpen: boolean; readonly onDismissContext: () => void
   readonly onContext: (session: LocalSession, event: ContextEvent) => void
   readonly onContextKeys: (session: LocalSession, event: KeyboardEvent & { currentTarget: HTMLElement }) => void
   readonly creating: boolean; readonly onCreate: () => void
-  readonly onTerms?: (() => void) | undefined
-  readonly onTopicTerms?: ((topic: { readonly id: string; readonly name: string }) => void) | undefined
+  readonly onTopicAssets?: ((topic: { readonly id: string; readonly name: string }) => void) | undefined
 }): unknown {
   const sessions = store.getActiveSessions(ownerId)
   const archived = store.getArchivedSessions(ownerId)
@@ -204,10 +203,10 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
     ...sessions.map(session => row(session)),
     archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
-    onTerms ? h(MenuItemButton, { onSelect: onTerms }, '主题术语') : null,
-    onTopicTerms && topics.length ? h(MenuGroup, { label: '主题档案' }, ...topics.map(topic => h(MenuItemButton, {
-      key: topic.id, onSelect: () => onTopicTerms(topic), 'aria-label': `打开主题档案：${topic.name}`,
-    }, topic.name))) : null,
+    onTopicAssets && topics.length ? h(MenuGroup, { label: '记忆资产' }, ...topics.map(topic => h('button', {
+      type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice',
+      key: topic.id, onClick: () => onTopicAssets(topic), 'aria-label': `打开记忆资产：${topic.name}`, 'aria-current': current?.topicId === topic.id,
+    }, topic.name, current?.topicId === topic.id ? h('span', { 'aria-hidden': true }, ' ✓') : null))) : null,
     h('button', {
       type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,
       onClick: onCreate,
@@ -376,11 +375,11 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
     void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)))
   }
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined) }
-  function openTopicTerms(topic: { readonly id: string; readonly name: string }): void {
+  function openTopicAssets(topic: { readonly id: string; readonly name: string }): void {
     if (!store.getTopics(ownerId).some(owned => owned.id === topic.id)) return
     closeSessionMenus(); onOpenAssets?.(ownerId, topic.id)
   }
-  function openTerms(session: LocalSession): void { openTopicTerms({ id: session.topicId, name: session.topicName }) }
+  function openSessionAssets(session: LocalSession): void { openTopicAssets({ id: session.topicId, name: session.topicName }) }
   function deliver(result: Pick<TranslationExport, 'content' | 'fileName' | 'mimeType'>): void {
     closeSessionMenus()
     try { downloadExport(result); setExportNotice({ message: '已向浏览器发起下载。', failure: false }); setExportRequest(undefined) }
@@ -426,7 +425,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
     h('div', { className: 'dsh-tp-main' },
       h('header', { className: 'dsh-tp-workspace-header' },
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
-        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTerms: onOpenAssets && current ? () => openTerms(current) : undefined, onTopicTerms: onOpenAssets ? openTopicTerms : undefined }),
+        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTopicAssets: onOpenAssets ? openTopicAssets : undefined }),
         current ? h('div', { className: 'dsh-tp-header-options' },
           h(ModePicker, { store, session: current, key: `mode:${current.id}` }),
           h(LanguagePicker, { store, session: current, key: `language:${current.id}` }),
@@ -523,7 +522,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
       h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建同主题子会话'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名主题'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '编辑会话备注'),
-      onOpenAssets ? h(MenuItemButton, { onSelect: () => openTerms(target) }, '主题术语') : null,
+      onOpenAssets ? h(MenuItemButton, { onSelect: () => openSessionAssets(target) }, '记忆资产') : null,
       h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'txt') }, '导出最终译文 TXT'),
       h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'json') }, '导出完整记录 JSON'),
       h(MenuItemButton, { disabled: action.pending, danger: true, onSelect: () => {

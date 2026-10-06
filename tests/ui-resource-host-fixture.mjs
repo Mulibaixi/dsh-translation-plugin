@@ -29,9 +29,14 @@ export function createResourceHost(react, renderer) {
     return react.createElement('div', { className: 'synthetic-resource-host' },
       react.createElement('div', { hidden: activeResource !== undefined }, react.createElement(workspace, { ...props,
         useTabInfo: () => tabInfo(`workspace:${owner}`, owner, 'translation-workspace', activeResource === undefined, workspaces.get(owner), () => {}) })),
-      ...[...resources.values()].map(resource => react.createElement('div', { key: resource.tabId, hidden: activeResource !== resource.tabId },
-        react.createElement(slots.get(`sidebar.right.pane.tab:${resource.definitionId}`), { key: resource.tabId, sessionId: resource.sessionId,
-          useTabInfo: () => tabInfo(resource.tabId, resource.sessionId, resource.contentId, activeResource === resource.tabId, resource.controller, () => closeResource(resource.tabId)) }))))
+      ...[...resources.values()].map(resource => {
+        const props = { sessionId: resource.sessionId,
+          useTabInfo: () => tabInfo(resource.tabId, resource.sessionId, resource.contentId, activeResource === resource.tabId, resource.controller, () => closeResource(resource.tabId)) }
+        const title = slots.get(`sidebar.right.pane.tab.title:${resource.definitionId}`)
+        return react.createElement('div', { key: resource.tabId, hidden: activeResource !== resource.tabId },
+          title ? react.createElement('header', { 'data-synthetic-host-caption': true }, react.createElement(title, { ...props, key: `title:${resource.tabId}` })) : null,
+          react.createElement(slots.get(`sidebar.right.pane.tab:${resource.definitionId}`), { ...props, key: resource.tabId }))
+      }))
   }
   const sidebarRight = {
     openTabs: { getSnapshot: () => [...resources.values()].map(({ sessionId, tabId, kind, contentId }) => ({ sessionId, tabId, kind, contentId })) },
@@ -48,7 +53,8 @@ export function createResourceHost(react, renderer) {
     get settingsPage() { return slots.get('settings.section:dsh-translation-plugin') },
     get activeResource() { return activeResource ? resources.get(activeResource) : undefined },
     restoreResource(sessionId, address) { const resource = openResource(address, sessionId); renderer.render(); return resource },
-    closeAssets() { if (activeResource) closeResource(activeResource); renderer.render() },
+    // Simulate the host caption close action, outside the resource Body.
+    closeAssetCaption() { if (activeResource) closeResource(activeResource); renderer.render() },
     showTranslation: renderer.showTranslation,
   }
 }

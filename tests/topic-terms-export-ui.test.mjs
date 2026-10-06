@@ -22,11 +22,16 @@ class Topics {
 const owner = 'synthetic-export-owner'
 function title(ui) { return ui.allNodes().find(node => node.type === 'button' && node.props.className === 'dsh-tp-current-title') }
 function picker(ui) { ui.showTranslation(); title(ui).props.onClick(); ui.render() }
-async function terms(ui) { picker(ui); await ui.click('主题术语') }
+async function terms(ui) {
+  picker(ui)
+  const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
+  const current = ui.nodes(group).find(node => node.type === 'button' && node.props['aria-current'] === true); assert.ok(current)
+  await ui.click(current.props['aria-label'])
+}
 async function archive(ui, topicName) {
   picker(ui)
-  const group = ui.nodes().find(node => node.props['aria-label'] === '主题档案'); assert.ok(group)
-  const target = ui.nodes(group).find(node => node.type === 'button' && ui.text(node) === topicName); assert.ok(target)
+  const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
+  const target = ui.nodes(group).find(node => node.type === 'button' && node.props['aria-label'] === `打开记忆资产：${topicName}`); assert.ok(target)
   target.props.onClick(); ui.render(); await ui.flush()
   assert.equal(title(ui).props['aria-expanded'], false)
 }
@@ -80,13 +85,19 @@ test('主题快照真实bundle：标题档案按owner/主题去重，删最后�
     await f.request(put(f.session))
     f.ui.context(title(f.ui)); await f.ui.click('新建同主题子会话')
     picker(f.ui)
-    const group = f.ui.nodes().find(node => node.props['aria-label'] === '主题档案')
+    const group = f.ui.nodes().find(node => node.props['aria-label'] === '记忆资产')
     assert.equal(f.ui.nodes(group).filter(node => node.type === 'button').length, 1)
     title(f.ui).props.onClick(); f.ui.render()
     f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
     f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
     assert.equal((await f.request({ kind: 'list_sessions' })).value.sessions.length, 0)
     assert.equal(title(f.ui).props['aria-label'], '选择翻译会话')
+    picker(f.ui)
+    const assets = f.ui.nodes().filter(node => node.props['aria-label'] === '记忆资产')
+    assert.equal(assets.length, 1)
+    assert.equal(f.ui.nodes(assets[0]).filter(node => node.type === 'button').length, 1)
+    assert.ok(!f.ui.nodes().some(node => node.props['aria-label'] === '主题档案'))
+    title(f.ui).props.onClick(); f.ui.render()
     await archive(f.ui, f.session.name); assert.match(f.ui.text(), /接口/)
     await f.ui.click('导出 JSON'); const exported = JSON.parse(await downloaded(f))
     assert.equal(exported.topicId, f.session.topicId); assert.equal(exported.snapshot.entries.length, 1)
@@ -105,7 +116,7 @@ test('主题快照真实bundle：别的owner不出现保留档案入口；普通
     f.ui.context(title(f.ui)); await f.ui.click('重命名主题'); await f.ui.input('主题名称', 'Synthetic private topic'); await f.ui.click('确认重命名主题')
     f.ui.render(f.app.panel, { sessionId: 'synthetic-other-owner' }); await f.ui.flush(); await f.ui.flush()
     picker(f.ui)
-    const group = f.ui.nodes().find(node => node.props['aria-label'] === '主题档案')
+    const group = f.ui.nodes().find(node => node.props['aria-label'] === '记忆资产')
     assert.ok(group); assert.ok(!f.ui.text(group).includes('Synthetic private topic'))
     title(f.ui).props.onClick(); f.ui.render()
     await f.ui.input('翻译模式', 'normal')
@@ -127,7 +138,7 @@ test('主题快照真实bundle：引用冻结可读性但不复制正文，删�
     const text = await downloaded(f), data = JSON.parse(text)
     assert.equal(data.evidenceAvailability[0].readable, true); assert.equal(data.evidenceAvailability[0].unitOrder, 1)
     assert.ok(!text.includes('Synthetic secret source body')); assert.ok(!text.includes('Synthetic secret translation body'))
-    await f.ui.click('关闭记忆资产'); f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
+    f.app.resourceHost.closeAssetCaption(); await f.ui.flush(); f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
     await archive(f.ui, f.session.name); await f.ui.click('导出 Markdown')
     const markdown = await downloaded(f)
     assert.match(markdown, /待复核/); assert.match(markdown, /依据已变化或不可用/)

@@ -7,6 +7,7 @@ import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore } from './topic-memory-store.js'
+import { MemoryAssetsTitle } from './memory-assets-title.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
   openMemoryAssets, parseMemoryAssetsAddress, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
@@ -121,7 +122,12 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, onDeleteTerm, onClose, ...scope })
+      return h(MemoryAssetsView, { store, quick, topics, terms, onDeleteTerm, ...scope })
+    }
+    const MemoryAssetsCaption: ClientComponent = (props = {}) => {
+      const ownerId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+      const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
+      return h(MemoryAssetsTitle, { store, ownerId, address: tabInfo?.tab.navigation.address })
     }
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {
       store, terms, onClose: typeof props.close === 'function' ? props.close : undefined,
@@ -150,6 +156,9 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => withClientDiagnostics('memory asset body register', () => ctx.slots.register(
       { name: 'sidebar.right.pane.tab', key: MEMORY_ASSETS_TAB_ID }, MemoryAssetsPanel,
     )), 'translation memory asset tab body')
+    ctx.effect(() => withClientDiagnostics('memory asset title register', () => ctx.slots.register(
+      { name: 'sidebar.right.pane.tab.title', key: MEMORY_ASSETS_TAB_ID }, MemoryAssetsCaption,
+    )), 'translation memory asset tab title')
 
     ctx.effect(() => withClientDiagnostics('settings.section register', () => ctx.slots.inject('settings.section', () => ctx.slots.register(
       { name: 'settings.section', id: CLIENT_ID, order: 40, label: '翻译' }, TranslationSettings,

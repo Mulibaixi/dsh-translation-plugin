@@ -10,11 +10,10 @@ import type { TopicTerm, TopicTermSnapshot } from '../memory/topic-terms.js'
 import type { TopicTermsExport } from './topic-terms-export.js'
 
 /** One resource owns a fixed owner/topic. Selection in the translator is unrelated. */
-export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId, onDeleteTerm, onClose }: {
+export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId, onDeleteTerm }: {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
   readonly topics?: TopicBridgeClient | undefined; readonly ownerId: string; readonly topicId: string
   readonly onDeleteTerm: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>
-  readonly onClose?: (() => void) | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   const [category, setCategory] = react.useState<'terms' | 'translations'>('terms')
@@ -31,8 +30,7 @@ export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId
     h('style', null, styles),
     h('header', { className: 'dsh-tp-assets-header' },
       h('div', { className: 'dsh-tp-assets-heading' }, h('h2', null, topic ? `${topic.name} · 记忆资产` : '记忆资产'),
-        h('small', { className: 'dsh-tp-muted', title: ownerId }, `所属主会话：${ownerId}`)),
-      onClose ? h('button', { type: 'button', onClick: onClose, 'aria-label': '关闭记忆资产' }, '×') : null),
+        h('small', { className: 'dsh-tp-muted', title: ownerId }, `所属主会话：${ownerId}`))),
     store.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null,
     topic ? h('div', { className: 'dsh-tp-assets-body' },
       h('nav', { className: 'dsh-tp-assets-nav', 'aria-label': '资产分类' },

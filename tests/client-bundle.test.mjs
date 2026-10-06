@@ -137,12 +137,14 @@ test('客户端注册会话面板和全局设置页，并正常注销全部贡�
     'settings.section',
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab',
+    'sidebar.right.pane.tab.title',
   ])
   const panel = slots.find(entry => entry.options.name === 'sidebar.right.pane.tab')
   const settings = slots.find(entry => entry.options.name === 'settings.section')
   assert.equal(panel.options.key, packageJson.name)
-  const assets = slots.find(entry => entry.options.key === 'dsh-translation-plugin/memory-assets')
+  const assets = slots.find(entry => entry.options.name === 'sidebar.right.pane.tab' && entry.options.key === 'dsh-translation-plugin/memory-assets')
   assert.ok(assets); assert.notEqual(assets.component, panel.component)
+  assert.ok(slots.some(entry => entry.options.name === 'sidebar.right.pane.tab.title' && entry.options.key === 'dsh-translation-plugin/memory-assets'))
   assert.equal(settings.options.id, packageJson.name)
   const label = settings.options.label
   assert.equal(typeof label === 'function' ? label() : label, '翻译')
