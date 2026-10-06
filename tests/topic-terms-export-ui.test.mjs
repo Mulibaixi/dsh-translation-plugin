@@ -25,13 +25,14 @@ function picker(ui) { ui.showTranslation(); title(ui).props.onClick(); ui.render
 async function terms(ui) {
   picker(ui)
   const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
-  const current = ui.nodes(group).find(node => node.type === 'button' && node.props['aria-current'] === true); assert.ok(current)
-  await ui.click(current.props['aria-label'])
+  const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node) === '记忆资产'); assert.ok(current)
+  current.props.onClick(); ui.render(); await ui.flush()
 }
 async function archive(ui, topicName) {
   picker(ui)
   const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
-  const target = ui.nodes(group).find(node => node.type === 'button' && node.props['aria-label'] === `打开记忆资产：${topicName}`); assert.ok(target)
+  const rows = ui.nodes(group).filter(node => node.type === 'button')
+  const target = rows.find(node => ui.text(node) === topicName) ?? rows.find(node => ui.text(node) === '记忆资产'); assert.ok(target)
   target.props.onClick(); ui.render(); await ui.flush()
   assert.equal(title(ui).props['aria-expanded'], false)
 }

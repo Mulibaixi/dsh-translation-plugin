@@ -33,8 +33,8 @@ function title(ui) { return ui.allNodes().find(node => node.props.className === 
 async function terms(ui) {
   ui.showTranslation(); title(ui).props.onClick(); ui.render()
   const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
-  const current = ui.nodes(group).find(node => node.type === 'button' && node.props['aria-current'] === true); assert.ok(current)
-  await ui.click(current.props['aria-label'])
+  const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node) === '记忆资产'); assert.ok(current)
+  current.props.onClick(); ui.render(); await ui.flush()
 }
 function details(ui) { return ui.nodes().find(node => node.props['aria-label'] === '术语详情') }
 function row(ui, preferred) { const found = ui.nodes().find(node => node.type === 'article' && node.props.className === 'dsh-tp-term' && ui.text(node).includes(`→ ${preferred}`)); assert.ok(found); return found }
@@ -324,22 +324,21 @@ test('资产UI：URI范围不随工作区选择变化，主题标题实时更新
   } finally { await f.app.dispose() }
 })
 
-test('资产UI：标题唯一记忆资产分组按主题去重/标当前，右键具体会话同入口，Body没有关闭按钮', async () => {
+test('资产UI：记忆资产是可点击主入口并按需列出其他主题，右键具体会话同入口，Body没有关闭按钮', async () => {
   const f = await setup()
   try {
     await f.request(put(f.session, 'one', '接口'))
     f.ui.context(title(f.ui)); await f.ui.click('新建同主题子会话')
     title(f.ui).props.onClick(); f.ui.render()
-    let groups = f.ui.nodes().filter(node => node.props['aria-label'] === '记忆资产')
+    let groups = f.ui.nodes().filter(node => node.props.role === 'group' && node.props['aria-label'] === '记忆资产')
     assert.equal(groups.length, 1)
     assert.ok(!f.ui.nodes().some(node => node.props['aria-label'] === '主题档案'))
     assert.ok(!f.ui.nodes().some(node => node.type === 'button' && f.ui.text(node) === '主题术语'))
     const entries = f.ui.nodes(groups[0]).filter(node => node.type === 'button')
     assert.equal(entries.length, 1)
-    assert.equal(entries[0].props['aria-current'], true)
-    assert.equal(entries[0].props['aria-label'], `打开记忆资产：${f.session.topicName}`)
-    assert.match(f.ui.text(entries[0]), /✓/)
-    await f.ui.click(entries[0].props['aria-label'])
+    assert.equal(f.ui.text(entries[0]), '记忆资产')
+    assert.ok(!entries[0].props.disabled)
+    entries[0].props.onClick(); f.ui.render(); await f.ui.flush()
     const body = f.ui.nodes().find(node => node.props.className === 'dsh-tp dsh-tp-assets')
     assert.ok(body)
     assert.equal(f.ui.nodes(body).filter(node => node.type === 'button' && (f.ui.text(node) === '×' || /关闭/.test(node.props['aria-label'] ?? ''))).length, 0)
@@ -349,11 +348,24 @@ test('资产UI：标题唯一记忆资产分组按主题去重/标当前，右�
     assert.equal(f.ui.nodes().filter(node => node.type === 'button' && f.ui.text(node) === '记忆资产').length, 1)
     await f.ui.click('记忆资产'); assert.match(f.ui.text(), /接口/)
     f.app.resourceHost.closeAssetCaption(); await f.ui.flush()
+    title(f.ui).props.onClick(); f.ui.render()
+    const createTopic = f.ui.nodes().find(node => node.props['aria-label'] === '新建主题及首会话'); assert.ok(createTopic)
+    createTopic.props.onClick(); f.ui.render(); await f.ui.flush()
+    title(f.ui).props.onClick(); f.ui.render()
+    groups = f.ui.nodes().filter(node => node.props.role === 'group' && node.props['aria-label'] === '记忆资产')
+    assert.equal(groups.length, 1)
+    const topicButtons = f.ui.nodes(groups[0]).filter(node => node.type === 'button')
+    assert.equal(topicButtons.length, 2)
+    assert.equal(f.ui.text(topicButtons[0]), '记忆资产')
+    assert.equal(f.ui.text(topicButtons[1]), f.session.topicName)
+    topicButtons[1].props.onClick(); f.ui.render(); await f.ui.flush()
+    assert.match(f.ui.text(), new RegExp(`${f.session.topicName} · 记忆资产`))
+    f.app.resourceHost.closeAssetCaption(); await f.ui.flush()
     // Archived sessions remain in the same unique theme asset group.
     f.ui.context(title(f.ui)); await f.ui.click('归档')
     title(f.ui).props.onClick(); f.ui.render()
-    groups = f.ui.nodes().filter(node => node.props['aria-label'] === '记忆资产')
-    assert.equal(groups.length, 1); assert.equal(f.ui.nodes(groups[0]).filter(node => node.type === 'button').length, 1)
+    groups = f.ui.nodes().filter(node => node.props.role === 'group' && node.props['aria-label'] === '记忆资产')
+    assert.equal(groups.length, 1); assert.equal(f.ui.nodes(groups[0]).filter(node => node.type === 'button').length, 2)
     assert.equal(f.quick.calls.length, 0)
   } finally { await f.app.dispose() }
 })

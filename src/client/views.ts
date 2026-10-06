@@ -173,6 +173,8 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
   const sessions = store.getActiveSessions(ownerId)
   const archived = store.getArchivedSessions(ownerId)
   const topics = [...new Map(store.getTopics(ownerId).map(topic => [topic.id, topic])).values()]
+  const assetTopic = topics.find(topic => topic.id === current?.topicId) ?? topics[0]
+  const otherAssetTopics = topics.filter(topic => topic.id !== assetTopic?.id)
   function row(session: LocalSession, restore = false): unknown {
     return h('button', {
       type: 'button', role: 'menuitem', key: session.id, className: 'dsh-tp-session-choice', title: sessionTitle(session),
@@ -203,10 +205,11 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
     ...sessions.map(session => row(session)),
     archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
-    onTopicAssets && topics.length ? h(MenuGroup, { label: '记忆资产' }, ...topics.map(topic => h('button', {
-      type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice',
-      key: topic.id, onClick: () => onTopicAssets(topic), 'aria-label': `打开记忆资产：${topic.name}`, 'aria-current': current?.topicId === topic.id,
-    }, topic.name, current?.topicId === topic.id ? h('span', { 'aria-hidden': true }, ' ✓') : null))) : null,
+    onTopicAssets && assetTopic ? h('div', { role: 'group', 'aria-label': '记忆资产' },
+      h(MenuItemButton, { separatorBefore: true, onSelect: () => onTopicAssets(assetTopic) }, '记忆资产'),
+      ...otherAssetTopics.map(topic => h(MenuItemButton, {
+        key: topic.id, onSelect: () => onTopicAssets(topic),
+      }, topic.name))) : null,
     h('button', {
       type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,
       onClick: onCreate,
