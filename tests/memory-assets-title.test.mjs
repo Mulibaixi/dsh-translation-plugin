@@ -8,12 +8,10 @@ const source = await readFile(new URL('../dist/client.js', import.meta.url), 'ut
 
 // Only the owned title is rendered. These hook/element assertions do not exercise desktop DOM.
 function mountCaption() {
-  let entry, caption, connected = false, stopCaption, refreshes = 0
+  let entry, caption
   const effects = []
   const react = {
     createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
-    useState: initial => [initial, () => { refreshes++ }],
-    useEffect(effect) { if (!connected) { connected = true; stopCaption = effect() } },
   }
   const window = {
     __ModuleLoader__: { load(value) { entry = value } },
@@ -44,46 +42,20 @@ function mountCaption() {
   function element(ownerId, address) {
     return caption({ sessionId: ownerId, useTabInfo: () => ({ tab: { navigation: { address } } }) })
   }
-  const store = element(undefined, undefined).props.store
   return {
-    store,
     render(ownerId, address) { const node = element(ownerId, address); return node.type(node.props) },
-    get refreshes() { return refreshes },
-    unmountTitle() { stopCaption?.(); stopCaption = undefined },
-    dispose() { stopCaption?.(); effects.reverse().forEach(cleanup => cleanup()) },
+    dispose() { effects.reverse().forEach(cleanup => cleanup()) },
   }
 }
 
 function titleText(node) { return node.children.filter(child => typeof child === 'string').join('') }
 function cursorCss(node) { return node.children.find(child => child?.type === 'style').children.join('') }
 
-test('title reads its fixed resource owner/topic and refreshes on that shared Store rename', t => {
+test('the floating caption always displays one memory-assets title', t => {
   const fixture = mountCaption(); t.after(() => fixture.dispose())
-  const a = fixture.store.createSession('owner-a'), b = fixture.store.createSession('owner-b')
-  assert.ok(a && b)
-  assert.equal(fixture.store.renameSession(a.id, '固定主题'), true)
-  assert.equal(fixture.store.renameSession(b.id, '其他主会话'), true)
-  const address = memoryAssetsAddress(a.ownerId, a.topicId)
-  assert.equal(titleText(fixture.render(a.ownerId, address)), '固定主题 · 记忆资产')
-  const before = fixture.refreshes
-  assert.equal(fixture.store.renameSession(a.id, '已重命名主题'), true)
-  assert.ok(fixture.refreshes > before, 'the title subscribed to the shared Store')
-  assert.equal(titleText(fixture.render(a.ownerId, address)), '已重命名主题 · 记忆资产')
-  assert.equal(fixture.store.renameSession(b.id, '另一主题已变化'), true)
-  assert.equal(titleText(fixture.render(a.ownerId, address)), '已重命名主题 · 记忆资产')
-  fixture.unmountTitle()
-  const released = fixture.refreshes
-  assert.equal(fixture.store.renameSession(a.id, '关闭标题后变化'), true)
-  assert.equal(fixture.refreshes, released, 'title unmount releases only its subscription')
-})
-
-test('invalid, cross-owner, unavailable or unbound resources use the neutral title', t => {
-  const fixture = mountCaption(); t.after(() => fixture.dispose())
-  const session = fixture.store.createSession('owner-a'); assert.ok(session)
-  fixture.store.renameSession(session.id, '仅属于A')
-  const address = memoryAssetsAddress(session.ownerId, session.topicId)
+  const address = memoryAssetsAddress('owner-a', 'topic-a')
   for (const [owner, resource] of [
-    ['owner-a', 'invalid'], ['owner-b', address], ['owner-a', address + '?topic=other'],
+    ['owner-a', address], ['owner-a', 'invalid'], ['owner-b', address], ['owner-a', address + '?topic=other'],
     ['owner-a', memoryAssetsAddress('owner-a', 'missing-topic')], [undefined, address], ['owner-a', undefined],
   ]) assert.equal(titleText(fixture.render(owner, resource)), '记忆资产')
 })

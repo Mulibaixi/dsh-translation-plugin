@@ -23,7 +23,7 @@ interface TopicUiProps {
   readonly topics?: TopicBridgeClient | undefined
   readonly terms?: (TopicTermsViewPort & TopicMemoryStore) | undefined
   readonly onDeleteTerm?: ((snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>) | undefined
-  readonly onOpenAssets?: ((ownerId: string, topicId: string) => void) | undefined
+  readonly onOpenAssets?: ((ownerId: string, topicId: string, sessionId?: string) => void) | undefined
 }
 
 function useStore(store: SessionStore): void {
@@ -384,11 +384,11 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
     void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)))
   }
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined) }
-  function openTopicAssets(topic: { readonly id: string; readonly name: string }): void {
+  function openTopicAssets(topic: { readonly id: string; readonly name: string }, sessionId?: string): void {
     if (!store.getTopics(ownerId).some(owned => owned.id === topic.id)) return
-    closeSessionMenus(); onOpenAssets?.(ownerId, topic.id)
+    closeSessionMenus(); onOpenAssets?.(ownerId, topic.id, sessionId ?? (current?.topicId === topic.id ? current.id : undefined))
   }
-  function openSessionAssets(session: LocalSession): void { openTopicAssets({ id: session.topicId, name: session.topicName }) }
+  function openSessionAssets(session: LocalSession): void { openTopicAssets({ id: session.topicId, name: session.topicName }, session.id) }
   function deliver(result: Pick<TranslationExport, 'content' | 'fileName' | 'mimeType'>): void {
     closeSessionMenus()
     try { downloadExport(result); setExportNotice({ message: '已向浏览器发起下载。', failure: false }); setExportRequest(undefined) }

@@ -30,7 +30,7 @@ v0.7.0 扩充共享工具命令及会话元数据，升级时须重建本地 bun
 
 `src/client/topic-terms-export.ts` 将冻结的现有主题术语快照纯投影为 JSON/Markdown，保留所有状态、版本、采用事件、时间与证据引用/可读性标签，不复制证据正文、主聊天或完整主题备份，不调用模型、不修改档案或最终指针、不触发提炼/整理。导出在历史关闭时仍可明确执行，未提供导入；浏览器下载接口的模拟证据不等于实际文件保存验证。
 
-记忆资产使用正式资源 Tab 与应用内浮窗。资源 URI 只编码稳定 owner/topic 标识，Body 同时核对 URI 与框架所属 Session；同主题复用已有 Tab，不通过当前焦点猜范围。原 Session 的公开 tab actions 打开资源，仅首次新建且其 Session 表面可见时使用公开 `float`；已有或恢复的停靠状态保持。翻译及资产 Tab 使用 `keepMounted`，切换/隐藏时保留已访问正文与人工编辑稿；明确关闭只释放视图，不删除资产或 dispose 共享 Store。复用唯一 SessionStore、TopicMemoryStore 与 TopicBridgeClient，不建立第二桥或持久化副本。资产标题使用正式 title slot，依据其 Session 和资源地址显示主题名；光标规则仅匹配自有标题，不替换宿主拖动、停靠、关闭或缩放逻辑，正常 Body 不增加第二个关闭控件。
+记忆资产使用正式资源 Tab 与应用内浮窗。资源 URI 只编码稳定 owner/topic 标识，Body 同时核对 URI 与框架所属 Session；同主题复用已有 Tab，不通过当前焦点猜范围。原 Session 的公开 tab actions 打开资源，通过公开 navigation params 传入关联会话；Body 核对其 owner/topic 后显示备注优先的会话标题和主题名称。仅首次新建且其 Session 表面可见时使用公开 `float`；已有或恢复的停靠状态保持。翻译及资产 Tab 使用 `keepMounted`，切换/隐藏时保留已访问正文与人工编辑稿；明确关闭只释放视图，不删除资产或 dispose 共享 Store。复用唯一 SessionStore、TopicMemoryStore 与 TopicBridgeClient，不建立第二桥或持久化副本。资产标题使用正式 title slot 固定显示记忆资产；光标规则仅匹配自有标题，不替换宿主拖动、停靠、关闭或缩放逻辑，正常 Body 不增加第二个关闭控件。
 
 术语用户表单通过 `TopicMemoryStore.saveUserTerm` 一次保存即可建立 active/user_explicit；输入只含语义字段与预期档案/条目版本，Store 生成确认事件。原位编辑保留 id、createdAt、旧来源引用（转为 example），冲突/陈旧不覆盖；相同有效内容不升版本。新增在同一锁中构造 candidate v1→adopted v2，仅最终快照写入，保持既有 schema1 确认约束。模型 put/RPC 权限不扩大，历史开关与保存失败语义沿用原实现；记录译文编辑复用人工修订，不修改源文本或会话日志。
 

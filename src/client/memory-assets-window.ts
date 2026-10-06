@@ -5,6 +5,7 @@ export const MEMORY_ASSETS_PATTERN = 'dsh-resource://translation-assets/**'
 export interface MemoryAssetsScope {
   readonly ownerId: string
   readonly topicId: string
+  readonly sessionId?: string | undefined
 }
 
 export interface MemoryAssetsTab {
@@ -12,9 +13,9 @@ export interface MemoryAssetsTab {
   readonly contentId: string
   readonly visible: boolean
   readonly signal: AbortSignal
-  readonly navigation: { readonly address: string }
+  readonly navigation: { readonly address: string; readonly params?: unknown }
   readonly actions: {
-    openResource(address: string): void
+    openResource(address: string, options?: { readonly params: { readonly topicId: string; readonly sessionId?: string | undefined } }): void
     close(): void
   }
 }
@@ -67,7 +68,7 @@ export function openMemoryAssets(
   const find = () => sidebar.openTabs.getSnapshot().find(tab => tab.sessionId === scope.ownerId
     && tab.kind === MEMORY_ASSETS_TAB_KIND && tab.contentId === address)
   const existing = find()
-  origin.tab.actions.openResource(address)
+  origin.tab.actions.openResource(address, { params: { topicId: scope.topicId, sessionId: scope.sessionId } })
   // The public open returns void. Adopted membership commits synchronously publish openTabs.
   const opened = find()
   if (!opened) return false

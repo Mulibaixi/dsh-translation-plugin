@@ -7,19 +7,20 @@ export function createResourceHost(react, renderer) {
   let owner, activeResource, nextTab = 0
   const slotKey = target => `${target.name}:${target.key ?? target.id ?? ''}`
   function closeResource(id) { resources.get(id)?.controller.abort(); resources.delete(id); if (activeResource === id) activeResource = undefined }
-  function openResource(address, sessionId) {
+  function openResource(address, sessionId, options) {
     const definition = [...definitions.values()].find(definition => definition.canOpen?.(address)); assert.ok(definition, 'resource has a registered tab type')
     let resource = [...resources.values()].find(resource => resource.sessionId === sessionId && resource.contentId === address)
     if (!resource) {
       resource = { tabId: `synthetic-resource-${++nextTab}`, sessionId, kind: definition.kind, contentId: address, definitionId: definition.id, controller: new AbortController() }
       resources.set(resource.tabId, resource)
     }
+    resource.params = options?.params
     activeResource = resource.tabId
     return resource
   }
-  function tabInfo(id, sessionId, address, visible, controller, close) {
-    return { tab: { id, contentId: address, visible, signal: controller.signal, navigation: { address, params: undefined, revision: 0 },
-      actions: { openResource: address => { openResource(address, sessionId) }, openTab() {}, close, bindCommands() { return () => {} } } } }
+  function tabInfo(id, sessionId, address, visible, controller, close, params) {
+    return { tab: { id, contentId: address, visible, signal: controller.signal, navigation: { address, params, revision: 0 },
+      actions: { openResource: (address, options) => { openResource(address, sessionId, options) }, openTab() {}, close, bindCommands() { return () => {} } } } }
   }
   function HostedWorkspace(props = {}) {
     if (owner !== props.sessionId) activeResource = undefined
@@ -31,7 +32,7 @@ export function createResourceHost(react, renderer) {
         useTabInfo: () => tabInfo(`workspace:${owner}`, owner, 'translation-workspace', activeResource === undefined, workspaces.get(owner), () => {}) })),
       ...[...resources.values()].map(resource => {
         const props = { sessionId: resource.sessionId,
-          useTabInfo: () => tabInfo(resource.tabId, resource.sessionId, resource.contentId, activeResource === resource.tabId, resource.controller, () => closeResource(resource.tabId)) }
+          useTabInfo: () => tabInfo(resource.tabId, resource.sessionId, resource.contentId, activeResource === resource.tabId, resource.controller, () => closeResource(resource.tabId), resource.params) }
         const title = slots.get(`sidebar.right.pane.tab.title:${resource.definitionId}`)
         return react.createElement('div', { key: resource.tabId, hidden: activeResource !== resource.tabId },
           title ? react.createElement('header', { 'data-synthetic-host-caption': true }, react.createElement(title, { ...props, key: `title:${resource.tabId}` })) : null,

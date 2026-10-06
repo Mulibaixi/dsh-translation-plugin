@@ -87,9 +87,9 @@ export const styles = `
 .dsh-tp-history-row span { overflow-wrap: anywhere; }
 .dsh-tp-assets { height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; }
 .dsh-tp-assets-header { flex: none; display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; padding: 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
-.dsh-tp-assets-heading { min-width: 0; }
-.dsh-tp-assets-heading h2 { font-size: 14px; overflow-wrap: anywhere; }
-.dsh-tp-assets-heading small { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-tp-assets-heading { min-width: 0; display: flex; align-items: baseline; gap: 8px; width: 100%; }
+.dsh-tp-assets-heading h2 { min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-tp-assets-heading small { min-width: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .dsh-tp-assets-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 120px minmax(0, 1fr); overflow: hidden; }
 .dsh-tp-assets-nav { min-height: 0; padding: 8px 5px; border-right: 1px solid var(--dsw-alias-border-l2, #8883); overflow-y: auto; }
 .dsh-tp-assets-nav button { display: block; width: 100%; text-align: left; margin-bottom: 4px; }

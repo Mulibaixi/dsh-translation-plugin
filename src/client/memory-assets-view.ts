@@ -10,9 +10,10 @@ import type { TopicTerm, TopicTermSnapshot } from '../memory/topic-terms.js'
 import type { TopicTermsExport } from './topic-terms-export.js'
 
 /** One resource owns a fixed owner/topic. Selection in the translator is unrelated. */
-export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId, onDeleteTerm }: {
+export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId, associatedSessionId, onDeleteTerm }: {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
   readonly topics?: TopicBridgeClient | undefined; readonly ownerId: string; readonly topicId: string
+  readonly associatedSessionId?: string | undefined
   readonly onDeleteTerm: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>
 }): unknown {
   const [, refresh] = react.useState(0)
@@ -22,6 +23,10 @@ export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId
   react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
   react.useEffect(() => topics?.subscribe(() => refresh(value => value + 1)), [topics])
   const topic = store.getTopics(ownerId).find(topic => topic.id === topicId)
+  const requested = associatedSessionId ? store.getSession(associatedSessionId) : undefined
+  const current = store.getActiveSession(ownerId)
+  const session = requested?.ownerId === ownerId && requested.topicId === topicId ? requested
+    : current?.topicId === topicId ? current : store.getAvailableSessions(ownerId).find(session => session.topicId === topicId)
   function deliver(result: TopicTermsExport): void {
     try { downloadExport(result); setExportNotice({ message: '已向浏览器发起下载。', failure: false }) }
     catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
@@ -29,8 +34,9 @@ export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId
   return h('section', { className: 'dsh-tp dsh-tp-assets', 'aria-label': '记忆资产', 'data-owner-id': ownerId, 'data-topic-id': topicId },
     h('style', null, styles),
     h('header', { className: 'dsh-tp-assets-header' },
-      h('div', { className: 'dsh-tp-assets-heading' }, h('h2', null, topic ? `${topic.name} · 记忆资产` : '记忆资产'),
-        h('small', { className: 'dsh-tp-muted', title: ownerId }, `所属主会话：${ownerId}`))),
+      h('div', { className: 'dsh-tp-assets-heading' },
+        h('h2', { title: session ? session.remark || session.name : undefined }, session ? session.remark || session.name : '无关联会话'),
+        topic ? h('small', { className: 'dsh-tp-muted', title: topic.name }, topic.name) : null)),
     store.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null,
     topic ? h('div', { className: 'dsh-tp-assets-body' },
       h('nav', { className: 'dsh-tp-assets-nav', 'aria-label': '资产分类' },

@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "private": true,
   "license": "MIT",
   "description": "A DeepSeek Harness translation plugin framework (early development).",
