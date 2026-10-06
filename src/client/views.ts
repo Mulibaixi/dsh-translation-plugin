@@ -174,7 +174,6 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
   const archived = store.getArchivedSessions(ownerId)
   const topics = [...new Map(store.getTopics(ownerId).map(topic => [topic.id, topic])).values()]
   const assetTopic = topics.find(topic => topic.id === current?.topicId) ?? topics[0]
-  const otherAssetTopics = topics.filter(topic => topic.id !== assetTopic?.id)
   function row(session: LocalSession, restore = false): unknown {
     return h('button', {
       type: 'button', role: 'menuitem', key: session.id, className: 'dsh-tp-session-choice', title: sessionTitle(session),
@@ -202,20 +201,16 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
   }, h('div', { className: 'dsh-tp dsh-tp-menu-content', 'aria-label': '已有翻译会话',
     onPointerDown: (event: { stopPropagation(): void }) => { if (contextOpen) event.stopPropagation() },
   },
-    ...sessions.map(session => row(session)),
-    archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
-    h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
     onTopicAssets && assetTopic ? h('div', { role: 'group', 'aria-label': '记忆资产' },
       h('button', {
         type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice dsh-tp-memory-assets-entry',
         key: assetTopic.id, title: `打开当前主题记忆资产：${assetTopic.name}`,
         'aria-label': `打开记忆资产：${assetTopic.name}`, 'data-topic-id': assetTopic.id,
         onClick: () => onTopicAssets(assetTopic),
-      }, '记忆资产'),
-      ...otherAssetTopics.map(topic => h('button', {
-        type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice',
-        key: topic.id, onClick: () => onTopicAssets(topic), 'aria-label': `打开记忆资产：${topic.name}`, 'data-topic-id': topic.id,
-      }, topic.name))) : null,
+      }, '记忆资产'), h('div', { role: 'separator', className: 'dsh-tp-session-divider' })) : null,
+    ...sessions.map(session => row(session)),
+    archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
+    h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
     h('button', {
       type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,
       onClick: onCreate,

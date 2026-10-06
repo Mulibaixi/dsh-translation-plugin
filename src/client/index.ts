@@ -124,7 +124,8 @@ export function apply(ctx: ClientPluginContext): void {
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
       const params = tabInfo?.tab.navigation.params
       const associatedSessionId = params && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' ? params.sessionId : undefined
-      return h(MemoryAssetsView, { store, quick, topics, terms, onDeleteTerm, ...scope, associatedSessionId })
+      const requestedTopicId = params && typeof params === 'object' && 'topicId' in params && typeof params.topicId === 'string' ? params.topicId : undefined
+      return h(MemoryAssetsView, { store, quick, topics, terms, onDeleteTerm, ...scope, associatedSessionId, requestedTopicId, navigationRevision: tabInfo?.tab.navigation.revision })
     }
     const MemoryAssetsCaption: ClientComponent = () => h(MemoryAssetsTitle, null)
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {

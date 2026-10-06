@@ -29,8 +29,9 @@ async function terms(ui) {
   current.props.onClick(); ui.render(); await ui.flush()
 }
 async function archive(ui, topicId) {
-  picker(ui)
-  const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
+  await terms(ui)
+  await ui.click('选择资产主题')
+  const group = ui.nodes().find(node => node.props['aria-label'] === '资产主题列表'); assert.ok(group)
   const rows = ui.nodes(group).filter(node => node.type === 'button')
   const target = rows.find(node => node.props['data-topic-id'] === topicId); assert.ok(target)
   target.props.onClick(); ui.render(); await ui.flush()

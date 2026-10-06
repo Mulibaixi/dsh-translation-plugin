@@ -13,7 +13,7 @@ export interface MemoryAssetsTab {
   readonly contentId: string
   readonly visible: boolean
   readonly signal: AbortSignal
-  readonly navigation: { readonly address: string; readonly params?: unknown }
+  readonly navigation: { readonly address: string; readonly params?: unknown; readonly revision?: number }
   readonly actions: {
     openResource(address: string, options?: { readonly params: { readonly topicId: string; readonly sessionId?: string | undefined } }): void
     close(): void
@@ -39,7 +39,7 @@ function validIdentity(value: string): boolean {
   return value.length > 0 && value !== '.' && value !== '..' && !/[\u0000-\u001f\u007f]/u.test(value)
 }
 
-/** The address, rather than navigation params, retains the asset's scope on reload. */
+/** The address retains the owner and initial topic on reload; navigation selects a topic. */
 export function memoryAssetsAddress(ownerId: string, topicId: string): string {
   if (!validIdentity(ownerId) || !validIdentity(topicId)) throw new Error('Invalid memory assets scope')
   return `dsh-resource://translation-assets/${encodeURIComponent(ownerId)}/${encodeURIComponent(topicId)}/terms`
@@ -64,13 +64,13 @@ export function openMemoryAssets(
   viewport: { readonly width: number; readonly height: number } = { width: 1024, height: 768 },
 ): boolean {
   if (origin.ownerId !== scope.ownerId || origin.tab.signal.aborted) return false
-  const address = memoryAssetsAddress(scope.ownerId, scope.topicId)
-  const find = () => sidebar.openTabs.getSnapshot().find(tab => tab.sessionId === scope.ownerId
-    && tab.kind === MEMORY_ASSETS_TAB_KIND && tab.contentId === address)
-  const existing = find()
+  const existing = sidebar.openTabs.getSnapshot().find(tab => tab.sessionId === scope.ownerId
+    && tab.kind === MEMORY_ASSETS_TAB_KIND && parseMemoryAssetsAddress(tab.contentId, scope.ownerId))
+  const address = existing?.contentId ?? memoryAssetsAddress(scope.ownerId, scope.topicId)
   origin.tab.actions.openResource(address, { params: { topicId: scope.topicId, sessionId: scope.sessionId } })
   // The public open returns void. Adopted membership commits synchronously publish openTabs.
-  const opened = find()
+  const opened = sidebar.openTabs.getSnapshot().find(tab => tab.sessionId === scope.ownerId
+    && tab.kind === MEMORY_ASSETS_TAB_KIND && tab.contentId === address)
   if (!opened) return false
   if (!existing && origin.tab.visible && !origin.tab.signal.aborted && sidebar.mounted.getSnapshot() === scope.ownerId) {
     const width = Math.max(1, Math.min(960, viewport.width - 32))

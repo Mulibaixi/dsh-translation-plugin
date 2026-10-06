@@ -10,6 +10,7 @@ function fixture({ visible = true, mounted = scope.ownerId, restored = false, co
   let tabs = restored ? [{ sessionId: scope.ownerId, tabId: 'restored', kind: MEMORY_ASSETS_TAB_KIND, contentId: memoryAssetsAddress(scope.ownerId, scope.topicId) }] : []
   let next = 0
   const opened = []
+  const navigations = []
   const floated = []
   const abort = new AbortController()
   const sidebar = {
@@ -20,8 +21,9 @@ function fixture({ visible = true, mounted = scope.ownerId, restored = false, co
   const tab = {
     id: 'workspace', contentId: 'workspace', navigation: { address: 'workspace' }, visible, signal: abort.signal,
     actions: {
-      openResource(address) {
+      openResource(address, options) {
         opened.push(address)
+        navigations.push(options.params)
         if (commit && !tabs.some(row => row.sessionId === scope.ownerId && row.kind === MEMORY_ASSETS_TAB_KIND && row.contentId === address)) {
           tabs = [...tabs, { sessionId: scope.ownerId, tabId: `asset-${++next}`, kind: MEMORY_ASSETS_TAB_KIND, contentId: address }]
         }
@@ -31,7 +33,7 @@ function fixture({ visible = true, mounted = scope.ownerId, restored = false, co
     },
   }
   return {
-    sidebar, origin: { ownerId: scope.ownerId, tab }, abort, opened, floated,
+    sidebar, origin: { ownerId: scope.ownerId, tab }, abort, opened, navigations, floated,
     closeAsset() { tabs = [] },
     setMounted(value) { mounted = value },
     addOtherOwner() { tabs = [{ sessionId: 'owner-b', tabId: 'foreign', kind: MEMORY_ASSETS_TAB_KIND, contentId: memoryAssetsAddress(scope.ownerId, scope.topicId) }] },
@@ -77,6 +79,16 @@ test('reopening an existing resource preserves its current docking placement', (
   assert.equal(f.opened.length, 2)
   assert.equal(f.floated.length, 1)
   assert.equal(f.sidebar.openTabs.getSnapshot().length, 1)
+})
+
+test('another topic in the same owner reuses the asset address and requests topic/session navigation', () => {
+  const f = fixture()
+  openMemoryAssets(f.sidebar, f.origin, scope)
+  openMemoryAssets(f.sidebar, f.origin, { ...scope, topicId: 'topic-b', sessionId: 'session-b' })
+  assert.equal(f.sidebar.openTabs.getSnapshot().length, 1)
+  assert.deepEqual(f.opened, [memoryAssetsAddress(scope.ownerId, scope.topicId), memoryAssetsAddress(scope.ownerId, scope.topicId)])
+  assert.deepEqual(f.navigations.at(-1), { topicId: 'topic-b', sessionId: 'session-b' })
+  assert.equal(f.floated.length, 1)
 })
 
 test('a restored resource is revealed without automatically floating again', () => {

@@ -15,11 +15,12 @@ export function createResourceHost(react, renderer) {
       resources.set(resource.tabId, resource)
     }
     resource.params = options?.params
+    resource.revision = (resource.revision ?? 0) + 1
     activeResource = resource.tabId
     return resource
   }
-  function tabInfo(id, sessionId, address, visible, controller, close, params) {
-    return { tab: { id, contentId: address, visible, signal: controller.signal, navigation: { address, params, revision: 0 },
+  function tabInfo(id, sessionId, address, visible, controller, close, params, revision = 0) {
+    return { tab: { id, contentId: address, visible, signal: controller.signal, navigation: { address, params, revision },
       actions: { openResource: (address, options) => { openResource(address, sessionId, options) }, openTab() {}, close, bindCommands() { return () => {} } } } }
   }
   function HostedWorkspace(props = {}) {
@@ -32,7 +33,7 @@ export function createResourceHost(react, renderer) {
         useTabInfo: () => tabInfo(`workspace:${owner}`, owner, 'translation-workspace', activeResource === undefined, workspaces.get(owner), () => {}) })),
       ...[...resources.values()].map(resource => {
         const props = { sessionId: resource.sessionId,
-          useTabInfo: () => tabInfo(resource.tabId, resource.sessionId, resource.contentId, activeResource === resource.tabId, resource.controller, () => closeResource(resource.tabId), resource.params) }
+          useTabInfo: () => tabInfo(resource.tabId, resource.sessionId, resource.contentId, activeResource === resource.tabId, resource.controller, () => closeResource(resource.tabId), resource.params, resource.revision) }
         const title = slots.get(`sidebar.right.pane.tab.title:${resource.definitionId}`)
         return react.createElement('div', { key: resource.tabId, hidden: activeResource !== resource.tabId },
           title ? react.createElement('header', { 'data-synthetic-host-caption': true }, react.createElement(title, { ...props, key: `title:${resource.tabId}` })) : null,

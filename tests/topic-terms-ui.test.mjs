@@ -36,6 +36,12 @@ async function terms(ui) {
   const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node).startsWith('记忆资产')); assert.ok(current)
   current.props.onClick(); ui.render(); await ui.flush()
 }
+async function selectAssetTopic(ui, topicId) {
+  await ui.click('选择资产主题')
+  const list = ui.nodes().find(node => node.props['aria-label'] === '资产主题列表'); assert.ok(list)
+  const item = ui.nodes(list).find(node => node.type === 'button' && node.props['data-topic-id'] === topicId); assert.ok(item)
+  item.props.onClick(); ui.render(); await ui.flush()
+}
 function details(ui) { return ui.nodes().find(node => node.props['aria-label'] === '术语详情') }
 function row(ui, preferred) { const found = ui.nodes().find(node => node.type === 'article' && node.props.className === 'dsh-tp-term' && ui.text(node).includes(`→ ${preferred}`)); assert.ok(found); return found }
 async function rowClick(ui, preferred, label) {
@@ -315,7 +321,7 @@ test('资产UI：URI范围不随工作区选择变化，主题标题实时更新
     assert.equal(renamed.ok, true); assert.match(f.ui.text(), /合成已重命名主题/)
     const heading = f.ui.nodes().find(node => node.props.className === 'dsh-tp-assets-heading'); assert.ok(heading)
     assert.equal(f.ui.nodes(heading).find(node => node.type === 'h2').children.join(''), '合成已重命名主题')
-    assert.equal(f.ui.nodes(heading).find(node => node.type === 'small').children.join(''), '合成已重命名主题')
+    assert.equal(f.ui.text(f.ui.nodes(heading).find(node => node.type === 'small')), '合成已重命名主题')
     assert.ok(!f.ui.text().includes('所属主会话：'))
     f.ui.showTranslation(); title(f.ui).props.onClick(); f.ui.render(); await f.ui.click('新建主题及首会话')
     const sessions = (await f.request({ kind: 'list_sessions' })).value.sessions
@@ -342,7 +348,7 @@ test('资产UI：标题单行备注优先，右键目标会话与当前选择独
     f.ui.nodes(context).find(node => node.type === 'button' && f.ui.text(node) === '记忆资产').props.onClick(); f.ui.render(); await f.ui.flush()
     let heading = f.ui.nodes().find(node => node.props.className === 'dsh-tp-assets-heading'); assert.ok(heading)
     assert.equal(f.ui.nodes(heading).find(node => node.type === 'h2').children.join(''), '原会话备注')
-    assert.equal(f.ui.nodes(heading).find(node => node.type === 'small').children.join(''), f.session.topicName)
+    assert.equal(f.ui.text(f.ui.nodes(heading).find(node => node.type === 'small')), f.session.topicName)
     const removed = await f.request({ kind: 'set_session_remark', translationSessionId: f.session.id, expectedRemark: '原会话备注', remark: '' })
     assert.equal(removed.ok, true)
     heading = f.ui.nodes().find(node => node.props.className === 'dsh-tp-assets-heading')
@@ -357,11 +363,11 @@ test('资产UI：标题单行备注优先，右键目标会话与当前选择独
     await terms(f.ui)
     heading = f.ui.nodes().find(node => node.props.className === 'dsh-tp-assets-heading')
     assert.equal(f.ui.nodes(heading).find(node => node.type === 'h2').children.join(''), '无关联会话')
-    assert.equal(f.ui.nodes(heading).find(node => node.type === 'small').children.join(''), f.session.topicName)
+    assert.equal(f.ui.text(f.ui.nodes(heading).find(node => node.type === 'small')), f.session.topicName)
   } finally { await f.app.dispose() }
 })
 
-test('资产UI：记忆资产是可点击主入口并按需列出其他主题，右键具体会话同入口，Body没有关闭按钮', async () => {
+test('资产UI：下拉最上方唯一记忆入口，主题在窗口内切换，右键具体会话同入口，Body没有关闭按钮', async () => {
   const f = await setup()
   try {
     await f.request(put(f.session, 'one', '接口'))
@@ -378,6 +384,7 @@ test('资产UI：记忆资产是可点击主入口并按需列出其他主题，
     assert.equal(entries[0].props['data-topic-id'], f.session.topicId)
     assert.match(f.ui.text(entries[0]), /记忆资产/)
     assert.match(entries[0].props.className, /dsh-tp-memory-assets-entry/)
+    assert.equal(f.ui.nodes().filter(node => node.props.role === 'menuitem')[0], entries[0])
     entries[0].props.onClick(); f.ui.render(); await f.ui.flush()
     const body = f.ui.nodes().find(node => node.props.className === 'dsh-tp dsh-tp-assets')
     assert.ok(body)
@@ -395,18 +402,76 @@ test('资产UI：记忆资产是可点击主入口并按需列出其他主题，
     groups = f.ui.nodes().filter(node => node.props.role === 'group' && node.props['aria-label'] === '记忆资产')
     assert.equal(groups.length, 1)
     const topicButtons = f.ui.nodes(groups[0]).filter(node => node.type === 'button')
-    assert.equal(topicButtons.length, 2)
+    assert.equal(topicButtons.length, 1)
     assert.equal(f.ui.text(topicButtons[0]), '记忆资产')
     assert.equal(topicButtons[0].props['aria-current'], undefined)
-    assert.equal(f.ui.text(topicButtons[1]), f.session.topicName)
-    topicButtons[1].props.onClick(); f.ui.render(); await f.ui.flush()
+    topicButtons[0].props.onClick(); f.ui.render(); await f.ui.flush()
+    await f.ui.click('选择资产主题')
+    const topicList = f.ui.nodes().find(node => node.props['aria-label'] === '资产主题列表'); assert.ok(topicList)
+    assert.equal(f.ui.nodes(topicList).filter(node => node.type === 'button').length, 2)
+    f.ui.nodes(topicList).find(node => node.props['data-topic-id'] === f.session.topicId).props.onClick(); f.ui.render(); await f.ui.flush()
     assert.match(f.ui.text(), new RegExp(f.session.topicName))
     f.app.resourceHost.closeAssetCaption(); await f.ui.flush()
     // Archived sessions remain in the same unique theme asset group.
     f.ui.context(title(f.ui)); await f.ui.click('归档')
     title(f.ui).props.onClick(); f.ui.render()
     groups = f.ui.nodes().filter(node => node.props.role === 'group' && node.props['aria-label'] === '记忆资产')
-    assert.equal(groups.length, 1); assert.equal(f.ui.nodes(groups[0]).filter(node => node.type === 'button').length, 2)
+    assert.equal(groups.length, 1); assert.equal(f.ui.nodes(groups[0]).filter(node => node.type === 'button').length, 1)
+    assert.equal(f.quick.calls.length, 0)
+  } finally { await f.app.dispose() }
+})
+
+test('资产UI：同名主题以ID切换保留术语和译文草稿，重复导航回请求主题，工作区选择不变', async () => {
+  const f = await setup()
+  try {
+    await translate(f)
+    title(f.ui).props.onClick(); f.ui.render(); await f.ui.click('新建主题及首会话')
+    const second = (await f.request({ kind: 'list_sessions' })).value.sessions.find(session => session.id !== f.session.id); assert.ok(second)
+    assert.equal(second.topicName, f.session.topicName); assert.notEqual(second.topicId, f.session.topicId)
+    await terms(f.ui)
+    const originalTab = f.app.resourceHost.sidebarRight.openTabs.getSnapshot()[0]
+    const navigationRevision = f.app.resourceHost.activeResource.revision
+    await selectAssetTopic(f.ui, f.session.topicId)
+    await f.ui.click('新增术语'); await f.ui.input('原文形式', 'A term'); await f.ui.input('首选译法', 'A术语草稿')
+    await f.ui.click('译文记录'); await f.ui.click(`${f.session.name} · 文本 1`)
+    await f.ui.click('编辑译文'); await f.ui.input('编辑译文', 'A译文草稿')
+    await selectAssetTopic(f.ui, second.topicId)
+    await f.ui.click('新增术语'); await f.ui.input('原文形式', 'B term'); await f.ui.input('首选译法', 'B术语草稿')
+    await selectAssetTopic(f.ui, f.session.topicId)
+    assert.equal(f.ui.control('编辑译文').props.value, 'A译文草稿')
+    await f.ui.click('结构化档案'); assert.equal(f.ui.control('首选译法').props.value, 'A术语草稿')
+    // Reopen the same initial topic/session request after a local switch: only revision changes.
+    await terms(f.ui)
+    assert.ok(f.app.resourceHost.activeResource.revision > navigationRevision)
+    const body = f.ui.nodes().find(node => node.props.className === 'dsh-tp dsh-tp-assets')
+    assert.equal(body.props['data-topic-id'], second.topicId)
+    assert.equal(f.ui.control('首选译法').props.value, 'B术语草稿')
+    assert.deepEqual(f.app.resourceHost.sidebarRight.openTabs.getSnapshot(), [originalTab])
+    assert.equal(f.app.resourceHost.floats.length, 1)
+    f.ui.showTranslation(); title(f.ui).props.onClick(); f.ui.render()
+    assert.equal(f.ui.nodes().find(node => node.props.className === 'dsh-tp-session-choice' && node.props['aria-current'] === true).props.key, second.id)
+    assert.equal(f.quick.calls.length, 1)
+  } finally { await f.app.dispose() }
+})
+
+test('资产UI：窗口主题搜索包含没有会话的保留档案，选择后不改变工作区当前会话', async () => {
+  const f = await setup()
+  try {
+    await f.request(put(f.session, 'retained', '保留术语'))
+    await f.request({ kind: 'rename_topic', topicId: f.session.topicId, expectedName: f.session.topicName, name: '保留主题' })
+    title(f.ui).props.onClick(); f.ui.render(); await f.ui.click('新建主题及首会话')
+    const second = (await f.request({ kind: 'list_sessions' })).value.sessions.find(session => session.id !== f.session.id); assert.ok(second)
+    title(f.ui).props.onClick(); f.ui.render()
+    const retained = f.ui.nodes().find(node => node.props.className === 'dsh-tp-session-choice' && node.props.key === f.session.id); assert.ok(retained)
+    f.ui.context(retained); await f.ui.click('删除'); await f.ui.click('确认删除会话')
+    await terms(f.ui); await f.ui.click('选择资产主题'); await f.ui.input('搜索资产主题', '保留')
+    const list = f.ui.nodes().find(node => node.props['aria-label'] === '资产主题列表')
+    const matches = f.ui.nodes(list).filter(node => node.type === 'button')
+    assert.equal(matches.length, 1); assert.equal(matches[0].props['data-topic-id'], f.session.topicId)
+    matches[0].props.onClick(); f.ui.render(); await f.ui.flush()
+    assert.match(f.ui.text(), /无关联会话/); assert.match(f.ui.text(), /保留术语/)
+    f.ui.showTranslation(); title(f.ui).props.onClick(); f.ui.render()
+    assert.equal(f.ui.nodes().find(node => node.props.className === 'dsh-tp-session-choice' && node.props['aria-current'] === true).props.key, second.id)
     assert.equal(f.quick.calls.length, 0)
   } finally { await f.app.dispose() }
 })
