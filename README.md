@@ -4,7 +4,7 @@
 
 A lightweight translation session panel for DeepSeek Harness (DSH). Quick mode translates plain text with a model already configured in DSH, retaining each admitted text unit, its revisions and one final-version selection. Local history is off by default; enabling it saves those records with session details and the current source draft.
 
-The topic terminology and management additions are included in the local `v0.6.0` release.
+Topic terminology and main-model management were added in `v0.6.0`.
 
 ## Current features
 
@@ -50,7 +50,7 @@ Editing, final selection and export do not call a model. Upgrading a Quick sessi
 
 Open **主题术语 (Topic terms)** from the current title dropdown or a session's context menu. Sessions in the same stable topic share one terminology record; renaming does not change that identity, and a new topic starts empty. Details show languages, sense, aliases, avoided translations, entry version and source references. Entries may be proposals, active, conflicting, awaiting review or disabled.
 
-The main model can list sessions, read explicitly supplied historical units, list/query terms and propose or source-check an entry. These five tools belong only to that main conversation's Agent and communicate with the browser through a bidirectional bridge. Inferences remain proposals. A source-checked entry with readable source evidence and no conflict can become active directly; a proposal requires the explicit **采用 (Adopt)** action. Adopted user rules cannot be overwritten by a model. Resolve conflicting rules explicitly; the newest suggestion does not win automatically. **停用 (Disable)** keeps an entry for reference; **删除 (Delete)** removes the selected shared entry after confirmation.
+The main model can list sessions, read explicitly supplied historical units, list/query terms and propose or source-check an entry. These five tools belong only to that main conversation's Agent and communicate with the browser through a bidirectional bridge. Inferences remain proposals. A source-checked entry with readable source evidence and no conflict can become active directly; a proposal requires the explicit **采用 (Adopt)** action. Adopted user rules cannot be overwritten by a model. Resolve conflicting rules explicitly; the newest suggestion does not win automatically. **停用 (Disable)** keeps an entry for reference; **重新采用 (Adopt again)** explicitly reactivates it subject to conflict checks. **删除 (Delete)** removes the selected shared entry after confirmation.
 
 Evidence references the existing source or final translation without copying its body into the terminology record. A changed/deleted basis becomes unavailable and the derived entry awaits review; queries exclude it immediately. Final evidence includes the final-selection event, so selecting the same old revision again does not revive an old basis. Losing a source example does not revoke an independently adopted user rule. Lookup matches explicitly requested source forms or aliases within the same owner, topic and languages; it does not guess terms from arbitrary English or code substrings. Quick lookup is empty, and Quick finals do not automatically extract terms.
 
@@ -134,6 +134,6 @@ The shared call-record module provides optional RPC metadata for the actual mode
 
 The topic-term core defines scoped references, versions, adoption, conflicts and exact-form lookup. `TopicMemoryStore` saves one topic record under the existing Web Locks and history-retention policy. `SessionStore` remains the only source/final authority. Host tools hold transient execution scope and never save a second terminology/history database. One combined remote contribution registers both Quick and topic-management namespaces, preserving their coexistence.
 
-See [CHANGELOG.md](CHANGELOG.md). The current tagged local version is `v0.6.0`; it adds shared-topic terminology and scoped main-model management. Plain-text Quick retranslation, manual revisions, final selection, TXT/JSON export and optional restart recovery remain available. Model preferences save independently. Normal execution and automatic main-Send integration remain unavailable until DSH provides the official extension; file translation and a complete knowledge system also remain unavailable. Local versions have not been published remotely. `private: true` prevents accidental npm publishing.
+See [CHANGELOG.md](CHANGELOG.md). The current local version is `v0.6.1`, a documentation correction for the shared-topic terminology and scoped main-model management added in v0.6.0. Plain-text Quick retranslation, manual revisions, final selection, TXT/JSON export and optional restart recovery remain available. Model preferences save independently. Normal execution and automatic main-Send integration remain unavailable until DSH provides the official extension; file translation and a complete knowledge system also remain unavailable. Local versions have not been published remotely. `private: true` prevents accidental npm publishing.
 
 License: [MIT](LICENSE).

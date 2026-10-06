@@ -20,16 +20,18 @@ pnpm test
 
 `src/client/translation-export.ts` 纯投影最终 TXT 与完整浏览器记录 JSON；UI 冻结会话/历史快照后通过 Blob 下载，不调用模型、不访问 Host 文件、不额外持久化副本。JSON 只含浏览器会话及安全调用字段，不宣称完整 Host/provider 配置或主聊天日志。存储/RPC 边界严格解析，可信内部转换只检查必要局部条件，编辑和导出复用同步内存转换与既有异步保存。
 
-`src/memory/topic-terms.ts` 是纯术语领域基础，不含存储或 Host/UI 接线。所属主会话和主题以 ID 限定，证据只引用权威文本单元；范围为 Unicode 码点半开区间。最终依据必须核对修订及最后选择事件；不可读取或已变化的依据排除于检索，并转为待复核。提案变更不增加 activeVersion，相同事实不增加任何版本。模型不能覆盖已采用用户规则或伪造采用事件；交叠形式的实质冲突不使用最新值覆盖。Quick 始终返回空集，Normal 只按明确给出的形式和别名精确检索。解析仅在外部边界执行，内部转换不反复解析全档案。v0.5.1 不启用术语持久化、界面和主模型工具。
+`src/memory/topic-terms.ts` 提供纯术语契约、来源核对、版本与精确检索；v0.6.0 已由 `src/client/topic-memory-store.ts` 接入独立主题存储、术语面板与主模型工具。所属主会话和主题以 ID 限定，证据只引用 `SessionStore` 权威文本单元，范围为 Unicode 码点半开区间。最终依据核对修订及最后选择事件，不可读取或已变化的依据立即排除并待复核；用户独立采用的规则不因示例丢失撤销。提案变化不增加 activeVersion，相同事实不增加版本；模型不能覆盖已采用规则或伪造采用事件，交叠形式的实质冲突需明确处理。Quick 检索为空且不自动提炼，Normal 仅按明确形式和别名精确检索。解析仅在外部边界执行，内部转换不反复解析全档案。
 
-快译 Host/Client Native 集成测试需另外准备完整的 DSH `0.2.0-rc.2` 组件目录。将 `DSH_RUNTIME_ROOT` 指向一个外部目录，其中包含 `dsh/node_modules/`，然后执行：
+`src/shared/topic-bridge.ts`、`src/host/topic-tools.ts` 与 `src/client/topic-bridge.ts` 通过实际双向 RemoteStream 实现五项管理工具，只绑定所属主会话 Agent。Host 不存第二份会话/术语数据库；历史原文只读取用户明确提供的普通模式单元投影，不读取当前草稿或未选历史。`src/shared/plugin-remote.ts` 合并快译和主题管理贡献，一次注册保持两个命名空间共存。术语及会话正文沿用历史开关，模型偏好独立保存。原主发送自动联动与普通执行仍需 DSH 正式发送前扩展，不以每次额外确认或手动两步发送替代。
+
+Native 集成测试需另外准备完整的 DSH `0.2.0-rc.2` 组件目录。除快译的 LLM、Session、Cordis、Gateway 和 ClientRemoteService 依赖外，主题工具入口还需 Agent、AgentLoop、ToolRuntime、SessionController、SystemPrompt、SessionProjection、SessionQuery 及其实际依赖；对应组件包含 `@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-agent-loop`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-api-session-controller` 等。使用同一完整组件树，不能以只含快译服务的精简目录代替。将 `DSH_RUNTIME_ROOT` 指向一个外部目录，其中包含 `dsh/node_modules/`，然后执行：
 
 ```powershell
 $env:DSH_RUNTIME_ROOT = '<外部目录，内含 dsh/node_modules>'
 pnpm test:native
 ```
 
-`pnpm test:native` 会先构建，再通过 `node --expose-internals --test scripts/quick-host-native.integration.mjs scripts/quick-client-native.integration.mjs scripts/quick-client-mount-native.integration.mjs` 运行三个集成入口。缺少环境变量或必需组件时会明确失败；测试不会下载依赖，也不会跳过。测试使用 DSH `0.2.0-rc.2` 组件包、一次性 synthetic profile 和 synthetic provider，不读取用户 profile/凭据，也不调用真实远端模型。除 Host/Client 组件与 RPC 集成外，挂载入口使用真实 `ClientRemoteService`、Cordis 与当前 Client bundle，检查异步挂载后的自主能力查询、合成翻译及卸载。它不代替在用户 DSH Desktop 中运行。
+`pnpm test:native` 会先构建，再通过 `node --expose-internals --test scripts/quick-host-native.integration.mjs scripts/quick-client-native.integration.mjs scripts/quick-client-mount-native.integration.mjs scripts/topic-tools-native.integration.mjs` 运行四个集成入口。缺少环境变量或必需组件时会明确失败；测试不会下载依赖，也不会跳过。测试使用 DSH `0.2.0-rc.2` 组件包、一次性 synthetic profile 和 synthetic provider，不读取用户 profile/凭据，也不调用真实远端模型。挂载入口使用真实 `ClientRemoteService`、Cordis 与当前 Client bundle 检查异步挂载、合成翻译及卸载；主题入口检查实际 Agent/Tools、双向 Gateway、范围绑定与工具调用，不替代用户 DSH Desktop 运行验证。
 
 `src/host/` 管理宿主服务，`src/client/` 管理 UI，`src/shared/` 管理共享契约，`src/memory/` 管理记忆接口实现。构建结果位于 `dist/`。在 DSH 桌面端验证前先构建，使用本地 bundle 安装后重启。若变更 `dsh.client.inject` 等 bundle 元信息，目录链接安装可能需要在插件管理器刷新或重新安装，再重启；不直接修改用户 profile。
 
@@ -40,7 +42,7 @@ pnpm test:native
 - Client 本地模块仅引用 `src` 内的浏览器代码。外部依赖限 React 和已在目标版本 platform seed 中核实的 `@deepseek-ai/dsh-client-ui-primitives`，禁止引入 Node 宿主接口、文件访问、凭据或模型直调。
 - 新会话默认值与历史使用 Web `localStorage`，不视为 Host 配置。有效设置使用 `patchSettingsAsync` 即时按字段合并保存，与正文写入共用锁；不能用陈旧的整页表单覆盖其他窗口未修改的字段，也不能用旧保存回执清除用户的新编辑。
 - 历史保存默认关闭，启用后自动写入；关闭后保留旧历史、停止后续正文写入，已持久主题仍可保留无正文的身份与编号元数据。删除必须明确范围与确认，只清理插件命名空间；选删和清理全部都需冻结确认时的版本。
-- 记忆联动删除没有后端实现时不可执行。后续须核对共享引用和用户选择，不能随历史删除整份共享记忆。
+- 会话删除默认保留共享主题术语，删除最后会话亦保留；明确勾选联动删除时，冻结会话及主题术语版本，在同一既有锁内先核对两个范围，再实际移除。提示同主题未选会话的影响，准确报告部分失败；不能默认扩大到未选主题或声称跨多项存储原子删除。
 - 读取、保存、清理失败和多窗口冲突均保留当前输入并提示。部分清理失败须报告准确范围，不将 localStorage 比较写入宣称为原子事务。
 - 从“+”创建的主题首会话冻结设置默认值；同主题子会话复制父会话的模式、目标语言、要求、单次上限及模型选择，输入为空。原文上限按 Unicode 码点计算，不写成 token 数。模型选择使用主窗口同一目录 RPC 和原生菜单组件，但只更新独立翻译会话，不调用主聊天的 selectModel。
 - 主题 ID、主题名、会话 ID、固定序号及独立备注分别管理。同主题编号只递增，不从存活会话数量重新计算；主题重命名联动显示名，备注不参与命名和执行要求。会话档位只允许 quick 升 normal。
@@ -114,7 +116,7 @@ refactor(host)!: 调整翻译会话事件协议
 
 ## 版本与发布
 
-使用 `MAJOR.MINOR.PATCH`，预发布使用 `-alpha.N`、`-beta.N` 或 `-rc.N`。`0.1.0` 为框架基线，`0.1.1` 为交互面板版本，`0.2.0` 为主题会话与 Host 执行基础版本，`0.2.1` 为会话保存回归修复版本，`0.3.0` 为纯文本快译版本，`0.3.1` 修复快译服务挂载并调整状态提示，`0.3.2` 修复会话控件并补充运行期文件选择入口，`0.3.3` 独立保存模型偏好并修复历史选择与菜单收起，`0.3.4` 准备文本单元与版本记录基础，`0.4.0` 实现快译文本重译、版本选择与历史恢复，`0.4.1` 准备共享调用记录与可选 RPC 兼容字段，`0.5.0` 实现人工修订、调用记录与 TXT/JSON 导出，当前 `0.5.1` 准备纯主题术语与来源核对基础；这些均为本地版本，不代表已经公开发布。0.x 的不兼容接口变更提高 MINOR，并明确说明迁移方法；兼容修复提高 PATCH。暂不根据提交自动发布。
+使用 `MAJOR.MINOR.PATCH`，预发布使用 `-alpha.N`、`-beta.N` 或 `-rc.N`。`0.1.0` 为框架基线，`0.1.1` 为交互面板版本，`0.2.0` 为主题会话与 Host 执行基础版本，`0.2.1` 为会话保存回归修复版本，`0.3.0` 为纯文本快译版本，`0.3.1` 修复快译服务挂载并调整状态提示，`0.3.2` 修复会话控件并补充运行期文件选择入口，`0.3.3` 独立保存模型偏好并修复历史选择与菜单收起，`0.3.4` 准备文本单元与版本记录基础，`0.4.0` 实现快译文本重译、版本选择与历史恢复，`0.4.1` 准备共享调用记录与可选 RPC 兼容字段，`0.5.0` 实现人工修订、调用记录与 TXT/JSON 导出，`0.5.1` 准备纯术语基础，`0.6.0` 接入共享主题术语、面板和主模型管理，当前 `0.6.1` 同步双语功能说明与 Native 验证前提；这些均为本地版本，不代表已经公开发布。0.x 的不兼容接口变更提高 MINOR，并明确说明迁移方法；兼容修复提高 PATCH。暂不根据提交自动发布。
 
 v0.5.0 的 schema5/history2 可读取旧记录但旧 0.4.x 及更早版本不能读取新快照；降级需备份应用本地数据并避免旧版改写。JSON 导出没有导入恢复功能，不能代替应用备份。
 
