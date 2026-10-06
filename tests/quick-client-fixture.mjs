@@ -237,6 +237,12 @@ export function mount(overrides = {}) {
   storage.failSet = !!overrides.failSet
   if (storage.failSet) storage.setItem = () => { throw new Error('quota') }
   const renderer = createRenderer({ deferFunctionalUpdates: overrides.deferFunctionalUpdates })
+  let store
+  const createElement = renderer.react.createElement
+  renderer.react.createElement = (type, props, ...children) => {
+    if (props?.store) store = props.store
+    return createElement(type, props, ...children)
+  }
   const entries = []; const effects = []; const listeners = new Set()
   const host = createResourceHost(renderer.react, renderer)
   let catalogCalls = 0
@@ -313,6 +319,7 @@ export function mount(overrides = {}) {
   }
   const applied = overrides.applyClient ? overrides.applyClient(exported, clientContext) : exported.apply(clientContext)
   return { renderer, storage, remote, applied, copies, downloads, revokedUrls, resourceHost: host,
+    get store() { return store },
     get downloadAnchorCount() { return anchors.size },
     get panel() { return host.panel },
     get settingsPage() { return host.settingsPage },

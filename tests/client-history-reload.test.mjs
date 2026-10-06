@@ -18,7 +18,7 @@ test('发布bundle：开启历史后重命名与模型/推理等级使用完整�
     ui.render(first.settingsPage, {}); await ui.remember(true)
     assert.equal(JSON.parse(first.storage.getItem(SETTINGS_KEY)).rememberHistory, true)
     ui.render(first.panel, { sessionId: 'synthetic-main' }); await ui.flush()
-    ui.context(title(ui)); await ui.click('重命名主题')
+    ui.context(title(ui)); await ui.click('重命名')
     await ui.input('主题名称', '合成主题'); await ui.click('确认重命名主题')
     await ui.click('模型：选择模型'); await ui.click('选择模型'); await ui.click('Synthetic Reasoner')
     await ui.click('选择推理等级'); await ui.click('High')

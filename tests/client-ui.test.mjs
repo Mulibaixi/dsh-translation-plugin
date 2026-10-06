@@ -255,7 +255,7 @@ async function newSession(ui) {
   const item = ui.nodes().find(node => node.type === 'button' && node.props.role === 'menuitem' && node.props['aria-label'] === '新建主题及首会话')
   assert.ok(item); assert.ok(!item.props.disabled); item.props.onClick(); ui.render(); await ui.flush()
 }
-async function rename(ui, value) { ui.context(currentTitle(ui)); await ui.click('重命名主题'); await ui.input('主题名称', value); await ui.click('确认重命名主题') }
+async function rename(ui, value) { ui.context(currentTitle(ui)); await ui.click('重命名'); await ui.input('主题名称', value); await ui.click('确认重命名主题') }
 const tick = () => new Promise(resolve => setImmediate(resolve))
 
 test('面板没有大标题或设置入口，无主会话时不开放输入', async () => {
@@ -283,8 +283,8 @@ test('无效目标语言留在编辑器并提示，修正后即时写入', async
 })
 test('多会话独立输入，重命名与从当前会话编号新建可用', async () => {
   const app = mount(); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' }); await ui.click('切换会话侧栏'); await ui.input('待翻译内容', '父会话文本'); await rename(ui, '故事A')
-  ui.context(currentTitle(ui)); await ui.click('新建同主题子会话'); assert.equal(ui.control('待翻译内容').props.value, ''); assert.match(ui.text(), /故事A-01/)
-  ui.context('故事A'); await ui.click('新建同主题子会话'); assert.match(ui.text(), /故事A-02/)
+  ui.context(currentTitle(ui)); await ui.click('新建子会话'); assert.equal(ui.control('待翻译内容').props.value, ''); assert.match(ui.text(), /故事A-01/)
+  ui.context('故事A'); await ui.click('新建子会话'); assert.match(ui.text(), /故事A-02/)
   await ui.click('故事A'); assert.equal(ui.control('待翻译内容').props.value, '父会话文本')
   await newSession(ui); assert.equal(ui.control('待翻译内容').props.value, ''); assert.match(ui.text(), /新翻译会话/)
   app.dispose()
@@ -373,7 +373,7 @@ test('侧栏取代页签，标题左侧与右侧模式/语言分组，末尾 + �
   assert.equal(toolbar.children.at(-1).props.className, 'dsh-tp-send')
   assert.ok(ui.nodes(toolbar).some(node => node.props['data-native-icon'] === 'send'))
   assert.ok(ui.nodes(header).some(node => node.props['data-native-icon'] === 'chevron-down'))
-  ui.context(currentTitle(ui)); assert.deepEqual(ui.nodes().filter(node => node.props.role === 'menuitem').map(node => ui.text(node)), ['新建同主题子会话', '重命名主题', '编辑会话备注', '记忆资产', '导出最终译文 TXT', '导出完整记录 JSON', '删除', '归档'])
+  ui.context(currentTitle(ui)); assert.deepEqual(ui.nodes().filter(node => node.props.role === 'menuitem').map(node => ui.text(node)), ['新建子会话', '重命名', '备注', '记忆', '导出译文 TXT', '导出对照 JSON', '归档', '删除'])
   assert.equal(ui.text().includes('关闭当前页签'), false)
   app.dispose()
 })
@@ -381,9 +381,9 @@ test('侧栏取代页签，标题左侧与右侧模式/语言分组，末尾 + �
 test('右键非当前会话的重命名、新建和删除始终绑定被点击的会话', async () => {
   const app = mount(); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' }); await ui.click('切换会话侧栏'); await rename(ui, '故事A'); await ui.input('待翻译内容', 'A原文')
   await newSession(ui); await rename(ui, '故事B'); await ui.input('待翻译内容', 'B原文')
-  ui.context('故事A'); await ui.click('重命名主题'); await ui.input('主题名称', 'A改名'); await ui.click('确认重命名主题')
+  ui.context('故事A'); await ui.click('重命名'); await ui.input('主题名称', 'A改名'); await ui.click('确认重命名主题')
   assert.equal(ui.control('待翻译内容').props.value, 'B原文'); assert.equal(ui.text(currentTitle(ui)), '故事B')
-  ui.context('A改名'); await ui.click('新建同主题子会话'); assert.equal(ui.text(currentTitle(ui)), 'A改名-01'); assert.equal(ui.control('待翻译内容').props.value, '')
+  ui.context('A改名'); await ui.click('新建子会话'); assert.equal(ui.text(currentTitle(ui)), 'A改名-01'); assert.equal(ui.control('待翻译内容').props.value, '')
   await ui.click('故事B'); ui.context('A改名'); await ui.click('删除'); assert.match(ui.text(), /删除「A改名」/); await ui.click('取消')
   assert.ok(ui.button('A改名')); ui.context('A改名'); await ui.click('删除'); await ui.click('确认删除会话')
   assert.equal(ui.control('待翻译内容').props.value, 'B原文'); assert.equal(ui.text(currentTitle(ui)), '故事B')
@@ -450,7 +450,7 @@ test('侧栏默认收起，标题下拉切换已有会话且保留独立输入',
 test('标题下拉内的右键操作绑定具体会话，切换主窗口会话时列表隔离', async () => {
   const app = mount(); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' }); await rename(ui, 'A'); await newSession(ui); await rename(ui, 'B')
   openSessionMenu(ui); ui.context('切换翻译会话：A'); assert.equal(currentTitle(ui).props['aria-expanded'], true)
-  await ui.click('新建同主题子会话'); assert.equal(ui.text(currentTitle(ui)), 'A-01')
+  await ui.click('新建子会话'); assert.equal(ui.text(currentTitle(ui)), 'A-01')
   ui.render(app.panel, { sessionId: 'main-b' }); openSessionMenu(ui)
   assert.equal(ui.nodes().some(node => node.props['aria-label'] === '切换翻译会话：A'), false)
   assert.equal(ui.button('切换会话侧栏').props['aria-expanded'], false)
@@ -522,7 +522,7 @@ test('右键会话列表保持展开，菜单操作绑定目标，点击外部�
   let stopped = false
   ui.nodes().find(node => node.props['aria-label'] === '翻译会话右键操作').props.onPointerDown({ stopPropagation() { stopped = true } })
   assert.equal(stopped, true)
-  await ui.click('重命名主题'); assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
+  await ui.click('重命名'); assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
   await ui.input('主题名称', 'A改名'); await ui.click('确认重命名主题'); assert.equal(ui.text(currentTitle(ui)), 'B')
   openSessionMenu(ui); assert.ok(ui.button('切换翻译会话：A改名'))
   ui.context('切换翻译会话：A改名')
@@ -547,16 +547,16 @@ test('键盘打开非当前会话右键，删除动作收起列表且取消不�
 })
 
 test('新建、备注与归档动作都收起标题列表且绑定右键目标', async () => {
-  for (const action of ['新建同主题子会话', '编辑会话备注', '归档']) {
+  for (const action of ['新建子会话', '备注', '归档']) {
     const app = mount(); const ui = app.renderer
     try {
       ui.render(app.panel, { sessionId: 'main-a' }); await rename(ui, 'A'); await newSession(ui); await rename(ui, 'B')
       openSessionMenu(ui); ui.context('切换翻译会话：A'); await ui.click(action)
       assert.equal(currentTitle(ui).props['aria-expanded'], false); assert.equal(sessionContextMenu(ui), undefined)
-      if (action === '新建同主题子会话') assert.equal(ui.text(currentTitle(ui)), 'A-01')
+      if (action === '新建子会话') assert.equal(ui.text(currentTitle(ui)), 'A-01')
       else {
         assert.equal(ui.text(currentTitle(ui)), 'B')
-        if (action === '编辑会话备注') {
+        if (action === '备注') {
           await ui.input('会话备注', 'A备注'); await ui.click('保存备注'); openSessionMenu(ui)
           assert.match(ui.text(ui.button('切换翻译会话：A · A备注')), /A备注/)
           assert.equal(ui.button('切换翻译会话：B').props.title, 'B')

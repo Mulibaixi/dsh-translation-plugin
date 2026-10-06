@@ -4,7 +4,7 @@ import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
 import { type TextUnit, type TextRevision } from './translation-history.js'
-import { buildFinalTextExport, buildFullRecordExport, type TranslationExport } from './translation-export.js'
+import { buildFinalTextExport, buildBilingualExport, type TranslationExport } from './translation-export.js'
 import { type HistoryVersion, type SessionStore } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
@@ -337,7 +337,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   const [deletion, setDeletion] = react.useState<DeleteRequest | undefined>(undefined)
   const [name, setName] = react.useState('')
   const [remark, setRemark] = react.useState('')
-  const [exportRequest, setExportRequest] = react.useState<{ readonly session: LocalSession; readonly history: NonNullable<ReturnType<SessionStore['getTranslationHistory']>>; readonly at: string; readonly result: TranslationExport } | undefined>(undefined)
+  const [exportRequest, setExportRequest] = react.useState<{ readonly session: LocalSession; readonly history: NonNullable<ReturnType<SessionStore['getTranslationHistory']>>; readonly at: string; readonly format: 'txt' | 'json'; readonly result: TranslationExport } | undefined>(undefined)
   const [exportNotice, setExportNotice] = react.useState<{ readonly message: string; readonly failure: boolean } | undefined>(undefined)
   const [files, setFiles] = react.useState(() => new Map<string, File>())
   const fileInput = react.useRef<HTMLInputElement | null>(null)
@@ -392,12 +392,12 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   function exportSession(id: string, format: 'txt' | 'json'): void {
     closeSessionMenus(); setExportNotice(undefined); setExportRequest(undefined)
     try {
-      if (format === 'txt' && !quick.finalizeForExport(id)) throw new Error('Cannot finalize export')
+      if (!quick.finalizeForExport(id)) throw new Error('Cannot finalize export')
       const session = store.getSession(id), history = store.getTranslationHistory(id)
       if (!session || !history) throw new Error('Session no longer available')
       const snapshot = structuredClone({ session, history }), at = new Date().toISOString()
-      const result = format === 'txt' ? buildFinalTextExport(snapshot.session, snapshot.history, at) : buildFullRecordExport(snapshot.session, snapshot.history, at)
-      if (format === 'txt' && !result.complete) setExportRequest({ ...snapshot, at, result })
+      const result = format === 'txt' ? buildFinalTextExport(snapshot.session, snapshot.history, at) : buildBilingualExport(snapshot.session, snapshot.history, at)
+      if (!result.complete) setExportRequest({ ...snapshot, at, format, result })
       else deliver(result)
     } catch { setExportNotice({ message: '导出失败，当前内容仍保留。', failure: true }) }
   }
@@ -457,11 +457,11 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
       storeNotice(store),
       terms?.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted dsh-tp-message' }, terms.getNotice()) : null,
       exportNotice ? h('div', { role: exportNotice.failure ? 'alert' : 'status', className: exportNotice.failure ? 'dsh-tp-message' : 'dsh-tp-muted dsh-tp-message' }, exportNotice.message) : null,
-      exportRequest ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '导出最终译文确认' },
+      exportRequest ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '导出译文确认' },
         h('h3', null, `导出「${exportRequest.session.name}」`),
         h('p', null, `尚无最终译文：${exportRequest.result.missingUnits.map(unit => `文本 ${unit.order}`).join('、')}。`),
         h('div', { className: 'dsh-tp-actions' },
-          button('仅导出已定稿', () => deliver(buildFinalTextExport(exportRequest.session, exportRequest.history, exportRequest.at, { allowPartial: true })), exportRequest.result.exportedUnitIds.length === 0),
+          button('仅导出已定稿', () => deliver((exportRequest.format === 'txt' ? buildFinalTextExport : buildBilingualExport)(exportRequest.session, exportRequest.history, exportRequest.at, { allowPartial: true })), exportRequest.result.exportedUnitIds.length === 0),
           button('取消', () => { closeSessionMenus(); setExportRequest(undefined) }),
         ),
       ) : null,
@@ -523,16 +523,16 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setContext(undefined); context.trigger?.focus() }
       },
     },
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建同主题子会话'),
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名主题'),
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '编辑会话备注'),
-      onOpenAssets ? h(MenuItemButton, { onSelect: () => openSessionAssets(target) }, '记忆资产') : null,
-      h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'txt') }, '导出最终译文 TXT'),
-      h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'json') }, '导出完整记录 JSON'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建子会话'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '备注'),
+      onOpenAssets ? h(MenuItemButton, { onSelect: () => openSessionAssets(target) }, '记忆') : null,
+      h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'txt') }, '导出译文 TXT'),
+      h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'json') }, '导出对照 JSON'),
+      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); store.archiveSession(ownerId, target.id, target.archivedAt === null) } }, target.archivedAt === null ? '归档' : '恢复'),
       h(MenuItemButton, { disabled: action.pending, danger: true, onSelect: () => {
         closeSessionMenus(); setDeletion(captureDeleteRequest(store, terms, `删除「${target.name}」`, [target.id]))
       } }, '删除'),
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); store.archiveSession(ownerId, target.id, target.archivedAt === null) } }, target.archivedAt === null ? '归档' : '恢复归档'),
     )) : null,
   )
 }

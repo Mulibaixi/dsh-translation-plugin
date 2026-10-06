@@ -4,7 +4,7 @@ import { mount } from './quick-client-fixture.mjs'
 
 function currentTitle(ui) { return ui.nodes().find(node => node.props.className === 'dsh-tp-current-title') }
 async function rename(ui, name) {
-  ui.context(currentTitle(ui)); await ui.click('重命名主题'); await ui.input('主题名称', name); await ui.click('确认重命名主题')
+  ui.context(currentTitle(ui)); await ui.click('重命名'); await ui.input('主题名称', name); await ui.click('确认重命名主题')
 }
 async function create(ui, name) {
   await ui.click('切换会话侧栏'); await ui.click('新建主题及首会话'); await ui.click('切换会话侧栏'); await rename(ui, name)

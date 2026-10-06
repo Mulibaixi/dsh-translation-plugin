@@ -85,7 +85,7 @@ test('主题快照真实bundle：标题档案按owner/主题去重，删最后�
   const f = await setup({ settings: on }); let restored
   try {
     await f.request(put(f.session))
-    f.ui.context(title(f.ui)); await f.ui.click('新建同主题子会话')
+    f.ui.context(title(f.ui)); await f.ui.click('新建子会话')
     picker(f.ui)
     const group = f.ui.nodes().find(node => node.props['aria-label'] === '记忆资产')
     assert.equal(f.ui.nodes(group).filter(node => node.type === 'button').length, 1)
@@ -115,7 +115,7 @@ test('主题快照真实bundle：别的owner不出现保留档案入口；普通
   const f = await setup()
   try {
     await f.request(put(f.session))
-    f.ui.context(title(f.ui)); await f.ui.click('重命名主题'); await f.ui.input('主题名称', 'Synthetic private topic'); await f.ui.click('确认重命名主题')
+    f.ui.context(title(f.ui)); await f.ui.click('重命名'); await f.ui.input('主题名称', 'Synthetic private topic'); await f.ui.click('确认重命名主题')
     f.ui.render(f.app.panel, { sessionId: 'synthetic-other-owner' }); await f.ui.flush(); await f.ui.flush()
     picker(f.ui)
     const group = f.ui.nodes().find(node => node.props['aria-label'] === '记忆资产')
