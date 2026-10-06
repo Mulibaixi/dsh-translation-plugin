@@ -34,6 +34,7 @@ function fixture({ initialAgent = true, timeout = 1000 } = {}) {
   }
 }
 const sessionsReply = id => ({ requestId: id, ok: true, value: { kind: 'sessions', sessions: [] } })
+const summary = { id: 's', topicId: 't', name: 'Synthetic 1', mode: 'quick', publishedUnitIds: [], topicName: 'Synthetic', sequence: 1, remark: '', archived: false }
 
 test('topic bridge仅公开管理/历史协议，严格拒绝凭据、伪造owner和普通材料命令', () => {
   assert.deepEqual(parseTopicBridgeOpen(open), open)
@@ -57,16 +58,83 @@ test('topic uplink预算拒绝超额，term query子集不会夹带非active条�
   assert.throws(() => parseTopicBridgeDown({ kind: 'request', requestId: 'r', mainSessionId: open.mainSessionId, callId: 'c', command: { kind: 'list_sessions' }, chat: [] }))
 })
 
-test('metadata绑定无需先激活Agent，created安装五工具且同Agent不重复安装', async () => {
+test('metadata绑定无需先激活Agent，created安装十工具且同Agent不重复安装', async () => {
   const f = fixture({ initialAgent: false })
   try {
     assert.equal((await f.stream.next()).value.kind, 'ready'); assert.equal(f.tools.size, 0); assert.deepEqual(f.calls, [{}])
-    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 5)
-    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 5)
+    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 10)
+    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 10)
     assert.ok(f.tools.has('translation_query_terms')); assert.ok(!f.tools.has('translation_read_material'))
     f.listeners.get('agent/disposed')({ agent: f.agent }); assert.equal(f.tools.size, 0)
   } finally { await f.close() }
   assert.equal(f.listeners.size, 0)
+})
+
+test('管理command严格区分三种起点、预期值及Unicode字段，无任意配置或执行入口', () => {
+  for (const start of [{ kind: 'new_topic' }, { kind: 'parent_session', translationSessionId: 's' }, { kind: 'existing_topic', topicId: 't' }]) {
+    const command = { kind: 'create_session', start, reason: '合成任务范围内创建' }
+    assert.deepEqual(parseTopicBridgeCommand(command), command)
+  }
+  for (const start of [{ kind: 'new_topic', model: {} }, { kind: 'parent_session', topicId: 't' }, { kind: 'existing_topic', translationSessionId: 's' }]) assert.throws(() => parseTopicBridgeCommand({ kind: 'create_session', start, reason: 'reason' }))
+  assert.throws(() => parseTopicBridgeCommand({ kind: 'create_session', start: { kind: 'new_topic' }, reason: ' ' }))
+  assert.throws(() => parseTopicBridgeCommand({ kind: 'create_session', start: { kind: 'new_topic' }, reason: 'x'.repeat(1001) }))
+  for (const command of [
+    { kind: 'list_topics' }, { kind: 'list_topic_terms', topicId: 't' },
+    { kind: 'rename_topic', topicId: 't', expectedName: 'Synthetic', name: '😀'.repeat(120) },
+    { kind: 'set_session_remark', translationSessionId: 's', expectedRemark: '旧备注', remark: '' },
+    { kind: 'archive_session', translationSessionId: 's', expectedArchived: false, archived: true },
+  ]) assert.deepEqual(parseTopicBridgeCommand(command), command)
+  assert.throws(() => parseTopicBridgeCommand({ kind: 'rename_topic', topicId: 't', expectedName: 'Synthetic', name: '😀'.repeat(121) }))
+  assert.throws(() => parseTopicBridgeCommand({ kind: 'archive_session', translationSessionId: 's', expectedArchived: false, archived: 'true' }))
+  assert.throws(() => parseTopicBridgeCommand({ kind: 'set_session_remark', translationSessionId: 's', expectedRemark: '', remark: '', instruction: 'forbidden' }))
+})
+
+test('管理回执仅安全metadata，创建理由与saved/runtime_only明确，orphan topic可空', () => {
+  const receipt = value => ({ requestId: 'r', ok: true, value })
+  for (const persistence of ['saved', 'runtime_only']) {
+    const created = { kind: 'session_created', session: summary, reason: 'Task explanation', persistence }
+    assert.deepEqual(parseTopicBridgeReply(receipt(created)).value, created)
+    assert.equal(parseTopicBridgeReply(receipt({ kind: 'sessions', sessions: [summary], persistence })).value.persistence, persistence)
+  }
+  assert.equal(parseTopicBridgeReply(receipt({ kind: 'sessions', sessions: [{ ...summary, sequence: 0 }] })).value.sessions[0].sequence, 0)
+  const unicode = { ...summary, name: `${'😀'.repeat(120)} 1`, topicName: '😀'.repeat(120) }
+  assert.deepEqual(parseTopicBridgeReply(receipt({ kind: 'sessions', sessions: [unicode] })).value.sessions[0], unicode)
+  const topics = { kind: 'topics', topics: [{ id: 't', name: 'Synthetic', nextSequence: 7, sessionIds: [] }] }
+  assert.deepEqual(parseTopicBridgeReply(receipt(topics)).value, topics)
+  assert.throws(() => parseTopicBridgeReply(receipt({ kind: 'session_created', session: summary, reason: 'Task explanation' })))
+  assert.throws(() => parseTopicBridgeReply(receipt({ kind: 'sessions', sessions: [summary], persistence: 'failed' })))
+  assert.throws(() => parseTopicBridgeReply(receipt({ kind: 'sessions', sessions: [{ ...summary, input: 'private draft' }] })))
+  assert.throws(() => parseTopicBridgeReply(receipt({ ...topics, topics: [{ ...topics.topics[0], ownerId: 'spoof' }] })))
+})
+
+test('list_terms工具恰好一项target，topic目标对应orphan命令，管理写带预期值与reason原样传递', async () => {
+  const f = fixture()
+  try {
+    await f.stream.next()
+    const list = f.tools.get('translation_list_terms')
+    assert.equal(Object.hasOwn(list.parameters.translationSessionId, 'required'), false)
+    assert.equal(Object.hasOwn(list.parameters.topicId, 'required'), false)
+    assert.throws(() => list.execute({}, f.exec), { code: 'invalid_target' })
+    assert.throws(() => list.execute({ translationSessionId: 's', topicId: 't' }, f.exec), { code: 'invalid_target' })
+    assert.throws(() => f.tools.get('translation_create_session').execute({ start: { kind: 'new_topic' }, reason: '' }, f.exec), TypeError)
+    assert.throws(() => f.tools.get('translation_rename_topic').execute({ topicId: 't', expectedName: 'Synthetic', name: 'x'.repeat(121) }, f.exec), TypeError)
+    const cases = [
+      ['translation_list_terms', { topicId: 't' }, { kind: 'list_topic_terms', topicId: 't' }, { kind: 'terms', snapshot: emptyTopicTerms(open.ownerId, 't', '2026-10-06T00:00:00.000Z') }],
+      ['translation_list_topics', {}, { kind: 'list_topics' }, { kind: 'topics', topics: [] }],
+      ['translation_create_session', { start: { kind: 'existing_topic', topicId: 't' }, reason: 'Reuse assigned topic' }, { kind: 'create_session', start: { kind: 'existing_topic', topicId: 't' }, reason: 'Reuse assigned topic' }, { kind: 'session_created', session: summary, reason: 'Reuse assigned topic', persistence: 'runtime_only' }],
+      ['translation_rename_topic', { topicId: 't', expectedName: 'Synthetic', name: 'Renamed' }, { kind: 'rename_topic', topicId: 't', expectedName: 'Synthetic', name: 'Renamed' }, { kind: 'sessions', sessions: [], persistence: 'saved' }],
+      ['translation_set_session_remark', { translationSessionId: 's', expectedRemark: '', remark: '合成备注' }, { kind: 'set_session_remark', translationSessionId: 's', expectedRemark: '', remark: '合成备注' }, { kind: 'sessions', sessions: [summary], persistence: 'runtime_only' }],
+      ['translation_archive_session', { translationSessionId: 's', expectedArchived: false, archived: true }, { kind: 'archive_session', translationSessionId: 's', expectedArchived: false, archived: true }, { kind: 'sessions', sessions: [summary], persistence: 'runtime_only' }],
+    ]
+    let next = f.stream.next()
+    for (const [name, args, command, value] of cases) {
+      const result = f.tools.get(name).execute(args, f.exec), frame = (await next).value
+      assert.deepEqual(frame.command, command); assert.equal(frame.callId, f.exec.callId)
+      f.inbox.push({ requestId: frame.requestId, ok: true, value }); next = f.stream.next()
+      assert.deepEqual(await result, value)
+    }
+    f.controller.abort(); await next
+  } finally { await f.close() }
 })
 
 test('同main第二管理连接拒绝占用，已abort/额外字段不会建立连接', async () => {
@@ -126,6 +194,18 @@ test('错误correlation不接受结果，pending变unknown并完整cleanup', asy
     const result = f.tools.get('translation_list_sessions').execute({}, f.exec)
     const rejected = assert.rejects(result, { code: 'outcome_unknown' })
     await f.stream.next(); f.inbox.push(sessionsReply('wrong-id'))
+    await assert.rejects(f.stream.next(), { code: 'invalid_reply' }); await rejected
+    assert.equal(f.tools.size, 0)
+  } finally { await f.close() }
+})
+
+test('管理成功sessions回执缺少persistence不算成功，list_sessions仍兼容无保存字段', async () => {
+  const f = fixture()
+  try {
+    await f.stream.next()
+    const result = f.tools.get('translation_rename_topic').execute({ topicId: 't', expectedName: 'Synthetic', name: 'Renamed' }, f.exec)
+    const rejected = assert.rejects(result, { code: 'outcome_unknown' }), frame = (await f.stream.next()).value
+    f.inbox.push(sessionsReply(frame.requestId))
     await assert.rejects(f.stream.next(), { code: 'invalid_reply' }); await rejected
     assert.equal(f.tools.size, 0)
   } finally { await f.close() }

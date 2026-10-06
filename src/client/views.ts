@@ -266,7 +266,7 @@ function LanguagePicker({ session, store }: StoreProps & { readonly session: Loc
   }))))
 }
 
-function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTerms }: StoreProps & {
+function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTerms, onTopicTerms }: StoreProps & {
   readonly ownerId: string; readonly current: LocalSession | undefined
   readonly open: boolean; readonly onOpenChange: (open: boolean) => void
   readonly contextOpen: boolean; readonly onDismissContext: () => void
@@ -274,9 +274,11 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
   readonly onContextKeys: (session: LocalSession, event: KeyboardEvent & { currentTarget: HTMLElement }) => void
   readonly creating: boolean; readonly onCreate: () => void
   readonly onTerms?: (() => void) | undefined
+  readonly onTopicTerms?: ((topic: { readonly id: string; readonly name: string }) => void) | undefined
 }): unknown {
   const sessions = store.getActiveSessions(ownerId)
   const archived = store.getArchivedSessions(ownerId)
+  const topics = [...new Map(store.getTopics(ownerId).map(topic => [topic.id, topic])).values()]
   function row(session: LocalSession, restore = false): unknown {
     return h('button', {
       type: 'button', role: 'menuitem', key: session.id, className: 'dsh-tp-session-choice', title: sessionTitle(session),
@@ -308,6 +310,9 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
     archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
     onTerms ? h(MenuItemButton, { onSelect: onTerms }, '主题术语') : null,
+    onTopicTerms && topics.length ? h(MenuGroup, { label: '主题档案' }, ...topics.map(topic => h(MenuItemButton, {
+      key: topic.id, onSelect: () => onTopicTerms(topic), 'aria-label': `打开主题档案：${topic.name}`,
+    }, topic.name))) : null,
     h('button', {
       type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,
       onClick: onCreate,
@@ -418,7 +423,7 @@ function TranslationUnit({ unit, quick, session, editor, topics }: { readonly un
   )
 }
 
-function downloadExport(result: TranslationExport): void {
+function downloadExport(result: Pick<TranslationExport, 'content' | 'fileName' | 'mimeType'>): void {
   if (result.content === null) throw new Error('No export content')
   const anchor = document.createElement('a')
   const url = URL.createObjectURL(new Blob([result.content], { type: result.mimeType }))
@@ -487,8 +492,13 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
     void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)))
   }
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined) }
-  function openTerms(session: LocalSession): void { closeSessionMenus(); setTermTopic({ id: session.topicId, name: session.topicName }) }
-  function deliver(result: TranslationExport): void {
+  function openTopicTerms(topic: { readonly id: string; readonly name: string }): void {
+    if (!store.getTopics(ownerId).some(owned => owned.id === topic.id)) return
+    closeSessionMenus(); setTermTopic({ id: topic.id, name: topic.name })
+  }
+  function openTerms(session: LocalSession): void { openTopicTerms({ id: session.topicId, name: session.topicName }) }
+  function deliver(result: Pick<TranslationExport, 'content' | 'fileName' | 'mimeType'>): void {
+    closeSessionMenus()
     try { downloadExport(result); setExportNotice({ message: '已向浏览器发起下载。', failure: false }); setExportRequest(undefined) }
     catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
   }
@@ -532,14 +542,14 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
     h('div', { className: 'dsh-tp-main' },
       h('header', { className: 'dsh-tp-workspace-header' },
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
-        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTerms: terms && onDeleteTerm && current ? () => openTerms(current) : undefined }),
+        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTerms: terms && onDeleteTerm && current ? () => openTerms(current) : undefined, onTopicTerms: terms && onDeleteTerm ? openTopicTerms : undefined }),
         current ? h('div', { className: 'dsh-tp-header-options' },
           h(ModePicker, { store, session: current, key: `mode:${current.id}` }),
           h(LanguagePicker, { store, session: current, key: `language:${current.id}` }),
         ) : null,
       ),
       termTopic && terms && onDeleteTerm ? h(TopicTermsView, { key: JSON.stringify([ownerId, termTopic.id]), sessions: store, terms, ownerId, topicId: termTopic.id,
-        topicName: store.getTopics(ownerId).find(topic => topic.id === termTopic.id)?.name ?? termTopic.name, onClose: () => setTermTopic(undefined), onDelete: onDeleteTerm, bridgeReason: topics?.getStatus(ownerId).reason,
+        topicName: store.getTopics(ownerId).find(topic => topic.id === termTopic.id)?.name ?? termTopic.name, onClose: () => setTermTopic(undefined), onDelete: onDeleteTerm, onExport: deliver, bridgeReason: topics?.getStatus(ownerId).reason,
         onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined }) : null,
       dialog?.kind === 'rename' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '重命名主题', 'aria-busy': action.pending },
         field('主题名称', h('input', { type: 'text', value: name, autoFocus: true, disabled: action.pending, onChange: (event: TextEvent) => setName(event.currentTarget.value) })),

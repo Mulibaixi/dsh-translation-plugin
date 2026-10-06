@@ -1,9 +1,10 @@
 import {
   MAX_TOPIC_BRIDGE_REPLY_BYTES, parseTopicBridgeCapability, parseTopicBridgeDown, parseTopicBridgeReply,
-  type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact,
+  type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact, type TopicSessionSummary,
 } from '../shared/topic-bridge.js'
 import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceRef, TopicTermQuery } from '../memory/topic-terms.js'
 import type { SessionStore } from './session-store.js'
+import type { LocalSession } from './sessions.js'
 
 export interface TopicBridgeRemotePort {
   capabilities(): Promise<unknown>
@@ -94,7 +95,7 @@ export class TopicBridgeClient {
         }
         if (!opened || frame.mainSessionId !== ownerId) throw new Error('主题管理请求归属无效。')
         let reply: TopicBridgeReply
-        if (connection.requests.has(frame.requestId)) reply = error(frame.requestId, 'duplicate_request', '此请求已经处理，未重复修改术语。')
+        if (connection.requests.has(frame.requestId)) reply = error(frame.requestId, 'duplicate_request', '此请求已经处理，未重复修改会话或术语。')
         else {
           connection.requests.add(frame.requestId)
           try { reply = await this.dispatch(ownerId, frame) }
@@ -125,17 +126,45 @@ export class TopicBridgeClient {
     if (!publication || publication.topicId !== topicId) return false
     return ref.kind === 'source' || (publication.fact.final?.revisionId === ref.revisionId && publication.fact.final.selectionEventId === ref.selectionEventId)
   }
+  private sessionSummary(session: LocalSession): TopicSessionSummary {
+    return { id: session.id, topicId: session.topicId, name: session.name, mode: session.mode,
+      topicName: session.topicName, sequence: session.sequence, remark: session.remark, archived: session.archivedAt !== null,
+      publishedUnitIds: [...this.publications.values()].filter(item => item.sessionId === session.id).map(item => item.fact.id) }
+  }
   private async dispatch(ownerId: string, request: TopicBridgeRequest): Promise<TopicBridgeReply> {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
-    if (command.kind === 'list_sessions') return success({ kind: 'sessions', sessions: this.sessions.getAvailableSessions(ownerId).filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => ({
-      id: session.id, topicId: session.topicId, name: session.name, mode: session.mode,
-      publishedUnitIds: [...this.publications.values()].filter(item => item.sessionId === session.id).map(item => item.fact.id),
-    })) })
+    if (command.kind === 'list_sessions') return success({ kind: 'sessions', sessions: this.sessions.getAvailableSessions(ownerId).filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => this.sessionSummary(session)) })
+    if (command.kind === 'list_topics') return success({ kind: 'topics', topics: this.sessions.getTopics(ownerId).map(topic => ({ ...topic,
+      sessionIds: this.sessions.getAvailableSessions(ownerId).filter(session => session.topicId === topic.id && !this.sessions.isSessionDeleted(session.id)).map(session => session.id) })) })
+    if (command.kind === 'list_topic_terms') {
+      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不属于当前主会话或不存在。')
+      return success({ kind: 'terms', snapshot: this.terms.getSnapshot(ownerId, command.topicId) })
+    }
+    if (command.kind === 'create_session') {
+      const result = await this.sessions.createManagedSessionAsync(ownerId, command.start)
+      return result.ok ? success({ kind: 'session_created', session: this.sessionSummary(result.sessions[0]!), reason: command.reason, persistence: result.persistence })
+        : error(request.requestId, result.code, result.message)
+    }
+    if (command.kind === 'rename_topic') {
+      const result = await this.sessions.renameTopicAsync(ownerId, command.topicId, command.expectedName, command.name)
+      return result.ok ? success({ kind: 'sessions', sessions: result.sessions.map(session => this.sessionSummary(session)), persistence: result.persistence })
+        : error(request.requestId, result.code, result.message)
+    }
     const session = this.sessions.getSession(command.translationSessionId)
     if (!session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id)) return error(request.requestId, 'out_of_scope', '翻译会话不属于当前主会话或已删除。')
     switch (command.kind) {
+      case 'set_session_remark': {
+        const result = await this.sessions.setSessionRemarkAsync(ownerId, session.id, command.expectedRemark, command.remark)
+        return result.ok ? success({ kind: 'sessions', sessions: result.sessions.map(session => this.sessionSummary(session)), persistence: result.persistence })
+          : error(request.requestId, result.code, result.message)
+      }
+      case 'archive_session': {
+        const result = await this.sessions.setSessionArchivedAsync(ownerId, session.id, command.expectedArchived, command.archived)
+        return result.ok ? success({ kind: 'sessions', sessions: result.sessions.map(session => this.sessionSummary(session)), persistence: result.persistence })
+          : error(request.requestId, result.code, result.message)
+      }
       case 'read_unit': {
         if (session.mode !== 'normal') return error(request.requestId, 'normal_required', '历史原文参考只在明确升级为普通后提供。')
         const publication = this.publications.get(this.key(ownerId, session.id, command.unitId))

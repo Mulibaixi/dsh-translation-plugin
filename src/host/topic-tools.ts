@@ -1,4 +1,4 @@
-import { TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
+import { TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
 
 interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
@@ -21,6 +21,12 @@ interface SessionController { list(request: Record<string, never>, signal: Abort
 interface ToolHelpers { defineTool(options: Record<string, unknown>): unknown }
 export type TopicToolLoader = () => Promise<ToolHelpers>
 const sessionParameter = { type: 'string', required: true, description: 'Exact translation Session id from translation_list_sessions.' }
+const topicParameter = { type: 'string', required: true, description: 'Exact topic id from translation_list_topics or translation_list_sessions.' }
+const sessionStartParameter = { required: true, oneOf: [
+  { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['new_topic'], required: true } } },
+  { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['parent_session'], required: true }, translationSessionId: sessionParameter } },
+  { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['existing_topic'], required: true }, topicId: topicParameter } },
+] }
 const termFields = {
   id: { type: 'string', required: true }, expectedEntryVersion: { oneOf: [{ type: 'integer' }, { type: 'null' }], required: true },
   sourceLanguage: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true }, targetLanguage: { type: 'string', required: true },
@@ -82,8 +88,10 @@ class ManagementConnection {
     const pending = this.pending
     if (!pending || reply.requestId !== pending.frame.requestId) throw bridgeError('invalid_reply', '主题管理回执与请求不一致。')
     if (reply.ok) {
-      const expected = { list_sessions: 'sessions', read_unit: 'unit', list_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms' }[pending.frame.command.kind]
+      const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
+        set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
+      if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
     } else pending.reject(bridgeError(reply.error.code, reply.error.message))
     pending.clean(); this.pending = undefined
@@ -158,8 +166,13 @@ export class TopicToolsService {
   private installTools(agent: MainAgent, connection: ManagementConnection, helpers: ToolHelpers): readonly (() => void)[] {
     const definitions: readonly { readonly name: string; readonly description: string; readonly kind: TopicBridgeCommand['kind']; readonly parameters: Record<string, unknown> }[] = [
       { name: 'translation_list_sessions', kind: 'list_sessions', parameters: {}, description: 'List quick and normal translation Sessions belonging to this main Session, including only metadata and explicitly published reference ids. Terms management does not change execution mode.' },
+      { name: 'translation_list_topics', kind: 'list_topics', parameters: {}, description: 'List topic metadata belonging to this main Session, including empty topics and topics whose last translation Session was deleted. Does not expose drafts or source bodies.' },
+      { name: 'translation_create_session', kind: 'create_session', parameters: { start: sessionStartParameter, reason: { type: 'string', required: true } }, description: 'Create a translation Session in the background within the user-assigned task scope. Use a parent Session for a same-topic child, an existing topic id to reuse a topic including an empty topic, or new_topic only when the user explicitly intends a separate topic. A nonempty reason is returned as an explanation, never saved as the Session remark. Uses existing defaults or inherited settings; does not select the new Session or execute translation.' },
+      { name: 'translation_rename_topic', kind: 'rename_topic', parameters: { topicId: topicParameter, expectedName: { type: 'string', required: true }, name: { type: 'string', required: true } }, description: 'Rename one owned topic, including an empty topic, only if its current name equals the observed expectedName. Changes metadata for its translation Sessions; does not alter drafts, models or requirements. Check returned persistence or an error; errors may require querying current metadata.' },
+      { name: 'translation_set_session_remark', kind: 'set_session_remark', parameters: { translationSessionId: sessionParameter, expectedRemark: { type: 'string', required: true }, remark: { type: 'string', required: true } }, description: 'Set one owned translation Session remark only if it still equals expectedRemark. Remark is separate from topic naming and translation requirements. This does not edit the draft or invoke a model. An empty string clears a remark.' },
+      { name: 'translation_archive_session', kind: 'archive_session', parameters: { translationSessionId: sessionParameter, expectedArchived: { type: 'boolean', required: true }, archived: { type: 'boolean', required: true } }, description: 'Archive or restore one owned translation Session only if its archived state still equals expectedArchived. Keeps content and topic assets, never deletes. Restoration happens in the background and does not select the Session. Check persistence; a failed save is not a rollback guarantee.' },
       { name: 'translation_read_unit', kind: 'read_unit', parameters: { translationSessionId: sessionParameter, unitId: { type: 'string', required: true } }, description: 'Read one historical text unit explicitly exposed by the user. Unpublished history and current drafts are inaccessible.' },
-      { name: 'translation_list_terms', kind: 'list_terms', parameters: { translationSessionId: sessionParameter }, description: 'Read this translation Session topic terminology, status, versions and evidence references; source bodies are not included.' },
+      { name: 'translation_list_terms', kind: 'list_terms', parameters: { translationSessionId: { type: 'string', description: sessionParameter.description }, topicId: { type: 'string', description: topicParameter.description } }, description: 'Read owned topic terminology, status, versions and evidence references. Supply exactly one translationSessionId or topicId; a topic id also works after its last Session was deleted. Source bodies are not included.' },
       { name: 'translation_query_terms', kind: 'query_terms', parameters: { translationSessionId: sessionParameter, sourceLanguage: termFields.sourceLanguage, targetLanguage: termFields.targetLanguage, forms: { type: 'array', items: { type: 'string' }, required: true } }, description: 'Select active topic terms by exact source language, target language and explicit forms or aliases. Invalid or outdated basis is excluded.' },
       { name: 'translation_upsert_term', kind: 'upsert_term', parameters: { translationSessionId: sessionParameter, expectedVersion: { type: 'integer', required: true }, entry: { type: 'object', additionalProperties: false, properties: termFields, required: true } }, description: 'Propose or source-check one topic term against the observed topic/entry versions. Source evidence must have been explicitly published. Cannot create user confirmation or rewrite a user-adopted rule.' },
     ]
@@ -169,7 +182,12 @@ export class TopicToolsService {
         output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
         execute: (args: Record<string, unknown>, exec: ToolExecution) => {
           if (exec.agent !== agent) throw bridgeError('scope_mismatch', '主题工具不属于此 Agent。')
-          return connection.request({ kind: definition.kind, ...args } as TopicBridgeCommand, exec)
+          if (definition.kind === 'list_terms') {
+            const session = args.translationSessionId !== undefined, topic = args.topicId !== undefined
+            if (session === topic) throw bridgeError('invalid_target', '术语读取必须恰好指定翻译会话或主题 ID。')
+            return connection.request(parseTopicBridgeCommand(topic ? { kind: 'list_topic_terms', topicId: args.topicId } : { kind: 'list_terms', translationSessionId: args.translationSessionId }), exec)
+          }
+          return connection.request(parseTopicBridgeCommand({ ...args, kind: definition.kind }), exec)
         },
       })))
       return disposers

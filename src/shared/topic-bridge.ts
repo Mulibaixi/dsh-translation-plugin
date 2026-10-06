@@ -4,13 +4,28 @@ import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type To
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
 export interface TopicBridgeOpen { readonly ownerId: string; readonly mainSessionId: string }
 export interface TopicBridgeCapability { readonly ready: boolean; readonly reason?: string }
+export type TopicPersistence = 'saved' | 'runtime_only'
+export interface TopicSummary {
+  readonly id: string
+  readonly name: string
+  readonly nextSequence: number
+  readonly sessionIds: readonly string[]
+}
 export interface TopicSessionSummary {
   readonly id: string
   readonly topicId: string
   readonly name: string
   readonly mode: 'quick' | 'normal'
   readonly publishedUnitIds: readonly string[]
+  readonly topicName: string
+  readonly sequence: number
+  readonly remark: string
+  readonly archived: boolean
 }
+export type TopicSessionStart =
+  | { readonly kind: 'new_topic' }
+  | { readonly kind: 'parent_session'; readonly translationSessionId: string }
+  | { readonly kind: 'existing_topic'; readonly topicId: string }
 export interface TopicUnitFact {
   readonly id: string
   readonly order: number
@@ -26,12 +41,20 @@ export interface TopicUnitFact {
 }
 export type TopicBridgeCommand =
   | { readonly kind: 'list_sessions' }
+  | { readonly kind: 'list_topics' }
+  | { readonly kind: 'list_topic_terms'; readonly topicId: string }
+  | { readonly kind: 'create_session'; readonly start: TopicSessionStart; readonly reason: string }
+  | { readonly kind: 'rename_topic'; readonly topicId: string; readonly expectedName: string; readonly name: string }
+  | { readonly kind: 'set_session_remark'; readonly translationSessionId: string; readonly expectedRemark: string; readonly remark: string }
+  | { readonly kind: 'archive_session'; readonly translationSessionId: string; readonly expectedArchived: boolean; readonly archived: boolean }
   | { readonly kind: 'read_unit'; readonly translationSessionId: string; readonly unitId: string }
   | { readonly kind: 'list_terms'; readonly translationSessionId: string }
   | { readonly kind: 'query_terms'; readonly translationSessionId: string; readonly sourceLanguage: string | null; readonly targetLanguage: string; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_term'; readonly translationSessionId: string; readonly expectedVersion: number; readonly entry: TopicTermPut }
 export type TopicBridgeValue =
-  | { readonly kind: 'sessions'; readonly sessions: readonly TopicSessionSummary[] }
+  | { readonly kind: 'sessions'; readonly sessions: readonly TopicSessionSummary[]; readonly persistence?: TopicPersistence }
+  | { readonly kind: 'topics'; readonly topics: readonly TopicSummary[] }
+  | { readonly kind: 'session_created'; readonly session: TopicSessionSummary; readonly reason: string; readonly persistence: TopicPersistence }
   | { readonly kind: 'unit'; readonly unit: TopicUnitFact }
   | { readonly kind: 'terms' | 'terms_query'; readonly snapshot: TopicTermSnapshot }
 export interface TopicBridgeRequest {
@@ -56,6 +79,15 @@ function exact(value: Data, keys: readonly string[]): void {
 function text(value: unknown, limit = 2048, empty = false): asserts value is string {
   if (typeof value !== 'string' || value.length > limit || (!empty && !value.trim())) throw new TypeError('Invalid topic bridge text')
 }
+function content(value: unknown, limit: number, empty = false): asserts value is string {
+  if (typeof value !== 'string' || [...value].length > limit || (!empty && !value.trim())) throw new TypeError('Invalid topic bridge content')
+}
+function boolean(value: unknown): asserts value is boolean {
+  if (typeof value !== 'boolean') throw new TypeError('Invalid topic bridge flag')
+}
+function persistence(value: unknown): asserts value is TopicPersistence {
+  if (value !== 'saved' && value !== 'runtime_only') throw new TypeError('Invalid topic persistence receipt')
+}
 function integer(value: unknown, minimum = 0): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < minimum) throw new TypeError('Invalid topic bridge version')
 }
@@ -70,10 +102,25 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
 }
 export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
   object(value)
-  if (value.kind === 'list_sessions') exact(value, ['kind'])
-  else {
-    text(value.translationSessionId)
-    switch (value.kind) {
+  switch (value.kind) {
+      case 'list_sessions': case 'list_topics': exact(value, ['kind']); break
+      case 'list_topic_terms': exact(value, ['kind', 'topicId']); text(value.topicId); break
+      case 'create_session': {
+        exact(value, ['kind', 'start', 'reason']); content(value.reason, 1000); object(value.start)
+        switch (value.start.kind) {
+          case 'new_topic': exact(value.start, ['kind']); break
+          case 'parent_session': exact(value.start, ['kind', 'translationSessionId']); text(value.start.translationSessionId); break
+          case 'existing_topic': exact(value.start, ['kind', 'topicId']); text(value.start.topicId); break
+          default: throw new TypeError('Invalid translation Session start')
+        }
+        break
+      }
+      case 'rename_topic':
+        exact(value, ['kind', 'topicId', 'expectedName', 'name']); text(value.topicId); content(value.expectedName, 120); content(value.name, 120); break
+      case 'set_session_remark':
+        exact(value, ['kind', 'translationSessionId', 'expectedRemark', 'remark']); text(value.translationSessionId); content(value.expectedRemark, 1000, true); content(value.remark, 1000, true); break
+      case 'archive_session':
+        exact(value, ['kind', 'translationSessionId', 'expectedArchived', 'archived']); text(value.translationSessionId); boolean(value.expectedArchived); boolean(value.archived); break
       case 'read_unit': exact(value, ['kind', 'translationSessionId', 'unitId']); text(value.unitId); break
       case 'list_terms': exact(value, ['kind', 'translationSessionId']); break
       case 'query_terms':
@@ -82,13 +129,14 @@ export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
         text(value.targetLanguage, 80); strings(value.forms, 500, 100); break
       case 'upsert_term': {
         exact(value, ['kind', 'translationSessionId', 'expectedVersion', 'entry']); integer(value.expectedVersion)
+        text(value.translationSessionId)
         const entry = decodeTopicTermPut(value.entry)
         if (!entry) throw new TypeError('Invalid model term proposal')
         return { kind: 'upsert_term', translationSessionId: value.translationSessionId, expectedVersion: value.expectedVersion, entry }
       }
       default: throw new TypeError('Unknown topic bridge command')
-    }
   }
+  if (['read_unit', 'list_terms', 'query_terms'].includes(value.kind as string)) text(value.translationSessionId)
   return structuredClone(value) as unknown as TopicBridgeCommand
 }
 export function parseTopicBridgeDown(value: unknown): TopicBridgeDown {
@@ -118,18 +166,31 @@ function parseUnit(value: unknown): TopicUnitFact {
   }
   return structuredClone(value) as unknown as TopicUnitFact
 }
+function sessionSummary(value: unknown): void {
+  object(value); exact(value, ['id', 'topicId', 'name', 'mode', 'publishedUnitIds', 'topicName', 'sequence', 'remark', 'archived'])
+  text(value.id); text(value.topicId); content(value.name, 200); content(value.topicName, 120); integer(value.sequence); content(value.remark, 1000, true); boolean(value.archived)
+  if (value.mode !== 'quick' && value.mode !== 'normal') throw new TypeError('Invalid translation Session mode')
+  strings(value.publishedUnitIds)
+}
 function parseValue(value: unknown): TopicBridgeValue {
   object(value)
   switch (value.kind) {
     case 'sessions':
-      exact(value, ['kind', 'sessions'])
+      exact(value, value.persistence === undefined ? ['kind', 'sessions'] : ['kind', 'sessions', 'persistence'])
+      if (value.persistence !== undefined) persistence(value.persistence)
       if (!Array.isArray(value.sessions) || value.sessions.length > 1000) throw new TypeError('Invalid topic session list')
-      for (const session of value.sessions) {
-        object(session); exact(session, ['id', 'topicId', 'name', 'mode', 'publishedUnitIds'])
-        text(session.id); text(session.topicId); text(session.name, 200)
-        if (session.mode !== 'quick' && session.mode !== 'normal') throw new TypeError('Invalid translation Session mode')
-        strings(session.publishedUnitIds)
+      value.sessions.forEach(sessionSummary)
+      break
+    case 'topics':
+      exact(value, ['kind', 'topics'])
+      if (!Array.isArray(value.topics) || value.topics.length > 1000) throw new TypeError('Invalid topic metadata list')
+      for (const topic of value.topics) {
+        object(topic); exact(topic, ['id', 'name', 'nextSequence', 'sessionIds'])
+        text(topic.id); content(topic.name, 120); integer(topic.nextSequence); strings(topic.sessionIds)
       }
+      break
+    case 'session_created':
+      exact(value, ['kind', 'session', 'reason', 'persistence']); sessionSummary(value.session); content(value.reason, 1000); persistence(value.persistence)
       break
     case 'unit': exact(value, ['kind', 'unit']); return { kind: 'unit', unit: parseUnit(value.unit) }
     case 'terms': case 'terms_query': {
