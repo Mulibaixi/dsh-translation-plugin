@@ -25,6 +25,12 @@ interface TopicSeat { identity: TopicIdentity; name: string; persistedName: stri
 interface Workspace { active: string | undefined }
 export interface HistoryVersion { readonly id: string; readonly stored: string | null; readonly legacyRaw: string | null; readonly current: string }
 export interface StructureLockPort { request<T>(name: string, action: () => T | Promise<T>): Promise<T> }
+/** One optional topic-term deletion, checked inside the existing history lock. */
+export interface HistoryDeleteCompanion {
+  readonly requiresStorage: boolean
+  preflight(): boolean
+  afterHistoryDeleted(): boolean
+}
 
 function browserLocks(): StructureLockPort | undefined {
   if (typeof navigator === 'undefined' || !navigator.locks) return undefined
@@ -72,6 +78,7 @@ export class SessionStore {
   getSettings(): SessionSettings { return this.settings }
   getNotice(): string | undefined { return this.notice }
   getSession(id: string): LocalSession | undefined { return this.seats.get(id)?.session }
+  isSessionDeleted(id: string): boolean { return this.isDeleted(id) }
   getTranslationHistory(id: string): TranslationHistory | undefined { return this.seats.get(id)?.translationHistory }
   getStatus(id: string): HistoryStatus { return this.seats.get(id)?.status ?? 'memory' }
   getStructureCapability(): 'web-locks' | 'runtime-only' { return this.storage && this.locks ? 'web-locks' : 'runtime-only' }
@@ -715,21 +722,21 @@ export class SessionStore {
     return ids.flatMap(id => { const seat = this.seats.get(id); return seat ? [{ id, stored: seat.stored, legacyRaw: seat.legacyRaw, current: currentVersion(seat) }] : [] })
   }
 
-  async deleteHistoryAsync(ids: readonly string[], deleteMemory = false, unreadable: readonly { readonly key: string; readonly raw: string }[] = [], expected?: readonly HistoryVersion[]): Promise<boolean> {
+  async deleteHistoryAsync(ids: readonly string[], deleteMemory = false, unreadable: readonly { readonly key: string; readonly raw: string }[] = [], expected?: readonly HistoryVersion[], companion?: HistoryDeleteCompanion): Promise<boolean> {
     if (deleteMemory) return this.deleteHistory(ids, true, unreadable, expected)
     const frozen = expected ?? this.captureHistoryVersions(ids)
-    const requiresStorage = unreadable.length > 0 || ids.some(id => {
+    const requiresStorage = !!companion?.requiresStorage || unreadable.length > 0 || ids.some(id => {
       const seat = this.seats.get(id)
       return seat && (seat.stored !== null || seat.legacyRaw !== null || this.topics.get(seat.session.topicId)?.durable)
     })
-    if (!requiresStorage) return this.deleteHistory(ids, false, unreadable, frozen)
+    if (!requiresStorage) return this.deleteHistoryLocked(ids, false, unreadable, frozen, companion)
     return this.withStructureLock(false, () => {
       // 只保存身份与既有发号记录，不把关闭保存期间的新名称/正文写入磁盘。
       for (const id of ids) {
         const seat = this.seats.get(id), topic = seat && this.topics.get(seat.session.topicId)
         if (topic?.durable) this.writeIdentity(topic)
       }
-      return this.deleteHistoryLocked(ids, false, unreadable, frozen)
+      return this.deleteHistoryLocked(ids, false, unreadable, frozen, companion)
     })
   }
 
@@ -743,8 +750,9 @@ export class SessionStore {
     return this.deleteHistoryLocked(ids, deleteMemory, unreadable, expected)
   }
 
-  private deleteHistoryLocked(ids: readonly string[], deleteMemory: boolean, unreadable: readonly { readonly key: string; readonly raw: string }[], expected?: readonly HistoryVersion[]): boolean {
+  private deleteHistoryLocked(ids: readonly string[], deleteMemory: boolean, unreadable: readonly { readonly key: string; readonly raw: string }[], expected?: readonly HistoryVersion[], companion?: HistoryDeleteCompanion): boolean {
     if (deleteMemory) { this.notice = '关联记忆档案尚未接入，此操作未执行。'; this.emit(); return false }
+    let removedSessions = 0, removedUnreadable = 0, currentRemoval = '删除前检查'
     try {
       const seats = [...new Set(ids)].map(id => this.seats.get(id)).filter((seat): seat is Seat => !!seat)
       if (!this.storage && (unreadable.length || seats.some(seat => seat.stored !== null || seat.legacyRaw !== null))) {
@@ -768,7 +776,11 @@ export class SessionStore {
           this.notice = '待删除会话或历史已变化，请核对最新内容后重新确认。'; this.emit(); return false
         }
       }
+      if (companion && !companion.preflight()) {
+        this.notice = '待删除主题术语已变化或无法读取，会话及术语均未删除。'; this.emit(); return false
+      }
       for (const item of unreadable) {
+        currentRemoval = `无法读取的历史副本 ${removedUnreadable + 1}`
         const legacyKey = item.key.startsWith(LEGACY_DRAFT_PREFIX) ? item.key : null
         let id: string | undefined
         try { id = legacyKey ? `legacy:${legacyKey}` : decodeURIComponent(item.key.slice(HISTORY_PREFIX.length)) } catch { /* 无可解码 ID 时仅删除确认过的原键。 */ }
@@ -778,8 +790,10 @@ export class SessionStore {
           this.storage!.removeItem(sessionModelKey(id))
         }
         this.storage?.removeItem(item.key)
+        removedUnreadable++
       }
       for (const seat of seats) {
+        currentRemoval = `会话「${seat.session.name}」`
         if (seat.stored !== null || seat.legacyRaw !== null || this.topics.get(seat.session.topicId)?.durable) {
           this.storage!.setItem(deletedSessionKey(seat.session.id), JSON.stringify({ schemaVersion: 1, sessionId: seat.session.id, legacyKey: seat.session.legacyKey }))
           this.deleted.add(seat.session.id); seat.status = 'conflict'; seat.savedSession = undefined
@@ -791,9 +805,13 @@ export class SessionStore {
         this.seats.delete(seat.session.id)
         this.migrationSources.delete(seat.session.id)
         this.reconcileWorkspace(seat.session.ownerId)
+        removedSessions++
+      }
+      if (companion && !companion.afterHistoryDeleted()) {
+        this.notice = '所选会话已删除，但主题术语未全部清理。请核对术语存储提示与剩余范围。'; this.emit(); return false
       }
       this.notice = undefined; this.emit(); return true
-    } catch { this.notice = '历史清理未完全完成。请检查本地存储，取消确认框后重新选择并重试。'; this.emit(); return false }
+    } catch { this.notice = `历史清理未完全完成：已移除 ${removedSessions} 条会话和 ${removedUnreadable} 份无法读取的副本；${currentRemoval}未完成。请核对剩余范围后重新确认。`; this.emit(); return false }
   }
 
   private externalChange(key: string | null): void {

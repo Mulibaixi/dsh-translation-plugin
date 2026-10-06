@@ -209,7 +209,7 @@ function mount(overrides = {}) {
   const catalogResponse = overrides.catalog ?? { ok: true, value: { default: { provider: 'provider-a', model: 'm1' }, routableProviders: ['provider-a'], groups: [{ id: 'provider-a', name: 'Provider A', models: Array.from({ length: 6 }, (_, i) => ({ id: 'm' + (i + 1), name: 'Model ' + (i + 1) })) }], failures: [] } }
   const window = { localStorage: storage, __ModuleLoader__: { load(entry) { entries.push(entry) } }, addEventListener(_name, listener) { listeners.add(listener) }, removeEventListener(_name, listener) { listeners.delete(listener) } }
   const locks = overrides.locks ?? new Locks()
-  const context = vm.createContext({ window, navigator: { locks }, console, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
+  const context = vm.createContext({ window, navigator: { locks }, structuredClone, AbortController, TextEncoder, console, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
   vm.runInContext(bundleSource, context)
   const exported = entries[0].factory(specifier => {
     if (specifier === 'react') return renderer.react
@@ -310,10 +310,10 @@ test('允许保存后自动写会话历史，关闭和恢复默认都保留旧�
   ui.render(app.settingsPage, {}); await ui.click('恢复默认设置'); assert.equal(saved(app).length, 1); assert.equal(JSON.parse(app.storage.getItem(SETTINGS_KEY)).rememberHistory, false)
   app.dispose()
 })
-test('选择性删除一条/多条历史需要确认，并明确询问关联记忆范围', async () => {
+test('选择性删除一条/多条历史需要确认，主题术语默认保留', async () => {
   const app = mount({ history: [fixture('a', '故事A'), fixture('b', '故事B', 'normal')] }); const ui = app.renderer; ui.render(app.settingsPage, {})
-  await checkbox(ui, '选择会话 故事A', true); await ui.click('删除所选历史（1）'); assert.match(ui.text(), /是否联动删除关联记忆档案/)
-  assert.ok(ui.nodes().some(node => node.type === 'input' && node.props.type === 'radio' && node.props.disabled)); await ui.click('取消'); assert.equal(saved(app).length, 2)
+  await checkbox(ui, '选择会话 故事A', true); await ui.click('删除所选历史（1）'); assert.match(ui.text(), /同主题全部会话共用术语/)
+  assert.equal(ui.control('同时删除所选主题术语').props.checked, false); await ui.click('取消'); assert.equal(saved(app).length, 2)
   await checkbox(ui, '选择会话 故事B', true); await ui.click('删除所选历史（2）'); await ui.click('确认删除历史'); assert.equal(saved(app).length, 0)
   app.dispose()
 })
@@ -365,7 +365,7 @@ test('侧栏取代页签，标题左侧与右侧模式/语言分组，末尾 + �
   assert.equal(toolbar.children.at(-1).props.className, 'dsh-tp-send')
   assert.ok(ui.nodes(toolbar).some(node => node.props['data-native-icon'] === 'send'))
   assert.ok(ui.nodes(header).some(node => node.props['data-native-icon'] === 'chevron-down'))
-  ui.context(currentTitle(ui)); assert.deepEqual(ui.nodes().filter(node => node.props.role === 'menuitem').map(node => ui.text(node)), ['新建同主题子会话', '重命名主题', '编辑会话备注', '导出最终译文 TXT', '导出完整记录 JSON', '删除', '归档'])
+  ui.context(currentTitle(ui)); assert.deepEqual(ui.nodes().filter(node => node.props.role === 'menuitem').map(node => ui.text(node)), ['新建同主题子会话', '重命名主题', '编辑会话备注', '主题术语', '导出最终译文 TXT', '导出完整记录 JSON', '删除', '归档'])
   assert.equal(ui.text().includes('关闭当前页签'), false)
   app.dispose()
 })

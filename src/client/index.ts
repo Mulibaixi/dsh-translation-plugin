@@ -4,7 +4,9 @@ import { createSessionStore } from './session-store.js'
 import { ModelCatalog, type ModelCatalogPort } from './models.js'
 import { QuickTranslationClient } from './quick-translation.js'
 import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
-import { QUICK_TRANSLATION_REMOTE } from '../shared/quick-translation.js'
+import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
+import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
+import { TopicMemoryStore } from './topic-memory-store.js'
 
 type Disposer = () => void
 type AsyncDisposer = () => void | Promise<void>
@@ -24,10 +26,12 @@ interface SidebarRightTabDefinition {
 
 interface ClientPluginContext {
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
+  get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
   readonly remote: {
     readonly session: ModelCatalogPort
     readonly translationQuick?: QuickRemotePort
-    $mount?(contribution: typeof QUICK_TRANSLATION_REMOTE): Promise<AsyncDisposer>
+    readonly translationTopics?: TopicBridgeRemotePort
+    $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
   on(event: string, listener: () => void): Disposer
@@ -58,34 +62,43 @@ export function apply(ctx: ClientPluginContext): void {
   withClientDiagnostics('apply', () => {
     const store = createSessionStore()
     const models = new ModelCatalog(ctx.remote.session)
-    let quickDisposed = false
-    // DSH installs remote.translationQuick asynchronously and returns its disposer only after mounting.
-    const mountedQuick = (async () => ctx.remote.$mount?.(QUICK_TRANSLATION_REMOTE))().catch(error => {
+    let remoteDisposed = false
+    // One DSH contribution owns both namespaces; mounting the package twice replaces its face.
+    const mountedRemote = (async () => ctx.remote.$mount?.(PLUGIN_REMOTE))().catch(error => {
       const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ''}` : String(error)
-      console.error(`[${CLIENT_ID}] Client translationQuick mount failed: ${detail}`)
+      console.error(`[${CLIENT_ID}] Client translation remote mount failed: ${detail}`)
       return undefined
     })
     const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.$mount ? async () => {
-      const unmountQuick = await mountedQuick
-      return quickDisposed || !unmountQuick ? undefined : ctx.get('remote.translationQuick')
+      const unmountRemote = await mountedRemote
+      return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationQuick')
     } : ctx.remote.translationQuick), store, models)
+    const terms = new TopicMemoryStore(store)
+    const topics = new TopicBridgeClient(ctx.remote.$mount ? async () => {
+      const unmountRemote = await mountedRemote
+      return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
+    } : ctx.remote.translationTopics, store, terms)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
+    ctx.effect(() => () => terms.dispose(), 'translation topic terms')
     ctx.effect(() => async () => {
-      quickDisposed = true
+      remoteDisposed = true
       quick.dispose()
-      const unmountQuick = await mountedQuick
-      await unmountQuick?.()
-    }, 'translation quick client')
+      await topics.dispose()
+      const unmountRemote = await mountedRemote
+      await unmountRemote?.()
+    }, 'translation remote clients')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
-    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset() }), 'translation catalog connection')
+    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset(); void topics.reset() }), 'translation catalog connection')
 
     const TranslationPanel: ClientComponent = (props = {}) => h(PanelRouter, {
-      store, models, quick, sessionId: typeof props.sessionId === 'string' ? props.sessionId : undefined,
+      store, models, quick, topics, terms,
+      onDeleteTerm: (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version),
+      sessionId: typeof props.sessionId === 'string' ? props.sessionId : undefined,
     })
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {
-      store, onClose: typeof props.close === 'function' ? props.close : undefined,
+      store, terms, onClose: typeof props.close === 'function' ? props.close : undefined,
     })
 
     ctx.effect(() => withClientDiagnostics('sidebarRightTabs.register', () => ctx.sidebarRightTabs.register({

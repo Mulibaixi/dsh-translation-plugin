@@ -7,11 +7,20 @@ import { buildFinalTextExport, buildFullRecordExport, type TranslationExport } f
 import { type HistoryVersion, type SessionStore } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
+import { TopicTermsView, type TopicTermsViewPort } from './topic-terms-view.js'
+import type { TopicBridgeClient } from './topic-bridge.js'
+import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
+import type { TopicMemoryStore, TopicTermVersion } from './topic-memory-store.js'
 
 type TextEvent = { currentTarget: { value: string } }
 type CheckEvent = { currentTarget: { checked: boolean } }
 type FileEvent = { currentTarget: { files: FileList | null; value: string } }
 interface StoreProps { readonly store: SessionStore }
+interface TopicUiProps {
+  readonly topics?: TopicBridgeClient | undefined
+  readonly terms?: (TopicTermsViewPort & TopicMemoryStore) | undefined
+  readonly onDeleteTerm?: ((snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>) | undefined
+}
 const styles = `
 .dsh-tp { box-sizing: border-box; color: var(--dsw-alias-label-primary, inherit); font: inherit; font-size: 14px; line-height: 1.6; }
 .dsh-tp * { box-sizing: border-box; }
@@ -98,6 +107,12 @@ const styles = `
 .dsh-tp-history-row { display: flex; gap: 8px; padding: 7px 0; align-items: flex-start; }
 .dsh-tp-history-row input { margin-top: 6px; }
 .dsh-tp-history-row span { overflow-wrap: anywhere; }
+.dsh-tp-terms { min-height: 0; overflow-y: auto; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
+.dsh-tp-term { padding: 8px 0; border-bottom: 1px solid var(--dsw-alias-border-l2, #8882); overflow-wrap: anywhere; }
+.dsh-tp-term:last-of-type { border-bottom: 0; }
+.dsh-tp-term-details { padding-top: 4px; font-size: 12px; }
+.dsh-tp-term-evidence { padding-top: 4px; }
+.dsh-tp-term-evidence .dsh-tp-translation-text { max-height: 180px; overflow-y: auto; padding: 5px 0; }
 .dsh-tp-model { min-width: 0; flex: 0 1 auto; }
 .dsh-tp-model-anchor { display: block; min-width: 0; max-width: 100%; }
 .dsh-tp-model-trigger { display: flex; align-items: center; gap: 4px; max-width: 100%; font-size: 13px !important; font-weight: 400; }
@@ -166,7 +181,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, sessionId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, sessionId, topics, terms, onDeleteTerm }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
     const reconcile = (): void => setDrafts(current => {
@@ -202,7 +217,7 @@ export function PanelRouter({ store, models, quick, sessionId }: StoreProps & { 
     },
   }
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, ownerId: sessionId, key: sessionId })
+    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, topics, terms, onDeleteTerm, ownerId: sessionId, key: sessionId })
       : h('p', { role: 'alert' }, '请在主窗口会话中打开翻译面板。'),
   )
 }
@@ -251,13 +266,14 @@ function LanguagePicker({ session, store }: StoreProps & { readonly session: Loc
   }))))
 }
 
-function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate }: StoreProps & {
+function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTerms }: StoreProps & {
   readonly ownerId: string; readonly current: LocalSession | undefined
   readonly open: boolean; readonly onOpenChange: (open: boolean) => void
   readonly contextOpen: boolean; readonly onDismissContext: () => void
   readonly onContext: (session: LocalSession, event: ContextEvent) => void
   readonly onContextKeys: (session: LocalSession, event: KeyboardEvent & { currentTarget: HTMLElement }) => void
   readonly creating: boolean; readonly onCreate: () => void
+  readonly onTerms?: (() => void) | undefined
 }): unknown {
   const sessions = store.getActiveSessions(ownerId)
   const archived = store.getArchivedSessions(ownerId)
@@ -291,6 +307,7 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
     ...sessions.map(session => row(session)),
     archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
+    onTerms ? h(MenuItemButton, { onSelect: onTerms }, '主题术语') : null,
     h('button', {
       type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,
       onClick: onCreate,
@@ -368,8 +385,9 @@ function TranslationRevision({ unit, revision, quick, session, editor }: { reado
   )
 }
 
-function TranslationUnit({ unit, quick, session, editor }: { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor }): unknown {
+function TranslationUnit({ unit, quick, session, editor, topics }: { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly topics?: TopicBridgeClient | undefined }): unknown {
   const [expanded, setExpanded] = react.useState(false)
+  const [referenceFailure, setReferenceFailure] = react.useState(false)
   const latest = unit.revisions.at(-1)
   const edit = [...editor.drafts.values()].find(edit => edit.sessionId === session.id && edit.unitId === unit.id)
   react.useEffect(() => { if (edit && edit.baseRevisionId !== latest?.id) setExpanded(true) }, [edit?.baseRevisionId, latest?.id])
@@ -377,6 +395,8 @@ function TranslationUnit({ unit, quick, session, editor }: { readonly unit: Text
   const final = unit.final ? unit.revisions.find(revision => revision.id === unit.final?.revisionId) : undefined
   const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : '待定稿'
   const blocked = quick.retranslateBlockedReason(session, unit.id)
+  const canReference = ['completed', 'failed', 'cancelled', 'interrupted'].includes(latest.status)
+  const published = topics?.isPublished(session.ownerId, session.id, unit.id) ?? false
   return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-muted' }, '原文'),
     h('div', { className: 'dsh-tp-translation-text' }, unit.source),
@@ -384,6 +404,12 @@ function TranslationUnit({ unit, quick, session, editor }: { readonly unit: Text
       h('span', { className: 'dsh-tp-muted', role: 'status' }, finalLabel),
       h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { void quick.retranslate(session.id, unit.id) } }, '重译'),
     ),
+    topics ? h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
+      h('button', { type: 'button', disabled: !canReference, 'aria-label': `文本 ${unit.order}供主模型参考`,
+        title: '仅此明确选择的历史单元供当前主会话读取；不发送翻译命令。', onClick: () => setReferenceFailure(!topics.publishUnit(session.ownerId, session.id, unit.id)) }, published ? '更新主模型参考' : '供主模型参考'),
+      published ? h('button', { type: 'button', 'aria-label': `取消文本 ${unit.order}参考`, onClick: () => { topics.revokeUnit(session.ownerId, session.id, unit.id); setReferenceFailure(false) } }, '取消参考') : null,
+    ) : null,
+    referenceFailure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '未能提供此参考，请核对单元状态及内容大小。') : null,
     h(TranslationRevision, { key: latest.id, unit, revision: latest, quick, session, editor }),
     unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, onClick: () => setExpanded(value => !value) }, `${expanded ? '收起' : '展开'}旧版本（${unit.revisions.length - 1}）`) : null,
     expanded ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
@@ -402,12 +428,15 @@ function downloadExport(result: TranslationExport): void {
   } finally { anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 0) }
 }
 
-function WorkspaceView({ store, models, quick, editor, ownerId }: StoreProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
+function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, onDeleteTerm }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   react.useEffect(() => quick.subscribe(() => refreshQuick(value => value + 1)), [quick])
   react.useEffect(() => models.subscribe(() => refreshQuick(value => value + 1)), [models])
   react.useEffect(() => { void quick.load() }, [quick])
+  react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
+  react.useEffect(() => topics?.subscribe(() => refreshQuick(value => value + 1)), [topics])
+  const [termTopic, setTermTopic] = react.useState<{ readonly id: string; readonly name: string } | undefined>(undefined)
   const [sidebar, setSidebar] = react.useState(false)
   const [sessionPickerOpen, setSessionPickerOpen] = react.useState(false)
   const [archives, setArchives] = react.useState(false)
@@ -458,6 +487,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId }: StoreProps & {
     void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)))
   }
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined) }
+  function openTerms(session: LocalSession): void { closeSessionMenus(); setTermTopic({ id: session.topicId, name: session.topicName }) }
   function deliver(result: TranslationExport): void {
     try { downloadExport(result); setExportNotice({ message: '已向浏览器发起下载。', failure: false }); setExportRequest(undefined) }
     catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
@@ -502,12 +532,15 @@ function WorkspaceView({ store, models, quick, editor, ownerId }: StoreProps & {
     h('div', { className: 'dsh-tp-main' },
       h('header', { className: 'dsh-tp-workspace-header' },
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
-        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create() }),
+        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTerms: terms && onDeleteTerm && current ? () => openTerms(current) : undefined }),
         current ? h('div', { className: 'dsh-tp-header-options' },
           h(ModePicker, { store, session: current, key: `mode:${current.id}` }),
           h(LanguagePicker, { store, session: current, key: `language:${current.id}` }),
         ) : null,
       ),
+      termTopic && terms && onDeleteTerm ? h(TopicTermsView, { key: JSON.stringify([ownerId, termTopic.id]), sessions: store, terms, ownerId, topicId: termTopic.id,
+        topicName: store.getTopics(ownerId).find(topic => topic.id === termTopic.id)?.name ?? termTopic.name, onClose: () => setTermTopic(undefined), onDelete: onDeleteTerm, bridgeReason: topics?.getStatus(ownerId).reason,
+        onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined }) : null,
       dialog?.kind === 'rename' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '重命名主题', 'aria-busy': action.pending },
         field('主题名称', h('input', { type: 'text', value: name, autoFocus: true, disabled: action.pending, onChange: (event: TextEvent) => setName(event.currentTarget.value) })),
         h('p', { className: 'dsh-tp-muted' }, '同主题的全部会话（含归档会话）一起更名，编号与单会话备注保持不变。'),
@@ -518,16 +551,17 @@ function WorkspaceView({ store, models, quick, editor, ownerId }: StoreProps & {
         h('div', { className: 'dsh-tp-actions' }, button('保存备注', () => { if (store.updateSession(dialog.id, { remark })) setDialog(undefined) }), button('取消', () => setDialog(undefined))),
       ) : null,
       deletion ? h(DeleteDialog, { request: deletion, sessionDeletion: true, pending: action.pending, onCancel: () => setDeletion(undefined), onConfirm: () => {
-        void action.run(() => store.deleteHistoryAsync(deletion.ids, false, deletion.unreadable, deletion.versions), () => setDeletion(currentRequest => currentRequest === deletion ? undefined : currentRequest))
-      } }) : null,
+        void action.run(() => deleteConfirmed(store, terms, deletion), () => setDeletion(currentRequest => currentRequest === deletion ? undefined : currentRequest))
+      }, onTermsChange: (checked: boolean) => setDeletion(currentRequest => currentRequest === deletion ? { ...deletion, includeTerms: checked } : currentRequest) }) : null,
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         units.length || records.length ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
-        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current!, editor })),
+        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current!, editor, topics: current?.mode === 'normal' ? topics : undefined })),
         ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
         units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),
       storeNotice(store),
+      !termTopic && terms?.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted dsh-tp-message' }, terms.getNotice()) : null,
       exportNotice ? h('div', { role: exportNotice.failure ? 'alert' : 'status', className: exportNotice.failure ? 'dsh-tp-message' : 'dsh-tp-muted dsh-tp-message' }, exportNotice.message) : null,
       exportRequest ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '导出最终译文确认' },
         h('h3', null, `导出「${exportRequest.session.name}」`),
@@ -598,32 +632,48 @@ function WorkspaceView({ store, models, quick, editor, ownerId }: StoreProps & {
       h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建同主题子会话'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名主题'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '编辑会话备注'),
+      terms && onDeleteTerm ? h(MenuItemButton, { onSelect: () => openTerms(target) }, '主题术语') : null,
       h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'txt') }, '导出最终译文 TXT'),
       h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'json') }, '导出完整记录 JSON'),
       h(MenuItemButton, { disabled: action.pending, danger: true, onSelect: () => {
-        closeSessionMenus(); setDeletion({ title: `删除「${target.name}」`, ids: [target.id], unreadable: [], versions: store.captureHistoryVersions([target.id]) })
+        closeSessionMenus(); setDeletion(captureDeleteRequest(store, terms, `删除「${target.name}」`, [target.id]))
       } }, '删除'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); store.archiveSession(ownerId, target.id, target.archivedAt === null) } }, target.archivedAt === null ? '归档' : '恢复归档'),
     )) : null,
   )
 }
 
-interface DeleteRequest { readonly title: string; readonly ids: readonly string[]; readonly unreadable: readonly { readonly key: string; readonly raw: string }[]; readonly versions: readonly HistoryVersion[] }
-function DeleteDialog({ request, onCancel, onConfirm, sessionDeletion = false, pending = false }: {
-  readonly request: DeleteRequest; readonly onCancel: () => void; readonly onConfirm: () => void; readonly sessionDeletion?: boolean; readonly pending?: boolean
+interface DeleteRequest {
+  readonly title: string; readonly ids: readonly string[]; readonly unreadable: readonly { readonly key: string; readonly raw: string }[]; readonly versions: readonly HistoryVersion[]
+  readonly termVersions: readonly TopicTermVersion[]; readonly termNames: readonly string[]; readonly includeTerms: boolean
+}
+function captureDeleteRequest(store: SessionStore, terms: TopicMemoryStore | undefined, title: string, ids: readonly string[], unreadable: DeleteRequest['unreadable'] = []): DeleteRequest {
+  const names = new Map<string, string>()
+  for (const id of ids) {
+    const session = store.getSession(id)
+    if (session) names.set(JSON.stringify([session.ownerId, session.topicId]), session.topicName)
+  }
+  return { title, ids: [...ids], unreadable, versions: store.captureHistoryVersions(ids), termVersions: terms?.captureForSessions(ids) ?? [], termNames: [...names.values()], includeTerms: false }
+}
+function deleteConfirmed(store: SessionStore, terms: TopicMemoryStore | undefined, request: DeleteRequest): Promise<boolean> {
+  return terms ? terms.deleteHistoryAsync(request.ids, request.unreadable, request.versions, request.includeTerms ? request.termVersions : [])
+    : store.deleteHistoryAsync(request.ids, false, request.unreadable, request.versions)
+}
+function DeleteDialog({ request, onCancel, onConfirm, onTermsChange, sessionDeletion = false, pending = false }: {
+  readonly request: DeleteRequest; readonly onCancel: () => void; readonly onConfirm: () => void; readonly onTermsChange: (checked: boolean) => void; readonly sessionDeletion?: boolean; readonly pending?: boolean
 }): unknown {
   return h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': sessionDeletion ? '删除翻译会话确认' : '删除会话历史确认', 'aria-busy': pending },
     h('h3', null, request.title),
     h('p', null, sessionDeletion ? '将删除该会话的当前内容与已保存历史，并从列表移除。'
       : `将删除 ${request.ids.length} 条会话历史${request.unreadable.length ? `及 ${request.unreadable.length} 份无法读取的历史副本` : ''}，并从会话列表移除。`),
-    h('p', null, '是否联动删除关联记忆档案？'),
-    h('label', { className: 'dsh-tp-history-row' }, h('input', { type: 'radio', name: 'translation-memory-deletion', checked: true, readOnly: true }), '保留关联记忆档案'),
-    h('label', { className: 'dsh-tp-history-row' }, h('input', { type: 'radio', name: 'translation-memory-deletion', disabled: true, checked: false, readOnly: true }), '同时删除关联记忆档案（尚未接入）'),
-    h('p', { className: 'dsh-tp-muted' }, '记忆系统尚未接入；本次保留关联记忆。'),
+    request.termVersions.length ? h('label', { className: 'dsh-tp-history-row' }, h('input', { type: 'checkbox', checked: request.includeTerms, disabled: pending, 'aria-label': '同时删除所选主题术语', onChange: (event: CheckEvent) => {
+      const checked = event.currentTarget.checked; onTermsChange(checked)
+    } }), `同时删除${request.termNames.length === 1 ? `「${request.termNames[0]}」` : `这些主题（${request.termNames.length} 个）`}的术语档案`) : null,
+    h('p', { className: 'dsh-tp-muted' }, request.termVersions.length ? `同主题全部会话共用术语${request.termNames.length > 1 ? `（${request.termNames.join('、')}）` : ''}；勾选后，未选中的同主题会话也会失去这些术语。未勾选则保留。` : '本次只删除会话，保留主题术语。'),
     h('div', { className: 'dsh-tp-actions' }, button(pending ? '正在删除…' : sessionDeletion ? '确认删除会话' : '确认删除历史', onConfirm, pending), button('取消', onCancel, pending)),
   )
 }
-function HistorySection({ store }: StoreProps): unknown {
+function HistorySection({ store, terms }: StoreProps & { readonly terms?: TopicMemoryStore | undefined }): unknown {
   useStore(store)
   const [selected, setSelected] = react.useState<readonly string[]>([])
   const [request, setRequest] = react.useState<DeleteRequest | undefined>(undefined)
@@ -631,7 +681,7 @@ function HistorySection({ store }: StoreProps): unknown {
   const history = store.getHistory()
   const selectedIds = selected.filter(id => history.some(session => session.id === id))
   function choose(title: string, ids: readonly string[], all = false): void {
-    setRequest({ title, ids, unreadable: all ? store.getUnreadableHistory() : [], versions: store.captureHistoryVersions(ids) })
+    setRequest(captureDeleteRequest(store, terms, title, ids, all ? store.getUnreadableHistory() : []))
   }
   return h('div', null,
     h('div', { className: 'dsh-tp-actions' },
@@ -652,13 +702,14 @@ function HistorySection({ store }: StoreProps): unknown {
     ),
     button(`删除所选历史（${selectedIds.length}）`, () => choose('删除所选历史', selectedIds), action.pending || selectedIds.length === 0),
     request ? h(DeleteDialog, { request, pending: action.pending, onCancel: () => setRequest(undefined), onConfirm: () => {
-        void action.run(() => store.deleteHistoryAsync(request.ids, false, request.unreadable, request.versions), () => { setSelected([]); setRequest(currentRequest => currentRequest === request ? undefined : currentRequest) })
-      } }) : null,
+        void action.run(() => deleteConfirmed(store, terms, request), () => { setSelected([]); setRequest(currentRequest => currentRequest === request ? undefined : currentRequest) })
+      }, onTermsChange: (checked: boolean) => setRequest(currentRequest => currentRequest === request ? { ...request, includeTerms: checked } : currentRequest) }) : null,
     action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
+    terms?.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, terms.getNotice()) : null,
   )
 }
 
-export function SettingsView({ store, onClose }: StoreProps & { readonly onClose?: (() => void) | undefined }): unknown {
+export function SettingsView({ store, onClose, terms }: StoreProps & { readonly onClose?: (() => void) | undefined; readonly terms?: TopicMemoryStore | undefined }): unknown {
   useStore(store)
   const [pending, setPending] = react.useState<Partial<Omit<SessionSettings, 'schemaVersion'>>>({})
   const [errors, setErrors] = react.useState<readonly string[]>([])
@@ -720,7 +771,7 @@ export function SettingsView({ store, onClose }: StoreProps & { readonly onClose
       h('p', { className: 'dsh-tp-muted' }, '模型与推理等级选择独立保存在此设备，不受此开关影响。开启后自动保存主题名称、会话配置和当前原文草稿，以及已受理的原文、各版译文与定稿选择，数据以明文保存在此设备。已保存的历史保留；关闭后的后续内容仅保留在本次运行。'),
       h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
       store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
-      h(HistorySection, { store }),
+      h(HistorySection, { store, terms }),
     ),
     errors.length ? h('div', { role: 'alert', className: 'dsh-tp-message' }, ...errors.map(error => h('p', { key: error }, error))) : null,
     storeNotice(store),

@@ -4,6 +4,7 @@ import { resolve, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createQuickHostFixture } from '../tests/quick-host-fixture.mjs'
 import { mount } from '../tests/quick-client-fixture.mjs'
+import { createTopicToolsNativeFixture } from '../tests/topic-tools-native-fixture.mjs'
 
 // Real DSH ClientRemoteService + Cordis lifecycle + current plugin bundle.
 // The Connection carrier only addresses the synthetic Host fixture; no real profile or network is used.
@@ -18,14 +19,17 @@ function deferred() { let resolve; const promise = new Promise(done => { resolve
 
 async function fixture({ mountGate, storage, settings, deferFunctionalUpdates } = {}) {
   const host = await createQuickHostFixture({ runtimeRoot })
+  const { OperatorPeer } = await host.native('@deepseek-ai/dsh-client-connection')
+  const topicPeer = new OperatorPeer(host.ctx)
   host.provider.catalog = ['model-a', 'model-b']
   const ctx = new Context()
   const calls = []
   ctx.provide('connection', {
     rpc: {
-      async call(path, endpoint, payload) {
-        assert.equal(path, '/api'); assert.match(endpoint, /^translationQuick\//)
+      async call(path, endpoint, payload, signal) {
+        assert.equal(path, '/api'); assert.match(endpoint, /^(translationQuick|translationTopics)\//)
         calls.push({ endpoint, payload: structuredClone(payload) })
+        if (endpoint.startsWith('translationTopics/')) return host.ctx.typertGateway.dispatchRpc(endpoint, payload, signal, topicPeer)
         return host.call(endpoint.split('/')[1], payload.args.request)
       },
       async *open() { throw new Error('Synthetic carrier does not open streams') },
@@ -71,7 +75,7 @@ test('实际ClientRemoteService.$mount + 发布bundle：异步namespace可就绪
     }
     assert.ok(ctx.remote.translationQuick)
     assert.ok(calls.length, `capabilities RPC was not called: ${ui.text()} / ${ui.button('发送快译').props.title}`)
-    assert.equal(calls[0].endpoint, 'translationQuick/capabilities')
+    assert.ok(calls.some(call => call.endpoint === 'translationQuick/capabilities'))
     await ui.click('模型：选择模型'); await ui.click('选择模型'); await ui.click('Synthetic Model')
     await ui.input('待翻译内容', 'Synthetic source'); await ui.click('发送快译')
     for (let i = 0; i < 100 && !ui.text().includes('合成译文'); i++) {

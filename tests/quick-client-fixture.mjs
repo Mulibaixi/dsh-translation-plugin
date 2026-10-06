@@ -258,7 +258,7 @@ export function mount(overrides = {}) {
     createObjectURL(blob) { const url = `blob:synthetic-${++urlSequence}`; blobUrls.set(url, blob); return url },
     revokeObjectURL(url) { revokedUrls.push(url); blobUrls.delete(url) },
   }
-  const context = vm.createContext({ window, navigator: { locks, clipboard }, Blob: globalThis.Blob, URL, setTimeout, clearTimeout, structuredClone, crypto: globalThis.crypto, console, document, Node: class {} })
+  const context = vm.createContext({ window, navigator: { locks, clipboard }, Blob: globalThis.Blob, URL, setTimeout, clearTimeout, structuredClone, AbortController, TextEncoder, crypto: globalThis.crypto, console, document, Node: class {} })
   vm.runInContext(bundleSource, context)
   const exported = entries[0].factory(specifier => {
     if (specifier === 'react') return renderer.react
@@ -275,20 +275,27 @@ export function mount(overrides = {}) {
     }
   })
   let mountCalls = 0; let unmountCalls = 0
+  let topicMountCalls = 0; let topicUnmountCalls = 0
   const remote = {
-    async $mount() {
-      mountCalls++
+    async $mount(contribution) {
+      assert.equal(contribution.package, 'dsh-translation-plugin')
+      assert.deepEqual([...new Set(contribution.descriptors.map(item => item.namespace))].sort(), ['translationQuick', 'translationTopics'])
+      mountCalls++; topicMountCalls++
       await overrides.mountGate
       if (overrides.mountError) throw overrides.mountError
       remote.translationQuick = overrides.quick
-      return async () => { unmountCalls++; delete remote.translationQuick }
+      remote.translationTopics = overrides.topics
+      return async () => {
+        unmountCalls++; topicUnmountCalls++
+        delete remote.translationQuick; delete remote.translationTopics
+      }
     },
     session: { async modelCatalog() { catalogCalls++; return catalogResponse }, selectModel() { throw new Error('main chat selection must remain independent') } },
     $on() { return () => {} },
   }
   const clientContext = {
     remote,
-    get(name) { assert.equal(name, 'remote.translationQuick'); return remote.translationQuick },
+    get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics'].includes(name)); return remote[name.slice('remote.'.length)] },
     on() { return () => {} }, sidebarRightTabs: { register() { return () => {} } },
     slots: { register(target, component) { slots.set(target.name, component); return () => slots.delete(target.name) }, inject(_name, register) { return register() } },
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
@@ -301,6 +308,8 @@ export function mount(overrides = {}) {
     get catalogCalls() { return catalogCalls },
     get mountCalls() { return mountCalls },
     get unmountCalls() { return unmountCalls },
+    get topicMountCalls() { return topicMountCalls },
+    get topicUnmountCalls() { return topicUnmountCalls },
     changeStorage(key, raw) { storage.setItem(key, raw); for (const listener of listeners) listener({ key, storageArea: storage }); renderer.render() },
     dispose() { renderer.dispose(); return Promise.all(effects.toReversed().map(effect => effect?.())) },
   }

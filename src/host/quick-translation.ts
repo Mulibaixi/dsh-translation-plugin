@@ -233,7 +233,7 @@ export class QuickTranslationService {
   }
 }
 
-export function installQuickTranslation(ctx: QuickHostContext, loadModule?: LlmModuleLoader): QuickTranslationService | undefined {
+export function installQuickTranslation(ctx: QuickHostContext, loadModule?: LlmModuleLoader, registerRemote = true): QuickTranslationService | undefined {
   if (!ctx.root || !ctx.effect) return undefined
   // This is the same invocation accessor admitted by bindTypertRemote in the native protocol.
   if (!Object.hasOwn(ctx.root.reflect.props, 'invocation')) ctx.root.accessor('invocation', { get: () => undefined })
@@ -244,8 +244,10 @@ export function installQuickTranslation(ctx: QuickHostContext, loadModule?: LlmM
     registry?.register({ package: QUICK_TRANSLATION_REMOTE.package, face: 'host', schemas: [],
       invocations: QUICK_TRANSLATION_REMOTE.descriptors, model: { package: QUICK_TRANSLATION_REMOTE.package, face: 'host', classes: [], events: [], objects: [] } })
   }
-  if (ctx.inject) ctx.inject(['typert'], register)
-  else register(ctx)
+  if (registerRemote) {
+    if (ctx.inject) ctx.inject(['typert'], register)
+    else register(ctx)
+  }
   ctx.effect(() => () => service.dispose(), 'translationQuick runtime lifetime')
   return service
 }

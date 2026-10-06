@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
  * Run with --expose-internals, as required by DSH's own profile package resolver.
  * All profile files are synthetic and disposable; no real profile or credentials are read.
  */
-export async function createQuickHostFixture({ runtimeRoot, pluginPath = fileURLToPath(new URL('..', import.meta.url)), omit = [] }) {
+export async function createQuickHostFixture({ runtimeRoot, pluginPath = fileURLToPath(new URL('..', import.meta.url)), omit = [], installationDependencies = {} }) {
   const modules = resolve(runtimeRoot, 'dsh/node_modules')
   const native = name => import(pathToFileURL(join(modules, name, 'lib/index.js')).href)
   const [{ Context }, { TypertRegistry }, { TypertGatewayService }, llm, { SessionStore }, { Loader }, boot, { OperatorPeer }] = await Promise.all([
@@ -28,6 +28,7 @@ export async function createQuickHostFixture({ runtimeRoot, pluginPath = fileURL
   await writeFile(manifestPath, JSON.stringify({ name: 'synthetic-dsh-installation', version: '0.2.0-rc.2', dependencies: {
     '@deepseek-ai/dsh-llm': '0.2.0-rc.2', '@deepseek-ai/dsh-session': '0.2.0-rc.2', '@deepseek-ai/dsh-api-gateway': '0.2.0-rc.2',
     '@deepseek-ai/dsh-typert-registry': '0.2.0-rc.2', '@deepseek-ai/cordis-plugin-loader': '~1.0.5',
+    ...installationDependencies,
   } }))
   await writeFile(join(profileDir, 'package.json'), JSON.stringify({ name: 'synthetic-dsh-profile', version: '1.0.0', dependencies: { 'dsh-translation-plugin': `link:${pluginPath}` } }))
   await writeFile(join(profileDir, 'cordis.yml'), '[]\n')
