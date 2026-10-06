@@ -6,6 +6,7 @@ interface ReactApi {
   createElement(type: unknown, props: Readonly<Record<string, unknown>> | null, ...children: unknown[]): unknown
   useState<T>(initial: T | (() => T)): [T, StateSetter<T>]
   useEffect(effect: () => void | (() => void), dependencies: readonly unknown[]): void
+  useMemo<T>(factory: () => T, dependencies: readonly unknown[]): T
   useRef<T>(initial: T): { current: T }
 }
 

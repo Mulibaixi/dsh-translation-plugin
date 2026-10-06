@@ -85,6 +85,13 @@ function createRenderer({ deferFunctionalUpdates = false } = {}) {
       }]
     },
     useRef(initial) { return hook(() => ({ current: initial })) },
+    useMemo(factory, dependencies) {
+      const cell = hook(() => ({ dependencies: undefined, value: undefined }))
+      if (!cell.dependencies || dependencies.some((value, index) => !Object.is(value, cell.dependencies[index])) || cell.dependencies.length !== dependencies.length) {
+        cell.dependencies = [...dependencies]; cell.value = factory()
+      }
+      return cell.value
+    },
     useEffect(effect, dependencies) {
       const cell = hook(() => ({ dependencies: undefined, cleanup: undefined }))
       const changed = !cell.dependencies || cell.dependencies.length !== dependencies.length ||
@@ -266,8 +273,11 @@ export function mount(overrides = {}) {
     const h = renderer.react.createElement
     const icon = name => props => h('svg', { ...props, 'data-native-icon': name })
     return {
-      Menu: props => h('div', { className: props.className, 'data-native-menu': true }, props.anchor,
-        props.open ? h('div', { role: 'menu', className: props.listClassName, 'data-portal': props.portal, 'data-side': props.side, 'data-align': props.align, 'data-compact': props.compact, onClose: props.onClose }, props.children) : null),
+      Menu: props => {
+        overrides.observeMenu?.(props)
+        return h('div', { className: props.className, 'data-native-menu': true }, props.anchor,
+          props.open ? h('div', { role: 'menu', className: props.listClassName, 'data-portal': props.portal, 'data-side': props.side, 'data-align': props.align, 'data-compact': props.compact, onClose: props.onClose }, props.children) : null)
+      },
       MenuItemButton: props => h('button', { type: 'button', role: 'menuitem', disabled: props.disabled, onClick: props.onSelect }, props.children),
       MenuGroup: props => h('section', { 'aria-label': props.label }, props.children),
       IconChevronDownOutlineRegular: icon('chevron-down'), IconChevronRightOutlineRegular: icon('chevron-right'),

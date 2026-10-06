@@ -13,8 +13,13 @@ export function ModelPicker({ catalog, current, onSelect }: {
   const [pane, setPane] = react.useState<'root' | 'models' | 'efforts'>('root')
   const [query, setQuery] = react.useState('')
   const menuRoot = react.useRef<HTMLElement | null>(null)
+  const trigger = react.useRef<HTMLButtonElement | null>(null)
   react.useEffect(() => catalog.subscribe(() => update(value => value + 1)), [catalog])
   const state = catalog.getSnapshot()
+  // Native Menu remeasures in its layout effect when getAnchorRect changes.
+  // A taller top-side pane must move before paint, rather than on the next RAF.
+  const getAnchorRect = react.useMemo(() => () => trigger.current?.getBoundingClientRect() ?? null,
+    [pane, query, state, current?.provider, current?.model, current?.reasoningEffort])
   react.useEffect(() => { if (open && state.status === 'idle') void catalog.load() }, [catalog, open, state.status])
   const choice = state.groups.flatMap(group => group.models.map(model => ({ group, model })))
     .find(item => item.group.id === current?.provider && item.model.id === current.model)
@@ -51,10 +56,10 @@ export function ModelPicker({ catalog, current, onSelect }: {
     }, h('span', null, title), h('span', { className: 'dsh-tp-model-cell-value dsh-tp-muted' }, value), h(IconChevronRightOutlineRegular, { size: 14, className: 'dsh-tp-chevron' }))
   }
   return h('div', { className: 'dsh-tp-model' }, h(Menu, {
-    open, onClose: () => setOpen(false), portal: true, side: 'top', align: 'end', compact: true,
+    open, onClose: () => setOpen(false), portal: true, side: 'top', align: 'end', compact: true, getAnchorRect,
     className: 'dsh-tp-model-anchor', listClassName: 'dsh-tp-popup dsh-tp-model-menu',
     anchor: h('button', {
-      type: 'button', className: 'dsh-tp-model-trigger', 'aria-label': `模型：${label}${effortLabel ? ` · ${effortLabel}` : ''}`,
+      type: 'button', ref: trigger, className: 'dsh-tp-model-trigger', 'aria-label': `模型：${label}${effortLabel ? ` · ${effortLabel}` : ''}`,
       'aria-expanded': open, 'aria-haspopup': 'menu', onClick: () => { setOpen(value => !value); setPane('root'); setQuery('') },
     }, h('span', { className: 'dsh-tp-model-label' }, label), effortLabel ? h('span', { className: 'dsh-tp-model-effort dsh-tp-muted' }, effortLabel) : null,
       h(IconChevronDownOutlineRegular, { size: 14, className: `dsh-tp-chevron${open ? ' dsh-tp-chevron-open' : ''}` }),

@@ -73,6 +73,13 @@ function createRenderer() {
       return [cell.value, next => { const value = typeof next === 'function' ? next(cell.value) : next; if (!Object.is(value, cell.value)) dirty = true; cell.value = value }]
     },
     useRef(initial) { return hook(() => ({ current: initial })) },
+    useMemo(factory, dependencies) {
+      const cell = hook(() => ({ dependencies: undefined, value: undefined }))
+      if (!cell.dependencies || dependencies.some((value, index) => !Object.is(value, cell.dependencies[index])) || cell.dependencies.length !== dependencies.length) {
+        cell.dependencies = [...dependencies]; cell.value = factory()
+      }
+      return cell.value
+    },
     useEffect(effect, dependencies) {
       const cell = hook(() => ({ dependencies: undefined, cleanup: undefined }))
       const changed = !cell.dependencies || cell.dependencies.length !== dependencies.length ||
