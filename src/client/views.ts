@@ -209,9 +209,9 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
       h('button', {
         type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice dsh-tp-memory-assets-entry',
         key: assetTopic.id, title: `打开当前主题记忆资产：${assetTopic.name}`,
-        'aria-label': `打开记忆资产：${assetTopic.name}`, 'aria-current': current?.topicId === assetTopic.id, 'data-topic-id': assetTopic.id,
+        'aria-label': `打开记忆资产：${assetTopic.name}`, 'data-topic-id': assetTopic.id,
         onClick: () => onTopicAssets(assetTopic),
-      }, '记忆资产', current?.topicId === assetTopic.id ? h('span', { 'aria-hidden': true }, ' ✓') : null),
+      }, '记忆资产'),
       ...otherAssetTopics.map(topic => h('button', {
         type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice',
         key: topic.id, onClick: () => onTopicAssets(topic), 'aria-label': `打开记忆资产：${topic.name}`, 'data-topic-id': topic.id,
