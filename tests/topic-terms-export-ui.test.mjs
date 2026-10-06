@@ -25,14 +25,14 @@ function picker(ui) { ui.showTranslation(); title(ui).props.onClick(); ui.render
 async function terms(ui) {
   picker(ui)
   const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
-  const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node) === '记忆资产'); assert.ok(current)
+  const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node).startsWith('记忆资产')); assert.ok(current)
   current.props.onClick(); ui.render(); await ui.flush()
 }
-async function archive(ui, topicName) {
+async function archive(ui, topicId) {
   picker(ui)
   const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
   const rows = ui.nodes(group).filter(node => node.type === 'button')
-  const target = rows.find(node => ui.text(node) === topicName) ?? rows.find(node => ui.text(node) === '记忆资产'); assert.ok(target)
+  const target = rows.find(node => node.props['data-topic-id'] === topicId); assert.ok(target)
   target.props.onClick(); ui.render(); await ui.flush()
   assert.equal(title(ui).props['aria-expanded'], false)
 }
@@ -99,12 +99,12 @@ test('主题快照真实bundle：标题档案按owner/主题去重，删最后�
     assert.equal(f.ui.nodes(assets[0]).filter(node => node.type === 'button').length, 1)
     assert.ok(!f.ui.nodes().some(node => node.props['aria-label'] === '主题档案'))
     title(f.ui).props.onClick(); f.ui.render()
-    await archive(f.ui, f.session.name); assert.match(f.ui.text(), /接口/)
+    await archive(f.ui, f.session.topicId); assert.match(f.ui.text(), /接口/)
     await f.ui.click('导出 JSON'); const exported = JSON.parse(await downloaded(f))
     assert.equal(exported.topicId, f.session.topicId); assert.equal(exported.snapshot.entries.length, 1)
     await f.app.dispose()
     restored = await setup({ storage: f.app.storage })
-    await archive(restored.ui, f.session.name)
+    await archive(restored.ui, f.session.topicId)
     await restored.ui.click('导出 Markdown'); assert.match(await downloaded(restored), /API → 接口/)
     assert.equal(restored.calls.length, 0)
   } finally { await restored?.app.dispose(); await f.app.dispose() }
@@ -140,7 +140,7 @@ test('主题快照真实bundle：引用冻结可读性但不复制正文，删�
     assert.equal(data.evidenceAvailability[0].readable, true); assert.equal(data.evidenceAvailability[0].unitOrder, 1)
     assert.ok(!text.includes('Synthetic secret source body')); assert.ok(!text.includes('Synthetic secret translation body'))
     f.app.resourceHost.closeAssetCaption(); await f.ui.flush(); f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
-    await archive(f.ui, f.session.name); await f.ui.click('导出 Markdown')
+    await archive(f.ui, f.session.topicId); await f.ui.click('导出 Markdown')
     const markdown = await downloaded(f)
     assert.match(markdown, /待复核/); assert.match(markdown, /依据已变化或不可用/)
     assert.ok(markdown.replace(/\\-/g, '-').includes(unitId)); assert.ok(!markdown.includes('Synthetic secret source body'))

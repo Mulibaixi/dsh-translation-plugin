@@ -26,6 +26,7 @@ export const styles = `
 .dsh-tp-current-title { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; text-align: left; }
 .dsh-tp-current-title-text { min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .dsh-tp-session-choice { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; }
+.dsh-tp button.dsh-tp-memory-assets-entry { min-height: 36px; padding: 6px 10px; font-size: 14px; line-height: 22px; font-weight: 500; }
 .dsh-tp-session-choice-name { display: block; min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .dsh-tp-session-choice[aria-current=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
 .dsh-tp-header-options { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: none; margin-left: auto; }

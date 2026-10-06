@@ -206,9 +206,15 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
     archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
     onTopicAssets && assetTopic ? h('div', { role: 'group', 'aria-label': '记忆资产' },
-      h(MenuItemButton, { separatorBefore: true, onSelect: () => onTopicAssets(assetTopic) }, '记忆资产'),
-      ...otherAssetTopics.map(topic => h(MenuItemButton, {
-        key: topic.id, onSelect: () => onTopicAssets(topic),
+      h('button', {
+        type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice dsh-tp-memory-assets-entry',
+        key: assetTopic.id, title: `打开当前主题记忆资产：${assetTopic.name}`,
+        'aria-label': `打开记忆资产：${assetTopic.name}`, 'aria-current': current?.topicId === assetTopic.id, 'data-topic-id': assetTopic.id,
+        onClick: () => onTopicAssets(assetTopic),
+      }, '记忆资产', current?.topicId === assetTopic.id ? h('span', { 'aria-hidden': true }, ' ✓') : null),
+      ...otherAssetTopics.map(topic => h('button', {
+        type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice',
+        key: topic.id, onClick: () => onTopicAssets(topic), 'aria-label': `打开记忆资产：${topic.name}`, 'data-topic-id': topic.id,
       }, topic.name))) : null,
     h('button', {
       type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,

@@ -33,7 +33,7 @@ function title(ui) { return ui.allNodes().find(node => node.props.className === 
 async function terms(ui) {
   ui.showTranslation(); title(ui).props.onClick(); ui.render()
   const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
-  const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node) === '记忆资产'); assert.ok(current)
+  const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node).startsWith('记忆资产')); assert.ok(current)
   current.props.onClick(); ui.render(); await ui.flush()
 }
 function details(ui) { return ui.nodes().find(node => node.props['aria-label'] === '术语详情') }
@@ -336,8 +336,11 @@ test('资产UI：记忆资产是可点击主入口并按需列出其他主题，
     assert.ok(!f.ui.nodes().some(node => node.type === 'button' && f.ui.text(node) === '主题术语'))
     const entries = f.ui.nodes(groups[0]).filter(node => node.type === 'button')
     assert.equal(entries.length, 1)
-    assert.equal(f.ui.text(entries[0]), '记忆资产')
-    assert.ok(!entries[0].props.disabled)
+    assert.equal(entries[0].props['aria-current'], true)
+    assert.equal(entries[0].props['aria-label'], `打开记忆资产：${f.session.topicName}`)
+    assert.equal(entries[0].props['data-topic-id'], f.session.topicId)
+    assert.match(f.ui.text(entries[0]), /记忆资产/)
+    assert.match(entries[0].props.className, /dsh-tp-memory-assets-entry/)
     entries[0].props.onClick(); f.ui.render(); await f.ui.flush()
     const body = f.ui.nodes().find(node => node.props.className === 'dsh-tp dsh-tp-assets')
     assert.ok(body)
@@ -356,7 +359,7 @@ test('资产UI：记忆资产是可点击主入口并按需列出其他主题，
     assert.equal(groups.length, 1)
     const topicButtons = f.ui.nodes(groups[0]).filter(node => node.type === 'button')
     assert.equal(topicButtons.length, 2)
-    assert.equal(f.ui.text(topicButtons[0]), '记忆资产')
+    assert.equal(f.ui.text(topicButtons[0]), '记忆资产 ✓')
     assert.equal(f.ui.text(topicButtons[1]), f.session.topicName)
     topicButtons[1].props.onClick(); f.ui.render(); await f.ui.flush()
     assert.match(f.ui.text(), new RegExp(`${f.session.topicName} · 记忆资产`))
