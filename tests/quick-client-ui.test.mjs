@@ -306,13 +306,21 @@ test('发布bundle复制失败保留版本并显示可重试提示', async () =>
 })
 
 const currentTitle = ui => ui.nodes().find(node => node.props.className === 'dsh-tp-current-title')
-async function exportFromTitle(ui, label) {
+async function exportFromTitle(ui, label, scope = '当前会话') {
   const model = ui.nodes().find(node => node.props.className === 'dsh-tp-model-trigger' && node.props['aria-expanded'])
   if (model) await ui.click(model.props['aria-label'])
   ui.context(currentTitle(ui)); await ui.click(label)
+  await ui.click(scope)
 }
 function callMetadata(request, inputTokens = 7, outputTokens = 4) {
   return { promptVersion: 'text-runtime-v1', model: { provider: request.model.providerId, model: request.model.modelId, reasoningEffort: request.model.reasoningEffort ?? null }, configVersion: null, maxOutputTokens: 1024, usage: { inputTokens, outputTokens } }
+}
+async function exportFromSession(ui, sessionId, label, scope) {
+  currentTitle(ui).props.onClick(); ui.render()
+  const row = ui.nodes().find(node => node.props.className === 'dsh-tp-session-choice' && node.props.key === sessionId); assert.ok(row)
+  ui.context(row); await ui.click(label)
+  assert.equal(currentTitle(ui).props['aria-expanded'], false)
+  await ui.click(scope)
 }
 
 test('发布bundle人工编辑：跨会话保留草稿、新机器版到达仍基于原版追加，保存候选不调用模型', async () => {
@@ -435,7 +443,7 @@ test('发布bundle人工修正失败输出并导出，取消编辑保留原版�
 })
 
 test('发布bundle下载失败保留正文与编辑草稿，菜单收起后可重新导出', async () => {
-  const app = mount({ quick: remote().port, downloadError: true })
+  const options = { quick: remote().port, downloadError: true }, app = mount(options)
   try {
     const ui = await start(app); await ui.input('待翻译内容', 'Synthetic download source'); await ui.click('发送快译')
     await ui.click('编辑文本 1 版本 1'); await ui.input('编辑文本 1 版本 1译文', 'Synthetic preserved edit')
@@ -444,6 +452,121 @@ test('发布bundle下载失败保留正文与编辑草稿，菜单收起后可�
     assert.equal(ui.control('编辑文本 1 版本 1译文').props.value, 'Synthetic preserved edit')
     assert.equal(app.downloads.length, 0); assert.equal(app.downloadAnchorCount, 0)
     assert.ok(!ui.nodes().some(node => node.props.role === 'menu'))
+    options.downloadError = false
+    await exportFromTitle(ui, '导出对照 JSON')
+    assert.equal(app.downloads.length, 1)
+    assert.equal(JSON.parse(await app.downloads[0].blob.text()).sessions[0].units[0].source, 'Synthetic download source')
+    assert.equal(ui.control('编辑文本 1 版本 1译文').props.value, 'Synthetic preserved edit')
+  } finally { await app.dispose() }
+})
+
+test('发布bundle范围导出：绑定非当前空会话，整个主题含归档并稳定排序，固定最终不被新候选覆盖', async () => {
+  const rpc = remote()
+  rpc.domain.submit = async request => { rpc.calls.submit.push(structuredClone(request)); return ok(rpc.job(request, { text: `Synthetic scoped ${rpc.calls.submit.length}` })) }
+  const app = mount({ quick: rpc.port })
+  try {
+    const ui = await start(app)
+    await ui.input('待翻译内容', 'A source 1'); await ui.click('发送快译'); await ui.click('文本 1 版本 1设为最终')
+    await ui.click('重译文本 1'); await ui.input('待翻译内容', 'A source 2'); await ui.click('发送快译')
+    const first = app.store.getActiveSession('synthetic-main')
+    ui.context(currentTitle(ui)); await ui.click('新建子会话')
+    const archived = app.store.getActiveSession('synthetic-main')
+    await ui.input('待翻译内容', 'B archived source'); await ui.click('发送快译')
+    ui.context(currentTitle(ui)); await ui.click('归档')
+    ui.context(currentTitle(ui)); await ui.click('新建子会话')
+    const empty = app.store.getActiveSession('synthetic-main')
+    currentTitle(ui).props.onClick(); ui.render(); await ui.click('新建主题及首会话')
+    const otherTopic = app.store.getActiveSession('synthetic-main')
+    assert.equal(otherTopic.topicName, first.topicName); assert.notEqual(otherTopic.topicId, first.topicId)
+    await ui.input('待翻译内容', 'Other topic source'); await ui.click('发送快译')
+    await exportFromSession(ui, first.id, '导出译文 TXT', '当前会话')
+    assert.equal(await app.downloads[0].blob.text(), 'Synthetic scoped 1\n\nSynthetic scoped 3')
+    assert.equal(app.store.getTranslationHistory(archived.id).units[0].final, null)
+    assert.equal(app.store.getTranslationHistory(otherTopic.id).units[0].final, null)
+    currentTitle(ui).props.onClick(); ui.render()
+    const emptyRow = ui.nodes().find(node => node.props.className === 'dsh-tp-session-choice' && node.props.key === empty.id); assert.ok(emptyRow)
+    ui.context(emptyRow); assert.equal(ui.button('导出译文 TXT').props.disabled, false)
+    await ui.click('导出译文 TXT')
+    assert.equal(currentTitle(ui).props['aria-expanded'], false)
+    assert.equal(ui.button('当前会话').props.disabled, true); assert.equal(ui.button('整个主题').props.disabled, false)
+    assert.equal(app.downloads.length, 1)
+    await ui.click('整个主题')
+    assert.equal(await app.downloads[1].blob.text(), 'Synthetic scoped 1\n\nSynthetic scoped 3\n\nSynthetic scoped 4')
+    await exportFromSession(ui, empty.id, '导出对照 JSON', '整个主题')
+    const json = JSON.parse(await app.downloads[2].blob.text())
+    assert.equal(json.scope, 'topic'); assert.equal(json.topic.topicId, first.topicId)
+    assert.deepEqual(json.sessions.map(session => session.id), [first.id, archived.id, empty.id])
+    assert.deepEqual(json.sessions.map(session => session.sequence), [0, 1, 2])
+    assert.equal(json.sessions[2].units.length, 0)
+    assert.deepEqual(json.sessions[0].units.map(unit => [unit.source, unit.translation]), [['A source 1', 'Synthetic scoped 1'], ['A source 2', 'Synthetic scoped 3']])
+    assert.equal(app.store.getTranslationHistory(first.id).units[0].final.selection, 'user_fixed')
+    assert.equal(app.store.getTranslationHistory(archived.id).units[0].final.selection, 'automatic')
+    assert.ok(app.store.getSession(archived.id).archivedAt)
+    assert.equal(app.store.getActiveSession('synthetic-main').id, otherTopic.id)
+    assert.equal(rpc.calls.submit.length, 5)
+  } finally { await app.dispose() }
+})
+
+test('发布bundle主题缺项：确认冻结会话集合与最终正文，新增会话或固定新版本不改变待导出文件', async () => {
+  const rpc = remote()
+  rpc.domain.submit = async request => {
+    rpc.calls.submit.push(structuredClone(request)); const count = rpc.calls.submit.length
+    return ok(rpc.job(request, { status: count === 1 ? 'failed' : 'completed', text: `Synthetic frozen ${count}`,
+      ...(count === 1 ? { error: { code: 'EXECUTION_FAILED', message: 'Synthetic failed first unit', stage: 'stream' } } : {}) }))
+  }
+  const app = mount({ quick: rpc.port })
+  try {
+    const ui = await start(app)
+    await ui.input('待翻译内容', 'Missing source'); await ui.click('发送快译')
+    await ui.input('待翻译内容', 'Final A source'); await ui.click('发送快译')
+    const first = app.store.getActiveSession('synthetic-main')
+    ui.context(currentTitle(ui)); await ui.click('新建子会话')
+    await ui.input('待翻译内容', 'Final B source'); await ui.click('发送快译')
+    const second = app.store.getActiveSession('synthetic-main')
+    await exportFromTitle(ui, '导出对照 JSON', '整个主题')
+    assert.match(ui.text(), new RegExp(`尚无最终译文：${first.name} · 文本 1`))
+    assert.equal(app.downloads.length, 0)
+    await ui.click('重译文本 1'); await ui.click('文本 1 版本 2设为最终')
+    ui.context(currentTitle(ui)); await ui.click('新建子会话')
+    await ui.input('待翻译内容', 'Late C source'); await ui.click('发送快译')
+    const late = app.store.getActiveSession('synthetic-main')
+    await ui.click('仅导出已定稿')
+    const json = JSON.parse(await app.downloads[0].blob.text())
+    assert.deepEqual(json.sessions.map(session => session.id), [first.id, second.id])
+    assert.equal(json.sessions[0].units[0].status, 'missing'); assert.equal(json.sessions[0].units[0].source, 'Missing source')
+    assert.equal(json.sessions[0].units[0].translation, null)
+    assert.equal(json.sessions[1].units[0].translation, 'Synthetic frozen 3')
+    assert.ok(!JSON.stringify(json).includes('Synthetic frozen 4')); assert.ok(!JSON.stringify(json).includes(late.id))
+    assert.match(app.downloads[0].fileName, /partial/)
+    await exportFromTitle(ui, '导出译文 TXT', '整个主题'); await ui.click('仅导出已定稿')
+    assert.equal(await app.downloads[1].blob.text(), 'Synthetic frozen 2\n\nSynthetic frozen 4\n\nSynthetic frozen 5')
+    assert.equal(rpc.calls.submit.length, 5)
+    assert.equal(app.store.getTranslationHistory(second.id).units[0].final.selection, 'user_fixed')
+    assert.ok(!ui.nodes().some(node => node.props.role === 'dialog' || node.props.role === 'menu'))
+  } finally { await app.dispose() }
+})
+
+test('发布bundle二级导出菜单：返回、Escape和外部关闭后重开主菜单，全缺两格式不生成文件', async () => {
+  const rpc = remote({ submit: async request => ok({ sessionKey: request.sessionKey, operationId: request.operationId, draftVersion: request.draftVersion, accepted: true, status: 'failed', text: 'Synthetic incomplete', error: { code: 'EXECUTION_FAILED', message: 'Synthetic failed', stage: 'stream' } }) })
+  const app = mount({ quick: rpc.port })
+  try {
+    const ui = await start(app); await ui.input('待翻译内容', 'All missing source'); await ui.click('发送快译')
+    const model = ui.nodes().find(node => node.props.className === 'dsh-tp-model-trigger' && node.props['aria-expanded'])
+    if (model) await ui.click(model.props['aria-label'])
+    ui.context(currentTitle(ui)); await ui.click('导出对照 JSON')
+    assert.ok(ui.button('当前会话')); await ui.click('返回')
+    assert.ok(ui.button('导出译文 TXT')); assert.ok(!ui.nodes().some(node => node.props['aria-label'] === '导出内容范围'))
+    await ui.click('导出译文 TXT')
+    ui.nodes().find(node => node.props['aria-label'] === '翻译会话右键操作').props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} }); ui.render()
+    assert.ok(!ui.nodes().some(node => node.props.role === 'menu'))
+    ui.context(currentTitle(ui)); assert.ok(ui.button('导出对照 JSON')); await ui.click('导出对照 JSON')
+    const nativeMenu = ui.nodes().find(node => node.props.role === 'menu' && ui.nodes(node).some(child => child.props['aria-label'] === '导出内容范围'))
+    nativeMenu.props.onClose(); ui.render()
+    ui.context(currentTitle(ui)); assert.ok(ui.button('导出译文 TXT'))
+    await ui.click('导出译文 TXT'); await ui.click('整个主题')
+    assert.equal(ui.button('仅导出已定稿').props.disabled, true); assert.equal(app.downloads.length, 0); await ui.click('取消')
+    await exportFromTitle(ui, '导出对照 JSON')
+    assert.equal(ui.button('仅导出已定稿').props.disabled, true); assert.equal(app.downloads.length, 0); await ui.click('取消')
   } finally { await app.dispose() }
 })
 
