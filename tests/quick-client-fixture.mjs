@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
 import vm from 'node:vm'
+import { createResourceHost } from './ui-resource-host-fixture.mjs'
 
 const bundleSource = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8')
 const SETTINGS_KEY = 'dsh-translation-plugin:settings:v2'
@@ -105,7 +106,7 @@ function createRenderer({ deferFunctionalUpdates = false } = {}) {
 
   function resolve(node, path) {
     if (node === null || node === undefined || typeof node === 'boolean') return null
-    if (Array.isArray(node)) return node.map((child, index) => resolve(child, `${path}.${index}`))
+    if (Array.isArray(node)) return node.map((child, index) => resolve(child, `${path}.${child?.props?.key ?? index}`))
     if (typeof node !== 'object') return node
     if (typeof node.type === 'function') {
       if (!typeIds.has(node.type)) typeIds.set(node.type, ++nextType)
@@ -121,7 +122,7 @@ function createRenderer({ deferFunctionalUpdates = false } = {}) {
       finally { active = previous }
       return resolve(result, `${path}.rendered`)
     }
-    return { ...node, children: node.children.map((child, index) => resolve(child, `${path}.${index}`)) }
+    return { ...node, children: node.children.map((child, index) => resolve(child, `${path}.${child?.props?.key ?? index}`)) }
   }
 
   function render(component = rootComponent, props = rootProps) {
@@ -144,11 +145,11 @@ function createRenderer({ deferFunctionalUpdates = false } = {}) {
     return tree
   }
 
-  function nodes(node = tree) {
-    if (Array.isArray(node)) return node.flatMap(child => nodes(child))
+  function nodes(node = tree, includeHidden = false) {
+    if (Array.isArray(node)) return node.flatMap(child => nodes(child, includeHidden))
     if (node === null || typeof node !== 'object') return []
-    if (node.props.hidden) return []
-    return [node, ...node.children.flatMap(child => nodes(child))]
+    if (node.props.hidden && !includeHidden) return []
+    return [node, ...node.children.flatMap(child => nodes(child, includeHidden))]
   }
 
   function text(node = tree) {
@@ -182,7 +183,7 @@ function createRenderer({ deferFunctionalUpdates = false } = {}) {
   }
 
   return {
-    react, render, text, control, button, nodes,
+    react, render, text, control, button, nodes, allNodes: () => nodes(tree, true),
     hasStateText(value) {
       return [...seats.values()].some(seat => seat.hooks.some(cell => cell.value === value ||
         (typeof cell.value?.values === 'function' && [...cell.value.values()].some(item => item?.text === value))))
@@ -236,10 +237,11 @@ export function mount(overrides = {}) {
   storage.failSet = !!overrides.failSet
   if (storage.failSet) storage.setItem = () => { throw new Error('quota') }
   const renderer = createRenderer({ deferFunctionalUpdates: overrides.deferFunctionalUpdates })
-  const entries = []; const effects = []; const slots = new Map(); const listeners = new Set()
+  const entries = []; const effects = []; const listeners = new Set()
+  const host = createResourceHost(renderer.react, renderer)
   let catalogCalls = 0
   const catalogResponse = overrides.catalog ?? { ok: true, value: { default: { provider: 'provider-a', model: 'm1' }, routableProviders: ['provider-a'], groups: [{ id: 'provider-a', name: 'Provider A', models: Array.from({ length: 6 }, (_, i) => ({ id: 'm' + (i + 1), name: 'Model ' + (i + 1) })) }], failures: [] } }
-  const window = { localStorage: storage, __ModuleLoader__: { load(entry) { entries.push(entry) } }, addEventListener(_name, listener) { listeners.add(listener) }, removeEventListener(_name, listener) { listeners.delete(listener) } }
+  const window = { innerWidth: 1024, innerHeight: 768, localStorage: storage, __ModuleLoader__: { load(entry) { entries.push(entry) } }, addEventListener(_name, listener) { listeners.add(listener) }, removeEventListener(_name, listener) { listeners.delete(listener) } }
   const locks = overrides.locks ?? new Locks()
   const copies = []
   const clipboard = overrides.clipboard ?? { async writeText(text) { copies.push(text) } }
@@ -306,15 +308,14 @@ export function mount(overrides = {}) {
   const clientContext = {
     remote,
     get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics'].includes(name)); return remote[name.slice('remote.'.length)] },
-    on() { return () => {} }, sidebarRightTabs: { register() { return () => {} } },
-    slots: { register(target, component) { slots.set(target.name, component); return () => slots.delete(target.name) }, inject(_name, register) { return register() } },
+    on() { return () => {} }, sidebarRightTabs: host.sidebarRightTabs, sidebarRight: host.sidebarRight, slots: host.slots,
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
   }
   const applied = overrides.applyClient ? overrides.applyClient(exported, clientContext) : exported.apply(clientContext)
-  return { renderer, storage, remote, applied, copies, downloads, revokedUrls,
+  return { renderer, storage, remote, applied, copies, downloads, revokedUrls, resourceHost: host,
     get downloadAnchorCount() { return anchors.size },
-    get panel() { return slots.get('sidebar.right.pane.tab') },
-    get settingsPage() { return slots.get('settings.section') },
+    get panel() { return host.panel },
+    get settingsPage() { return host.settingsPage },
     get catalogCalls() { return catalogCalls },
     get mountCalls() { return mountCalls },
     get unmountCalls() { return unmountCalls },

@@ -58,6 +58,12 @@ export interface TopicTermPut extends TopicTermContent {
   readonly origin: 'inferred' | 'source_checked'
   readonly status: 'proposal' | 'active'
 }
+/** An explicit Client form edits semantic fields; existing evidence is retained as examples. */
+export interface TopicTermUserInput extends Omit<TopicTermContent, 'evidence'> {
+  readonly id: string | null
+  readonly expectedEntryVersion: number | null
+}
+export interface TopicTermUserPut extends TopicTermUserInput { readonly id: string }
 export interface TermMutationResult {
   readonly status: 'updated' | 'unchanged' | 'stale' | 'invalid' | 'requires_user_action' | 'conflict'
   readonly snapshot: TopicTermSnapshot
@@ -107,6 +113,14 @@ export function decodeTopicTermPut(value: unknown): TopicTermPut | undefined {
     (value.status === 'active' && (value.origin !== 'source_checked' || !hasSourceBasis(value as unknown as TopicTermContent)))) return undefined
   return { ...copyContent(value as unknown as TopicTermContent), id: value.id, expectedEntryVersion: value.expectedEntryVersion,
     origin: value.origin as TopicTermPut['origin'], status: value.status as TopicTermPut['status'] }
+}
+
+/** Local form boundary. The model RPC continues to accept only TopicTermPut. */
+export function decodeTopicTermUserInput(value: unknown): TopicTermUserInput | undefined {
+  if (!record(value) || !exact(value, ['id', 'expectedEntryVersion', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden']) ||
+    !(value.id === null || text(value.id, 2048)) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
+    (value.id === null && value.expectedEntryVersion !== null) || !content({ ...value, evidence: [] } as unknown as TopicTermContent)) return undefined
+  return structuredClone(value) as unknown as TopicTermUserInput
 }
 
 /** Parse only at storage/RPC boundaries. Parsing does not resolve or restore source facts. */
@@ -191,6 +205,27 @@ export function putTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermPut, r
   const entry: TopicTerm = { ...copyContent(input), id: input.id, origin: input.origin, status, confirmation: null, version: (old?.version ?? 0) + 1, createdAt: old?.createdAt ?? at, updatedAt: at }
   if (old && old.origin === entry.origin && old.status === entry.status && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(entry))) return result(snapshot, 'unchanged', old)
   return result(replace(snapshot, entry, at), 'updated', entry)
+}
+
+/** One explicit user save, with no intermediate persisted proposal or second adoption action. */
+export function putUserTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermUserPut, action: { readonly eventId: string; readonly at: string }): TermMutationResult {
+  const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
+  if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
+  const submitted = { ...input, evidence: old?.evidence ?? [] }
+  if (!text(input.id, 2048) || !text(action.eventId, 2048) || !time(action.at) || !content(submitted)) return result(snapshot, 'invalid', old)
+  const fields = copyContent(submitted)
+  if (hasConflict(snapshot, { ...fields, id: input.id })) return result(snapshot, 'conflict', old)
+  const examples = fields.evidence.map(ref => ({ ...ref, role: 'example' as const }))
+  if (old?.origin === 'user_explicit' && old.status === 'active' && JSON.stringify(copyContent(old)) === JSON.stringify({ ...fields, evidence: examples })) return result(snapshot, 'unchanged', old)
+  if (!old) {
+    // Existing schema1 confirmation references a real candidate version >= 1.
+    // Build both facts in memory; the caller writes only the final adopted snapshot.
+    const candidate = putTopicTerm(snapshot, { ...fields, id: input.id, expectedEntryVersion: null, origin: 'inferred', status: 'proposal' }, () => undefined, action.at)
+    return adoptTopicTerm(candidate.snapshot, input.id, candidate.entry!.version, action)
+  }
+  const entry: TopicTerm = { ...fields, evidence: examples, id: old.id, createdAt: old.createdAt, updatedAt: action.at,
+    version: old.version + 1, origin: 'user_explicit', status: 'active', confirmation: { ...action, adoptedEntryVersion: old.version } }
+  return result(replace(snapshot, entry, action.at), 'updated', entry)
 }
 
 /** Only an explicit UI adoption supplies this event; model put has no confirmation field. */

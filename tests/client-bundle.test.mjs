@@ -59,7 +59,7 @@ test('客户端 bundle 只登记一个包标识，初始化不读取本地存储
   assert.equal(bundle.registrations[0].id, packageJson.name)
   assert.equal(bundle.registrations[0].id, 'dsh-translation-plugin')
   assert.equal(typeof bundle.exports.apply, 'function')
-  assert.deepEqual(Array.from(bundle.exports.inject), ['sidebarRightTabs', 'slots', 'remote', 'remote.session'])
+  assert.deepEqual(Array.from(bundle.exports.inject), ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session'])
   assert.ok(bundle.externalRequests.every(specifier => ['react', '@deepseek-ai/dsh-client-ui-primitives'].includes(specifier)))
   assert.equal(bundle.storageReads(), 0)
   assert.deepEqual(bundle.diagnostics, [])
@@ -89,6 +89,7 @@ test('客户端注册会话面板和全局设置页，并正常注销全部贡�
   const context = {
     remote: { session: { modelCatalog() { throw new Error('catalog is loaded only when requested') } }, $on() { return () => {} } },
     on() { return () => {} },
+    sidebarRight: { openTabs: { getSnapshot: () => [] }, mounted: { getSnapshot: () => undefined }, float() {} },
     sidebarRightTabs: {
       register(definition) {
         assert.ok(!Array.isArray(definition), 'register receives one tab definition')
@@ -120,10 +121,14 @@ test('客户端注册会话面板和全局设置页，并正常注销全部贡�
   }
 
   exports.apply(context)
-  assert.equal(tabDefinitions.length, 1)
+  assert.equal(tabDefinitions.length, 2)
   const definition = tabDefinitions[0]
   assert.equal(definition.id, packageJson.name)
   assert.equal(definition.kind, 'translation-workspace')
+  assert.equal(definition.keepMounted, true)
+  const assetsDefinition = tabDefinitions.find(definition => definition.id === 'dsh-translation-plugin/memory-assets')
+  assert.equal(assetsDefinition.kind, 'translation-memory-assets'); assert.equal(assetsDefinition.keepMounted, true)
+  assert.equal(assetsDefinition.title(), '记忆资产'); assert.equal(typeof assetsDefinition.canOpen, 'function')
   assert.ok(Array.isArray(definition.guide))
   assert.equal(definition.guide.length, 1)
   assert.equal(definition.guide[0].id, 'translation-workspace')
@@ -131,10 +136,13 @@ test('客户端注册会话面板和全局设置页，并正常注销全部贡�
   assert.deepEqual(slots.map(entry => entry.options.name).sort(), [
     'settings.section',
     'sidebar.right.pane.tab',
+    'sidebar.right.pane.tab',
   ])
   const panel = slots.find(entry => entry.options.name === 'sidebar.right.pane.tab')
   const settings = slots.find(entry => entry.options.name === 'settings.section')
   assert.equal(panel.options.key, packageJson.name)
+  const assets = slots.find(entry => entry.options.key === 'dsh-translation-plugin/memory-assets')
+  assert.ok(assets); assert.notEqual(assets.component, panel.component)
   assert.equal(settings.options.id, packageJson.name)
   const label = settings.options.label
   assert.equal(typeof label === 'function' ? label() : label, '翻译')

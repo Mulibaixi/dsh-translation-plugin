@@ -1,3 +1,4 @@
+import { styles } from './view-styles.js'
 import { h, react } from './react.js'
 import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
@@ -7,10 +8,12 @@ import { buildFinalTextExport, buildFullRecordExport, type TranslationExport } f
 import { type HistoryVersion, type SessionStore } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
-import { TopicTermsView, type TopicTermsViewPort } from './topic-terms-view.js'
+import { type TopicTermsViewPort } from './topic-terms-view.js'
+import { downloadExport } from './browser-download.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
 import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
 import type { TopicMemoryStore, TopicTermVersion } from './topic-memory-store.js'
+export { MemoryAssetsView } from './memory-assets-view.js'
 
 type TextEvent = { currentTarget: { value: string } }
 type CheckEvent = { currentTarget: { checked: boolean } }
@@ -20,116 +23,8 @@ interface TopicUiProps {
   readonly topics?: TopicBridgeClient | undefined
   readonly terms?: (TopicTermsViewPort & TopicMemoryStore) | undefined
   readonly onDeleteTerm?: ((snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>) | undefined
+  readonly onOpenAssets?: ((ownerId: string, topicId: string) => void) | undefined
 }
-const styles = `
-.dsh-tp { box-sizing: border-box; color: var(--dsw-alias-label-primary, inherit); font: inherit; font-size: 14px; line-height: 1.6; }
-.dsh-tp * { box-sizing: border-box; }
-.dsh-tp button, .dsh-tp input, .dsh-tp select, .dsh-tp textarea { font: inherit; color: inherit; }
-.dsh-tp button { border: 0; background: transparent; border-radius: 6px; padding: 5px 8px; cursor: pointer; }
-.dsh-tp button:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover, #8882); }
-.dsh-tp button:disabled { opacity: .45; cursor: default; }
-.dsh-tp :focus-visible { outline: 2px solid var(--dsw-focus-ring-color, #568bf0); outline-offset: 2px; }
-.dsh-tp input:not([type=checkbox]), .dsh-tp textarea, .dsh-tp select { min-width: 0; padding: 8px; border: 1px solid var(--dsw-alias-border-l2, #8884); border-radius: 6px; background: var(--dsw-specific-input-major, #8881); }
-.dsh-tp-panel { height: 100%; max-height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; container-type: inline-size; }
-.dsh-tp-workspace { min-height: 0; height: 100%; display: flex; overflow: hidden; }
-.dsh-tp-session-sidebar { flex: 0 0 160px; min-height: 0; padding: 10px 6px; border-right: 1px solid var(--dsw-alias-border-l2, #8883); overflow-y: auto; }
-.dsh-tp-session-sidebar[hidden] { display: none; }
-.dsh-tp-session-list { display: flex; flex-direction: column; gap: 3px; }
-.dsh-tp-session-item { display: block; width: 100%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dsh-tp-session-name, .dsh-tp-session-remark { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dsh-tp-session-remark { color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
-.dsh-tp-session-item[aria-current=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
-.dsh-tp-session-add { display: flex; align-items: center; justify-content: center; width: 100%; align-self: stretch; text-align: center; margin-top: 2px; }
-.dsh-tp-session-divider { border-top: 1px solid var(--dsw-alias-border-l2, #8883); margin: 4px 0; }
-.dsh-tp-archive-toggle { width: 100%; margin-top: 14px; text-align: left; font-size: 12px !important; color: var(--dsw-alias-label-caption, #888) !important; }
-.dsh-tp-main { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; }
-.dsh-tp-workspace-header { display: flex; align-items: center; gap: 5px; flex: none; padding: 8px 10px; }
-.dsh-tp-title-select { min-width: 0; flex: 1; }
-.dsh-tp-title-anchor { display: block; min-width: 0; width: 100%; }
-.dsh-tp-current-title { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; text-align: left; }
-.dsh-tp-current-title-text { min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
-.dsh-tp-session-choice { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; }
-.dsh-tp-session-choice-name { display: block; min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
-.dsh-tp-session-choice[aria-current=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
-.dsh-tp-header-options { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: none; margin-left: auto; }
-.dsh-tp-compact-trigger { display: flex; align-items: center; gap: 4px; font-weight: 400; white-space: nowrap; max-width: 110px; }
-.dsh-tp-compact-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.dsh-tp-chevron { color: var(--dsw-alias-label-caption, #888); flex: none; transition: transform .12s; }
-.dsh-tp-chevron-open { transform: rotate(180deg); }
-.dsh-tp-popup { z-index: 1100; min-width: 180px; max-width: min(320px, calc(100vw - 32px)); max-height: min(420px, calc(100vh - 96px)); overflow-y: auto; }
-.dsh-tp-popup .dsh-tp-menu-content { padding: 4px; }
-@container (max-width: 520px) { .dsh-tp-session-sidebar { flex-basis: 120px; } .dsh-tp-workspace-header { padding: 8px 6px; gap: 2px; } .dsh-tp-header-options { gap: 2px; } }
-.dsh-tp-transcript { flex: 1 1 0; min-height: 0; overflow-y: scroll; overflow-x: hidden; scrollbar-gutter: stable; padding: 12px 16px; overscroll-behavior: contain; }
-.dsh-tp-empty { color: var(--dsw-alias-label-caption, #888); text-align: center; padding: 28px 8px; font-size: 13px; }
-.dsh-tp-composer-area { flex: none; margin: 8px 12px 12px; }
-.dsh-tp-service-status { display: flex; align-items: center; gap: 6px; margin: 0 3px 4px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
-.dsh-tp-service-status-text { min-width: 0; flex: 1; }
-.dsh-tp button.dsh-tp-service-recheck { display: flex; align-items: center; justify-content: center; flex: 0 0 24px; width: 24px; height: 24px; padding: 4px; }
-.dsh-tp-service-recheck[aria-busy=true] svg { animation: dsh-tp-checking 1s linear infinite; }
-@keyframes dsh-tp-checking { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .dsh-tp-service-recheck[aria-busy=true] svg { animation: none; } }
-.dsh-tp-runtime-note { display: block; margin: 4px 3px 0; color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
-.dsh-tp-composer { padding: 10px; border-radius: var(--dsw-radius-panel, 14px); background: var(--dsw-specific-input-major, #8881); border: 1px solid var(--dsw-alias-border-l2, #8883); }
-.dsh-tp-composer textarea { display: block; resize: none; width: 100%; min-height: 70px; max-height: 180px; overflow-y: auto; padding: 4px; background: transparent; border: 0; }
-.dsh-tp-composer:focus-within, .dsh-tp-composer textarea:focus, .dsh-tp-composer textarea:focus-visible { outline: none !important; box-shadow: none !important; }
-.dsh-tp-composer-toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; }
-.dsh-tp button.dsh-tp-attach { display: flex; align-items: center; justify-content: center; padding: 5px; margin-right: auto; }
-.dsh-tp-attachment { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 12px; }
-.dsh-tp-attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dsh-tp-attachment-note { margin: 2px 0 5px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }
-/* DSH 主题全局使用 superellipse；普通圆形必须同时指定 corner-shape。 */
-.dsh-tp .dsh-tp-send { display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; flex: 0 0 38px; border-radius: 50% !important; corner-shape: round !important; background: var(--dsw-alias-interactive-bg-accent, #4d7df3); color: #fff; padding: 0; }
-.dsh-tp-muted { color: var(--dsw-alias-label-caption, #888); font-size: 12px; font-weight: 400; }
-.dsh-tp-message { border-left: 3px solid #c68b32; padding: 6px 10px; margin: 6px 12px; font-size: 12px; overflow-wrap: anywhere; }
-.dsh-tp-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.dsh-tp-dialog { flex: none; padding: 12px; margin: 6px 12px; border: 1px solid var(--dsw-alias-border-l2, #8884); border-radius: 8px; max-height: 45%; overflow-y: auto; }
-.dsh-tp-dialog p { margin: 6px 0; }
-.dsh-tp-dialog input[type=text] { width: 100%; }
-.dsh-tp-legacy { white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 8px; background: var(--dsw-alias-interactive-bg-hover, #8881); }
-.dsh-tp-translation { margin: 0 0 20px; }
-.dsh-tp-translation-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 12px; }
-.dsh-tp-unit-header, .dsh-tp-version-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
-.dsh-tp-version { padding: 6px 0; }
-.dsh-tp-version-actions { gap: 4px; font-size: 12px; }
-.dsh-tp-version-details { font-size: 11px; overflow-wrap: anywhere; margin: 4px 0 8px; }
-.dsh-tp-version-editor { margin: 6px 0; }
-.dsh-tp-version-editor textarea { display: block; width: 100%; min-height: 90px; max-height: 240px; resize: vertical; overflow-y: auto; margin: 4px 0; }
-.dsh-tp-old-versions { margin-top: 6px; padding-left: 10px; border-left: 1px solid var(--dsw-alias-border-l2, #8883); }
-.dsh-tp-history-note { margin: 0 0 14px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }
-.dsh-tp-settings { padding: 16px 20px; height: 100%; max-height: 100%; min-height: 0; overflow-y: auto; }
-.dsh-tp-settings-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
-.dsh-tp h2 { font-size: 18px; margin: 0; }
-.dsh-tp h3 { font-size: 14px; margin: 0 0 12px; }
-.dsh-tp-settings-section { padding: 18px 0; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
-.dsh-tp-field { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; }
-.dsh-tp-field textarea { resize: vertical; min-height: 80px; }
-.dsh-tp-history-list { max-height: 280px; overflow-y: auto; margin: 12px 0; }
-.dsh-tp-history-row { display: flex; gap: 8px; padding: 7px 0; align-items: flex-start; }
-.dsh-tp-history-row input { margin-top: 6px; }
-.dsh-tp-history-row span { overflow-wrap: anywhere; }
-.dsh-tp-terms { min-height: 0; overflow-y: auto; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
-.dsh-tp-term { padding: 8px 0; border-bottom: 1px solid var(--dsw-alias-border-l2, #8882); overflow-wrap: anywhere; }
-.dsh-tp-term:last-of-type { border-bottom: 0; }
-.dsh-tp-term-details { padding-top: 4px; font-size: 12px; }
-.dsh-tp-term-evidence { padding-top: 4px; }
-.dsh-tp-term-evidence .dsh-tp-translation-text { max-height: 180px; overflow-y: auto; padding: 5px 0; }
-.dsh-tp-model { min-width: 0; flex: 0 1 auto; }
-.dsh-tp-model-anchor { display: block; min-width: 0; max-width: 100%; }
-.dsh-tp-model-trigger { display: flex; align-items: center; gap: 4px; max-width: 100%; font-size: 13px !important; font-weight: 400; }
-.dsh-tp-model-label { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.dsh-tp-model-effort { min-width: 0; flex-shrink: 1000; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.dsh-tp-model-menu { min-width: min(260px, calc(100vw - 32px)); }
-/* 与 DSH 原生紧凑菜单（目标语言）的文字规格一致。 */
-.dsh-tp-model-menu .dsh-tp-menu-content { font-size: 11px; line-height: 17px; }
-.dsh-tp-model-menu .dsh-tp-muted { font-size: inherit; line-height: inherit; }
-.dsh-tp-popup .dsh-tp-language-custom { font-size: 11px; line-height: 17px; }
-.dsh-tp-model-menu input { width: 100%; margin-bottom: 6px; }
-.dsh-tp-model-search:focus, .dsh-tp-model-search:focus-visible { outline: none !important; box-shadow: none !important; border-color: var(--dsw-alias-border-l2, #8884) !important; }
-.dsh-tp-model-list { max-height: 260px; overflow-y: auto; }
-.dsh-tp-model-row { display: block; text-align: left; width: 100%; font-weight: 400; }
-.dsh-tp-model-cell { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; }
-.dsh-tp-model-cell-value { margin-left: auto; text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-`
 
 function useStore(store: SessionStore): void {
   const [, update] = react.useState(0)
@@ -181,7 +76,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, sessionId, topics, terms, onDeleteTerm }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, sessionId, topics, terms, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
     const reconcile = (): void => setDrafts(current => {
@@ -217,7 +112,7 @@ export function PanelRouter({ store, models, quick, sessionId, topics, terms, on
     },
   }
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, topics, terms, onDeleteTerm, ownerId: sessionId, key: sessionId })
+    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, topics, terms, onDeleteTerm, onOpenAssets, ownerId: sessionId, key: sessionId })
       : h('p', { role: 'alert' }, '请在主窗口会话中打开翻译面板。'),
   )
 }
@@ -423,17 +318,7 @@ function TranslationUnit({ unit, quick, session, editor, topics }: { readonly un
   )
 }
 
-function downloadExport(result: Pick<TranslationExport, 'content' | 'fileName' | 'mimeType'>): void {
-  if (result.content === null) throw new Error('No export content')
-  const anchor = document.createElement('a')
-  const url = URL.createObjectURL(new Blob([result.content], { type: result.mimeType }))
-  try {
-    anchor.href = url; anchor.download = result.fileName; anchor.hidden = true
-    document.body.appendChild(anchor); anchor.click()
-  } finally { anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 0) }
-}
-
-function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, onDeleteTerm }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
+function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   react.useEffect(() => quick.subscribe(() => refreshQuick(value => value + 1)), [quick])
@@ -441,7 +326,6 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   react.useEffect(() => { void quick.load() }, [quick])
   react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
   react.useEffect(() => topics?.subscribe(() => refreshQuick(value => value + 1)), [topics])
-  const [termTopic, setTermTopic] = react.useState<{ readonly id: string; readonly name: string } | undefined>(undefined)
   const [sidebar, setSidebar] = react.useState(false)
   const [sessionPickerOpen, setSessionPickerOpen] = react.useState(false)
   const [archives, setArchives] = react.useState(false)
@@ -494,7 +378,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined) }
   function openTopicTerms(topic: { readonly id: string; readonly name: string }): void {
     if (!store.getTopics(ownerId).some(owned => owned.id === topic.id)) return
-    closeSessionMenus(); setTermTopic({ id: topic.id, name: topic.name })
+    closeSessionMenus(); onOpenAssets?.(ownerId, topic.id)
   }
   function openTerms(session: LocalSession): void { openTopicTerms({ id: session.topicId, name: session.topicName }) }
   function deliver(result: Pick<TranslationExport, 'content' | 'fileName' | 'mimeType'>): void {
@@ -542,15 +426,12 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
     h('div', { className: 'dsh-tp-main' },
       h('header', { className: 'dsh-tp-workspace-header' },
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
-        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTerms: terms && onDeleteTerm && current ? () => openTerms(current) : undefined, onTopicTerms: terms && onDeleteTerm ? openTopicTerms : undefined }),
+        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTerms: onOpenAssets && current ? () => openTerms(current) : undefined, onTopicTerms: onOpenAssets ? openTopicTerms : undefined }),
         current ? h('div', { className: 'dsh-tp-header-options' },
           h(ModePicker, { store, session: current, key: `mode:${current.id}` }),
           h(LanguagePicker, { store, session: current, key: `language:${current.id}` }),
         ) : null,
       ),
-      termTopic && terms && onDeleteTerm ? h(TopicTermsView, { key: JSON.stringify([ownerId, termTopic.id]), sessions: store, terms, ownerId, topicId: termTopic.id,
-        topicName: store.getTopics(ownerId).find(topic => topic.id === termTopic.id)?.name ?? termTopic.name, onClose: () => setTermTopic(undefined), onDelete: onDeleteTerm, onExport: deliver, bridgeReason: topics?.getStatus(ownerId).reason,
-        onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined }) : null,
       dialog?.kind === 'rename' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '重命名主题', 'aria-busy': action.pending },
         field('主题名称', h('input', { type: 'text', value: name, autoFocus: true, disabled: action.pending, onChange: (event: TextEvent) => setName(event.currentTarget.value) })),
         h('p', { className: 'dsh-tp-muted' }, '同主题的全部会话（含归档会话）一起更名，编号与单会话备注保持不变。'),
@@ -571,7 +452,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
         units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),
       storeNotice(store),
-      !termTopic && terms?.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted dsh-tp-message' }, terms.getNotice()) : null,
+      terms?.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted dsh-tp-message' }, terms.getNotice()) : null,
       exportNotice ? h('div', { role: exportNotice.failure ? 'alert' : 'status', className: exportNotice.failure ? 'dsh-tp-message' : 'dsh-tp-muted dsh-tp-message' }, exportNotice.message) : null,
       exportRequest ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '导出最终译文确认' },
         h('h3', null, `导出「${exportRequest.session.name}」`),
@@ -642,7 +523,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
       h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建同主题子会话'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名主题'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '编辑会话备注'),
-      terms && onDeleteTerm ? h(MenuItemButton, { onSelect: () => openTerms(target) }, '主题术语') : null,
+      onOpenAssets ? h(MenuItemButton, { onSelect: () => openTerms(target) }, '主题术语') : null,
       h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'txt') }, '导出最终译文 TXT'),
       h(MenuItemButton, { disabled: action.pending || !store.getTranslationHistory(target.id)?.units.length, onSelect: () => exportSession(target.id, 'json') }, '导出完整记录 JSON'),
       h(MenuItemButton, { disabled: action.pending, danger: true, onSelect: () => {

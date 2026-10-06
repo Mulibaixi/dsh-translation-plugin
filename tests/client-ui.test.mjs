@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import vm from 'node:vm'
+import { createResourceHost } from './ui-resource-host-fixture.mjs'
 
 const bundleSource = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8')
 const SETTINGS_KEY = 'dsh-translation-plugin:settings:v2'
@@ -211,10 +212,11 @@ function mount(overrides = {}) {
   storage.failSet = !!overrides.failSet
   if (storage.failSet) storage.setItem = () => { throw new Error('quota') }
   const renderer = createRenderer()
-  const entries = []; const effects = []; const slots = new Map(); const listeners = new Set()
+  const entries = []; const effects = []; const listeners = new Set()
+  const host = createResourceHost(renderer.react, renderer)
   let catalogCalls = 0
   const catalogResponse = overrides.catalog ?? { ok: true, value: { default: { provider: 'provider-a', model: 'm1' }, routableProviders: ['provider-a'], groups: [{ id: 'provider-a', name: 'Provider A', models: Array.from({ length: 6 }, (_, i) => ({ id: 'm' + (i + 1), name: 'Model ' + (i + 1) })) }], failures: [] } }
-  const window = { localStorage: storage, __ModuleLoader__: { load(entry) { entries.push(entry) } }, addEventListener(_name, listener) { listeners.add(listener) }, removeEventListener(_name, listener) { listeners.delete(listener) } }
+  const window = { innerWidth: 1024, innerHeight: 768, localStorage: storage, __ModuleLoader__: { load(entry) { entries.push(entry) } }, addEventListener(_name, listener) { listeners.add(listener) }, removeEventListener(_name, listener) { listeners.delete(listener) } }
   const locks = overrides.locks ?? new Locks()
   const context = vm.createContext({ window, navigator: { locks }, structuredClone, AbortController, TextEncoder, console, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
   vm.runInContext(bundleSource, context)
@@ -234,11 +236,10 @@ function mount(overrides = {}) {
   })
   exported.apply({
     remote: { session: { async modelCatalog() { catalogCalls++; return catalogResponse }, selectModel() { throw new Error('main chat selection must remain independent') } }, $on() { return () => {} } },
-    on() { return () => {} }, sidebarRightTabs: { register() { return () => {} } },
-    slots: { register(target, component) { slots.set(target.name, component); return () => slots.delete(target.name) }, inject(_name, register) { return register() } },
+    on() { return () => {} }, sidebarRightTabs: host.sidebarRightTabs, sidebarRight: host.sidebarRight, slots: host.slots,
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
   })
-  return { renderer, storage, panel: slots.get('sidebar.right.pane.tab'), settingsPage: slots.get('settings.section'),
+  return { renderer, storage, panel: host.panel, settingsPage: host.settingsPage, resourceHost: host,
     get catalogCalls() { return catalogCalls },
     changeStorage(key, raw) { storage.setItem(key, raw); for (const listener of listeners) listener({ key, storageArea: storage }); renderer.render() },
     dispose() { renderer.dispose(); for (const effect of effects.toReversed()) effect?.() },

@@ -29,11 +29,13 @@ function quickPort() {
   } }
 }
 const owner = 'synthetic-terms-ui-main'
-function title(ui) { return ui.nodes().find(node => node.props.className === 'dsh-tp-current-title' && node.type === 'button') }
-async function terms(ui) { title(ui).props.onClick(); ui.render(); await ui.click('主题术语') }
+function title(ui) { return ui.allNodes().find(node => node.props.className === 'dsh-tp-current-title' && node.type === 'button') }
+async function terms(ui) { ui.showTranslation(); title(ui).props.onClick(); ui.render(); await ui.click('主题术语') }
+function details(ui) { return ui.nodes().find(node => node.props['aria-label'] === '术语详情') }
 function row(ui, preferred) { const found = ui.nodes().find(node => node.type === 'article' && node.props.className === 'dsh-tp-term' && ui.text(node).includes(`→ ${preferred}`)); assert.ok(found); return found }
 async function rowClick(ui, preferred, label) {
   const button = ui.nodes(row(ui, preferred)).find(node => node.type === 'button' && ui.text(node) === label)
+    ?? ui.nodes(details(ui)).find(node => node.type === 'button' && ui.text(node) === label)
   assert.ok(button); assert.ok(!button.props.disabled); button.props.onClick(); ui.render(); await ui.flush()
 }
 async function setup(options = {}) {
@@ -65,7 +67,7 @@ test('术语UI：标题菜单紧凑列表，采用/停用/重新采用真实事�
     await terms(f.ui); assert.equal(title(f.ui).props['aria-expanded'], false)
     assert.match(f.ui.text(), /待确认/); assert.match(f.ui.text(), /档案更新于/)
     await rowClick(f.ui, '接口', '详情')
-    assert.match(f.ui.text(row(f.ui, '接口')), /English → 中文/)
+    assert.match(f.ui.text(details(f.ui)), /English → 中文/)
     assert.equal((await snapshot(f)).updatedAt, before.updatedAt)
     await rowClick(f.ui, '接口', '采用')
     let current = await snapshot(f)
@@ -73,7 +75,7 @@ test('术语UI：标题菜单紧凑列表，采用/停用/重新采用真实事�
     await rowClick(f.ui, '接口', '停用'); assert.equal((await snapshot(f)).entries[0].status, 'disabled')
     await rowClick(f.ui, '接口', '重新采用'); assert.equal((await snapshot(f)).entries[0].status, 'active')
     assert.equal(f.quick.calls.length, 0)
-    assert.equal(f.ui.button('发送快译').props.disabled, true, 'management does not prepare or translate a draft')
+    assert.equal(f.ui.allNodes().find(node => node.props['aria-label'] === '发送快译').props.disabled, true, 'management does not prepare or translate a draft')
     assert.equal(f.app.mountCalls, 1); assert.equal(f.app.topicMountCalls, 1)
   } finally { await f.app.dispose() }
   assert.equal(f.app.unmountCalls, 1); assert.equal(f.app.topicUnmountCalls, 1)
@@ -97,12 +99,12 @@ test('术语UI：历史主动参考仅normal，来源展开真实材料；confli
     await terms(f.ui); assert.match(f.ui.text(row(f.ui, '接口二')), /有冲突/)
     await rowClick(f.ui, '接口二', '采用'); assert.match(f.ui.text(), /先停用或处理同范围的冲突条目/)
     await rowClick(f.ui, '接口一', '详情')
-    await rowClick(f.ui, '接口一', '查看来源'); assert.match(f.ui.text(row(f.ui, '接口一')), /Synthetic API source/)
+    await rowClick(f.ui, '接口一', '查看来源'); assert.match(f.ui.text(details(f.ui)), /Synthetic API source/)
     assert.equal(fact.source, 'Synthetic API source')
     await rowClick(f.ui, '接口一', '停用'); await rowClick(f.ui, '接口二', '采用')
     assert.equal((await snapshot(f)).entries.find(entry => entry.id === 'synthetic-two').origin, 'user_explicit')
     assert.equal(f.quick.calls.length, 1)
-    await f.ui.click('取消文本 1参考')
+    f.ui.showTranslation(); await f.ui.click('取消文本 1参考')
     assert.equal((await f.request({ kind: 'read_unit', translationSessionId: f.session.id, unitId: selected })).ok, false)
   } finally { await f.app.dispose() }
 })
@@ -114,12 +116,12 @@ test('术语UI：同主题子会话共用，删除当前和最后会话默认保
     f.ui.context(title(f.ui)); await f.ui.click('新建同主题子会话')
     const child = (await f.request({ kind: 'list_sessions' })).value.sessions.find(session => session.id !== f.session.id)
     assert.equal(child.topicId, f.session.topicId)
-    await terms(f.ui); assert.match(f.ui.text(), /接口/); await f.ui.click('关闭主题术语')
+    await terms(f.ui); assert.match(f.ui.text(), /接口/); await f.ui.click('关闭记忆资产')
     f.ui.context(title(f.ui)); await f.ui.click('删除')
     assert.equal(f.ui.control('同时删除所选主题术语').props.checked, false)
     await f.ui.click('确认删除会话')
     assert.equal((await snapshot(f)).entries.length, 1)
-    await terms(f.ui); await f.ui.click('关闭主题术语')
+    await terms(f.ui); await f.ui.click('关闭记忆资产')
     f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
     assert.equal((await f.request({ kind: 'list_sessions' })).value.sessions.length, 0)
     assert.ok([...f.app.storage.values.entries()].some(([key, value]) => key.startsWith('dsh-translation-plugin:topic-terms:v1:') && value.includes('接口')))
@@ -179,4 +181,140 @@ test('术语UI：保存on真实恢复术语，off保留旧副本并显示准确�
     await terms(restored.ui); assert.match(restored.ui.text(), /待确认/)
     assert.equal((await snapshot(restored)).entries[0].origin, 'inferred')
   } finally { await restored?.app.dispose(); await f.app.dispose() }
+})
+
+test('资产UI：独立keyed Body首次浮出、重复复用，隐藏翻译的人工稿保持', async () => {
+  const f = await setup()
+  try {
+    await translate(f)
+    await f.ui.click('编辑文本 1 版本 1'); await f.ui.input('编辑文本 1 版本 1译文', '工作区未保存人工稿')
+    await terms(f.ui)
+    assert.equal(f.app.resourceHost.definitions.size, 2)
+    assert.equal(f.app.resourceHost.registrations.size, 3)
+    assert.equal(f.app.resourceHost.floats.length, 1)
+    assert.equal(f.app.resourceHost.sidebarRight.openTabs.getSnapshot().length, 1)
+    assert.match(f.ui.text(), /所属主会话：synthetic-terms-ui-main/)
+    assert.equal(f.ui.button('其他记忆 · 暂未开放').props.disabled, true)
+    assert.equal(f.ui.button('临时文件 · 暂未开放').props.disabled, true)
+    f.ui.showTranslation()
+    assert.equal(f.ui.control('编辑文本 1 版本 1译文').props.value, '工作区未保存人工稿')
+    await terms(f.ui)
+    assert.equal(f.app.resourceHost.floats.length, 1)
+    await f.ui.click('关闭记忆资产')
+    assert.equal(f.ui.control('编辑文本 1 版本 1译文').props.value, '工作区未保存人工稿')
+    assert.equal(f.app.resourceHost.sidebarRight.openTabs.getSnapshot().length, 0)
+    assert.equal(f.quick.calls.length, 1)
+  } finally { await f.app.dispose() }
+})
+
+test('资产UI：搜索语义字段/状态仅筛列表，导出保持完整快照与时间', async () => {
+  const f = await setup()
+  try {
+    await f.request(put(f.session, 'one', '接口', { aliases: ['interface'], forbidden: ['端口'], sense: '连接语境' }))
+    await f.request(put(f.session, 'two', '数据', { sourceForms: ['Data'], aliases: [], sense: '资料' }, 1))
+    const before = await snapshot(f)
+    await terms(f.ui)
+    for (const query of ['API', 'interface', '接口', '端口', '连接语境']) {
+      await f.ui.input('搜索术语', query)
+      assert.equal(f.ui.nodes().filter(node => node.type === 'article').length, 1)
+    }
+    await f.ui.input('术语状态', 'active'); assert.match(f.ui.text(), /没有匹配的术语/)
+    await f.ui.click('导出 JSON')
+    const exported = JSON.parse(await f.app.downloads.at(-1).blob.text())
+    assert.equal(exported.snapshot.entries.length, 2)
+    assert.equal(exported.snapshot.updatedAt, before.updatedAt)
+    assert.deepEqual(await snapshot(f), before)
+    assert.equal(f.quick.calls.length, 0)
+  } finally { await f.app.dispose() }
+})
+
+test('资产UI：新增/编辑一次保存采用，dirty门禁，条目/category切换保留草稿且new ID不混淆', async () => {
+  const f = await setup({ settings: { schemaVersion: 2, defaultMode: 'quick', targetLanguage: '日文', defaultInstruction: '', maxInputChars: 20000, rememberHistory: false } })
+  try {
+    await f.request(put(f.session, 'new', '接口'))
+    await terms(f.ui); await f.ui.click('新增术语')
+    assert.equal(f.ui.control('目标语言').props.value, '日文')
+    assert.equal(f.ui.button('保存并采用').props.disabled, true)
+    await f.ui.input('原文形式', 'Cache'); await f.ui.input('首选译法', '缓存新稿')
+    await rowClick(f.ui, '接口', '详情'); await f.ui.click('编辑')
+    assert.equal(f.ui.control('首选译法').props.value, '接口')
+    await f.ui.input('首选译法', '接口编辑稿')
+    await f.ui.click('译文记录'); await f.ui.click('结构化档案')
+    assert.equal(f.ui.control('首选译法').props.value, '接口编辑稿')
+    await f.ui.click('取消'); await f.ui.click('新增术语')
+    assert.equal(f.ui.control('首选译法').props.value, '缓存新稿')
+    await f.ui.click('保存并采用')
+    let current = await snapshot(f)
+    const created = current.entries.find(entry => entry.preferred === '缓存新稿')
+    assert.equal(created.status, 'active'); assert.equal(created.origin, 'user_explicit'); assert.equal(created.version, 2)
+    assert.ok(created.confirmation.eventId)
+    await rowClick(f.ui, '接口', '详情'); await f.ui.click('编辑')
+    assert.equal(f.ui.button('保存并采用').props.disabled, true)
+    await f.ui.input('首选译法', '新接口'); await f.ui.click('保存并采用')
+    current = await snapshot(f)
+    assert.equal(current.entries.find(entry => entry.id === 'new').preferred, '新接口')
+    assert.equal(current.entries.find(entry => entry.id === 'new').origin, 'user_explicit')
+    assert.equal(f.quick.calls.length, 0)
+  } finally { await f.app.dispose() }
+})
+
+test('资产UI：陈旧术语保存保留输入，显式核对后重试；删除清掉旧条目草稿', async () => {
+  const f = await setup()
+  try {
+    await f.request(put(f.session, 'one', '接口'))
+    await terms(f.ui); await rowClick(f.ui, '接口', '详情'); await f.ui.click('编辑'); await f.ui.input('首选译法', '编辑中的接口')
+    await f.request(put(f.session, 'late', '数据', { sourceForms: ['Data'] }, 1))
+    await f.ui.click('保存并采用')
+    assert.match(f.ui.text(), /术语已变化，输入仍保留/)
+    assert.equal(f.ui.control('首选译法').props.value, '编辑中的接口')
+    await f.ui.click('继续基于最新版本编辑'); await f.ui.click('保存并采用')
+    assert.equal((await snapshot(f)).entries.find(entry => entry.id === 'one').preferred, '编辑中的接口')
+    await f.ui.click('编辑'); await f.ui.input('首选译法', '将被删除的稿')
+    await rowClick(f.ui, '编辑中的接口', '删除'); await f.ui.click('确认删除术语')
+    assert.ok(!f.ui.nodes().some(node => node.props['aria-label'] === '编辑术语'))
+    assert.equal((await snapshot(f)).entries.length, 1)
+  } finally { await f.app.dispose() }
+})
+
+test('资产UI：译文原文只读，人工候选及固定独立执行，草稿跨分类保留且归档只读', async () => {
+  const f = await setup()
+  try {
+    await translate(f); await terms(f.ui); await f.ui.click('译文记录')
+    await f.ui.click(`${f.session.name} · 文本 1`)
+    assert.match(f.ui.text(), /Synthetic API source/)
+    await f.ui.click('编辑译文'); assert.equal(f.ui.button('保存新版本').props.disabled, true)
+    await f.ui.input('编辑译文', '资产窗口人工候选')
+    await f.ui.click('结构化档案'); await f.ui.click('译文记录')
+    assert.equal(f.ui.control('编辑译文').props.value, '资产窗口人工候选')
+    await f.ui.click('保存新版本')
+    assert.match(f.ui.text(), /尚无最终译文/); assert.match(f.ui.text(), /候选 · 版本 2/)
+    assert.equal(f.quick.calls.length, 1)
+    await f.ui.click('设为最终'); assert.match(f.ui.text(), /用户固定/)
+    await f.ui.click('复制最终译文'); assert.equal(f.app.copies.at(-1), '资产窗口人工候选')
+    f.ui.showTranslation(); f.ui.context(title(f.ui)); await f.ui.click('归档')
+    // The asset tab remains mounted; focus its exact existing resource again.
+    const resource = f.app.resourceHost.sidebarRight.openTabs.getSnapshot()[0]
+    f.app.resourceHost.restoreResource(owner, resource.contentId); await f.ui.flush()
+    assert.match(f.ui.text(), /会话已归档/)
+    assert.equal(f.ui.button('编辑译文').props.disabled, true)
+    assert.equal(f.quick.calls.length, 1)
+  } finally { await f.app.dispose() }
+})
+
+test('资产UI：URI范围不随工作区选择变化，主题标题实时更新，外owner URI拒绝读取', async () => {
+  const f = await setup()
+  try {
+    await f.request(put(f.session, 'scope', '原主题接口')); await terms(f.ui)
+    const address = f.app.resourceHost.activeResource.contentId
+    const renamed = await f.request({ kind: 'rename_topic', topicId: f.session.topicId, expectedName: f.session.topicName, name: '合成已重命名主题' })
+    assert.equal(renamed.ok, true); assert.match(f.ui.text(), /合成已重命名主题 · 记忆资产/)
+    f.ui.showTranslation(); title(f.ui).props.onClick(); f.ui.render(); await f.ui.click('新建主题及首会话')
+    const sessions = (await f.request({ kind: 'list_sessions' })).value.sessions
+    assert.equal(sessions.length, 2)
+    f.app.resourceHost.restoreResource(owner, address); await f.ui.flush()
+    assert.match(f.ui.text(), /原主题接口/); assert.match(f.ui.text(), /合成已重命名主题 · 记忆资产/)
+    f.app.resourceHost.restoreResource('synthetic-other-owner', address); await f.ui.flush()
+    assert.match(f.ui.text(), /不可用/); assert.ok(!f.ui.text().includes('原主题接口'))
+    assert.equal(f.quick.calls.length, 0)
+  } finally { await f.app.dispose() }
 })

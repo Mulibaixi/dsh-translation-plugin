@@ -1,6 +1,6 @@
 import {
-  emptyTopicTerms, decodeTopicTermSnapshot, putTopicTerm, adoptTopicTerm, disableTopicTerm, reconcileTopicTerms, queryTopicTerms,
-  type TopicTermSnapshot, type TopicTermPut, type TermMutationResult, type TermEvidenceFact, type TopicTermQuery,
+  emptyTopicTerms, decodeTopicTermSnapshot, decodeTopicTermUserInput, putTopicTerm, putUserTopicTerm, adoptTopicTerm, disableTopicTerm, reconcileTopicTerms, queryTopicTerms,
+  type TopicTermSnapshot, type TopicTermPut, type TopicTermUserInput, type TopicTermUserPut, type TermMutationResult, type TermEvidenceFact, type TopicTermQuery,
 } from '../memory/topic-terms.js'
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryVersion, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
@@ -15,6 +15,7 @@ export interface TopicTermVersion {
   readonly current: string
 }
 export type TopicTermCommand = { readonly kind: 'put'; readonly input: TopicTermPut }
+  | { readonly kind: 'user_put'; readonly input: TopicTermUserPut }
   | { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }
 interface Seat { snapshot: TopicTermSnapshot; stored: string | null; dirty: boolean; status: HistoryStatus }
 function browserStorage(): LocalStoragePort | undefined { try { return typeof window === 'undefined' ? undefined : window.localStorage } catch { return undefined } }
@@ -159,11 +160,23 @@ export class TopicMemoryStore {
         this.emit(); return { status: 'stale', snapshot: seat.snapshot, entry: null }
       }
       const result = command.kind === 'put' ? putTopicTerm(seat.snapshot, command.input, (sessionId, unitId) => this.readEvidence(sessionId, unitId), now()) :
+        command.kind === 'user_put' ? putUserTopicTerm(seat.snapshot, command.input, { eventId: `term-user-save:${Date.now()}:${Math.random()}`, at: now() }) :
         command.kind === 'adopt' ? adoptTopicTerm(seat.snapshot, command.id, command.expectedEntryVersion, { eventId: `term-adoption:${Date.now()}:${Math.random()}`, at: now() }) :
           disableTopicTerm(seat.snapshot, command.id, command.expectedEntryVersion, now())
       if (result.snapshot !== seat.snapshot) { seat.snapshot = result.snapshot; seat.dirty = true; seat.status = 'memory'; this.notice = undefined; this.persistLocked(seat); this.emit() }
       return result
     })
+  }
+  async saveUserTerm(ownerId: string, topicId: string, expectedVersion: number, input: TopicTermUserInput): Promise<TermMutationResult> {
+    const parsed = decodeTopicTermUserInput(input), snapshot = this.getSnapshot(ownerId, topicId)
+    if (!parsed) return { status: 'invalid', snapshot, entry: null }
+    let id = parsed.id
+    if (id === null) {
+      do {
+        id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? `term:${crypto.randomUUID()}` : `term:${Date.now()}:${Math.random()}`
+      } while (snapshot.entries.some(entry => entry.id === id))
+    }
+    return this.apply(ownerId, topicId, expectedVersion, { kind: 'user_put', input: { ...parsed, id } })
   }
   reload(ownerId: string, topicId: string): boolean {
     const seat = this.seat(ownerId, topicId)

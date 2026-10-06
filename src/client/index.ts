@@ -1,5 +1,5 @@
 import { h } from './react.js'
-import { PanelRouter, SettingsView } from './components.js'
+import { PanelRouter, SettingsView, MemoryAssetsView } from './views.js'
 import { createSessionStore } from './session-store.js'
 import { ModelCatalog, type ModelCatalogPort } from './models.js'
 import { QuickTranslationClient } from './quick-translation.js'
@@ -7,6 +7,10 @@ import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore } from './topic-memory-store.js'
+import {
+  MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
+  openMemoryAssets, parseMemoryAssetsAddress, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
+} from './memory-assets-window.js'
 
 type Disposer = () => void
 type AsyncDisposer = () => void | Promise<void>
@@ -16,7 +20,10 @@ interface SidebarRightTabDefinition {
   readonly id: string
   readonly kind: string
   readonly title: (address: string) => string
-  readonly guide: readonly {
+  readonly patterns?: readonly string[]
+  readonly canOpen?: (address: string) => boolean
+  readonly keepMounted?: boolean
+  readonly guide?: readonly {
     readonly id: string
     readonly order: number
     readonly title: () => string
@@ -36,6 +43,7 @@ interface ClientPluginContext {
   }
   on(event: string, listener: () => void): Disposer
   readonly sidebarRightTabs: { register(definition: SidebarRightTabDefinition): Disposer }
+  readonly sidebarRight: MemoryAssetsSidebar
   readonly slots: {
     register(
       target: { readonly name: string; readonly key?: string; readonly id?: string; readonly order?: number; readonly label?: string },
@@ -48,7 +56,7 @@ interface ClientPluginContext {
 
 const CLIENT_ID = 'dsh-translation-plugin'
 export const name = 'dsh-translation-client'
-export const inject = ['sidebarRightTabs', 'slots', 'remote', 'remote.session'] as const
+export const inject = ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session'] as const
 
 function withClientDiagnostics<T>(stage: string, action: () => T): T {
   try { return action() } catch (error) {
@@ -92,11 +100,29 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
     ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset(); void topics.reset() }), 'translation catalog connection')
 
-    const TranslationPanel: ClientComponent = (props = {}) => h(PanelRouter, {
-      store, models, quick, topics, terms,
-      onDeleteTerm: (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version),
-      sessionId: typeof props.sessionId === 'string' ? props.sessionId : undefined,
-    })
+    const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
+    const TranslationPanel: ClientComponent = (props = {}) => {
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+      const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
+      return h(PanelRouter, {
+        store, models, quick, topics, terms, onDeleteTerm, sessionId,
+        onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string) => {
+          if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
+          openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId },
+            typeof window === 'undefined' ? undefined : { width: window.innerWidth, height: window.innerHeight })
+        } : undefined,
+      })
+    }
+    const MemoryAssetsPanel: ClientComponent = (props = {}) => {
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+      const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
+      const scope = sessionId && tabInfo ? parseMemoryAssetsAddress(tabInfo.tab.navigation.address, sessionId) : undefined
+      const onClose = tabInfo ? () => tabInfo.tab.actions.close() : undefined
+      if (!scope) return h('section', { className: 'dsh-translation' },
+        h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
+        onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
+      return h(MemoryAssetsView, { store, quick, topics, terms, onDeleteTerm, onClose, ...scope })
+    }
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {
       store, terms, onClose: typeof props.close === 'function' ? props.close : undefined,
     })
@@ -105,12 +131,25 @@ export function apply(ctx: ClientPluginContext): void {
       id: CLIENT_ID,
       kind: 'translation-workspace',
       title: () => '翻译',
+      keepMounted: true,
       guide: [{ id: 'translation-workspace', order: 40, title: () => '翻译', description: () => '打开翻译会话。' }],
     })), 'translation tab type')
 
     ctx.effect(() => withClientDiagnostics('sidebar.right.pane.tab register', () => ctx.slots.register(
       { name: 'sidebar.right.pane.tab', key: CLIENT_ID }, TranslationPanel,
     )), 'translation tab body')
+
+    ctx.effect(() => withClientDiagnostics('memory asset type register', () => ctx.sidebarRightTabs.register({
+      id: MEMORY_ASSETS_TAB_ID,
+      kind: MEMORY_ASSETS_TAB_KIND,
+      title: () => '记忆资产',
+      patterns: [MEMORY_ASSETS_PATTERN],
+      canOpen: address => parseMemoryAssetsAddress(address) !== undefined,
+      keepMounted: true,
+    })), 'translation memory asset tab type')
+    ctx.effect(() => withClientDiagnostics('memory asset body register', () => ctx.slots.register(
+      { name: 'sidebar.right.pane.tab', key: MEMORY_ASSETS_TAB_ID }, MemoryAssetsPanel,
+    )), 'translation memory asset tab body')
 
     ctx.effect(() => withClientDiagnostics('settings.section register', () => ctx.slots.inject('settings.section', () => ctx.slots.register(
       { name: 'settings.section', id: CLIENT_ID, order: 40, label: '翻译' }, TranslationSettings,

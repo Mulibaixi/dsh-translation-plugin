@@ -20,8 +20,8 @@ class Topics {
   }
 }
 const owner = 'synthetic-export-owner'
-function title(ui) { return ui.nodes().find(node => node.type === 'button' && node.props.className === 'dsh-tp-current-title') }
-function picker(ui) { title(ui).props.onClick(); ui.render() }
+function title(ui) { return ui.allNodes().find(node => node.type === 'button' && node.props.className === 'dsh-tp-current-title') }
+function picker(ui) { ui.showTranslation(); title(ui).props.onClick(); ui.render() }
 async function terms(ui) { picker(ui); await ui.click('主题术语') }
 async function archive(ui, topicName) {
   picker(ui)
@@ -127,7 +127,7 @@ test('主题快照真实bundle：引用冻结可读性但不复制正文，删�
     const text = await downloaded(f), data = JSON.parse(text)
     assert.equal(data.evidenceAvailability[0].readable, true); assert.equal(data.evidenceAvailability[0].unitOrder, 1)
     assert.ok(!text.includes('Synthetic secret source body')); assert.ok(!text.includes('Synthetic secret translation body'))
-    await f.ui.click('关闭主题术语'); f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
+    await f.ui.click('关闭记忆资产'); f.ui.context(title(f.ui)); await f.ui.click('删除'); await f.ui.click('确认删除会话')
     await archive(f.ui, f.session.name); await f.ui.click('导出 Markdown')
     const markdown = await downloaded(f)
     assert.match(markdown, /待复核/); assert.match(markdown, /依据已变化或不可用/)
