@@ -14,6 +14,7 @@ import { downloadExport } from './browser-download.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
 import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
 import type { TopicMemoryStore, TopicTermVersion } from './topic-memory-store.js'
+import { createSessionReorder, type SessionDrop, type SessionPointerEvent } from './session-reorder.js'
 export { MemoryAssetsView } from './memory-assets-view.js'
 
 type TextEvent = { currentTarget: { value: string } }
@@ -141,6 +142,27 @@ function sessionLabel(session: LocalSession): unknown {
     session.remark ? h('span', { className: 'dsh-tp-session-remark' }, session.remark) : null,
   )
 }
+type SessionClickEvent = { preventDefault(): void; stopPropagation(): void }
+interface SessionSorting {
+  readonly gesture: ReturnType<typeof createSessionReorder>
+  props(id: string): Readonly<Record<string, unknown>>
+  clicked(id: string, event?: SessionClickEvent): boolean
+}
+function useSessionSorting(store: SessionStore, ownerId: string): SessionSorting {
+  const [drop, setDrop] = react.useState<SessionDrop | undefined>(undefined)
+  const gesture = react.useMemo(() => createSessionReorder(setDrop, move => { store.moveSessionInDisplay(ownerId, move.id, move.targetId, move.after) }), [store, ownerId])
+  react.useEffect(() => () => gesture.dispose(), [gesture])
+  function clicked(id: string, event?: SessionClickEvent): boolean {
+    if (!gesture.consumeClick(id)) return false
+    event?.preventDefault(); event?.stopPropagation(); return true
+  }
+  return { gesture, clicked, props: id => ({
+    'data-session-sort-id': id, 'data-session-dragging': drop?.id === id || undefined,
+    'data-session-drop': drop?.targetId === id && drop.id !== id ? (drop.after ? 'after' : 'before') : undefined,
+    onPointerDown: (event: SessionPointerEvent) => gesture.down(id, event),
+    onClickCapture: (event: SessionClickEvent) => { clicked(id, event) },
+  }) }
+}
 
 function ModePicker({ session, store }: StoreProps & { readonly session: LocalSession }): unknown {
   const [open, setOpen] = react.useState(false)
@@ -171,24 +193,27 @@ function LanguagePicker({ session, store }: StoreProps & { readonly session: Loc
   }))))
 }
 
-function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTopicAssets }: StoreProps & {
+function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTopicAssets, sorting }: StoreProps & {
   readonly ownerId: string; readonly current: LocalSession | undefined
   readonly open: boolean; readonly onOpenChange: (open: boolean) => void
   readonly contextOpen: boolean; readonly onDismissContext: () => void
   readonly onContext: (session: LocalSession, event: ContextEvent) => void
   readonly onContextKeys: (session: LocalSession, event: KeyboardEvent & { currentTarget: HTMLElement }) => void
   readonly creating: boolean; readonly onCreate: () => void
+  readonly sorting: SessionSorting
   readonly onTopicAssets?: ((topic: { readonly id: string; readonly name: string }) => void) | undefined
 }): unknown {
-  const sessions = store.getActiveSessions(ownerId)
-  const archived = store.getArchivedSessions(ownerId)
+  const displayed = store.getDisplaySessions(ownerId)
+  const sessions = displayed.filter(session => session.archivedAt === null)
+  const archived = displayed.filter(session => session.archivedAt !== null)
   const topics = [...new Map(store.getTopics(ownerId).map(topic => [topic.id, topic])).values()]
   const assetTopic = topics.find(topic => topic.id === current?.topicId) ?? topics[0]
   function row(session: LocalSession, restore = false): unknown {
     return h('button', {
       type: 'button', role: 'menuitem', key: session.id, className: 'dsh-tp-session-choice', title: sessionTitle(session),
+      ...sorting.props(session.id),
       'aria-label': `${restore ? '恢复归档会话' : '切换翻译会话'}：${sessionTitle(session)}`, 'aria-current': current?.id === session.id,
-      onClick: () => { if (restore && !store.archiveSession(ownerId, session.id, false)) return; if (!restore) store.openSession(ownerId, session.id); onDismissContext(); setOpen(false) },
+      onClick: (event?: SessionClickEvent) => { if (sorting.clicked(session.id, event)) return; if (restore && !store.archiveSession(ownerId, session.id, false)) return; if (!restore) store.openSession(ownerId, session.id); onDismissContext(); setOpen(false) },
       onContextMenu: (event: ContextEvent) => onContext(session, event),
       onKeyDown: (event: KeyboardEvent & { currentTarget: HTMLElement }) => {
         if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) onContextKeys(session, event)
@@ -218,8 +243,8 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
         'aria-label': `打开记忆资产：${assetTopic.name}`, 'data-topic-id': assetTopic.id,
         onClick: () => onTopicAssets(assetTopic),
       }, '记忆资产'), h('div', { role: 'separator', className: 'dsh-tp-session-divider' })) : null,
-    ...sessions.map(session => row(session)),
-    archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, ...archived.map(session => row(session, true))) : null,
+    h('div', { 'data-session-sort-list': true }, ...sessions.map(session => row(session))),
+    archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, h('div', { 'data-session-sort-list': true }, ...archived.map(session => row(session, true)))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
     h('button', {
       type: 'button', role: 'menuitem', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: creating,
@@ -341,6 +366,8 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   react.useEffect(() => topics?.subscribe(() => refreshQuick(value => value + 1)), [topics])
   const [sidebar, setSidebar] = react.useState(false)
   const [sessionPickerOpen, setSessionPickerOpen] = react.useState(false)
+  const sorting = useSessionSorting(store, ownerId)
+  react.useEffect(() => { sorting.gesture.cancel() }, [sidebar, sessionPickerOpen, sorting.gesture])
   const [archives, setArchives] = react.useState(false)
   const [context, setContext] = react.useState<ContextRequest | undefined>(undefined)
   const [dialog, setDialog] = react.useState<WorkspaceDialog | undefined>(undefined)
@@ -357,8 +384,9 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   })), [store])
   const action = useAsyncAction()
   react.useEffect(() => { store.ensureWorkspace(ownerId) }, [store, ownerId])
-  const sessions = store.getActiveSessions(ownerId)
-  const archived = store.getArchivedSessions(ownerId)
+  const displayed = store.getDisplaySessions(ownerId)
+  const sessions = displayed.filter(session => session.archivedAt === null)
+  const archived = displayed.filter(session => session.archivedAt !== null)
   const current = store.getActiveSession(ownerId)
   const target = context ? store.getSession(context.id) : undefined
   const targetTopicSessions = target ? store.getAvailableSessions(ownerId).filter(session => session.topicId === target.topicId) : []
@@ -378,6 +406,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   const serviceStatus = current?.mode === 'normal' ? blocked : readiness.status !== 'ready'
     ? checking ? '正在检查翻译服务…' : readiness.reason : undefined
   function contextMenu(session: LocalSession, event: ContextEvent): void {
+    sorting.gesture.cancel()
     event.preventDefault(); event.stopPropagation()
     setContext({ id: session.id, x: event.clientX, y: event.clientY, trigger: event.currentTarget })
   }
@@ -422,24 +451,26 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   function sessionItem(session: LocalSession): unknown {
     return h('button', {
       key: session.id, type: 'button', className: 'dsh-tp-session-item', title: sessionTitle(session),
+      ...sorting.props(session.id),
       'aria-current': session.id === current?.id, 'aria-haspopup': 'menu',
-      onClick: () => { store.openSession(ownerId, session.id); setContext(undefined) },
+      onClick: (event?: SessionClickEvent) => { if (sorting.clicked(session.id, event)) return; store.openSession(ownerId, session.id); setContext(undefined) },
       onContextMenu: (event: ContextEvent) => contextMenu(session, event),
       onKeyDown: (event: KeyboardEvent & { currentTarget: HTMLElement }) => contextKeys(session, event),
     }, sessionLabel(session))
   }
   return h('div', { className: 'dsh-tp-workspace' },
     h('aside', { className: 'dsh-tp-session-sidebar', hidden: !sidebar, 'aria-label': '翻译会话侧栏' },
-      h('div', { className: 'dsh-tp-session-list', 'aria-label': '使用中的翻译会话' },
+      h('div', { className: 'dsh-tp-session-list', 'aria-label': '使用中的翻译会话', 'data-session-sort-list': true },
         ...sessions.map(sessionItem),
         h('button', { type: 'button', className: 'dsh-tp-session-add', title: '新建主题及首会话', 'aria-label': '新建主题及首会话', disabled: action.pending, onClick: () => create() }, '+'),
       ),
       h('button', { type: 'button', className: 'dsh-tp-archive-toggle', 'aria-expanded': archives, onClick: () => setArchives(value => !value) }, `已归档（${archived.length}）`),
-      archives ? h('div', { className: 'dsh-tp-session-list', 'aria-label': '已归档翻译会话' },
+      archives ? h('div', { className: 'dsh-tp-session-list', 'aria-label': '已归档翻译会话', 'data-session-sort-list': true },
         ...archived.map(session => h('button', { type: 'button', className: 'dsh-tp-session-item', key: session.id, title: sessionTitle(session), 'aria-haspopup': 'menu',
+          ...sorting.props(session.id),
           onContextMenu: (event: ContextEvent) => contextMenu(session, event),
           onKeyDown: (event: KeyboardEvent & { currentTarget: HTMLElement }) => contextKeys(session, event),
-          onClick: () => { if (store.archiveSession(ownerId, session.id, false)) setContext(undefined) },
+          onClick: (event?: SessionClickEvent) => { if (sorting.clicked(session.id, event)) return; if (store.archiveSession(ownerId, session.id, false)) setContext(undefined) },
         }, sessionLabel(session))),
         archived.length === 0 ? h('small', { className: 'dsh-tp-muted' }, '暂无归档会话。') : null,
       ) : null,
@@ -447,7 +478,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
     h('div', { className: 'dsh-tp-main' },
       h('header', { className: 'dsh-tp-workspace-header' },
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
-        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTopicAssets: onOpenAssets ? openTopicAssets : undefined }),
+        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTopicAssets: onOpenAssets ? openTopicAssets : undefined, sorting }),
         current ? h('div', { className: 'dsh-tp-header-options' },
           h(ModePicker, { store, session: current, key: `mode:${current.id}` }),
           h(LanguagePicker, { store, session: current, key: `language:${current.id}` }),

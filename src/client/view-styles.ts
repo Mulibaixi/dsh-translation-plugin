@@ -29,6 +29,9 @@ export const styles = `
 .dsh-tp button.dsh-tp-memory-assets-entry { min-height: 36px; padding: 6px 10px; font-size: 14px; line-height: 22px; font-weight: 500; }
 .dsh-tp-session-choice-name { display: block; min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .dsh-tp-session-choice[aria-current=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
+.dsh-tp [data-session-dragging=true] { cursor: grabbing; opacity: .6; user-select: none; }
+.dsh-tp [data-session-drop=before] { box-shadow: inset 0 2px var(--dsw-focus-ring-color, #568bf0); }
+.dsh-tp [data-session-drop=after] { box-shadow: inset 0 -2px var(--dsw-focus-ring-color, #568bf0); }
 .dsh-tp-header-options { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: none; margin-left: auto; }
 .dsh-tp-compact-trigger { display: flex; align-items: center; gap: 4px; font-weight: 400; white-space: nowrap; max-width: 110px; }
 .dsh-tp-compact-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }

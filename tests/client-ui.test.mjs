@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import vm from 'node:vm'
 import { createResourceHost } from './ui-resource-host-fixture.mjs'
+import { reorderSurface, pointer } from './session-reorder-fixture.mjs'
 
 const bundleSource = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8')
 const SETTINGS_KEY = 'dsh-translation-plugin:settings:v2'
@@ -218,7 +219,7 @@ function mount(overrides = {}) {
   const catalogResponse = overrides.catalog ?? { ok: true, value: { default: { provider: 'provider-a', model: 'm1' }, routableProviders: ['provider-a'], groups: [{ id: 'provider-a', name: 'Provider A', models: Array.from({ length: 6 }, (_, i) => ({ id: 'm' + (i + 1), name: 'Model ' + (i + 1) })) }], failures: [] } }
   const window = { innerWidth: 1024, innerHeight: 768, localStorage: storage, __ModuleLoader__: { load(entry) { entries.push(entry) } }, addEventListener(_name, listener) { listeners.add(listener) }, removeEventListener(_name, listener) { listeners.delete(listener) } }
   const locks = overrides.locks ?? new Locks()
-  const context = vm.createContext({ window, navigator: { locks }, structuredClone, AbortController, TextEncoder, console, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
+  const context = vm.createContext({ window, navigator: { locks }, structuredClone, AbortController, TextEncoder, console, setTimeout, clearTimeout, document: { addEventListener() {}, removeEventListener() {} }, Node: class {} })
   vm.runInContext(bundleSource, context)
   const exported = entries[0].factory(specifier => {
     if (specifier === 'react') return renderer.react
@@ -257,6 +258,46 @@ async function newSession(ui) {
 }
 async function rename(ui, value) { ui.context(currentTitle(ui)); await ui.click('重命名'); await ui.input('主题名称', value); await ui.click('确认重命名主题') }
 const tick = () => new Promise(resolve => setImmediate(resolve))
+
+test('下拉与侧栏长按排序同步，拖后click不切换会话或关闭菜单，短按和右键保持可用', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const app = mount({ history: [fixture('a', 'A'), fixture('b', 'B'), fixture('c', 'C')] }), ui = app.renderer
+  ui.render(app.panel, { sessionId: 'main-a' }); await ui.click('切换会话侧栏'); openSessionMenu(ui)
+  const displayed = className => ui.nodes().filter(node => node.type === 'button' && node.props.className === className).map(node => node.props['data-session-sort-id'])
+  const choice = id => ui.nodes().find(node => node.props.className === 'dsh-tp-session-choice' && node.props['data-session-sort-id'] === id)
+  const startTitle = ui.text(currentTitle(ui)), surface = reorderSurface(['a', 'b', 'c'])
+  const source = choice('a')
+  source.props.onPointerDown({ ...pointer('pointerdown'), currentTarget: surface.rows[0] })
+  t.mock.timers.tick(400); ui.render()
+  surface.doc.dispatchEvent(pointer('pointermove', 88)); surface.doc.dispatchEvent(pointer('pointerup', 88)); ui.render()
+  assert.deepEqual(displayed('dsh-tp-session-choice'), ['b', 'c', 'a'])
+  assert.deepEqual(displayed('dsh-tp-session-item'), ['b', 'c', 'a'])
+  let prevented = false, stopped = false
+  choice('a').props.onClickCapture({ preventDefault() { prevented = true }, stopPropagation() { stopped = true } })
+  assert.equal(prevented, true); assert.equal(stopped, true); assert.equal(ui.text(currentTitle(ui)), startTitle); assert.equal(currentTitle(ui).props['aria-expanded'], true)
+  assert.deepEqual(JSON.parse(app.storage.getItem('dsh-translation-plugin:session-order:v1:main-a')), { schemaVersion: 1, ids: ['b', 'c', 'a'] })
+  const short = choice('b')
+  short.props.onPointerDown({ ...pointer('pointerdown'), currentTarget: surface.rows[1] }); surface.doc.dispatchEvent(pointer('pointerup'))
+  await ui.click(short.props['aria-label']); assert.equal(ui.text(currentTitle(ui)), 'B'); assert.equal(currentTitle(ui).props['aria-expanded'], false)
+  openSessionMenu(ui); ui.context(choice('c')); assert.ok(sessionContextMenu(ui))
+  t.mock.timers.tick(400); assert.deepEqual(JSON.parse(app.storage.getItem('dsh-translation-plugin:session-order:v1:main-a')).ids, ['b', 'c', 'a'])
+  app.dispose()
+})
+
+test('切换所属主会话或关闭下拉时取消未激活长按，不遗留排序写入', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const app = mount({ history: [fixture('a', 'A'), fixture('b', 'B')] }), ui = app.renderer
+  ui.render(app.panel, { sessionId: 'main-a' }); openSessionMenu(ui)
+  const surface = reorderSurface(['a', 'b'])
+  const choice = () => ui.nodes().find(node => node.props.className === 'dsh-tp-session-choice' && node.props['data-session-sort-id'] === 'a')
+  choice().props.onPointerDown({ ...pointer('pointerdown'), currentTarget: surface.rows[0] })
+  currentTitle(ui).props.onClick(); ui.render(); t.mock.timers.tick(400)
+  assert.equal(surface.rows[0].capture, undefined)
+  openSessionMenu(ui); choice().props.onPointerDown({ ...pointer('pointerdown'), currentTarget: surface.rows[0] })
+  ui.render(app.panel, { sessionId: 'main-b' }); t.mock.timers.tick(400)
+  assert.equal(surface.rows[0].capture, undefined); assert.equal(app.storage.getItem('dsh-translation-plugin:session-order:v1:main-a'), null)
+  app.dispose()
+})
 
 test('面板没有大标题或设置入口，无主会话时不开放输入', async () => {
   const app = mount(); const ui = app.renderer; ui.render(app.panel, {})

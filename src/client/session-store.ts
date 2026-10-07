@@ -4,6 +4,7 @@ import {
   type LocalSession, type ModelRoute, type SessionSettings,
 } from './sessions.js'
 import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKey, encodeModelPreference, decodeModelPreference } from './model-preferences.js'
+import { SESSION_ORDER_PREFIX, sessionOrderKey, encodeSessionOrder, decodeSessionOrder, reconcileSessionOrder, moveSessionOrder } from './session-order.js'
 import { decodeTranslationHistory, emptyTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
 import {
   DELETED_SESSION_PREFIX, TOPIC_IDENTITY_PREFIX, TOPIC_NAME_PREFIX, TOPIC_LOCK_NAME,
@@ -68,6 +69,7 @@ export class SessionStore {
   private readonly pendingSaves = new Map<string, Promise<boolean>>()
   private readonly dirtySaves = new Set<string>()
   private readonly lastModels = new Map<string, ModelRoute | null>()
+  private readonly sessionOrders = new Map<string, readonly string[]>()
   private readonly workspaces = new Map<string, Workspace>()
   private readonly listeners = new Set<Disposer>()
   private notice: string | undefined
@@ -92,7 +94,7 @@ export class SessionStore {
   }
   subscribe(listener: Disposer): Disposer { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const fn of this.listeners) fn() }
-  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); this.workspaces.clear(); this.seats.clear(); this.topics.clear(); this.migrationSources.clear(); this.lastModels.clear() }
+  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); this.workspaces.clear(); this.seats.clear(); this.topics.clear(); this.migrationSources.clear(); this.lastModels.clear(); this.sessionOrders.clear() }
 
   private readModelPreference(key: string): ModelRoute | null | undefined {
     try {
@@ -345,6 +347,42 @@ export class SessionStore {
   getAvailableSessions(ownerId: string): readonly LocalSession[] {
     return [...this.seats.values()].map(seat => seat.session).filter(session => session.ownerId === ownerId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  }
+  private readSessionOrder(ownerId: string): readonly string[] {
+    const cached = this.sessionOrders.get(ownerId)
+    if (cached) return cached
+    let ids: readonly string[] = []
+    try {
+      const raw = this.storage?.getItem(sessionOrderKey(ownerId))
+      if (raw !== undefined && raw !== null) {
+        const decoded = decodeSessionOrder(raw)
+        if (!decoded) throw new Error('invalid session order')
+        ids = decoded
+      }
+    } catch { this.notice = '会话排序偏好读取失败，当前会话仍可使用。' }
+    this.sessionOrders.set(ownerId, ids); return ids
+  }
+  /** Presentation only: fixed topic sequences and export order keep their own authority. */
+  getDisplaySessions(ownerId: string): readonly LocalSession[] {
+    const sessions = this.getAvailableSessions(ownerId), byId = new Map(sessions.map(session => [session.id, session]))
+    return reconcileSessionOrder(this.readSessionOrder(ownerId), sessions.map(session => session.id)).map(id => byId.get(id)!)
+  }
+  private saveSessionOrder(ownerId: string, ids: readonly string[]): boolean {
+    this.sessionOrders.set(ownerId, ids)
+    try {
+      if (!this.storage) throw new Error('storage unavailable')
+      this.storage.setItem(sessionOrderKey(ownerId), encodeSessionOrder(ids)); return true
+    } catch { this.notice = '会话排序未保存，当前顺序仍保留在本次运行中。'; return false }
+  }
+  moveSessionInDisplay(ownerId: string, id: string, targetId: string, after = false): boolean {
+    const session = this.getSession(id), target = this.getSession(targetId)
+    if (!session || !target || session.ownerId !== ownerId || target.ownerId !== ownerId ||
+      (session.archivedAt === null) !== (target.archivedAt === null)) return false
+    const ids = this.getDisplaySessions(ownerId).map(session => session.id), next = moveSessionOrder(ids, id, targetId, after)
+    if (ids.every((value, index) => value === next[index])) return true
+    this.notice = undefined
+    const saved = this.saveSessionOrder(ownerId, next)
+    this.emit(); return saved
   }
   getActiveSessions(ownerId: string): readonly LocalSession[] { return this.getAvailableSessions(ownerId).filter(session => session.archivedAt === null) }
   getArchivedSessions(ownerId: string): readonly LocalSession[] { return this.getAvailableSessions(ownerId).filter(session => session.archivedAt !== null) }
@@ -868,7 +906,7 @@ export class SessionStore {
 
   private deleteHistoryLocked(ids: readonly string[], deleteMemory: boolean, unreadable: readonly { readonly key: string; readonly raw: string }[], expected?: readonly HistoryVersion[], companion?: HistoryDeleteCompanion): boolean {
     if (deleteMemory) { this.notice = '关联记忆档案尚未接入，此操作未执行。'; this.emit(); return false }
-    let removedSessions = 0, removedUnreadable = 0, currentRemoval = '删除前检查'
+    let removedSessions = 0, removedUnreadable = 0, currentRemoval = '删除前检查', orderSaved = true
     try {
       const seats = [...new Set(ids)].map(id => this.seats.get(id)).filter((seat): seat is Seat => !!seat)
       if (!this.storage && (unreadable.length || seats.some(seat => seat.stored !== null || seat.legacyRaw !== null))) {
@@ -920,17 +958,23 @@ export class SessionStore {
         this.storage?.removeItem(sessionModelKey(seat.session.id))
         this.seats.delete(seat.session.id)
         this.migrationSources.delete(seat.session.id)
+        const order = this.readSessionOrder(seat.session.ownerId)
+        if (order.includes(seat.session.id)) orderSaved = this.saveSessionOrder(seat.session.ownerId, order.filter(id => id !== seat.session.id)) && orderSaved
         this.reconcileWorkspace(seat.session.ownerId)
         removedSessions++
       }
       if (companion && !companion.afterHistoryDeleted()) {
         this.notice = '所选会话已删除，但主题术语未全部清理。请核对术语存储提示与剩余范围。'; this.emit(); return false
       }
-      this.notice = undefined; this.emit(); return true
+      this.notice = orderSaved ? undefined : '会话已删除，但排序偏好清理未保存；当前列表已移除该会话。'; this.emit(); return true
     } catch { this.notice = `历史清理未完全完成：已移除 ${removedSessions} 条会话和 ${removedUnreadable} 份无法读取的副本；${currentRemoval}未完成。请核对剩余范围后重新确认。`; this.emit(); return false }
   }
 
   private externalChange(key: string | null): void {
+    if (key === null) this.sessionOrders.clear()
+    else if (key.startsWith(SESSION_ORDER_PREFIX)) {
+      for (const ownerId of this.sessionOrders.keys()) if (key === sessionOrderKey(ownerId)) this.sessionOrders.delete(ownerId)
+    }
     if (key === null || key.startsWith(OWNER_MODEL_PREFIX)) this.lastModels.clear()
     if (key === null || key.startsWith(SESSION_MODEL_PREFIX)) {
       for (const seat of this.seats.values()) {
