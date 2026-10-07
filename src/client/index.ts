@@ -125,7 +125,11 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, onDeleteTerm, ...scope })
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, onDeleteTerm, ...scope,
+        onSelectTopic: tabInfo ? (topicId: string) => {
+          if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
+          tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })
+        } : undefined })
     }
     const MemoryAssetsCaption: ClientComponent = (props = {}) => {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined

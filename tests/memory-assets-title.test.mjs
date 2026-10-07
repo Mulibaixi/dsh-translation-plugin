@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFile } from 'node:fs/promises'
+import vm from 'node:vm'
+import ts from 'typescript'
 import { mount } from './quick-client-fixture.mjs'
 import { memoryAssetsAddress } from '../dist/client/memory-assets-window.js'
 
@@ -57,6 +60,19 @@ test('cursor rule still selects only the owned floating caption and excludes nat
   assert.equal(f.ui.nodes(node).filter(child => child.type === 'button').length, 1, 'only the topic button, no duplicate host controls')
 })
 
+test('docked host title hides only the owned session and topic while floating caption keeps both', async t => {
+  const f = mountCaption(); t.after(() => f.app.dispose())
+  const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId), { topicId: f.session.topicId, sessionId: f.session.id })
+  const styles = f.ui.nodes(node).find(child => child.type === 'style' && !child.props['data-assets-cursor-style']).children.join('')
+  assert.match(styles, /\[data-dockkit-tab\] \[data-dsh-translation-assets-title\] \.dsh-tp-assets-title-session,\s*\[data-dockkit-tab\] \[data-dsh-translation-assets-title\] \.dsh-tp-assets-title-picker\s*\{\s*display: none;\s*\}/u)
+  const hideRules = [...styles.matchAll(/([^{}]+)\{\s*display: none;\s*\}/gu)]
+  assert.equal(hideRules.length, 1)
+  assert.doesNotMatch(hideRules[0][1], /data-dockkit-float-title|data-dockkit-tab-close|data-dockkit-float-(?:close|dock)|assets-title-label/u)
+  assert.equal(f.ui.nodes(node).filter(child => child.props.className === 'dsh-tp-assets-title-label').length, 1)
+  assert.ok(f.ui.nodes(node).some(child => child.props.className === 'dsh-tp-assets-title-session'))
+  assert.ok(f.ui.nodes(node).some(child => child.props.className === 'dsh-tp-assets-title-picker'))
+})
+
 test('topic interactions stop bubbling drag/focus/menu events while caption text remains draggable', async t => {
   const f = mountCaption(); t.after(() => f.app.dispose())
   const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId))
@@ -77,4 +93,51 @@ test('topic interactions stop bubbling drag/focus/menu events while caption text
   assert.equal(menu.props['data-compact'], true)
   const openPicker = f.ui.nodes().find(child => child.props.className === 'dsh-tp-assets-title-picker')
   assert.ok(f.ui.nodes(openPicker).some(child => child.props['aria-label'] === '搜索资产主题'), 'portal contents retain the interaction boundary in React')
+})
+
+test('the open title menu capture closes only its own native dock operation and leaves host events intact', async () => {
+  // Run the actual component's capture effect with explicit DOM ancestry; no desktop claim.
+  const source = await readFile(new URL('../src/client/memory-assets-title.ts', import.meta.url), 'utf8')
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+  const effects = [], values = [0, true, ''], rootRef = { current: null }, handlers = new Map()
+  let stateIndex = 0, closes = 0
+  const h = (type, props, ...children) => ({ type, props: props ?? {}, children })
+  const react = {
+    useState() { const index = stateIndex++; return [values[index], value => { values[index] = value; if (index === 1 && value === false) closes++ }] },
+    useRef() { return rootRef },
+    useEffect(effect, deps) { effects.push({ effect, deps }) },
+  }
+  class Element {
+    constructor({ float, dock } = {}) { this.float = float; this.dock = dock }
+    closest(selector) {
+      assert.ok(['[data-dockkit-float]', '[data-dockkit-float-dock]'].includes(selector))
+      return selector === '[data-dockkit-float]' ? this.float ?? null : this.dock ?? null
+    }
+  }
+  const exported = {}
+  vm.runInNewContext(compiled, { exports: exported, Element,
+    document: {
+      addEventListener(name, listener, capture) { assert.equal(name, 'pointerdown'); assert.equal(capture, true); handlers.set(name, listener) },
+      removeEventListener(name, listener, capture) { assert.equal(handlers.get(name), listener); assert.equal(capture, true); handlers.delete(name) },
+    },
+    require(id) {
+      if (id === './react.js') return { h, react }
+      if (id === './native-ui.js') return { Menu: 'native-menu', IconChevronDownOutlineRegular: 'svg' }
+      assert.equal(id, './memory-assets-window.js')
+      return { resolveMemoryAssetsSelection: () => undefined }
+    },
+  })
+  const title = exported.MemoryAssetsTitle({ store: { subscribe() { return () => {} } } })
+  assert.equal(title.props.ref, rootRef)
+  const ownFloat = new Element(), otherFloat = new Element(), ownDock = new Element({ float: ownFloat }), otherDock = new Element({ float: otherFloat })
+  ownDock.dock = ownDock; otherDock.dock = otherDock
+  rootRef.current = new Element({ float: ownFloat })
+  const cleanup = effects.find(({ deps }) => deps.length === 1 && deps[0] === true).effect()
+  const handler = handlers.get('pointerdown')
+  const dispatch = target => handler({ target, preventDefault() { assert.fail('native dock default must remain') }, stopPropagation() { assert.fail('native dock propagation must remain') } })
+  dispatch(otherDock); dispatch(new Element({ float: ownFloat })); dispatch(null)
+  assert.equal(closes, 0, 'other floats, ordinary targets and missing nodes do not close this menu')
+  dispatch(new Element({ dock: ownDock, float: ownFloat }))
+  assert.equal(closes, 1); assert.equal(values[1], false)
+  cleanup(); assert.equal(handlers.size, 0)
 })

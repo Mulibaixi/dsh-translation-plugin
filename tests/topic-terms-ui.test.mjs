@@ -48,7 +48,7 @@ async function selectAssetTopic(ui, topicId) {
   const body = ui.nodes().find(node => node.props.className === 'dsh-tp dsh-tp-assets')
   assert.equal(caption.props['data-topic-id'], topicId, 'host title follows the same navigation')
   assert.equal(body.props['data-topic-id'], topicId, 'Body follows the same navigation')
-  assert.ok(!ui.nodes(body).some(node => node.type === 'header' || node.props['aria-label'] === '选择资产主题'), 'Body does not repeat the host title or picker')
+  assert.ok(!ui.nodes(body).some(node => node.type === 'header'), 'Body does not repeat the host title')
 }
 function details(ui) { return ui.nodes().find(node => node.props['aria-label'] === '术语详情') }
 function row(ui, preferred) { const found = ui.nodes().find(node => node.type === 'article' && node.props.className === 'dsh-tp-term' && ui.text(node).includes(`→ ${preferred}`)); assert.ok(found); return found }

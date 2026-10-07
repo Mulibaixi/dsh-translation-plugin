@@ -12,6 +12,7 @@ import { buildTopicArchiveJsonExport, buildTopicArchiveMarkdownExport, type Topi
 import type { TopicArchiveStore } from './topic-archive-store.js'
 import { TopicArchiveView } from './topic-archive-view.js'
 import { resolveMemoryAssetsSelection } from './memory-assets-window.js'
+import { Menu, IconChevronDownOutlineRegular } from './native-ui.js'
 
 interface MemoryAssetsProps {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
@@ -21,31 +22,52 @@ interface MemoryAssetsProps {
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, quick, topics, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, quick, topics, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
+  readonly onSelectTopic?: ((topicId: string) => void) | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   const { availableTopics, topicId: selectedTopicId, topic } = resolveMemoryAssetsSelection(store, { ownerId, topicId, requestedTopicId, associatedSessionId })
   const [visited, setVisited] = react.useState<readonly string[]>(() => [selectedTopicId])
+  const [pickerOpen, setPickerOpen] = react.useState(false)
+  const [query, setQuery] = react.useState('')
   react.useEffect(() => store.subscribe(() => refresh(value => value + 1)), [store])
   react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
   react.useEffect(() => topics?.subscribe(() => refresh(value => value + 1)), [topics])
   react.useEffect(() => {
     setVisited(current => current.includes(selectedTopicId) ? current : [...current, selectedTopicId])
+    setPickerOpen(false); setQuery('')
   }, [ownerId, selectedTopicId, navigationRevision])
   return h('section', { className: 'dsh-tp dsh-tp-assets', 'aria-label': '记忆资产', 'data-owner-id': ownerId, 'data-topic-id': selectedTopicId },
     h('style', null, styles),
+    // Docked tabs show a compact host title; their topic navigation lives in the Body.
+    onSelectTopic ? h('div', { className: 'dsh-tp-assets-topic-toolbar' }, h(Menu, {
+      open: pickerOpen, onClose: () => setPickerOpen(false), portal: true, compact: true, listClassName: 'dsh-tp-popup',
+      anchor: h('button', { type: 'button', className: 'dsh-tp-assets-topic-trigger', title: topic?.name,
+        'aria-label': '选择资产主题', 'aria-haspopup': 'menu', 'aria-expanded': pickerOpen,
+        onClick: () => { setPickerOpen(!pickerOpen); setQuery('') } }, h('span', null, topic?.name ?? '选择主题'), h(IconChevronDownOutlineRegular, { size: 12 })),
+    }, h('div', { className: 'dsh-tp dsh-tp-menu-content', 'aria-label': '资产主题列表' },
+      h('input', { value: query, 'aria-label': '搜索资产主题', placeholder: '搜索主题', onChange: (event: { currentTarget: { value: string } }) => setQuery(event.currentTarget.value) }),
+      ...availableTopics.filter(topic => topic.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())).map(topic => h('button', {
+        type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice', key: topic.id, 'data-topic-id': topic.id, 'aria-current': topic.id === selectedTopicId,
+        onClick: () => { onSelectTopic(topic.id); setPickerOpen(false); setQuery('') },
+      }, topic.name))))) : null,
     store.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null,
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: id, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
-        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm })) : null
+        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
+          active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
+          navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
     }),
     topic ? null : h('p', { className: 'dsh-tp-message', role: 'status' }, '此主题不可用，请选择其他主题。'),
   )
 }
 
-function MemoryAssetsTopicView({ store, terms, archive, quick, topics, ownerId, topicId, topicName, onDeleteTerm }: MemoryAssetsProps & { readonly topicName: string }): unknown {
+function MemoryAssetsTopicView({ store, terms, archive, quick, topics, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
+  readonly topicName: string; readonly active: boolean
+  readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined
+}): unknown {
   const [category, setCategory] = react.useState<'terms' | 'translations'>('terms')
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
@@ -96,5 +118,5 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, ownerId, 
             ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
               h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type }))))),
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
-          h(MemoryTranslationRecordsView, { store, quick, ownerId, topicId }))))
+          h(MemoryTranslationRecordsView, { store, quick, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations' }))))
 }

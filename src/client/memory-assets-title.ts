@@ -16,6 +16,9 @@ const titleStyles = `
 .dsh-tp-assets-title-label { flex: 0 0 auto; white-space: nowrap; font-size: 14px; font-weight: 700; }
 .dsh-tp-assets-title-session { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 400; }
 .dsh-tp-assets-title-picker { display: block; flex: 0 1 auto; min-width: 0; }
+/* The host marks docked title occurrences separately from floating captions. */
+[data-dockkit-tab] [data-dsh-translation-assets-title] .dsh-tp-assets-title-session,
+[data-dockkit-tab] [data-dsh-translation-assets-title] .dsh-tp-assets-title-picker { display: none; }
 .dsh-tp-assets-title button.dsh-tp-assets-topic-trigger { display: flex; align-items: center; gap: 3px; min-width: 0; max-width: 100%; border: 0; border-radius: 4px; padding: 0 3px; background: transparent; color: var(--dsw-alias-label-caption, #888); font: inherit; font-size: 11px; cursor: pointer; }
 .dsh-tp-assets-topic-trigger span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-tp-assets-title button:hover { background: var(--dsw-alias-interactive-bg-hover, #8882); }
@@ -30,14 +33,26 @@ export function MemoryAssetsTitle({ store, scope, onSelectTopic }: {
   const [, refresh] = react.useState(0)
   const [pickerOpen, setPickerOpen] = react.useState(false)
   const [query, setQuery] = react.useState('')
+  const titleRoot = react.useRef<HTMLElement | null>(null)
   react.useEffect(() => store.subscribe(() => refresh(value => value + 1)), [store])
   react.useEffect(() => { setPickerOpen(false); setQuery('') },
     [scope?.ownerId, scope?.topicId, scope?.requestedTopicId, scope?.associatedSessionId, scope?.navigationRevision])
+  react.useEffect(() => {
+    if (!pickerOpen || typeof document === 'undefined') return
+    // The host dock button stops bubbling pointerdown before the portaled Menu's outside listener.
+    const closeForDock = (event: PointerEvent): void => {
+      const ownFloat = titleRoot.current?.closest('[data-dockkit-float]')
+      const dock = event.target instanceof Element ? event.target.closest('[data-dockkit-float-dock]') : null
+      if (ownFloat && dock?.closest('[data-dockkit-float]') === ownFloat) setPickerOpen(false)
+    }
+    document.addEventListener('pointerdown', closeForDock, true)
+    return () => document.removeEventListener('pointerdown', closeForDock, true)
+  }, [pickerOpen])
   const selection = scope ? resolveMemoryAssetsSelection(store, scope) : undefined
   const sessionName = selection?.session ? selection.session.remark || selection.session.name : '无关联会话'
   const filtered = selection?.availableTopics.filter(topic => topic.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())) ?? []
   const stopPropagation = (event: { stopPropagation(): void }) => event.stopPropagation()
-  return h('span', { className: 'dsh-tp-assets-title', 'data-dsh-translation-assets-title': true, 'data-owner-id': scope?.ownerId, 'data-topic-id': selection?.topicId },
+  return h('span', { ref: titleRoot, className: 'dsh-tp-assets-title', 'data-dsh-translation-assets-title': true, 'data-owner-id': scope?.ownerId, 'data-topic-id': selection?.topicId },
     h('style', { 'data-assets-cursor-style': true }, MEMORY_ASSETS_TITLE_CURSOR_CSS), h('style', null, titleStyles),
     h('span', { className: 'dsh-tp-assets-title-label' }, '记忆资产'),
     scope ? h('span', { className: 'dsh-tp-assets-title-session', title: sessionName }, sessionName) : null,

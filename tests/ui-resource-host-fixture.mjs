@@ -54,7 +54,7 @@ export function createResourceHost(react, renderer) {
     panel: HostedWorkspace,
     get settingsPage() { return slots.get('settings.section:dsh-translation-plugin') },
     get activeResource() { return activeResource ? resources.get(activeResource) : undefined },
-    restoreResource(sessionId, address) { const resource = openResource(address, sessionId); renderer.render(); return resource },
+    restoreResource(sessionId, address, params) { const resource = openResource(address, sessionId, { params }); renderer.render(); return resource },
     // Simulate the host caption close action, outside the resource Body.
     closeAssetCaption() { if (activeResource) closeResource(activeResource); renderer.render() },
     showTranslation: renderer.showTranslation,
