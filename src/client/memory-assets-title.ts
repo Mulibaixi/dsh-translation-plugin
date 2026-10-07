@@ -9,6 +9,9 @@ export const MEMORY_ASSETS_TITLE_CURSOR_CSS = `
 `
 
 const titleStyles = `
+/* Native float and docked titles share the tab chip's 170px cap. Release only our occurrence. */
+[data-dockkit-float-title]:has([data-dsh-translation-assets-title]),
+[data-dockkit-tab]:has([data-dsh-translation-assets-title]) { min-width: 0; max-width: none; }
 .dsh-tp-assets-title { display: flex; flex: 1 1 auto; align-items: baseline; gap: 8px; width: 100%; min-width: 0; max-width: 100%; }
 .dsh-tp-assets-title-label { flex: 0 0 auto; white-space: nowrap; font-size: 14px; font-weight: 700; }
 .dsh-tp-assets-title-session { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 400; }

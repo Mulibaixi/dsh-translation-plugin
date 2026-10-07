@@ -43,6 +43,8 @@ test('title text uses responsive per-name truncation with the fixed 14px bold as
   assert.match(styles, /\.dsh-tp-assets-title-picker[^}]*min-width:\s*0/u)
   assert.doesNotMatch(styles, /\.dsh-tp-assets-title-session[^}]*max-width:/u)
   assert.doesNotMatch(styles, /\.dsh-tp-assets-title-picker[^}]*max-width:/u)
+  assert.match(styles, /\[data-dockkit-float-title\]:has\(\[data-dsh-translation-assets-title\]\),\s*\[data-dockkit-tab\]:has\(\[data-dsh-translation-assets-title\]\)\s*\{\s*min-width: 0; max-width: none;\s*\}/u)
+  assert.doesNotMatch(styles, /justify-content:\s*space-between|max-width:\s*(?:\d+px|(?:[1-9]|[1-9]\d)%)/u)
 })
 
 test('cursor rule still selects only the owned floating caption and excludes native controls', async t => {
