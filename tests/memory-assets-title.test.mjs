@@ -37,9 +37,12 @@ test('title text uses responsive per-name truncation with the fixed 14px bold as
   const f = mountCaption(); t.after(() => f.app.dispose())
   const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId), { topicId: f.session.topicId, sessionId: f.session.id })
   const styles = f.ui.nodes(node).find(child => child.type === 'style' && !child.props['data-assets-cursor-style']).children.join('')
+  assert.match(styles, /\.dsh-tp-assets-title\s*\{[^}]*flex:\s*1 1 auto/u)
   assert.match(styles, /\.dsh-tp-assets-title-label[^}]*font-size:\s*14px[^}]*font-weight:\s*700/u)
-  assert.match(styles, /\.dsh-tp-assets-title-session[^}]*max-width:\s*60%[^}]*text-overflow:\s*ellipsis[^}]*font-size:\s*14px[^}]*font-weight:\s*400/u)
-  assert.match(styles, /\.dsh-tp-assets-title-picker[^}]*max-width:\s*30%/u)
+  assert.match(styles, /\.dsh-tp-assets-title-session[^}]*text-overflow:\s*ellipsis[^}]*font-size:\s*14px[^}]*font-weight:\s*400/u)
+  assert.match(styles, /\.dsh-tp-assets-title-picker[^}]*min-width:\s*0/u)
+  assert.doesNotMatch(styles, /\.dsh-tp-assets-title-session[^}]*max-width:/u)
+  assert.doesNotMatch(styles, /\.dsh-tp-assets-title-picker[^}]*max-width:/u)
 })
 
 test('cursor rule still selects only the owned floating caption and excludes native controls', async t => {

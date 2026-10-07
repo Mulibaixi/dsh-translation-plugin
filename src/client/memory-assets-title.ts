@@ -9,10 +9,10 @@ export const MEMORY_ASSETS_TITLE_CURSOR_CSS = `
 `
 
 const titleStyles = `
-.dsh-tp-assets-title { display: flex; align-items: baseline; gap: 8px; width: 100%; min-width: 0; max-width: 100%; }
+.dsh-tp-assets-title { display: flex; flex: 1 1 auto; align-items: baseline; gap: 8px; width: 100%; min-width: 0; max-width: 100%; }
 .dsh-tp-assets-title-label { flex: 0 0 auto; white-space: nowrap; font-size: 14px; font-weight: 700; }
-.dsh-tp-assets-title-session { flex: 0 1 auto; max-width: 60%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 400; }
-.dsh-tp-assets-title-picker { display: block; flex: 0 1 auto; min-width: 0; max-width: 30%; }
+.dsh-tp-assets-title-session { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 400; }
+.dsh-tp-assets-title-picker { display: block; flex: 0 1 auto; min-width: 0; }
 .dsh-tp-assets-title button.dsh-tp-assets-topic-trigger { display: flex; align-items: center; gap: 3px; min-width: 0; max-width: 100%; border: 0; border-radius: 4px; padding: 0 3px; background: transparent; color: var(--dsw-alias-label-caption, #888); font: inherit; font-size: 11px; cursor: pointer; }
 .dsh-tp-assets-topic-trigger span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-tp-assets-title button:hover { background: var(--dsw-alias-interactive-bg-hover, #8882); }
