@@ -212,7 +212,7 @@ test('发布bundle保存开关：真实保存并恢复版本/定稿，关闭保�
     await ui.input('待翻译内容', 'Synthetic saved source'); await ui.click('发送快译')
     await ui.click('重译文本 1'); await ui.click('文本 1旧版本'); await ui.click('文本 1 版本 1设为最终')
     await ui.flush(); await ui.flush()
-    assert.match(ui.text(), /已开启历史保存/)
+    assert.doesNotMatch(ui.text(), /已开启历史保存/)
     await app.dispose()
     restored = mount({ quick: rpc.port, storage: app.storage, deferFunctionalUpdates: true })
     const saved = restored.renderer; saved.render(restored.panel, { sessionId: 'synthetic-main' }); await saved.flush()

@@ -361,7 +361,7 @@ test('允许保存后自动写会话历史，关闭和恢复默认都保留旧�
 })
 test('选择性删除一条/多条历史需要确认，主题术语默认保留', async () => {
   const app = mount({ history: [fixture('a', '故事A'), fixture('b', '故事B', 'normal')] }); const ui = app.renderer; ui.render(app.settingsPage, {})
-  await checkbox(ui, '选择会话 故事A', true); await ui.click('删除所选历史（1）'); assert.match(ui.text(), /同主题全部会话共用术语/)
+  await checkbox(ui, '选择会话 故事A', true); await ui.click('删除所选历史（1）'); assert.doesNotMatch(ui.text(), /同主题全部会话共用术语/)
   assert.equal(ui.control('同时删除所选主题术语').props.checked, false); await ui.click('取消'); assert.equal(saved(app).length, 2)
   await checkbox(ui, '选择会话 故事B', true); await ui.click('删除所选历史（2）'); await ui.click('确认删除历史'); assert.equal(saved(app).length, 0)
   app.dispose()

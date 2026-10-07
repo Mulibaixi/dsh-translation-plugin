@@ -399,7 +399,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   const units = current ? quick.getUnits(current.id) : []
   const represented = new Set(units.flatMap(unit => unit.revisions.map(revision => revision.operationId)))
   const transient = records.filter(record => !represented.has(record.id))
-  const historyNote = store.getSettings().rememberHistory ? '已开启历史保存；原文和各版译文会保存在此设备。'
+  const historyNote = store.getSettings().rememberHistory ? undefined
     : store.getHistory().length ? '已保存的历史保留；后续内容仅保留在本次运行。' : '本次内容仅保留在本次运行。'
   const blocked = current ? quick.blockedReason(current) : undefined
   const busy = current ? quick.isBusy(current.id) : false
@@ -500,7 +500,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
         void action.run(() => deleteConfirmed(store, terms, deletion), () => setDeletion(currentRequest => currentRequest === deletion ? undefined : currentRequest))
       }, onTermsChange: (checked: boolean) => setDeletion(currentRequest => currentRequest === deletion ? { ...deletion, includeTerms: checked } : currentRequest) }) : null,
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
-        units.length || records.length ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
+        historyNote && (units.length || records.length) ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
         ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined })),
         ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
@@ -621,7 +621,6 @@ function DeleteDialog({ request, onCancel, onConfirm, onTermsChange, sessionDele
     request.termVersions.length ? h('label', { className: 'dsh-tp-history-row' }, h('input', { type: 'checkbox', checked: request.includeTerms, disabled: pending, 'aria-label': '同时删除所选主题术语', onChange: (event: CheckEvent) => {
       const checked = event.currentTarget.checked; onTermsChange(checked)
     } }), `同时删除${request.termNames.length === 1 ? `「${request.termNames[0]}」` : `这些主题（${request.termNames.length} 个）`}的术语档案`) : null,
-    h('p', { className: 'dsh-tp-muted' }, request.termVersions.length ? `同主题全部会话共用术语${request.termNames.length > 1 ? `（${request.termNames.join('、')}）` : ''}；勾选后，未选中的同主题会话也会失去这些术语。未勾选则保留。` : '本次只删除会话，保留主题术语。'),
     h('div', { className: 'dsh-tp-actions' }, button(pending ? '正在删除…' : sessionDeletion ? '确认删除会话' : '确认删除历史', onConfirm, pending), button('取消', onCancel, pending)),
   )
 }

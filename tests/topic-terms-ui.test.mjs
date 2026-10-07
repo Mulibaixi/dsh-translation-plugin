@@ -154,7 +154,7 @@ test('术语UI：显式共享删除checkbox捕获事件值，主题去重且未�
     f.ui.context(title(f.ui)); await f.ui.click('新建子会话')
     const child = (await f.request({ kind: 'list_sessions' })).value.sessions.find(session => session.id !== f.session.id)
     f.ui.context(title(f.ui)); await f.ui.click('删除')
-    assert.match(f.ui.text(), /未选中的同主题会话也会失去这些术语/)
+    assert.doesNotMatch(f.ui.text(), /未选中的同主题会话也会失去这些术语/)
     await f.ui.check('同时删除所选主题术语', true)
     assert.equal(f.ui.control('同时删除所选主题术语').props.checked, true)
     assert.ok(f.ui.deferredUpdateCount > 0)
