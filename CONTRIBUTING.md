@@ -36,7 +36,7 @@ v0.9.0 扩充共享档案协议，升级须重建本地 bundle 并重启，加�
 
 实体/事实/关系编辑中或已缓存的条目被其他窗口删除后，保留未保存稿供复制，缺失 ID 禁止保存或重新绑定版本，不以旧稿复活已删除条目；仅本视图明确删除成功后清除对应草稿。
 
-记忆资产使用正式资源 Tab 与应用内浮窗。资源 URI 保留稳定 owner 与初始 topic，Body 同时核对 URI 与框架所属 Session；同 owner 复用既有窗口。原 Session 的公开 tab actions 打开资源，通过公开 navigation params 请求主题和关联会话，navigation revision 驱动重复导航；Body 核对主题与会话归属后选择并显示备注优先的会话标题。窗口内原生主题下拉可搜索全部所属主题（包括没有会话的保留档案），不改变翻译工作区选择。仅首次新建且其 Session 表面可见时使用公开 `float`；已有或恢复的停靠状态保持。翻译及资产 Tab 使用 `keepMounted`，已访问主题和分类隐藏时保持挂载，保留正文与人工编辑稿；明确关闭只释放视图，不删除资产或 dispose 共享 Store。复用唯一 SessionStore、TopicMemoryStore、TopicArchiveStore 与 TopicBridgeClient，不建立第二桥或持久化副本。资产标题使用正式 title slot 固定显示记忆资产；光标规则仅匹配自有标题，不替换宿主拖动、停靠、关闭或缩放逻辑，正常 Body 不增加第二个关闭控件。
+记忆资产使用正式资源 Tab 与应用内浮窗。资源 URI 保留稳定 owner 与初始 topic，Title/Body 通过所属 Session 的 `useTabInfo` 核对同一 URI 与 navigation params；同 owner 复用窗口。正式 title slot 一行显示“记忆资产 · 备注或会话名称”、灰色主题选择按钮，Body 不重复显示上下文标题。主题菜单搜索全部所属主题（包括无会话保留档案），通过当前 tab.actions 与公开 navigation params 更新主题及关联会话，revision 同步 Title/Body，不改变翻译工作区选择。主题按钮局部阻止 pointer 事件进入宿主拖动，标题文字和空白保留原生拖动，停靠/关闭/缩放控件仍由宿主提供；光标规则只匹配自有标题。仅首次新建且所属 Session 可见时使用公开 `float`，已有或恢复状态保持。翻译及资产 Tab 使用 `keepMounted`，已访问主题/分类隐藏时保留正文和编辑稿；关闭只释放视图，不删除资产或 dispose 共享 Store。复用唯一 SessionStore、TopicMemoryStore、TopicArchiveStore 与 TopicBridgeClient，不建立第二桥、持久化副本或正文关闭控件。
 
 术语用户表单通过 `TopicMemoryStore.saveUserTerm` 一次保存即可建立 active/user_explicit；输入只含语义字段与预期档案/条目版本，Store 生成确认事件。原位编辑保留 id、createdAt、旧来源引用（转为 example），冲突/陈旧不覆盖；相同有效内容不升版本。新增在同一锁中构造 candidate v1→adopted v2，仅最终快照写入，保持既有 schema1 确认约束。模型 put/RPC 权限不扩大，历史开关与保存失败语义沿用原实现；记录译文编辑复用人工修订，不修改源文本或会话日志。
 

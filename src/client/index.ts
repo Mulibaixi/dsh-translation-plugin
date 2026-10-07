@@ -11,7 +11,7 @@ import { TopicArchiveStore } from './topic-archive-store.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
-  openMemoryAssets, parseMemoryAssetsAddress, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
+  openMemoryAssets, parseMemoryAssetsAddress, readMemoryAssetsNavigation, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
 } from './memory-assets-window.js'
 
 type Disposer = () => void
@@ -120,17 +120,23 @@ export function apply(ctx: ClientPluginContext): void {
     const MemoryAssetsPanel: ClientComponent = (props = {}) => {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
-      const scope = sessionId && tabInfo ? parseMemoryAssetsAddress(tabInfo.tab.navigation.address, sessionId) : undefined
+      const scope = readMemoryAssetsNavigation(sessionId, tabInfo?.tab)
       const onClose = tabInfo ? () => tabInfo.tab.actions.close() : undefined
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      const params = tabInfo?.tab.navigation.params
-      const associatedSessionId = params && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' ? params.sessionId : undefined
-      const requestedTopicId = params && typeof params === 'object' && 'topicId' in params && typeof params.topicId === 'string' ? params.topicId : undefined
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, onDeleteTerm, ...scope, associatedSessionId, requestedTopicId, navigationRevision: tabInfo?.tab.navigation.revision })
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, onDeleteTerm, ...scope })
     }
-    const MemoryAssetsCaption: ClientComponent = () => h(MemoryAssetsTitle, null)
+    const MemoryAssetsCaption: ClientComponent = (props = {}) => {
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+      const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
+      const scope = readMemoryAssetsNavigation(sessionId, tabInfo?.tab)
+      return h(MemoryAssetsTitle, { store, scope,
+        onSelectTopic: scope && tabInfo ? (topicId: string) => {
+          if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
+          tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })
+        } : undefined })
+    }
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {
       store, terms, onClose: typeof props.close === 'function' ? props.close : undefined,
     })

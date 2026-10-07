@@ -1,80 +1,64 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
 import test from 'node:test'
-import vm from 'node:vm'
+import { mount } from './quick-client-fixture.mjs'
 import { memoryAssetsAddress } from '../dist/client/memory-assets-window.js'
 
-const source = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8')
-
-// Only the owned title is rendered. These hook/element assertions do not exercise desktop DOM.
+// Published title slot with the shared hook renderer; this is not a desktop DOM test.
 function mountCaption() {
-  let entry, caption
-  const effects = []
-  const react = {
-    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
-  }
-  const window = {
-    __ModuleLoader__: { load(value) { entry = value } },
-    addEventListener() {}, removeEventListener() {},
-  }
-  vm.runInNewContext(source, { window, console, crypto: globalThis.crypto, AbortController })
-  const plugin = entry.factory(name => {
-    assert.ok(['react', '@deepseek-ai/dsh-client-ui-primitives'].includes(name))
-    return name === 'react' ? react : { MenuSurface: 'div', MenuGroup: 'section' }
-  })
-  plugin.apply({
-    remote: { session: {}, $on: () => () => {} }, on: () => () => {},
-    sidebarRight: {}, sidebarRightTabs: { register: () => () => {} },
-    slots: {
-      inject: (_name, register) => register(),
-      register(target, component) {
-        if (target.name === 'sidebar.right.pane.tab.title') {
-          assert.equal(target.key, 'dsh-translation-plugin/memory-assets')
-          assert.equal(caption, undefined, 'one owned title contribution')
-          caption = component
-        }
-        return () => {}
-      },
-    },
-    effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
-  })
+  const app = mount(), ui = app.renderer
+  ui.render(app.panel, { sessionId: 'owner-a' })
+  const session = app.store.getActiveSession('owner-a')
+  const caption = app.resourceHost.registrations.get('sidebar.right.pane.tab.title:dsh-translation-plugin/memory-assets')
   assert.equal(typeof caption, 'function')
-  function element(ownerId, address) {
-    return caption({ sessionId: ownerId, useTabInfo: () => ({ tab: { navigation: { address } } }) })
-  }
-  return {
-    render(ownerId, address) { const node = element(ownerId, address); return node.type(node.props) },
-    dispose() { effects.reverse().forEach(cleanup => cleanup()) },
+  return { app, ui, session,
+    render(ownerId, address, params) {
+      ui.render(caption, { sessionId: ownerId, useTabInfo: () => ({ tab: { id: 'caption', contentId: address, signal: new AbortController().signal,
+        navigation: { address, params, revision: 1 }, actions: { openResource() {}, close() {} } } }) })
+      return ui.nodes().find(node => node.props['data-dsh-translation-assets-title'])
+    },
   }
 }
 
-function titleText(node) { return node.children.filter(child => typeof child === 'string').join('') }
-function cursorCss(node) { return node.children.find(child => child?.type === 'style').children.join('') }
-
-test('the floating caption always displays one memory-assets title', t => {
-  const fixture = mountCaption(); t.after(() => fixture.dispose())
-  const address = memoryAssetsAddress('owner-a', 'topic-a')
-  for (const [owner, resource] of [
-    ['owner-a', address], ['owner-a', 'invalid'], ['owner-b', address], ['owner-a', address + '?topic=other'],
-    ['owner-a', memoryAssetsAddress('owner-a', 'missing-topic')], [undefined, address], ['owner-a', undefined],
-  ]) assert.equal(titleText(fixture.render(owner, resource)), '记忆资产')
+test('owned host title combines the associated session and interactive topic; invalid scope stays generic', async t => {
+  const f = mountCaption(); t.after(() => f.app.dispose())
+  const address = memoryAssetsAddress('owner-a', f.session.topicId)
+  const title = f.render('owner-a', address, { topicId: f.session.topicId, sessionId: f.session.id })
+  assert.equal(f.ui.text(title), `记忆资产 · ${f.session.name}${f.session.topicName}`)
+  assert.equal(f.ui.button('选择资产主题').props.title, f.session.topicName)
+  for (const [owner, resource] of [['owner-a', 'invalid'], ['owner-b', address], ['owner-a', address + '?topic=other'], [undefined, address], ['owner-a', undefined]]) {
+    assert.equal(f.ui.text(f.render(owner, resource)), '记忆资产')
+    assert.ok(!f.ui.nodes().some(node => node.props['aria-label'] === '选择资产主题'))
+  }
 })
 
-test('cursor rule selects only an owned floating caption and leaves native controls out', t => {
-  const fixture = mountCaption(); t.after(() => fixture.dispose())
-  const node = fixture.render('owner-a', memoryAssetsAddress('owner-a', 'missing-topic'))
-  assert.equal(node.props['data-dsh-translation-assets-title'], true)
-  const css = cursorCss(node).trim()
+test('cursor rule still selects only the owned floating caption and excludes native controls', async t => {
+  const f = mountCaption(); t.after(() => f.app.dispose())
+  const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId))
+  const css = f.ui.nodes(node).find(child => child.props['data-assets-cursor-style']).children.join('').trim()
   assert.equal(css, '[data-dockkit-float] [data-dockkit-float-grip]:has([data-dockkit-float-title] [data-dsh-translation-assets-title]) { cursor: default; }')
   assert.doesNotMatch(css, /data-dockkit-float-(?:close|dock|resize)|\bbutton\b|\bbody\b|pointer-events|!important|\*/u)
-  assert.equal((css.match(/\{/gu) ?? []).length, 1, 'no broader fallback selector')
+  assert.equal((css.match(/\{/gu) ?? []).length, 1)
+  assert.equal(f.ui.nodes(node).filter(child => child.type === 'button').length, 1, 'only the topic button, no duplicate host controls')
 })
 
-test('owned title adds no pointer, mouse, touch or drag event interception', t => {
-  const fixture = mountCaption(); t.after(() => fixture.dispose())
-  const node = fixture.render('owner-a', memoryAssetsAddress('owner-a', 'missing-topic'))
-  for (const element of [node, ...node.children.filter(child => child && typeof child === 'object')]) {
-    assert.ok(Object.keys(element.props).every(key => !/^on(?:Pointer|Mouse|Touch|Drag)/u.test(key)))
-    assert.equal(element.props.style?.pointerEvents, undefined)
+test('topic interactions stop bubbling drag/focus/menu events while caption text remains draggable', async t => {
+  const f = mountCaption(); t.after(() => f.app.dispose())
+  const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId))
+  const label = f.ui.nodes(node).find(child => child.props.className === 'dsh-tp-assets-title-label')
+  const picker = f.ui.nodes(node).find(child => child.props.className === 'dsh-tp-assets-title-picker')
+  for (const nonInteractive of [node, label]) {
+    assert.ok(Object.keys(nonInteractive.props).every(key => !/^on(?:Pointer|Mouse|Touch|Drag|Click|ContextMenu)/u.test(key)))
+    assert.equal(nonInteractive.props.style?.pointerEvents, undefined)
   }
+  for (const eventName of ['onPointerDown', 'onClick', 'onContextMenu']) {
+    let stopped = false
+    picker.props[eventName]({ stopPropagation() { stopped = true }, preventDefault() { assert.fail('keep native menu and input defaults') } })
+    assert.equal(stopped, true, `${eventName} cannot reach either native caption or docked tab`)
+  }
+  await f.ui.click('选择资产主题')
+  const menu = f.ui.nodes().find(child => child.props.role === 'menu')
+  assert.equal(menu.props['data-portal'], true)
+  assert.equal(menu.props['data-compact'], true)
+  const openPicker = f.ui.nodes().find(child => child.props.className === 'dsh-tp-assets-title-picker')
+  assert.ok(f.ui.nodes(openPicker).some(child => child.props['aria-label'] === '搜索资产主题'), 'portal contents retain the interaction boundary in React')
 })

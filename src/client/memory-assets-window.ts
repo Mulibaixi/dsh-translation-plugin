@@ -1,3 +1,5 @@
+import type { SessionStore } from './session-store.js'
+
 export const MEMORY_ASSETS_TAB_ID = 'dsh-translation-plugin/memory-assets'
 export const MEMORY_ASSETS_TAB_KIND = 'translation-memory-assets'
 export const MEMORY_ASSETS_PATTERN = 'dsh-resource://translation-assets/**'
@@ -21,6 +23,12 @@ export interface MemoryAssetsTab {
 }
 
 export interface MemoryAssetsTabInfo { readonly tab: MemoryAssetsTab }
+
+export interface MemoryAssetsNavigation extends MemoryAssetsScope {
+  readonly associatedSessionId?: string | undefined
+  readonly requestedTopicId?: string | undefined
+  readonly navigationRevision?: number | undefined
+}
 
 export interface MemoryAssetsSidebar {
   readonly openTabs: {
@@ -54,6 +62,27 @@ export function parseMemoryAssetsAddress(address: string, ownerId?: string): Mem
     if (ownerId !== undefined && scope.ownerId !== ownerId) return undefined
     return memoryAssetsAddress(scope.ownerId, scope.topicId) === address ? scope : undefined
   } catch { return undefined }
+}
+
+/** Title and Body read the same Session-bound occurrence, including repeated navigation. */
+export function readMemoryAssetsNavigation(ownerId: string | undefined, tab: MemoryAssetsTab | undefined): MemoryAssetsNavigation | undefined {
+  const scope = ownerId && tab ? parseMemoryAssetsAddress(tab.navigation.address, ownerId) : undefined
+  if (!scope || !tab) return undefined
+  const params = tab.navigation.params
+  return { ...scope, navigationRevision: tab.navigation.revision,
+    requestedTopicId: params && typeof params === 'object' && 'topicId' in params && typeof params.topicId === 'string' ? params.topicId : undefined,
+    associatedSessionId: params && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' ? params.sessionId : undefined }
+}
+
+export function resolveMemoryAssetsSelection(store: SessionStore, scope: MemoryAssetsNavigation) {
+  const availableTopics = store.getTopics(scope.ownerId)
+  const topicId = availableTopics.some(topic => topic.id === scope.requestedTopicId) ? scope.requestedTopicId! : scope.topicId
+  const topic = availableTopics.find(topic => topic.id === topicId)
+  const requested = scope.associatedSessionId ? store.getSession(scope.associatedSessionId) : undefined
+  const current = store.getActiveSession(scope.ownerId)
+  const session = requested?.ownerId === scope.ownerId && requested.topicId === topicId ? requested
+    : current?.topicId === topicId ? current : store.getAvailableSessions(scope.ownerId).find(session => session.topicId === topicId)
+  return { availableTopics, topicId, topic, session }
 }
 
 /** Open through the tab's own Session; float only a new foreground occurrence. */
