@@ -86,9 +86,8 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, ownerId, 
                   const value = event.currentTarget.value
                   if (value === 'terms' || value === 'entity' || value === 'fact' || value === 'relation') setKind(value)
                 } }, h('option', { value: 'terms' }, '术语'), h('option', { value: 'entity' }, '实体'), h('option', { value: 'fact' }, '事实'), h('option', { value: 'relation' }, '关系')),
-                h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', onClick: () => exportArchive('json') }, '导出 JSON'),
-                  h('button', { type: 'button', onClick: () => exportArchive('markdown') }, '导出 Markdown'))),
-              h('small', { className: 'dsh-tp-muted' }, '导出当前主题全部档案，不受筛选影响。'),
+                h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('json') }, '导出 JSON'),
+                  h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('markdown') }, '导出 Markdown'))),
               exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null),
             h('div', { className: 'dsh-tp-assets-module', hidden: kind !== 'terms' },
               h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName, hideExport: true,

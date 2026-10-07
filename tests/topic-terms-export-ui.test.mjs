@@ -65,7 +65,10 @@ test('主题快照真实bundle：history off可下载两格式，按钮即时冻
     assert.equal((await f.request(put(f.session))).ok, true)
     const before = await snapshot(f), stored = [...f.app.storage.values]
     await terms(f.ui)
-    assert.match(f.ui.text(), /导出当前主题全部档案，不受筛选影响/)
+    const exportButtons = f.ui.nodes().filter(node => node.type === 'button' && ['导出 JSON', '导出 Markdown'].includes(f.ui.text(node)))
+    assert.equal(exportButtons.length, 2)
+    assert.ok(exportButtons.every(button => button.props.title === '导出当前主题全部档案，不受筛选影响。'))
+    assert.ok(!f.ui.text().includes('导出当前主题全部档案，不受筛选影响。'))
     f.ui.button('导出 JSON').props.onClick(); f.ui.render()
     await f.request(put(f.session, 'synthetic-later', before.version, { sourceForms: ['Later'] }))
     const data = JSON.parse(await downloaded(f))

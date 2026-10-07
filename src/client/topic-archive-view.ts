@@ -78,6 +78,11 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
   const alive = react.useRef(true), busy = react.useRef(false)
   react.useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   const snapshot = archive.getSnapshot(ownerId, topicId), all = snapshot.entries.filter(entry => entry.kind === kind)
+  const note = [
+    '同主题共用；快译不使用。关联实体须为生效条目。',
+    sessions.getSettings().rememberHistory ? '已开启历史保存。' : '已保存的档案保留；后续修改仅保留在本次运行。',
+    `保存状态：${storageLabels[archive.getStatus(ownerId, topicId)]}`,
+  ].join(' ')
   const entities = snapshot.entries.filter(entry => entry.kind === 'entity'), needle = query.trim().toLocaleLowerCase()
   const entries = all.filter(entry => (status === 'all' || status === entry.status) &&
     (entry.kind === 'entity' ? [entry.name, ...entry.aliases, entry.description] : entry.kind === 'fact' ? [entry.title, entry.body, ...entry.entityIds.map(id => entityLabel(snapshot, id))] :
@@ -165,14 +170,13 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
   }
   return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题${kinds[kind]}` },
     h('div', { className: 'dsh-tp-asset-toolbar' },
-      h('div', { className: 'dsh-tp-unit-header' }, h('h3', null, `主题${kinds[kind]}`), h('button', { type: 'button', disabled: pending || Boolean(form), onClick: () => edit() }, `新增${kinds[kind]}`)),
+      h('div', { className: 'dsh-tp-unit-header' },
+        h('div', { className: 'dsh-tp-asset-heading' }, h('h3', null, `主题${kinds[kind]}`), h('small', { className: 'dsh-tp-muted dsh-tp-asset-note', title: note }, note)),
+        h('button', { type: 'button', disabled: pending || Boolean(form), onClick: () => edit() }, `新增${kinds[kind]}`)),
       h('div', { className: 'dsh-tp-asset-filters' },
         h('input', { type: 'search', 'aria-label': '搜索档案', placeholder: `搜索${kinds[kind]}`, value: query, onChange: (event: TextEvent) => setQuery(event.currentTarget.value) }),
         h('select', { 'aria-label': '档案状态', value: status, onChange: (event: TextEvent) => setStatus(event.currentTarget.value) }, h('option', { value: 'all' }, '全部状态'),
           ...Object.entries(statuses).map(([value, label]) => h('option', { key: value, value }, label)))),
-      h('small', { className: 'dsh-tp-muted' }, '同主题共用；快译不使用。关联实体须为生效条目。'),
-      h('small', { className: 'dsh-tp-muted' }, sessions.getSettings().rememberHistory ? '已开启历史保存。' : '已保存的档案保留；后续修改仅保留在本次运行。'),
-      h('small', { className: 'dsh-tp-muted' }, `保存状态：${storageLabels[archive.getStatus(ownerId, topicId)]}`),
       snapshot.version > 0 ? h('small', { className: 'dsh-tp-muted' }, h('time', { dateTime: snapshot.updatedAt }, `档案更新于 ${new Date(snapshot.updatedAt).toLocaleString()}`)) : null,
       archive.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, archive.getNotice()) : null,
       failure ? h('p', { role: 'alert', className: 'dsh-tp-message' }, failure) : null,

@@ -35,6 +35,9 @@ async function terms(ui) {
   const group = ui.nodes().find(node => node.props['aria-label'] === '记忆资产'); assert.ok(group)
   const current = ui.nodes(group).find(node => node.type === 'button' && ui.text(node).startsWith('记忆资产')); assert.ok(current)
   current.props.onClick(); ui.render(); await ui.flush()
+  const note = ui.nodes().find(node => node.props.className === 'dsh-tp-muted dsh-tp-asset-note')
+  assert.ok(note)
+  assert.equal(note.props.title, ui.text(note), 'term guidance and save state share one compact line')
 }
 async function selectAssetTopic(ui, topicId) {
   await ui.click('选择资产主题')
@@ -325,7 +328,8 @@ test('资产UI：URI范围不随工作区选择变化，主题标题实时更新
     const renamed = await f.request({ kind: 'rename_topic', topicId: f.session.topicId, expectedName: f.session.topicName, name: '合成已重命名主题' })
     assert.equal(renamed.ok, true); assert.match(f.ui.text(), /合成已重命名主题/)
     const heading = f.ui.nodes().find(node => node.props['data-dsh-translation-assets-title']); assert.ok(heading)
-    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-label').children.join(''), '记忆资产 · 合成已重命名主题')
+    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-label').children.join(''), '记忆资产')
+    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-session').props.title, '合成已重命名主题')
     assert.equal(f.ui.text(f.ui.nodes(heading).find(node => node.type === 'small')), '合成已重命名主题')
     assert.ok(!f.ui.text().includes('所属主会话：'))
     f.ui.showTranslation(); title(f.ui).props.onClick(); f.ui.render(); await f.ui.click('新建主题及首会话')
@@ -352,12 +356,12 @@ test('资产UI：标题单行备注优先，右键目标会话与当前选择独
     const context = f.ui.nodes().find(node => node.props['aria-label'] === '翻译会话右键操作')
     f.ui.nodes(context).find(node => node.type === 'button' && f.ui.text(node) === '记忆').props.onClick(); f.ui.render(); await f.ui.flush()
     let heading = f.ui.nodes().find(node => node.props['data-dsh-translation-assets-title']); assert.ok(heading)
-    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-label').children.join(''), '记忆资产 · 原会话备注')
+    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-session').props.title, '原会话备注')
     assert.equal(f.ui.text(f.ui.nodes(heading).find(node => node.type === 'small')), f.session.topicName)
     const removed = await f.request({ kind: 'set_session_remark', translationSessionId: f.session.id, expectedRemark: '原会话备注', remark: '' })
     assert.equal(removed.ok, true)
     heading = f.ui.nodes().find(node => node.props['data-dsh-translation-assets-title'])
-    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-label').children.join(''), `记忆资产 · ${f.session.name}`)
+    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-session').props.title, f.session.name)
     f.ui.showTranslation()
     const listed = (await f.request({ kind: 'list_sessions' })).value.sessions
     for (const session of listed) {
@@ -367,7 +371,7 @@ test('资产UI：标题单行备注优先，右键目标会话与当前选择独
     }
     await terms(f.ui)
     heading = f.ui.nodes().find(node => node.props['data-dsh-translation-assets-title'])
-    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-label').children.join(''), '记忆资产 · 无关联会话')
+    assert.equal(f.ui.nodes(heading).find(node => node.props.className === 'dsh-tp-assets-title-session').props.title, '无关联会话')
     assert.equal(f.ui.text(f.ui.nodes(heading).find(node => node.type === 'small')), f.session.topicName)
   } finally { await f.app.dispose() }
 })

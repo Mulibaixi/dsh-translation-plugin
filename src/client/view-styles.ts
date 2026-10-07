@@ -108,6 +108,9 @@ export const styles = `
 .dsh-tp-asset-toolbar { flex: none; max-height: 42%; overflow-y: auto; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-asset-toolbar h3 { margin: 0; }
 .dsh-tp-asset-toolbar small { display: block; font-size: 11px; }
+.dsh-tp-asset-heading { display: flex; align-items: baseline; gap: 8px; flex: 1 1 auto; min-width: 0; }
+.dsh-tp-asset-heading h3 { flex: none; white-space: nowrap; }
+.dsh-tp-asset-heading .dsh-tp-asset-note { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .dsh-tp-asset-filters { display: flex; gap: 6px; margin: 6px 0; }
 .dsh-tp-asset-filters input { flex: 1; width: 0; }
 .dsh-tp-asset-filters select { max-width: 120px; }

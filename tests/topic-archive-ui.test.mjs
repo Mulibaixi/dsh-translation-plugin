@@ -52,6 +52,10 @@ test('档案UI：直接保存实体/事实/关系，实体选择显示名称，�
   const f = await setup({ deferFunctionalUpdates: true })
   try {
     await assets(f.ui); const a = await entity(f, '林'); const b = await entity(f, '组织')
+    const note = f.ui.nodes().find(node => node.props.className === 'dsh-tp-muted dsh-tp-asset-note' && f.ui.text(node).includes('关联实体须为生效条目'))
+    assert.ok(note)
+    assert.equal(note.props.title, f.ui.text(note), 'asset guidance is one compact line with the full detail available on hover')
+    assert.match(f.ui.text(note), /同主题共用；快译不使用。关联实体须为生效条目。.*保存状态：/u)
     assert.equal(a.origin, 'user_explicit'); assert.equal(a.status, 'active'); assert.ok(a.confirmation.eventId)
     await f.ui.input('档案类型', 'fact'); await f.ui.click('新增事实'); await f.ui.input('事实标题', '到访'); await f.ui.input('事实内容', '林到访组织。')
     await f.ui.check('关联实体：林', true); await f.ui.check('关联实体：组织', true); await f.ui.click('保存并采用')
