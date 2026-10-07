@@ -52,6 +52,7 @@ async function fixture({ mountGate, storage, settings, deferFunctionalUpdates } 
     ctx.provide('slots', mock.slots)
     ctx.provide('sidebarRightTabs', mock.sidebarRightTabs)
     ctx.provide('sidebarRight', mock.sidebarRight)
+    ctx.provide('fileUpload', mock.fileUpload)
     fiber = ctx.plugin({ name: plugin.name, inject: plugin.inject, apply(child) {
       plugin.apply(child)
       assert.equal(child.remote.translationQuick, undefined, 'actual $mount has not installed the namespace when apply returns')

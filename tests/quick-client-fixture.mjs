@@ -237,10 +237,13 @@ export function mount(overrides = {}) {
   storage.failSet = !!overrides.failSet
   if (storage.failSet) storage.setItem = () => { throw new Error('quota') }
   const renderer = createRenderer({ deferFunctionalUpdates: overrides.deferFunctionalUpdates })
-  let store
+  let store, objects, objectAssets, quick
   const createElement = renderer.react.createElement
   renderer.react.createElement = (type, props, ...children) => {
     if (props?.store) store = props.store
+    if (props?.objects) objects = props.objects
+    if (props?.objectAssets) objectAssets = props.objectAssets
+    if (props?.quick) quick = props.quick
     return createElement(type, props, ...children)
   }
   const entries = []; const effects = []; const listeners = new Set()
@@ -253,8 +256,10 @@ export function mount(overrides = {}) {
   const clipboard = overrides.clipboard ?? { async writeText(text) { copies.push(text) } }
   const downloads = [], revokedUrls = [], anchors = new Set(), blobUrls = new Map()
   let urlSequence = 0
+  const documentListeners = new Map()
   const document = {
-    addEventListener() {}, removeEventListener() {},
+    addEventListener(name, callback, capture) { const key = `${name}:${!!capture}`; const callbacks = documentListeners.get(key) ?? new Set(); callbacks.add(callback); documentListeners.set(key, callbacks) },
+    removeEventListener(name, callback, capture) { documentListeners.get(`${name}:${!!capture}`)?.delete(callback) },
     body: { appendChild(anchor) { anchors.add(anchor) } },
     createElement(tag) {
       assert.equal(tag, 'a', 'the browser download uses an anchor')
@@ -290,6 +295,7 @@ export function mount(overrides = {}) {
       MenuGroup: props => h('section', { 'aria-label': props.label }, props.children),
       IconChevronDownOutlineRegular: icon('chevron-down'), IconChevronRightOutlineRegular: icon('chevron-right'),
       IconPanelLeftOutlineRegular: icon('panel-left'), IconSendOutlineMedium: icon('send'),
+      MarkdownText: props => h('div', { 'data-native-markdown': true }, props.text),
     }
   })
   let mountCalls = 0; let unmountCalls = 0
@@ -297,15 +303,16 @@ export function mount(overrides = {}) {
   const remote = {
     async $mount(contribution) {
       assert.equal(contribution.package, 'dsh-translation-plugin')
-      assert.deepEqual([...new Set(contribution.descriptors.map(item => item.namespace))].sort(), ['translationQuick', 'translationTopics'])
+      assert.deepEqual([...new Set(contribution.descriptors.map(item => item.namespace))].sort(), ['translationObjects', 'translationQuick', 'translationTopics'])
       mountCalls++; topicMountCalls++
       await overrides.mountGate
       if (overrides.mountError) throw overrides.mountError
       remote.translationQuick = overrides.quick
       remote.translationTopics = overrides.topics
+      remote.translationObjects = overrides.objects
       return async () => {
         unmountCalls++; topicUnmountCalls++
-        delete remote.translationQuick; delete remote.translationTopics
+        delete remote.translationQuick; delete remote.translationTopics; delete remote.translationObjects
       }
     },
     session: { async modelCatalog() { catalogCalls++; return catalogResponse }, selectModel() { throw new Error('main chat selection must remain independent') } },
@@ -313,13 +320,16 @@ export function mount(overrides = {}) {
   }
   const clientContext = {
     remote,
-    get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics'].includes(name)); return remote[name.slice('remote.'.length)] },
+    fileUpload: overrides.fileUpload ?? { async upload() { throw new Error('Synthetic upload not configured') } },
+    get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics', 'remote.translationObjects'].includes(name)); return remote[name.slice('remote.'.length)] },
     on() { return () => {} }, sidebarRightTabs: host.sidebarRightTabs, sidebarRight: host.sidebarRight, slots: host.slots,
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
   }
   const applied = overrides.applyClient ? overrides.applyClient(exported, clientContext) : exported.apply(clientContext)
   return { renderer, storage, remote, applied, copies, downloads, revokedUrls, resourceHost: host,
     get store() { return store },
+    get objects() { return objects }, get objectAssets() { return objectAssets }, get quick() { return quick },
+    dispatchDocument(name, event, capture = true) { for (const callback of documentListeners.get(`${name}:${capture}`) ?? []) callback(event); renderer.render() },
     get downloadAnchorCount() { return anchors.size },
     get panel() { return host.panel },
     get settingsPage() { return host.settingsPage },

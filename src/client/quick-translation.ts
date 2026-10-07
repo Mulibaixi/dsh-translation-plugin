@@ -58,7 +58,7 @@ export class QuickTranslationClient {
   private disposed = false
   private loading: Promise<void> | undefined
   constructor(private readonly port: QuickTranslationPort | undefined, private readonly store: SessionStore, private readonly models: ModelCatalog,
-    private readonly options: { readonly pollMs?: number; readonly requestTimeoutMs?: number; readonly makeId?: () => string } = {}) {
+    private readonly options: { readonly pollMs?: number; readonly requestTimeoutMs?: number; readonly makeId?: () => string; readonly canManualEdit?: (session: LocalSession, unitId: string, revisionId: string) => boolean } = {}) {
     this.stopStore = store.subscribe(() => this.reconcile())
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
@@ -98,9 +98,13 @@ export class QuickTranslationClient {
   }
   saveManualRevision(id: string, unitId: string, baseRevisionId: string, text: string): boolean {
     const session = this.store.getSession(id)
-    if (this.disposed || !session || session.archivedAt !== null) return false
+    if (this.disposed || !session || session.archivedAt !== null || this.manualEditBlockedReason(id, unitId, baseRevisionId)) return false
     const revisionId = `manual-revision:${this.options.makeId?.() ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now()}:${++this.sequence}:${Math.random().toString(36).slice(2)}`}`
     return this.store.updateTranslationHistory(id, history => appendManualRevision(history, unitId, { id: revisionId, baseRevisionId, text, at: new Date().toISOString() }))
+  }
+  manualEditBlockedReason(id: string, unitId: string, revisionId: string): string | undefined {
+    const session = this.store.getSession(id)
+    return session && this.options.canManualEdit?.(session, unitId, revisionId) === false ? '此版本含原件关联，位置只读；暂不支持人工改写。' : undefined
   }
   finalizeForExport(id: string): boolean {
     const session = this.store.getSession(id)

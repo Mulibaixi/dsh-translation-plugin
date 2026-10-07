@@ -13,8 +13,9 @@ import type { TopicArchiveStore } from './topic-archive-store.js'
 import { TopicArchiveView } from './topic-archive-view.js'
 import { resolveMemoryAssetsSelection } from './memory-assets-window.js'
 import { Menu, IconChevronDownOutlineRegular } from './native-ui.js'
+import type { RecordObjectsProps } from './record-object-view.js'
 
-interface MemoryAssetsProps {
+interface MemoryAssetsProps extends RecordObjectsProps {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
   readonly archive: TopicArchiveStore
   readonly topics?: TopicBridgeClient | undefined; readonly ownerId: string; readonly topicId: string
@@ -22,7 +23,7 @@ interface MemoryAssetsProps {
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, quick, topics, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, quick, topics, objects, objectAssets, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly onSelectTopic?: ((topicId: string) => void) | undefined
 }): unknown {
@@ -34,6 +35,12 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, ownerId
   react.useEffect(() => store.subscribe(() => refresh(value => value + 1)), [store])
   react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
   react.useEffect(() => topics?.subscribe(() => refresh(value => value + 1)), [topics])
+  react.useEffect(() => {
+    if (!pickerOpen) return
+    const closeForNativeTab = (event: PointerEvent): void => { if ((event.target as Element | null)?.closest?.('[data-dockkit-tab]')) setPickerOpen(false) }
+    document.addEventListener('pointerdown', closeForNativeTab, true)
+    return () => document.removeEventListener('pointerdown', closeForNativeTab, true)
+  }, [pickerOpen])
   react.useEffect(() => {
     setVisited(current => current.includes(selectedTopicId) ? current : [...current, selectedTopicId])
     setPickerOpen(false); setQuery('')
@@ -56,7 +63,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, ownerId
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: id, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
-        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
+        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
           active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
           navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
     }),
@@ -64,7 +71,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, ownerId
   )
 }
 
-function MemoryAssetsTopicView({ store, terms, archive, quick, topics, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
+function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
   readonly topicName: string; readonly active: boolean
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined
 }): unknown {
@@ -118,5 +125,5 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, ownerId, 
             ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
               h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type }))))),
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
-          h(MemoryTranslationRecordsView, { store, quick, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations' }))))
+          h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations' }))))
 }

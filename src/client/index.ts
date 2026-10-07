@@ -8,6 +8,8 @@ import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore } from './topic-memory-store.js'
 import { TopicArchiveStore } from './topic-archive-store.js'
+import { RecordObjectStore } from './record-object-store.js'
+import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
@@ -36,10 +38,13 @@ interface SidebarRightTabDefinition {
 interface ClientPluginContext {
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
   get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
+  get(name: 'remote.translationObjects'): ObjectAssetsRemotePort | undefined
+  readonly fileUpload: NativeFileUploadPort
   readonly remote: {
     readonly session: ModelCatalogPort
     readonly translationQuick?: QuickRemotePort
     readonly translationTopics?: TopicBridgeRemotePort
+    readonly translationObjects?: ObjectAssetsRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
@@ -58,7 +63,7 @@ interface ClientPluginContext {
 
 const CLIENT_ID = 'dsh-translation-plugin'
 export const name = 'dsh-translation-client'
-export const inject = ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session'] as const
+export const inject = ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload'] as const
 
 function withClientDiagnostics<T>(stage: string, action: () => T): T {
   try { return action() } catch (error) {
@@ -73,26 +78,32 @@ export function apply(ctx: ClientPluginContext): void {
     const store = createSessionStore()
     const models = new ModelCatalog(ctx.remote.session)
     let remoteDisposed = false
-    // One DSH contribution owns both namespaces; mounting the package twice replaces its face.
+    // One DSH contribution owns the namespaces; mounting the package twice replaces its face.
     const mountedRemote = (async () => ctx.remote.$mount?.(PLUGIN_REMOTE))().catch(error => {
       const detail = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ''}` : String(error)
       console.error(`[${CLIENT_ID}] Client translation remote mount failed: ${detail}`)
       return undefined
     })
+    const objects = new RecordObjectStore(store)
     const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationQuick')
-    } : ctx.remote.translationQuick), store, models)
+    } : ctx.remote.translationQuick), store, models, { canManualEdit: (session, unitId, revisionId) => !objects.hasRevisionObjects(session.ownerId, session.topicId, session.id, unitId, revisionId) })
     const terms = new TopicMemoryStore(store)
     const archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
     const topics = new TopicBridgeClient(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
     } : ctx.remote.translationTopics, store, terms, archive)
+    const objectAssets = new ObjectAssetsClient(adaptObjectAssetsRemote(ctx.remote.$mount ? async () => {
+      const unmountRemote = await mountedRemote
+      return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationObjects')
+    } : ctx.remote.translationObjects), ctx.fileUpload, store, objects, ownerId => topics.getStatus(ownerId))
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
     ctx.effect(() => () => terms.dispose(), 'translation topic terms')
     ctx.effect(() => () => archive.dispose(), 'translation topic archive')
+    ctx.effect(() => () => { objectAssets.dispose(); objects.dispose() }, 'translation record objects')
     ctx.effect(() => async () => {
       remoteDisposed = true
       quick.dispose()
@@ -109,7 +120,7 @@ export function apply(ctx: ClientPluginContext): void {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       return h(PanelRouter, {
-        store, models, quick, topics, terms, onDeleteTerm, sessionId,
+        store, models, quick, topics, terms, objects, objectAssets, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId },
@@ -125,7 +136,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, objects, objectAssets, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })

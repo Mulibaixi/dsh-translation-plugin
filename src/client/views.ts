@@ -4,8 +4,10 @@ import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
 import { type TextUnit, type TextRevision } from './translation-history.js'
-import { buildFinalTextExport, buildBilingualExport, buildTopicFinalTextExport, buildTopicBilingualExport,
-  type TranslationExport, type TranslationExportTopic, type TranslationExportSession } from './translation-export.js'
+import { type TranslationExport, type TranslationExportTopic, type TranslationExportSession } from './translation-export.js'
+import { buildRecordObjectExport, recordObjectPlainText } from './record-object-export.js'
+import type { RecordObjectReference } from '../shared/record-objects.js'
+import { RecordObjectText, type RecordObjectsProps } from './record-object-view.js'
 import { type HistoryVersion, type SessionStore } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
@@ -21,7 +23,7 @@ type TextEvent = { currentTarget: { value: string } }
 type CheckEvent = { currentTarget: { checked: boolean } }
 type FileEvent = { currentTarget: { files: FileList | null; value: string } }
 interface StoreProps { readonly store: SessionStore }
-interface TopicUiProps {
+interface TopicUiProps extends RecordObjectsProps {
   readonly topics?: TopicBridgeClient | undefined
   readonly terms?: (TopicTermsViewPort & TopicMemoryStore) | undefined
   readonly onDeleteTerm?: ((snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>) | undefined
@@ -78,7 +80,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, sessionId, topics, terms, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, sessionId, topics, terms, objects, objectAssets, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
     const reconcile = (): void => setDrafts(current => {
@@ -93,7 +95,7 @@ export function PanelRouter({ store, models, quick, sessionId, topics, terms, on
   const editor: RevisionEditor = {
     drafts,
     start(sessionId, unitId, baseRevisionId, text) {
-      if (!store.getSession(sessionId) || !store.getTranslationHistory(sessionId)?.units.some(unit => unit.id === unitId && unit.revisions.some(revision => revision.id === baseRevisionId))) return
+      if (quick.manualEditBlockedReason(sessionId, unitId, baseRevisionId) || !store.getSession(sessionId) || !store.getTranslationHistory(sessionId)?.units.some(unit => unit.id === unitId && unit.revisions.some(revision => revision.id === baseRevisionId))) return
       const key = editKey(sessionId, unitId, baseRevisionId)
       setDrafts(current => current.has(key) ? current : new Map(current).set(key, { sessionId, unitId, baseRevisionId, text, failure: null }))
     },
@@ -114,7 +116,7 @@ export function PanelRouter({ store, models, quick, sessionId, topics, terms, on
     },
   }
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, topics, terms, onDeleteTerm, onOpenAssets, ownerId: sessionId, key: sessionId })
+    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, topics, terms, objects, objectAssets, onDeleteTerm, onOpenAssets, ownerId: sessionId, key: sessionId })
       : h('p', { role: 'alert' }, '请在主窗口会话中打开翻译面板。'),
   )
 }
@@ -123,11 +125,10 @@ interface ContextRequest { readonly id: string; readonly x: number; readonly y: 
 interface FrozenTranslationExport {
   readonly topic: TranslationExportTopic; readonly entries: readonly TranslationExportSession[]
   readonly scope: 'session' | 'topic'; readonly format: 'txt' | 'json'; readonly at: string
+  readonly references: readonly RecordObjectReference[]
 }
 function projectTranslationExport(request: FrozenTranslationExport, allowPartial = false): TranslationExport {
-  if (request.scope === 'topic') return (request.format === 'txt' ? buildTopicFinalTextExport : buildTopicBilingualExport)(request.topic, request.entries, request.at, { allowPartial })
-  const { session, history } = request.entries[0]!
-  return (request.format === 'txt' ? buildFinalTextExport : buildBilingualExport)(session, history, request.at, { allowPartial })
+  return buildRecordObjectExport({ ...request, exportedAt: request.at }, allowPartial)
 }
 type WorkspaceDialog = { readonly kind: 'rename' | 'remark' | 'reload'; readonly id: string }
 type ContextEvent = { preventDefault(): void; stopPropagation(): void; readonly clientX: number; readonly clientY: number; readonly currentTarget?: HTMLElement }
@@ -266,7 +267,7 @@ function TranslationRecord({ record, quick, canRestore }: { readonly record: Qui
   )
 }
 
-function TranslationRevision({ unit, revision, quick, session, editor }: { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor }): unknown {
+function TranslationRevision({ unit, revision, quick, session, editor, objects, objectAssets }: RecordObjectsProps & { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor }): unknown {
   const [details, setDetails] = react.useState(false)
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断' }[revision.status]
@@ -278,12 +279,13 @@ function TranslationRevision({ unit, revision, quick, session, editor }: { reado
   const draft = editor.drafts.get(key)
   const otherEdit = [...editor.drafts.values()].some(edit => edit.sessionId === session.id && edit.unitId === unit.id && edit.baseRevisionId !== revision.id)
   const canEdit = !!revision.text.trim() && ['completed', 'failed', 'cancelled', 'interrupted'].includes(revision.status) && session.archivedAt === null
+  const editBlocked = quick.manualEditBlockedReason(session.id, unit.id, revision.id)
   const base = unit.revisions.find(base => base.id === revision.baseRevisionId)
   const metadata = revision.callRecord
   const model = metadata?.model ?? revision.model
   const usage = (count: number | null | undefined): string => count === null || count === undefined ? '未提供' : String(count)
   async function copy(): Promise<void> {
-    try { await navigator.clipboard.writeText(revision.text); setCopyState('copied') }
+    try { const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision' as const, revisionId: revision.id }; await navigator.clipboard.writeText(recordObjectPlainText(revision.text, target, objects?.getReferences(target) ?? [])); setCopyState('copied') }
     catch { setCopyState('failed') }
   }
   return h('section', { className: 'dsh-tp-version', 'aria-label': label },
@@ -292,7 +294,7 @@ function TranslationRevision({ unit, revision, quick, session, editor }: { reado
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
         h('button', { type: 'button', 'aria-label': `复制${label}`, disabled: !revision.text, onClick: () => { void copy() } }, copyState === 'copied' ? '已复制' : '复制'),
         h('button', { type: 'button', 'aria-label': `${label}设为最终`, disabled: !eligible || fixed, onClick: () => { quick.selectFinal(session.id, unit.id, revision.id) } }, fixed ? '已固定' : '设为最终'),
-        h('button', { type: 'button', 'aria-label': `编辑${label}`, disabled: !canEdit || !!draft || otherEdit, title: otherEdit ? '请先保存或取消此段的当前编辑。' : undefined, onClick: () => editor.start(session.id, unit.id, revision.id, revision.text) }, draft ? '编辑中' : '编辑'),
+        h('button', { type: 'button', 'aria-label': `编辑${label}`, disabled: !!editBlocked || !canEdit || !!draft || otherEdit, title: editBlocked ?? (otherEdit ? '请先保存或取消此段的当前编辑。' : undefined), onClick: () => editor.start(session.id, unit.id, revision.id, revision.text) }, draft ? '编辑中' : '编辑'),
         h('button', { type: 'button', 'aria-label': `${label}详情`, 'aria-expanded': details, onClick: () => setDetails(value => !value) }, '详情'),
       ),
     ),
@@ -310,18 +312,19 @@ function TranslationRevision({ unit, revision, quick, session, editor }: { reado
       h('small', { className: 'dsh-tp-muted' }, `基于版本 ${revision.order}保存为新版本`),
       h('textarea', { 'aria-label': `编辑${label}译文`, value: draft.text, rows: 4, onChange: (event: TextEvent) => { const text = event.currentTarget.value; editor.change(key, text) } }),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
-        h('button', { type: 'button', 'aria-label': `保存${label}编辑`, disabled: !draft.text.trim(), onClick: () => editor.save(key) }, '保存为新版本'),
+        h('button', { type: 'button', 'aria-label': `保存${label}编辑`, disabled: !!editBlocked || !draft.text.trim(), title: editBlocked, onClick: () => editor.save(key) }, '保存为新版本'),
         h('button', { type: 'button', 'aria-label': `取消${label}编辑`, onClick: () => editor.cancel(key) }, '取消'),
       ),
       draft.failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, draft.failure) : null,
-    ) : revision.text ? h('div', { className: 'dsh-tp-translation-text' }, revision.text) : null,
+    ) : revision.text ? h(RecordObjectText, { text: revision.text, target: { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id }, objects, objectAssets }) : null,
+    editBlocked ? h('small', { className: 'dsh-tp-muted' }, editBlocked) : null,
     revision.message ? h('p', { role: revision.status === 'failed' || revision.status === 'unknown' ? 'alert' : 'status', className: 'dsh-tp-muted' }, revision.message) : null,
     copyState === 'failed' ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '复制失败，请重试。') : null,
     revision.status === 'unknown' && record?.status === 'unknown' ? button('查询本轮结果', () => quick.query(record)) : null,
   )
 }
 
-function TranslationUnit({ unit, quick, session, editor, topics }: { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly topics?: TopicBridgeClient | undefined }): unknown {
+function TranslationUnit({ unit, quick, session, editor, topics, objects, objectAssets }: RecordObjectsProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly topics?: TopicBridgeClient | undefined }): unknown {
   const [expanded, setExpanded] = react.useState(false)
   const [referenceFailure, setReferenceFailure] = react.useState(false)
   const latest = unit.revisions.at(-1)
@@ -335,7 +338,7 @@ function TranslationUnit({ unit, quick, session, editor, topics }: { readonly un
   const published = topics?.isPublished(session.ownerId, session.id, unit.id) ?? false
   return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-muted' }, '原文'),
-    h('div', { className: 'dsh-tp-translation-text' }, unit.source),
+    h(RecordObjectText, { text: unit.source, target: { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
     h('div', { className: 'dsh-tp-unit-header' },
       h('span', { className: 'dsh-tp-muted', role: 'status' }, finalLabel),
       h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { void quick.retranslate(session.id, unit.id) } }, '重译'),
@@ -346,18 +349,19 @@ function TranslationUnit({ unit, quick, session, editor, topics }: { readonly un
       published ? h('button', { type: 'button', 'aria-label': `取消文本 ${unit.order}参考`, onClick: () => { topics.revokeUnit(session.ownerId, session.id, unit.id); setReferenceFailure(false) } }, '取消参考') : null,
     ) : null,
     referenceFailure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '未能提供此参考，请核对单元状态及内容大小。') : null,
-    h(TranslationRevision, { key: latest.id, unit, revision: latest, quick, session, editor }),
+    h(TranslationRevision, { key: latest.id, unit, revision: latest, quick, session, editor, objects, objectAssets }),
     unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, onClick: () => setExpanded(value => !value) }, `${expanded ? '收起' : '展开'}旧版本（${unit.revisions.length - 1}）`) : null,
     expanded ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
-      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, unit, revision, quick, session, editor })),
+      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, unit, revision, quick, session, editor, objects, objectAssets })),
     ) : null,
   )
 }
 
-function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
+function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, objects, objectAssets, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   react.useEffect(() => quick.subscribe(() => refreshQuick(value => value + 1)), [quick])
+  react.useEffect(() => objects?.subscribe(() => refreshQuick(value => value + 1)), [objects])
   react.useEffect(() => models.subscribe(() => refreshQuick(value => value + 1)), [models])
   react.useEffect(() => { void quick.load() }, [quick])
   react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
@@ -440,7 +444,8 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
         if (!history) throw new Error('Session no longer available')
         return { session, history }
       })
-      const snapshot: FrozenTranslationExport = structuredClone({ topic: { ownerId, topicId: target.topicId, topicName: target.topicName }, entries, scope, format, at: new Date().toISOString() })
+      const references = entries.flatMap(({ session }) => objects?.getSnapshot(ownerId, target.topicId, session.id).references ?? [])
+      const snapshot: FrozenTranslationExport = structuredClone({ topic: { ownerId, topicId: target.topicId, topicName: target.topicName }, entries, references, scope, format, at: new Date().toISOString() })
       const result = projectTranslationExport(snapshot)
       if (!result.complete) setExportRequest({ ...snapshot, result })
       else deliver(result)
@@ -497,7 +502,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         units.length || records.length ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
-        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current!, editor, topics: current?.mode === 'normal' ? topics : undefined })),
+        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined })),
         ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
         units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),

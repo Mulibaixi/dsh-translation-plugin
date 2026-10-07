@@ -135,6 +135,17 @@ export const styles = `
 .dsh-tp-record-pair h4 { margin: 0 0 4px; font-size: 12px; }
 .dsh-tp-record-actions { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-record-actions[hidden] { display: none; }
+/* Managed originals: plain body segments with explicit, immutable links. */
+.dsh-tp-object-link { display: inline; padding: 0 2px; color: var(--dsw-alias-text-link, #598de5); text-decoration: underline; background: transparent; border: 0; font: inherit; cursor: pointer; }
+.dsh-tp-object-failure { display: block; white-space: normal; }
+.dsh-tp-object-editor { padding: 8px 10px; }
+.dsh-tp-object-editor h4 { margin: 0 0 6px; }
+.dsh-tp-object-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 0 0 6px; padding: 0; border: 0; }
+.dsh-tp-object-formula { display: block; white-space: normal; margin: 6px 0; }
+.dsh-tp-object-formula-preview { display: block; overflow-x: auto; }
+.dsh-tp-object-formula pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.dsh-tp-object-controls input[type=number] { width: 70px; }
+.dsh-tp-object-controls input[type=file] { min-width: 0; max-width: 100%; width: 200px; }
 @container (max-width: 600px) {
   .dsh-tp-assets-body { display: flex; flex-direction: column; }
   .dsh-tp-assets-nav { flex: none; display: flex; gap: 3px; padding: 4px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }

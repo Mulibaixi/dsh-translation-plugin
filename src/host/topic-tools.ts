@@ -75,6 +75,7 @@ interface Pending {
 class ManagementConnection {
   pending: Pending | undefined
   closed = false
+  ready = false
   private wake: (() => void) | undefined
   readonly stopped: Promise<void>
   private stop!: () => void
@@ -130,6 +131,11 @@ export class TopicToolsService {
     const ready = !this.disposed && !!this.ctx.get?.('agents') && !!this.ctx.get?.('tools') && !!this.ctx.get?.('sessionController')
     return ready ? { ready: true } : { ready: false, reason: '宿主主题管理接口尚未就绪。' }
   }
+  /** Only an authorized, fully established Client connection can address managed objects. */
+  ownsConnection(ownerId: string, peerId: string): boolean {
+    const connection = this.connections.get(ownerId)
+    return !this.disposed && !!connection?.ready && !connection.closed && connection.peerId === peerId
+  }
   async *connect(request: TopicBridgeOpen, signal: AbortSignal): AsyncGenerator<TopicBridgeDown> {
     request = parseTopicBridgeOpen(request)
     signal.throwIfAborted()
@@ -163,6 +169,7 @@ export class TopicToolsService {
       const agent = (this.ctx.get?.('agents') as Agents).get(request.mainSessionId)
       if (agent) install({ agent })
       uplink = this.ctx.invocation!.uplink()[Symbol.asyncIterator]()
+      connection.ready = true
       yield { kind: 'ready', ...request }
       while (!connection.closed) {
         const pending = await connection.next()

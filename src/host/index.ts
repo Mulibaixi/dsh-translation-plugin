@@ -2,19 +2,22 @@ import { createTranslationFramework } from './framework.js'
 import { installQuickTranslation, type QuickHostContext } from './quick-translation.js'
 import { installTopicTools, type TopicHostContext } from './topic-tools.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
+import { installObjectAssets } from './object-assets.js'
 
 export { createTranslationFramework } from './framework.js'
 export { TextTranslationRuntime } from './text-runtime.js'
 export { QuickTranslationService, installQuickTranslation } from './quick-translation.js'
 export { DshTextExecutionAdapter } from './dsh-text-adapter.js'
 export { TopicToolsService, installTopicTools } from './topic-tools.js'
+export { ObjectAssetsService, installObjectAssets } from './object-assets.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects'] as const
 
 export function apply(ctx: QuickHostContext): void {
   installTopicTools(ctx as TopicHostContext, undefined, false)
+  installObjectAssets(ctx, {}, false)
   const quick = installQuickTranslation(ctx, undefined, false)
   const register = (scope: QuickHostContext): void => {
     const registry = scope.get ? scope.get('typert') as QuickHostContext['typert'] : scope.typert

@@ -8,8 +8,11 @@ import { TopicBridgeClient } from '../dist/client/topic-bridge.js'
 /** Actual installed Agent/Loop/Tools/SessionController/Gateway and ClientRemoteService.
  * Unused image/upload/workspace ports are inert; this fixture never touches real profiles or a network.
  */
-export async function createTopicToolsNativeFixture({ runtimeRoot, mountContribution = true }) {
-  const host = await createQuickHostFixture({ runtimeRoot, installationDependencies: { '@deepseek-ai/dsh-tools': '0.2.0-rc.2' } })
+export async function createTopicToolsNativeFixture({ runtimeRoot, mountContribution = true, managedObjects = false }) {
+  const host = await createQuickHostFixture({ runtimeRoot, installationDependencies: { '@deepseek-ai/dsh-tools': '0.2.0-rc.2',
+    ...(managedObjects ? { '@deepseek-ai/dsh-client-file-upload': '0.2.0-rc.2', '@deepseek-ai/dsh-attachment-local': '0.2.0-rc.2',
+      '@deepseek-ai/dsh-fs-local': '0.2.0-rc.2', '@deepseek-ai/dsh-home-paths': '0.2.0-rc.2', '@deepseek-ai/dsh-atomic-write': '0.2.0-rc.2' } : {}),
+  } })
   const [agents, loop, tools, prompts, projections, query, controller, { Context }, { TypertRegistry }, clientGateway, { OperatorPeer }] = await Promise.all([
     host.native('@deepseek-ai/dsh-agent'), host.native('@deepseek-ai/dsh-agent-loop'), host.native('@deepseek-ai/dsh-tools'),
     host.native('@deepseek-ai/dsh-system-prompt'), host.native('@deepseek-ai/dsh-session-projection'), host.native('@deepseek-ai/dsh-session-query'),
@@ -27,11 +30,24 @@ export async function createTopicToolsNativeFixture({ runtimeRoot, mountContribu
   await ctx.plugin(query.SessionQueryEngine)
   await ctx.plugin(loop.AgentLoop, { agents: [], maxParallelToolCalls: 10 })
   ctx.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'synthetic', model: 'model-a' }) })
-  ctx.provide('attachments', { imageLimits: { maxImageBytes: 1024, maxImagesPerMessage: 1, maxMessageImageBytes: 1024, maxImagePixels: 1024, maxImageDimension: 32, mediaTypes: ['image/png'] } })
-  ctx.provide('fileUploads', { registerAgentResolver: () => () => {} })
-  ctx.provide('fs', {})
+  const managedOpened = []
+  if (managedObjects) {
+    const [attachments, uploads, fs] = await Promise.all([host.native('@deepseek-ai/dsh-attachment-local'), host.native('@deepseek-ai/dsh-client-file-upload'), host.native('@deepseek-ai/dsh-fs-local')])
+    ctx.provide('commands', { registerFileReceiptResolver: () => () => {} })
+    ctx.provide('connection', { fetch: { register: () => () => {} } })
+    await ctx.plugin(attachments.LocalAttachmentStore, { dshHome: join(host.directory, 'home') })
+    await ctx.plugin(fs.LocalFileSystem, { cwd: host.directory })
+    await ctx.plugin(uploads.FileUploads)
+    const { TYPERT } = await import(pathToFileURL(join(resolve(runtimeRoot, 'dsh/node_modules'), '@deepseek-ai/dsh-client-file-upload/lib/typert.host.js')).href)
+    ctx.typert.register(TYPERT)
+  } else {
+    ctx.provide('attachments', { imageLimits: { maxImageBytes: 1024, maxImagesPerMessage: 1, maxMessageImageBytes: 1024, maxImagePixels: 1024, maxImageDimension: 32, mediaTypes: ['image/png'] } })
+    ctx.provide('fileUploads', { registerAgentResolver: () => () => {} })
+    ctx.provide('fs', {})
+  }
   ctx.provide('workspaceRegistry', { archivedSessionIds: [], list: () => [] })
-  await ctx.plugin(controller.SessionController, { nativeOpen: false })
+  await ctx.plugin(controller.SessionController, { nativeOpen: managedObjects })
+  if (managedObjects) ctx.sessionController.openPath = async path => { managedOpened.push(path) }
   assert.equal(ctx.translationTopics.capabilities().ready, true)
   const client = new Context(), peer = new OperatorPeer(ctx), requests = [], replies = [], carrierErrors = []
   client.provide('connection', {
@@ -51,11 +67,16 @@ export async function createTopicToolsNativeFixture({ runtimeRoot, mountContribu
   await client.plugin(TypertRegistry)
   await client.plugin(clientModule)
   const unmount = mountContribution ? await client.remote.$mount(PLUGIN_REMOTE) : undefined
+  let unmountUploads
+  if (managedObjects) {
+    const { TYPERT_REMOTE } = await import(pathToFileURL(join(resolve(runtimeRoot, 'dsh/node_modules'), '@deepseek-ai/dsh-client-file-upload/lib/typert.remote-client.js')).href)
+    unmountUploads = await client.remote.$mount(TYPERT_REMOTE)
+  }
   const bridges = []
-  return { host, client, requests, replies, carrierErrors, get remote() { return client.remote.translationTopics },
+  return { host, client, requests, replies, carrierErrors, managedOpened, get remote() { return client.remote.translationTopics },
     async createAgent(sessionId) { return ctx.agents.create({ sessionId, agentOptions: { provider: 'synthetic', model: 'model-a' } }) },
     bridge(sessions, terms, archive) { const bridge = new TopicBridgeClient(client.remote.translationTopics, sessions, terms, archive); bridges.push(bridge); return bridge },
-    async close() { for (const bridge of bridges) await bridge.dispose(); await unmount?.(); await client.fiber.dispose(); await host.dispose() },
+    async close() { for (const bridge of bridges) await bridge.dispose(); await unmountUploads?.(); await unmount?.(); await client.fiber.dispose(); await host.dispose() },
   }
 }
 

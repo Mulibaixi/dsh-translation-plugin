@@ -59,7 +59,7 @@ test('客户端 bundle 只登记一个包标识，初始化不读取本地存储
   assert.equal(bundle.registrations[0].id, packageJson.name)
   assert.equal(bundle.registrations[0].id, 'dsh-translation-plugin')
   assert.equal(typeof bundle.exports.apply, 'function')
-  assert.deepEqual(Array.from(bundle.exports.inject), ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session'])
+  assert.deepEqual(Array.from(bundle.exports.inject), ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload'])
   assert.ok(bundle.externalRequests.every(specifier => ['react', '@deepseek-ai/dsh-client-ui-primitives'].includes(specifier)))
   assert.equal(bundle.storageReads(), 0)
   assert.deepEqual(bundle.diagnostics, [])

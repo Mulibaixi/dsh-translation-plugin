@@ -73,6 +73,21 @@ test('docked host title hides only the owned session and topic while floating ca
   assert.ok(f.ui.nodes(node).some(child => child.props.className === 'dsh-tp-assets-title-picker'))
 })
 
+test('owned docked title reserves native close space and clears only its own mask', async t => {
+  const f = mountCaption(); t.after(() => f.app.dispose())
+  const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId), { topicId: f.session.topicId, sessionId: f.session.id })
+  const styles = f.ui.nodes(node).find(child => child.type === 'style' && !child.props['data-assets-cursor-style']).children.join('')
+  assert.match(styles, /\[data-dockkit-tab\]:has\(\[data-dsh-translation-assets-title\]\)\s*\{\s*padding-right: 30px;\s*\}/u)
+  assert.match(styles, /\[data-dockkit-tab\]:has\(\[data-dsh-translation-assets-title\]\) \[data-dockkit-tab-title\]:has\(\[data-dsh-translation-assets-title\]\)\s*\{\s*mask-image: none;\s*\}/u)
+  const layoutRules = [...styles.matchAll(/([^{}]+)\{([^{}]*(?:padding-right|mask-image)[^{}]*)\}/gu)]
+  assert.equal(layoutRules.length, 2)
+  for (const rule of layoutRules) {
+    assert.match(rule[1], /data-dockkit-tab.*data-dsh-translation-assets-title/u)
+    assert.doesNotMatch(rule[1], /data-dockkit-float|data-dockkit-tab-close/u)
+    assert.doesNotMatch(rule[2], /(?:^|;)\s*(?:width|position|right|left):/u, 'native controls and intrinsic tab sizing remain owned by the host')
+  }
+})
+
 test('topic interactions stop bubbling drag/focus/menu events while caption text remains draggable', async t => {
   const f = mountCaption(); t.after(() => f.app.dispose())
   const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId))
