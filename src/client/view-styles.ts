@@ -13,8 +13,6 @@ export const styles = `
 .dsh-tp-session-sidebar[hidden] { display: none; }
 .dsh-tp-session-list { display: flex; flex-direction: column; gap: 3px; }
 .dsh-tp-session-item { display: block; width: 100%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dsh-tp-session-name, .dsh-tp-session-remark { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dsh-tp-session-remark { color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
 .dsh-tp-session-item[aria-current=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
 .dsh-tp-session-add { display: flex; align-items: center; justify-content: center; width: 100%; align-self: stretch; text-align: center; margin-top: 2px; }
 .dsh-tp-session-divider { border-top: 1px solid var(--dsw-alias-border-l2, #8883); margin: 4px 0; }

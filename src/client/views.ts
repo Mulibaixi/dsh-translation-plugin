@@ -136,11 +136,9 @@ function sessionTitle(session: LocalSession): string {
   const label = session.remark ? `${session.name} · ${session.remark}` : session.name
   return session.legacyName ? `${label}\n旧名称：${session.legacyName}` : label
 }
+function sessionDisplayName(session: LocalSession): string { return session.remark || session.name }
 function sessionLabel(session: LocalSession): unknown {
-  return h('span', { className: 'dsh-tp-session-choice-name' },
-    h('span', { className: 'dsh-tp-session-name' }, session.name),
-    session.remark ? h('span', { className: 'dsh-tp-session-remark' }, session.remark) : null,
-  )
+  return h('span', { className: 'dsh-tp-session-choice-name' }, sessionDisplayName(session))
 }
 type SessionClickEvent = { preventDefault(): void; stopPropagation(): void }
 interface SessionSorting {
@@ -223,14 +221,14 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
   return h('div', { className: 'dsh-tp-title-select' }, h(Menu, {
     open, onClose: () => { if (!contextOpen) setOpen(false) }, portal: true, compact: true, className: 'dsh-tp-title-anchor', listClassName: 'dsh-tp-popup',
     anchor: h('button', {
-      type: 'button', className: 'dsh-tp-current-title', 'aria-label': current ? `当前翻译会话：${current.name}` : '选择翻译会话',
+      type: 'button', className: 'dsh-tp-current-title', 'aria-label': current ? `当前翻译会话：${sessionDisplayName(current)}` : '选择翻译会话',
       title: current ? sessionTitle(current) : '选择翻译会话', 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => { onDismissContext(); setOpen(!open) },
       onPointerDown: (event: { stopPropagation(): void }) => { if (contextOpen) event.stopPropagation() },
       onContextMenu: current ? (event: ContextEvent) => onContext(current, event) : undefined,
       onKeyDown: current ? (event: KeyboardEvent & { currentTarget: HTMLElement }) => {
         if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) onContextKeys(current, event)
       } : undefined,
-    }, h('span', { className: 'dsh-tp-current-title-text' }, current?.name ?? '选择翻译会话'),
+    }, h('span', { className: 'dsh-tp-current-title-text' }, current ? sessionDisplayName(current) : '选择翻译会话'),
       h(IconChevronDownOutlineRegular, { size: 14, className: `dsh-tp-chevron${open ? ' dsh-tp-chevron-open' : ''}` }),
     ),
   }, h('div', { className: 'dsh-tp dsh-tp-menu-content', 'aria-label': '已有翻译会话',
