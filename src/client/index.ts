@@ -7,6 +7,7 @@ import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore } from './topic-memory-store.js'
+import { TopicArchiveStore } from './topic-archive-store.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
@@ -83,13 +84,15 @@ export function apply(ctx: ClientPluginContext): void {
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationQuick')
     } : ctx.remote.translationQuick), store, models)
     const terms = new TopicMemoryStore(store)
+    const archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
     const topics = new TopicBridgeClient(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
-    } : ctx.remote.translationTopics, store, terms)
+    } : ctx.remote.translationTopics, store, terms, archive)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
     ctx.effect(() => () => terms.dispose(), 'translation topic terms')
+    ctx.effect(() => () => archive.dispose(), 'translation topic archive')
     ctx.effect(() => async () => {
       remoteDisposed = true
       quick.dispose()
@@ -125,7 +128,7 @@ export function apply(ctx: ClientPluginContext): void {
       const params = tabInfo?.tab.navigation.params
       const associatedSessionId = params && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' ? params.sessionId : undefined
       const requestedTopicId = params && typeof params === 'object' && 'topicId' in params && typeof params.topicId === 'string' ? params.topicId : undefined
-      return h(MemoryAssetsView, { store, quick, topics, terms, onDeleteTerm, ...scope, associatedSessionId, requestedTopicId, navigationRevision: tabInfo?.tab.navigation.revision })
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, onDeleteTerm, ...scope, associatedSessionId, requestedTopicId, navigationRevision: tabInfo?.tab.navigation.revision })
     }
     const MemoryAssetsCaption: ClientComponent = () => h(MemoryAssetsTitle, null)
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {

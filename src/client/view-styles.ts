@@ -105,6 +105,12 @@ export const styles = `
 .dsh-tp-assets-content, .dsh-tp-assets-module { min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 .dsh-tp-assets-module { flex: 1; }
 .dsh-tp-assets-module[hidden] { display: none; }
+.dsh-tp-structured { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.dsh-tp-archive-toolbar { flex: none; padding: 7px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
+.dsh-tp-archive-toolbar select { padding: 4px 6px; }
+.dsh-tp-archive-toolbar small { display: block; margin-top: 4px; font-size: 11px; }
+.dsh-tp-archive-entities { margin: 10px 0; padding: 6px 8px; border: 1px solid var(--dsw-alias-border-l2, #8884); border-radius: 6px; }
+.dsh-tp-archive-entities label { display: flex; align-items: flex-start; gap: 6px; margin: 4px 0; }
 .dsh-tp-terms { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .dsh-tp-asset-toolbar { flex: none; max-height: 42%; overflow-y: auto; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-asset-toolbar h3 { margin: 0; }

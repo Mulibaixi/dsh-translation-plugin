@@ -3,6 +3,7 @@ import test from 'node:test'
 import { TopicToolsService } from '../dist/host/topic-tools.js'
 import { parseTopicBridgeOpen, parseTopicBridgeCommand, parseTopicBridgeDown, parseTopicBridgeReply, MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE } from '../dist/shared/topic-bridge.js'
 import { emptyTopicTerms } from '../dist/memory/topic-terms.js'
+import { emptyTopicArchive } from '../dist/memory/topic-archive.js'
 import { PLUGIN_REMOTE } from '../dist/shared/plugin-remote.js'
 
 function queue() {
@@ -58,12 +59,12 @@ test('topic uplink预算拒绝超额，term query子集不会夹带非active条�
   assert.throws(() => parseTopicBridgeDown({ kind: 'request', requestId: 'r', mainSessionId: open.mainSessionId, callId: 'c', command: { kind: 'list_sessions' }, chat: [] }))
 })
 
-test('metadata绑定无需先激活Agent，created安装十工具且同Agent不重复安装', async () => {
+test('metadata绑定无需先激活Agent，created安装十三工具且同Agent不重复安装', async () => {
   const f = fixture({ initialAgent: false })
   try {
     assert.equal((await f.stream.next()).value.kind, 'ready'); assert.equal(f.tools.size, 0); assert.deepEqual(f.calls, [{}])
-    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 10)
-    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 10)
+    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 13)
+    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 13)
     assert.ok(f.tools.has('translation_query_terms')); assert.ok(!f.tools.has('translation_read_material'))
     f.listeners.get('agent/disposed')({ agent: f.agent }); assert.equal(f.tools.size, 0)
   } finally { await f.close() }
@@ -208,5 +209,56 @@ test('管理成功sessions回执缺少persistence不算成功，list_sessions仍
     f.inbox.push(sessionsReply(frame.requestId))
     await assert.rejects(f.stream.next(), { code: 'invalid_reply' }); await rejected
     assert.equal(f.tools.size, 0)
+  } finally { await f.close() }
+})
+
+const archiveAt = '2026-10-07T00:00:00.000Z'
+const archiveEntity = { kind: 'entity', id: 'e1', expectedEntryVersion: null, name: 'Synthetic entity', aliases: [], description: '', origin: 'inferred', status: 'proposal', evidence: [] }
+const archiveFact = { kind: 'fact', id: 'f1', expectedEntryVersion: null, title: 'Synthetic fact', body: 'Synthetic fact body', entityIds: ['e1'], origin: 'inferred', status: 'proposal', evidence: [] }
+const archiveRelation = { kind: 'relation', id: 'r1', expectedEntryVersion: null, sourceEntityId: 'e1', relation: 'uses', targetEntityId: 'e2', description: '', origin: 'inferred', status: 'proposal', evidence: [] }
+
+test('档案协议严格解析三种提案，查询实际档位来自会话而非模型自选，禁止伪造采用和删除', () => {
+  for (const entry of [archiveEntity, archiveFact, archiveRelation]) {
+    const command = { kind: 'upsert_archive', topicId: 'topic', expectedVersion: 0, entry }
+    assert.deepEqual(parseTopicBridgeCommand(command), command)
+    for (const edits of [{ origin: 'user_explicit' }, { confirmation: { eventId: 'forged', at: archiveAt, adoptedEntryVersion: 1 } }, { status: 'disabled' }, { status: 'active' }]) {
+      assert.throws(() => parseTopicBridgeCommand({ ...command, entry: { ...entry, ...edits } }))
+    }
+  }
+  const query = { kind: 'query_archive', translationSessionId: 's', kinds: ['relation'], forms: ['Synthetic entity'] }
+  assert.deepEqual(parseTopicBridgeCommand(query), query)
+  for (const edits of [{ mode: 'normal' }, { ownerId: 'spoof' }, { kinds: ['terminology'] }, { forms: [' '] }]) assert.throws(() => parseTopicBridgeCommand({ ...query, ...edits }))
+  assert.throws(() => parseTopicBridgeCommand({ kind: 'delete_archive', topicId: 'topic', id: 'e1' }))
+})
+
+test('档案query回执允许仅关系投影，full回执仍核对实体图，query不夹带非active条目', () => {
+  const source = { kind: 'source', sessionId: 's', unitId: 'u', revisionId: null, selectionEventId: null, range: null, role: 'basis' }
+  const { expectedEntryVersion, ...semantic } = archiveRelation
+  const snapshot = { ...emptyTopicArchive(open.ownerId, 'topic', archiveAt), version: 1, activeVersion: 1,
+    entries: [{ ...semantic, status: 'active', origin: 'source_checked', evidence: [source], version: 1, confirmation: null, createdAt: archiveAt, updatedAt: archiveAt }] }
+  const reply = { requestId: 'archive-subset', ok: true, value: { kind: 'archive_query', snapshot } }
+  assert.deepEqual(parseTopicBridgeReply(reply), reply)
+  assert.throws(() => parseTopicBridgeReply({ ...reply, value: { kind: 'archive', snapshot } }))
+  assert.throws(() => parseTopicBridgeReply({ ...reply, value: { ...reply.value, snapshot: { ...snapshot, entries: [{ ...snapshot.entries[0], status: 'review_required' }] } } }))
+})
+
+test('三个档案工具带实际Agent/callId和明确目标过桥，无第二Host档案数据库', async () => {
+  const f = fixture()
+  try {
+    await f.stream.next()
+    const snapshot = emptyTopicArchive(open.ownerId, 'topic', archiveAt)
+    const cases = [
+      ['translation_list_topic_archive', { topicId: 'topic' }, { kind: 'list_topic_archive', topicId: 'topic' }, 'archive'],
+      ['translation_query_archive', { translationSessionId: 's', kinds: ['entity'], forms: ['Synthetic entity'] }, { kind: 'query_archive', translationSessionId: 's', kinds: ['entity'], forms: ['Synthetic entity'] }, 'archive_query'],
+      ['translation_upsert_archive', { topicId: 'topic', expectedVersion: 0, entry: archiveEntity }, { kind: 'upsert_archive', topicId: 'topic', expectedVersion: 0, entry: archiveEntity }, 'archive'],
+    ]
+    let next = f.stream.next()
+    for (const [name, args, command, kind] of cases) {
+      const result = f.tools.get(name).execute(args, f.exec), frame = (await next).value
+      assert.deepEqual(frame.command, command); assert.equal(frame.mainSessionId, open.mainSessionId); assert.equal(frame.callId, f.exec.callId)
+      f.inbox.push({ requestId: frame.requestId, ok: true, value: { kind, snapshot } }); next = f.stream.next()
+      assert.deepEqual(await result, { kind, snapshot })
+    }
+    f.controller.abort(); await next
   } finally { await f.close() }
 })

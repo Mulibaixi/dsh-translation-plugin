@@ -54,7 +54,7 @@ export async function createTopicToolsNativeFixture({ runtimeRoot, mountContribu
   const bridges = []
   return { host, client, requests, replies, carrierErrors, get remote() { return client.remote.translationTopics },
     async createAgent(sessionId) { return ctx.agents.create({ sessionId, agentOptions: { provider: 'synthetic', model: 'model-a' } }) },
-    bridge(sessions, terms) { const bridge = new TopicBridgeClient(client.remote.translationTopics, sessions, terms); bridges.push(bridge); return bridge },
+    bridge(sessions, terms, archive) { const bridge = new TopicBridgeClient(client.remote.translationTopics, sessions, terms, archive); bridges.push(bridge); return bridge },
     async close() { for (const bridge of bridges) await bridge.dispose(); await unmount?.(); await client.fiber.dispose(); await host.dispose() },
   }
 }

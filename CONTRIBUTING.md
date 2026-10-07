@@ -22,21 +22,27 @@ pnpm test
 
 `src/memory/topic-terms.ts` 提供纯术语契约、来源核对、版本与精确检索；v0.6.0 已由 `src/client/topic-memory-store.ts` 接入独立主题存储、术语面板与主模型工具。所属主会话和主题以 ID 限定，证据只引用 `SessionStore` 权威文本单元，范围为 Unicode 码点半开区间。最终依据核对修订及最后选择事件，不可读取或已变化的依据立即排除并待复核；用户独立采用的规则不因示例丢失撤销。提案变化不增加 activeVersion，相同事实不增加版本；模型不能覆盖已采用规则或伪造采用事件，交叠形式的实质冲突需明确处理。Quick 检索为空且不自动提炼，Normal 仅按明确形式和别名精确检索。解析仅在外部边界执行，内部转换不反复解析全档案。
 
-`src/shared/topic-bridge.ts`、`src/host/topic-tools.ts` 与 `src/client/topic-bridge.ts` 通过实际双向 RemoteStream 实现十项工具，只绑定所属主会话 Agent：列出主题/会话、新建会话、主题重命名、独立备注、归档/恢复、读取明确参考、列出/检索/提交术语。会话工具只按明确 ID 操作，不能删除、改草稿/模型/默认值或自动升档；术语读取兼容主题 ID，支持没有会话的保留主题。Host 不存第二份会话/术语数据库；历史原文只读取用户明确提供的普通模式单元投影，不读取当前草稿或未选历史。`src/shared/plugin-remote.ts` 合并快译和主题管理贡献，一次注册保持两个命名空间共存。术语及会话正文沿用历史开关，模型偏好独立保存。原主发送自动联动与普通执行仍需 DSH 正式发送前扩展，不以每次额外确认或手动两步发送替代。
+`src/memory/topic-archive.ts` 提供实体、事实和关系纯契约，`src/client/topic-archive-store.ts` 按 owner/topic 共享唯一 `TopicArchiveStore`，与术语 Store 复用 SessionStore 依据及既有主题锁。事实与关系只关联同主题实体 ID；实体语义变化、停用、删除或依据失效使依赖项待复核。版本只随实际变化递增，activeVersion 只随有效生效内容变化；模型只能写 inferred/source_checked，不能伪造 user_explicit 确认或覆盖用户采用条目。完整持久快照 decoder 核对关联图；专用 `decodeTopicArchiveQuerySnapshot` 只接受 active 投影，允许未命中的关联实体不在回执中，查询仍在完整权威快照上核对有效关联，不放宽持久格式。
+
+`src/shared/topic-bridge.ts`、`src/host/topic-tools.ts` 与 `src/client/topic-bridge.ts` 通过实际双向 RemoteStream 实现十三项工具，只绑定所属主会话 Agent：列出主题/会话、新建会话、主题重命名、独立备注、归档/恢复、读取明确参考、列出/检索/提交术语，以及 `list_topic_archive`、`query_archive`、`upsert_archive`。新档案列出/提交使用明确 topicId，兼容没有会话的保留主题；query 使用 translationSessionId 推导真实 owner/topic/mode，不接受模型指定档位，Quick 返回空。提交依据须属于用户明确公开的普通模式历史单元，不能读取草稿或未选历史。工具不能删除会话/档案、改草稿/模型/默认值或自动升档。Host 不存第二份会话或档案数据库；`src/shared/plugin-remote.ts` 一次合并注册快译和主题管理命名空间。会话及两类档案沿用历史开关，模型偏好独立保存。原主发送自动联动与普通执行仍需 DSH 正式发送前扩展，不以每次额外确认或手动两步发送替代。
 
 `SessionStore` 的后台管理入口在既有结构锁内核对预期名称、备注、归档状态及当前保存策略；原界面默认激活新建/恢复会话，模型工具使用后台参数。纯临时环境可在内存管理，不扩大为无锁持久写入。工具回执根据实际结果区分 `saved` 与 `runtime_only`；保存失败提示内存可能已变化，可查询核对，不能伪造回滚或自动重试创建。理由只在创建回执保留，不自动覆盖备注。已持久主题关闭历史后的发号身份仍按原例外保存，不代表新会话正文已保存。
 
-v0.7.0 扩充共享工具命令及会话元数据，升级时须重建本地 bundle 并重启，加载同版本 Host/Client。会话仍使用 schema5/history2，独立术语快照格式不变；本轮无需新的数据格式迁移，既有降级备份规则继续适用。
+v0.9.0 扩充共享档案协议，升级须重建本地 bundle 并重启，加载同版本 Host/Client。会话仍用 schema5/history2，独立术语 schema1 不变；实体/事实/关系新增 `topic-archive:v1` 独立命名空间与 schema1，不迁移或重写旧快照。旧版不会管理新档案，既有降级备份规则继续适用。
 
-`src/client/topic-terms-export.ts` 将冻结的现有主题术语快照纯投影为 JSON/Markdown，保留所有状态、版本、采用事件、时间与证据引用/可读性标签，不复制证据正文、主聊天或完整主题备份，不调用模型、不修改档案或最终指针、不触发提炼/整理。导出在历史关闭时仍可明确执行，未提供导入；浏览器下载接口的模拟证据不等于实际文件保存验证。
+`src/client/topic-archive-export.ts` 将同时冻结的主题资料、术语及实体/事实/关系快照纯投影为综合 JSON/Markdown，复用 `topic-terms-export.ts` 术语投影。核对两快照的 owner/topic 一致，保留所有状态、版本、采用事件、时间、实体关联及证据引用/可读性标签，不复制证据正文、主聊天或完整主题备份。列表搜索、状态及类型不改变导出范围；导出不调用模型、不改档案/最终指针、不触发提炼或持久化，历史关闭仍可明确执行。没有导入功能，浏览器下载模拟不等于实际文件保存验证。
 
-记忆资产使用正式资源 Tab 与应用内浮窗。资源 URI 保留稳定 owner 与初始 topic，Body 同时核对 URI 与框架所属 Session；同 owner 复用既有窗口。原 Session 的公开 tab actions 打开资源，通过公开 navigation params 请求主题和关联会话，navigation revision 驱动重复导航；Body 核对主题与会话归属后选择并显示备注优先的会话标题。窗口内原生主题下拉可搜索全部所属主题（包括没有会话的保留档案），不改变翻译工作区选择。仅首次新建且其 Session 表面可见时使用公开 `float`；已有或恢复的停靠状态保持。翻译及资产 Tab 使用 `keepMounted`，已访问主题和分类隐藏时保持挂载，保留正文与人工编辑稿；明确关闭只释放视图，不删除资产或 dispose 共享 Store。复用唯一 SessionStore、TopicMemoryStore 与 TopicBridgeClient，不建立第二桥或持久化副本。资产标题使用正式 title slot 固定显示记忆资产；光标规则仅匹配自有标题，不替换宿主拖动、停靠、关闭或缩放逻辑，正常 Body 不增加第二个关闭控件。
+新档案变更返回 `save_failed` 时，内存 snapshot/entry 可能已更新，UI 保留表单，工具要求先查询当前版本后明确重试，不假称回滚。同内容重试可写入未保存的 dirty 快照而不增加语义版本；历史关闭的正常内存变更仍视为成功。明确删除分别处理已保存副本及当前内存，仅删除选中条目及使引用失效，不顺带保存关闭历史后的其他临时编辑。
+
+实体/事实/关系编辑中或已缓存的条目被其他窗口删除后，保留未保存稿供复制，缺失 ID 禁止保存或重新绑定版本，不以旧稿复活已删除条目；仅本视图明确删除成功后清除对应草稿。
+
+记忆资产使用正式资源 Tab 与应用内浮窗。资源 URI 保留稳定 owner 与初始 topic，Body 同时核对 URI 与框架所属 Session；同 owner 复用既有窗口。原 Session 的公开 tab actions 打开资源，通过公开 navigation params 请求主题和关联会话，navigation revision 驱动重复导航；Body 核对主题与会话归属后选择并显示备注优先的会话标题。窗口内原生主题下拉可搜索全部所属主题（包括没有会话的保留档案），不改变翻译工作区选择。仅首次新建且其 Session 表面可见时使用公开 `float`；已有或恢复的停靠状态保持。翻译及资产 Tab 使用 `keepMounted`，已访问主题和分类隐藏时保持挂载，保留正文与人工编辑稿；明确关闭只释放视图，不删除资产或 dispose 共享 Store。复用唯一 SessionStore、TopicMemoryStore、TopicArchiveStore 与 TopicBridgeClient，不建立第二桥或持久化副本。资产标题使用正式 title slot 固定显示记忆资产；光标规则仅匹配自有标题，不替换宿主拖动、停靠、关闭或缩放逻辑，正常 Body 不增加第二个关闭控件。
 
 术语用户表单通过 `TopicMemoryStore.saveUserTerm` 一次保存即可建立 active/user_explicit；输入只含语义字段与预期档案/条目版本，Store 生成确认事件。原位编辑保留 id、createdAt、旧来源引用（转为 example），冲突/陈旧不覆盖；相同有效内容不升版本。新增在同一锁中构造 candidate v1→adopted v2，仅最终快照写入，保持既有 schema1 确认约束。模型 put/RPC 权限不扩大，历史开关与保存失败语义沿用原实现；记录译文编辑复用人工修订，不修改源文本或会话日志。
 
-资产导航提供译文记录与结构化档案（当前为术语），其他记忆、临时文件标为暂未开放。译文只投影现有 SessionStore 的源/当前 final；最新版本完整时显示为 candidate，不跳过新失败版本寻找旧成功。原文只读，归档可读但须恢复后编辑。人工保存复用原 API 追加候选，“设为最终”独立执行，不修改源或机器执行事实。分类和条目切换保留本视图草稿，明确关闭释放草稿，不持久化第二份编辑正文。
+资产导航提供译文记录与结构化档案，后者用“档案类型”切换术语/实体/事实/关系；其他记忆、临时文件暂未开放。实体/事实/关系用户表单复用 `TopicArchiveStore.saveUserEntry` 一次保存并采用，不扩展模型 put 权限；事实及关系候选实体来自同主题生效项。译文只投影 SessionStore 源/当前 final，最新完整版本为 candidate，不跳过新失败版本寻找旧成功。原文只读，归档可读但须恢复后编辑；人工保存追加候选，“设为最终”独立执行，不改源或机器事实。主题、分类、类型和条目切换保留视图草稿，关闭释放草稿，不持久化第二份编辑正文。
 
-资产列表搜索/状态筛选只改变视图，导出仍是完整快照。长列表与详情分别滚动，小屏单列；移动、resize、停靠委托宿主。当前支持应用内浮窗，Windows 原生子窗口仍需正式宿主入口；实际 DOM/拖拽/缩放/停靠验收必须另行记录。升级须重建并加载同版本 Client 注册，Host 协议与存储格式保持。
+资产列表搜索/状态筛选只改变视图，导出仍是完整快照。长列表与详情分别滚动，小屏单列；移动、resize、停靠委托宿主。当前支持应用内浮窗，Windows 原生子窗口仍需正式宿主入口；实际 DOM/拖拽/缩放/停靠验收必须另行记录。
 
 Native 集成测试需另外准备完整的 DSH `0.2.0-rc.2` 组件目录。除快译的 LLM、Session、Cordis、Gateway 和 ClientRemoteService 依赖外，主题工具入口还需 Agent、AgentLoop、ToolRuntime、SessionController、SystemPrompt、SessionProjection、SessionQuery 及其实际依赖；对应组件包含 `@deepseek-ai/dsh-agent`、`@deepseek-ai/dsh-agent-loop`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-api-session-controller` 等。使用同一完整组件树，不能以只含快译服务的精简目录代替。将 `DSH_RUNTIME_ROOT` 指向一个外部目录，其中包含 `dsh/node_modules/`，然后执行：
 
@@ -56,7 +62,7 @@ pnpm test:native
 - Client 本地模块仅引用 `src` 内的浏览器代码。外部依赖限 React 和已在目标版本 platform seed 中核实的 `@deepseek-ai/dsh-client-ui-primitives`，禁止引入 Node 宿主接口、文件访问、凭据或模型直调。
 - 新会话默认值与历史使用 Web `localStorage`，不视为 Host 配置。有效设置使用 `patchSettingsAsync` 即时按字段合并保存，与正文写入共用锁；不能用陈旧的整页表单覆盖其他窗口未修改的字段，也不能用旧保存回执清除用户的新编辑。
 - 历史保存默认关闭，启用后自动写入；关闭后保留旧历史、停止后续正文写入，已持久主题仍可保留无正文的身份与编号元数据。删除必须明确范围与确认，只清理插件命名空间；选删和清理全部都需冻结确认时的版本。
-- 会话删除默认保留共享主题术语，删除最后会话亦保留；明确勾选联动删除时，冻结会话及主题术语版本，在同一既有锁内先核对两个范围，再实际移除。提示同主题未选会话的影响，准确报告部分失败；不能默认扩大到未选主题或声称跨多项存储原子删除。
+- 会话删除默认保留共享主题术语，删除最后会话亦保留；明确勾选联动删除时，冻结会话及主题术语版本，在同一既有锁内先核对两个范围，再实际移除。实体/事实/关系不纳入该勾选或历史清理，须在资产视图独立明确删除。提示同主题未选会话的影响，准确报告部分失败；不能默认扩大到未选主题或声称跨多项存储原子删除。
 - 读取、保存、清理失败和多窗口冲突均保留当前输入并提示。部分清理失败须报告准确范围，不将 localStorage 比较写入宣称为原子事务。
 - 从“+”创建的主题首会话冻结设置默认值；同主题子会话复制父会话的模式、目标语言、要求、单次上限及模型选择，输入为空。原文上限按 Unicode 码点计算，不写成 token 数。模型选择使用主窗口同一目录 RPC 和原生菜单组件，但只更新独立翻译会话，不调用主聊天的 selectModel。
 - 主题 ID、主题名、会话 ID、固定序号及独立备注分别管理。同主题编号只递增，不从存活会话数量重新计算；主题重命名联动显示名，备注不参与命名和执行要求。会话档位只允许 quick 升 normal。

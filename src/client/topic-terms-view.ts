@@ -66,10 +66,11 @@ function mutationMessage(result: TermMutationResult): true | string {
   if (result.status === 'invalid') return '术语内容或来源无效，未修改此条目。'
   return result.status === 'updated' || result.status === 'unchanged' ? true : '操作未完成，请核对后重试。'
 }
-export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect }: {
+export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect, hideExport = false }: {
   readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly ownerId: string; readonly topicId: string; readonly topicName: string
   readonly onDelete: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>; readonly onExport: (result: TopicTermsExport) => void
   readonly bridgeReason?: string | undefined; readonly onReconnect?: (() => void) | undefined
+  readonly hideExport?: boolean | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => terms.subscribe(() => refresh(value => value + 1)), [terms])
@@ -143,12 +144,12 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
     h('div', { className: 'dsh-tp-asset-toolbar' },
       h('div', { className: 'dsh-tp-unit-header' }, h('h3', null, '主题术语'), h('div', { className: 'dsh-tp-actions' },
         h('button', { type: 'button', disabled: pending || Boolean(form), onClick: () => startEdit() }, '新增术语'),
-        h('button', { type: 'button', onClick: () => exportTerms('json') }, '导出 JSON'), h('button', { type: 'button', onClick: () => exportTerms('markdown') }, '导出 Markdown'))),
+        hideExport ? null : h('button', { type: 'button', onClick: () => exportTerms('json') }, '导出 JSON'), hideExport ? null : h('button', { type: 'button', onClick: () => exportTerms('markdown') }, '导出 Markdown'))),
       h('div', { className: 'dsh-tp-asset-filters' },
         h('input', { type: 'search', 'aria-label': '搜索术语', placeholder: '搜索术语', value: query, onChange: (event: { currentTarget: { value: string } }) => setQuery(event.currentTarget.value) }),
         h('select', { 'aria-label': '术语状态', value: status, onChange: (event: { currentTarget: { value: string } }) => setStatus(event.currentTarget.value) },
           h('option', { value: 'all' }, '全部状态'), ...Object.entries(labels).map(([value, label]) => h('option', { key: value, value }, label)))),
-      h('small', { className: 'dsh-tp-muted' }, '同主题共用；快译不使用。导出仅现有术语快照，不提炼或整理，不含来源正文和主聊天。'),
+      h('small', { className: 'dsh-tp-muted' }, hideExport ? '同主题共用；快译不使用。' : '同主题共用；快译不使用。导出仅现有术语快照，不提炼或整理，不含来源正文和主聊天。'),
       h('small', { className: 'dsh-tp-muted' }, sessions.getSettings().rememberHistory ? '已开启历史保存；主题术语保存在此设备。' : '已保存的术语保留；后续修改仅保留在本次运行。'),
       snapshot.version > 0 ? h('div', { className: 'dsh-tp-muted' }, h('time', { dateTime: snapshot.updatedAt }, `档案更新于 ${new Date(snapshot.updatedAt).toLocaleString()}`)) : null,
       bridgeReason ? h('small', { role: 'status', className: 'dsh-tp-muted' }, bridgeReason) : null,

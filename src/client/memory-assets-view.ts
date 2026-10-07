@@ -8,16 +8,20 @@ import type { SessionStore } from './session-store.js'
 import type { QuickTranslationClient } from './quick-translation.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
 import type { TopicTerm, TopicTermSnapshot } from '../memory/topic-terms.js'
-import type { TopicTermsExport } from './topic-terms-export.js'
+import { resolveTermEvidence, type TermEvidenceRef } from '../memory/topic-terms.js'
+import { buildTopicArchiveJsonExport, buildTopicArchiveMarkdownExport, type TopicArchiveExportSnapshot } from './topic-archive-export.js'
+import type { TopicArchiveStore } from './topic-archive-store.js'
+import { TopicArchiveView } from './topic-archive-view.js'
 
 interface MemoryAssetsProps {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
+  readonly archive: TopicArchiveStore
   readonly topics?: TopicBridgeClient | undefined; readonly ownerId: string; readonly topicId: string
   readonly onDeleteTerm: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, quick, topics, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
@@ -68,18 +72,36 @@ export function MemoryAssetsView({ store, terms, quick, topics, ownerId, topicId
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: id, className: 'dsh-tp-assets-topic', hidden: id !== selection.topicId },
-        h(MemoryAssetsTopicView, { store, terms, quick, topics, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm })) : null
+        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm })) : null
     }),
     topic ? null : h('p', { className: 'dsh-tp-message', role: 'status' }, '此主题不可用，请选择其他主题。'),
   )
 }
 
-function MemoryAssetsTopicView({ store, terms, quick, topics, ownerId, topicId, topicName, onDeleteTerm }: MemoryAssetsProps & { readonly topicName: string }): unknown {
+function MemoryAssetsTopicView({ store, terms, archive, quick, topics, ownerId, topicId, topicName, onDeleteTerm }: MemoryAssetsProps & { readonly topicName: string }): unknown {
   const [category, setCategory] = react.useState<'terms' | 'translations'>('terms')
+  const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
-  function deliver(result: TopicTermsExport): void {
-    try { downloadExport(result); setExportNotice({ message: '已向浏览器发起下载。', failure: false }) }
-    catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
+  function exportArchive(format: 'json' | 'markdown'): void {
+    try {
+      const frozen = structuredClone({ terms: terms.getSnapshot(ownerId, topicId), archive: archive.getSnapshot(ownerId, topicId) })
+      function availability(snapshot: { readonly ownerId: string; readonly topicId: string; readonly entries: readonly { readonly id: string; readonly evidence: readonly TermEvidenceRef[] }[] }) {
+        return snapshot.entries.flatMap(entry => entry.evidence.map((ref, evidenceIndex) => {
+          const candidate = store.getSession(ref.sessionId)
+          const session = candidate?.ownerId === ownerId && candidate.topicId === topicId && !store.isSessionDeleted(candidate.id) ? candidate : undefined
+          const unit = session ? store.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined
+          const revision = unit?.revisions.find(revision => revision.id === ref.revisionId)
+          return { entryId: entry.id, evidenceIndex, sessionName: session?.name ?? null, unitOrder: unit?.order ?? null, revisionOrder: revision?.order ?? null,
+            readable: resolveTermEvidence(snapshot, ref, (sessionId, unitId) => terms.readEvidence(sessionId, unitId)) !== undefined }
+        }))
+      }
+      const input: TopicArchiveExportSnapshot = { ...frozen, topicName: store.getTopics(ownerId).find(topic => topic.id === topicId)?.name ?? topicName,
+        exportedAt: new Date().toISOString(), rememberHistory: store.getSettings().rememberHistory,
+        termsStorageStatus: terms.getStatus(ownerId, topicId), archiveStorageStatus: archive.getStatus(ownerId, topicId),
+        termEvidenceAvailability: availability(frozen.terms), archiveEvidenceAvailability: availability(frozen.archive) }
+      downloadExport(format === 'json' ? buildTopicArchiveJsonExport(input) : buildTopicArchiveMarkdownExport(input))
+      setExportNotice({ message: '已向浏览器发起下载。', failure: false })
+    } catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
   }
   return h('div', { className: 'dsh-tp-assets-body' },
       h('nav', { className: 'dsh-tp-assets-nav', 'aria-label': '资产分类' },
@@ -90,10 +112,23 @@ function MemoryAssetsTopicView({ store, terms, quick, topics, ownerId, topicId, 
       h('div', { className: 'dsh-tp-assets-content' },
         // Visited topics and both categories stay mounted to retain local edit drafts.
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'terms' },
-          h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName,
-            onDelete: onDeleteTerm, onExport: deliver, bridgeReason: topics?.getStatus(ownerId).reason,
-            onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined }),
-          exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null),
+          h('div', { className: 'dsh-tp-structured' },
+            h('div', { className: 'dsh-tp-archive-toolbar' },
+              h('div', { className: 'dsh-tp-unit-header' },
+                h('select', { 'aria-label': '档案类型', value: kind, onChange: (event: { currentTarget: { value: string } }) => {
+                  const value = event.currentTarget.value
+                  if (value === 'terms' || value === 'entity' || value === 'fact' || value === 'relation') setKind(value)
+                } }, h('option', { value: 'terms' }, '术语'), h('option', { value: 'entity' }, '实体'), h('option', { value: 'fact' }, '事实'), h('option', { value: 'relation' }, '关系')),
+                h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', onClick: () => exportArchive('json') }, '导出 JSON'),
+                  h('button', { type: 'button', onClick: () => exportArchive('markdown') }, '导出 Markdown'))),
+              h('small', { className: 'dsh-tp-muted' }, '导出当前主题全部档案，不受筛选影响。'),
+              exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null),
+            h('div', { className: 'dsh-tp-assets-module', hidden: kind !== 'terms' },
+              h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName, hideExport: true,
+                onDelete: onDeleteTerm, onExport: () => {}, bridgeReason: topics?.getStatus(ownerId).reason,
+                onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined })),
+            ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
+              h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type }))))),
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
           h(MemoryTranslationRecordsView, { store, quick, ownerId, topicId }))))
 }

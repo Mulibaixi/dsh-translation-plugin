@@ -232,8 +232,8 @@ test('资产UI：搜索语义字段/状态仅筛列表，导出保持完整快�
     await f.ui.input('术语状态', 'active'); assert.match(f.ui.text(), /没有匹配的术语/)
     await f.ui.click('导出 JSON')
     const exported = JSON.parse(await f.app.downloads.at(-1).blob.text())
-    assert.equal(exported.snapshot.entries.length, 2)
-    assert.equal(exported.snapshot.updatedAt, before.updatedAt)
+    assert.equal(exported.terms.entries.length, 2)
+    assert.equal(exported.terms.updatedAt, before.updatedAt)
     assert.deepEqual(await snapshot(f), before)
     assert.equal(f.quick.calls.length, 0)
   } finally { await f.app.dispose() }

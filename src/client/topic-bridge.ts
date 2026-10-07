@@ -3,6 +3,7 @@ import {
   type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact, type TopicSessionSummary,
 } from '../shared/topic-bridge.js'
 import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceRef, TopicTermQuery } from '../memory/topic-terms.js'
+import type { TopicArchiveSnapshot, TopicArchivePut, ArchiveMutationResult, TopicArchiveQuery } from '../memory/topic-archive.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 
@@ -17,6 +18,11 @@ export interface TopicBridgeTermsPort {
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot
   query(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): TopicTermSnapshot
   apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicTermPut }): Promise<TermMutationResult>
+}
+export interface TopicBridgeArchivePort {
+  getSnapshot(ownerId: string, topicId: string): TopicArchiveSnapshot
+  query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot
+  apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicArchivePut }): Promise<ArchiveMutationResult>
 }
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
 interface Connection {
@@ -39,7 +45,7 @@ export class TopicBridgeClient {
   private readonly stopStore: () => void
   private disposed = false
   constructor(private readonly remote: TopicBridgeRemotePort | (() => Promise<TopicBridgeRemotePort | undefined>) | undefined,
-    private readonly sessions: SessionStore, private readonly terms: TopicBridgeTermsPort) {
+    private readonly sessions: SessionStore, private readonly terms: TopicBridgeTermsPort, private readonly archive: TopicBridgeArchivePort) {
     this.stopStore = sessions.subscribe(() => this.reconcile())
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
@@ -142,6 +148,15 @@ export class TopicBridgeClient {
       if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不属于当前主会话或不存在。')
       return success({ kind: 'terms', snapshot: this.terms.getSnapshot(ownerId, command.topicId) })
     }
+    if (command.kind === 'list_topic_archive' || command.kind === 'upsert_archive') {
+      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不属于当前主会话或不存在。')
+      if (command.kind === 'list_topic_archive') return success({ kind: 'archive', snapshot: this.archive.getSnapshot(ownerId, command.topicId) })
+      if (!command.entry.evidence.every(ref => this.publishedEvidence(ownerId, command.topicId, ref))) return error(request.requestId, 'reference_not_published', '档案依据不在用户明确提供的历史范围中。')
+      const result = await this.archive.apply(ownerId, command.topicId, command.expectedVersion, { kind: 'put', input: command.entry })
+      if (result.status === 'save_failed') return error(request.requestId, result.status, '当前档案内容可能已更新但未保存，请先查询当前版本后明确重试。')
+      if (result.status !== 'updated' && result.status !== 'unchanged') return error(request.requestId, result.status, '档案提交未完成，请核对当前版本及依据。')
+      return success({ kind: 'archive', snapshot: result.snapshot })
+    }
     if (command.kind === 'create_session') {
       const result = await this.sessions.createManagedSessionAsync(ownerId, command.start)
       return result.ok ? success({ kind: 'session_created', session: this.sessionSummary(result.sessions[0]!), reason: command.reason, persistence: result.persistence })
@@ -176,6 +191,10 @@ export class TopicBridgeClient {
         const snapshot = this.terms.query(ownerId, session.topicId, { mode: session.mode, sourceLanguage: command.sourceLanguage,
           targetLanguage: command.targetLanguage, forms: command.forms })
         return success({ kind: 'terms_query', snapshot })
+      }
+      case 'query_archive': {
+        const snapshot = this.archive.query(ownerId, session.topicId, { mode: session.mode, kinds: command.kinds, forms: command.forms })
+        return success({ kind: 'archive_query', snapshot })
       }
       case 'upsert_term': {
         if (!command.entry.evidence.every(ref => this.publishedEvidence(ownerId, session.topicId, ref))) return error(request.requestId, 'reference_not_published', '术语依据不在用户明确提供的历史范围中。')

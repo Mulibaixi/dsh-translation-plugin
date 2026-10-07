@@ -1,4 +1,5 @@
 import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot } from '../memory/topic-terms.js'
+import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
@@ -51,12 +52,16 @@ export type TopicBridgeCommand =
   | { readonly kind: 'list_terms'; readonly translationSessionId: string }
   | { readonly kind: 'query_terms'; readonly translationSessionId: string; readonly sourceLanguage: string | null; readonly targetLanguage: string; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_term'; readonly translationSessionId: string; readonly expectedVersion: number; readonly entry: TopicTermPut }
+  | { readonly kind: 'list_topic_archive'; readonly topicId: string }
+  | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
+  | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
   | { readonly kind: 'sessions'; readonly sessions: readonly TopicSessionSummary[]; readonly persistence?: TopicPersistence }
   | { readonly kind: 'topics'; readonly topics: readonly TopicSummary[] }
   | { readonly kind: 'session_created'; readonly session: TopicSessionSummary; readonly reason: string; readonly persistence: TopicPersistence }
   | { readonly kind: 'unit'; readonly unit: TopicUnitFact }
   | { readonly kind: 'terms' | 'terms_query'; readonly snapshot: TopicTermSnapshot }
+  | { readonly kind: 'archive' | 'archive_query'; readonly snapshot: TopicArchiveSnapshot }
 export interface TopicBridgeRequest {
   readonly kind: 'request'
   readonly requestId: string
@@ -104,7 +109,7 @@ export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
   object(value)
   switch (value.kind) {
       case 'list_sessions': case 'list_topics': exact(value, ['kind']); break
-      case 'list_topic_terms': exact(value, ['kind', 'topicId']); text(value.topicId); break
+      case 'list_topic_terms': case 'list_topic_archive': exact(value, ['kind', 'topicId']); text(value.topicId); break
       case 'create_session': {
         exact(value, ['kind', 'start', 'reason']); content(value.reason, 1000); object(value.start)
         switch (value.start.kind) {
@@ -133,6 +138,17 @@ export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
         const entry = decodeTopicTermPut(value.entry)
         if (!entry) throw new TypeError('Invalid model term proposal')
         return { kind: 'upsert_term', translationSessionId: value.translationSessionId, expectedVersion: value.expectedVersion, entry }
+      }
+      case 'query_archive':
+        exact(value, ['kind', 'translationSessionId', 'kinds', 'forms']); text(value.translationSessionId)
+        strings(value.kinds, 20, 3); strings(value.forms, 500, 100)
+        if (value.kinds.some(kind => !['entity', 'fact', 'relation'].includes(kind))) throw new TypeError('Invalid topic archive kinds')
+        break
+      case 'upsert_archive': {
+        exact(value, ['kind', 'topicId', 'expectedVersion', 'entry']); text(value.topicId); integer(value.expectedVersion)
+        const entry = decodeTopicArchivePut(value.entry)
+        if (!entry) throw new TypeError('Invalid model archive proposal')
+        return { kind: 'upsert_archive', topicId: value.topicId, expectedVersion: value.expectedVersion, entry }
       }
       default: throw new TypeError('Unknown topic bridge command')
   }
@@ -197,6 +213,12 @@ function parseValue(value: unknown): TopicBridgeValue {
       exact(value, ['kind', 'snapshot'])
       const snapshot = decodeTopicTermSnapshot(value.snapshot)
       if (!snapshot || (value.kind === 'terms_query' && snapshot.entries.some(entry => entry.status !== 'active'))) throw new TypeError('Invalid topic terms reply')
+      return { kind: value.kind, snapshot }
+    }
+    case 'archive': case 'archive_query': {
+      exact(value, ['kind', 'snapshot'])
+      const snapshot = (value.kind === 'archive_query' ? decodeTopicArchiveQuerySnapshot : decodeTopicArchiveSnapshot)(value.snapshot)
+      if (!snapshot) throw new TypeError('Invalid topic archive reply')
       return { kind: value.kind, snapshot }
     }
     default: throw new TypeError('Unknown topic bridge reply')

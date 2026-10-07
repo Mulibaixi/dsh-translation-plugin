@@ -4,17 +4,20 @@ import { createTopicToolsNativeFixture, waitTopicReady } from '../tests/topic-to
 import { SessionStore } from '../dist/client/session-store.js'
 import { DEFAULT_SESSION_SETTINGS, SETTINGS_KEY } from '../dist/client/sessions.js'
 import { TopicMemoryStore } from '../dist/client/topic-memory-store.js'
+import { TopicArchiveStore } from '../dist/client/topic-archive-store.js'
 import { appendTextUnit, selectFinalRevision } from '../dist/client/translation-history.js'
 
 const runtimeRoot = process.env.DSH_RUNTIME_ROOT
 if (!runtimeRoot) throw new Error('DSH_RUNTIME_ROOT is required with the installed Agent/Tools/SessionController and Gateway components')
 const at = '2026-10-06T00:00:00.000Z', mainId = 'synthetic-topic-main', otherId = 'synthetic-topic-neighbor'
 const toolNames = ['translation_list_sessions', 'translation_list_topics', 'translation_create_session', 'translation_rename_topic', 'translation_set_session_remark',
-  'translation_archive_session', 'translation_read_unit', 'translation_list_terms', 'translation_query_terms', 'translation_upsert_term']
+  'translation_archive_session', 'translation_read_unit', 'translation_list_terms', 'translation_query_terms', 'translation_upsert_term',
+  'translation_list_topic_archive', 'translation_query_archive', 'translation_upsert_archive']
 function browser(ownerId = mainId) {
   const sessions = new SessionStore(), session = sessions.createSession(ownerId)
   const terms = new TopicMemoryStore(sessions)
-  return { sessions, session, terms, close() { terms.dispose(); sessions.dispose() } }
+  const archive = new TopicArchiveStore(sessions, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
+  return { sessions, session, terms, archive, close() { archive.dispose(); terms.dispose(); sessions.dispose() } }
 }
 async function execute(f, agent, name, args = {}, callId = `synthetic-${name}`) {
   return f.host.ctx.tools.execute({ agent, name, arguments: args, callId, signal: new AbortController().signal })
@@ -31,15 +34,19 @@ function put(sessionId, edits = {}) {
     sourceLanguage: 'English', targetLanguage: '中文', sourceForms: ['API'], aliases: ['interface'], sense: 'Synthetic interface', preferred: '接口', forbidden: [],
     origin: 'inferred', status: 'proposal', evidence: [], ...edits } }
 }
+function archivePut(topicId, edits = {}, expectedVersion = 0) {
+  return { topicId, expectedVersion, entry: { kind: 'entity', id: 'native-archive-entity', expectedEntryVersion: null,
+    name: 'API', aliases: ['interface'], description: 'Synthetic archive entity', origin: 'inferred', status: 'proposal', evidence: [], ...edits } }
+}
 
-test('Native Agent/Tools + ClientRemoteService/Gateway：十工具真实注册、metadata双向回执与邻Agent隔离，断开卸载', async () => {
+test('Native Agent/Tools + ClientRemoteService/Gateway：十三工具真实注册、metadata双向回执与邻Agent隔离，断开卸载', async () => {
   const f = await createTopicToolsNativeFixture({ runtimeRoot }), b = browser()
   let main, neighbor, release
   try {
     main = await f.createAgent(mainId); neighbor = await f.createAgent(otherId)
     assert.equal((await f.client.remote.translationQuick.capabilities()).value.ok, true, 'combined mount retains the Quick namespace')
     assert.equal((await f.client.remote.translationQuick.open({ localSessionId: 'synthetic-coexisting-quick', maxSourceCodePoints: 100 })).value.ok, true)
-    const bridge = f.bridge(b.sessions, b.terms); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
+    const bridge = f.bridge(b.sessions, b.terms, b.archive); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
     const schema = f.host.ctx.tools.schemas(main.agent).filter(item => item.name.startsWith('translation_'))
     assert.deepEqual(new Set(schema.map(item => item.name)), new Set(toolNames))
     assert.equal(f.host.ctx.tools.schemas(neighbor.agent).filter(item => item.name.startsWith('translation_')).length, 0)
@@ -71,7 +78,7 @@ test('Native主模型真实tool-call→Client权威：历史需显式公开，ac
   let main, release
   try {
     main = await f.createAgent(mainId); history(b.sessions, b.session.id); b.sessions.updateSession(b.session.id, { mode: 'normal', input: 'Unpublished current draft' })
-    const bridge = f.bridge(b.sessions, b.terms); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
+    const bridge = f.bridge(b.sessions, b.terms, b.archive); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
     const undisclosed = await execute(f, main.agent, 'translation_read_unit', { translationSessionId: b.session.id, unitId: 'synthetic-unit' })
     assert.equal(undisclosed.isError, true)
     assert.equal(bridge.publishUnit(mainId, b.session.id, 'synthetic-unit'), true)
@@ -122,13 +129,13 @@ test('Native Session metadata可在Agent存在前绑定，created补装；同主
   const session = f.host.ctx.sessions.prepare(mainId), detach = f.host.ctx.sessions.enter(session)
   f.host.ctx.sessions.announce(session)
   try {
-    const bridge = f.bridge(b.sessions, b.terms); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
+    const bridge = f.bridge(b.sessions, b.terms, b.archive); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
     assert.equal(f.host.ctx.agents.get(mainId), undefined); assert.equal(f.host.provider.calls.length, 0)
     const duplicate = f.remote.connect({ ownerId: mainId, mainSessionId: mainId })
     await assert.rejects(duplicate[Symbol.asyncIterator]().next(), /占用/)
     duplicate.dispose(); detach()
     main = await f.createAgent(mainId)
-    assert.equal(f.host.ctx.tools.schemas(main.agent).filter(item => item.name.startsWith('translation_')).length, 10)
+    assert.equal(f.host.ctx.tools.schemas(main.agent).filter(item => item.name.startsWith('translation_')).length, 13)
     assert.equal((await execute(f, main.agent, 'translation_list_sessions')).isError, false)
     release(); release = undefined
     for (let i = 0; i < 100 && f.host.ctx.tools.schemas(main.agent).some(item => item.name.startsWith('translation_')); i++) await new Promise(resolve => setTimeout(resolve, 5))
@@ -158,12 +165,12 @@ test('Native Gateway strict uplink拒绝任意配置，未确认写结束unknown
   } finally { handle?.dispose(); await main?.dispose(); await f.close() }
 })
 
-test('Native PTC呈现：真实perAgent SDK含十工具，主模型仅见run_code入口，邻Agent不包含管理SDK', async () => {
+test('Native PTC呈现：真实perAgent SDK含十三工具，主模型仅见run_code入口，邻Agent不包含管理SDK', async () => {
   const f = await createTopicToolsNativeFixture({ runtimeRoot }), b = browser()
   let main, neighbor, release, presentation
   try {
     main = await f.createAgent(mainId); neighbor = await f.createAgent(otherId)
-    const bridge = f.bridge(b.sessions, b.terms); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
+    const bridge = f.bridge(b.sessions, b.terms, b.archive); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
     // Presentation-only metadata. No pretend code execution or substitute PTC backend is used.
     f.host.ctx.provide('ptcRuntime', { language: 'typescript' })
     presentation = main.agent.ctx.tools.presentAs('ptc')
@@ -187,7 +194,7 @@ test('Native管理工具：三创建分支、CAS与runtime_only回执真实过�
   try {
     main = await f.createAgent(mainId)
     b.sessions.updateSession(b.session.id, { mode: 'normal', input: 'Private managed-session draft', instruction: 'Private translation requirements' })
-    const active = b.sessions.getActiveSession(mainId).id, bridge = f.bridge(b.sessions, b.terms)
+    const active = b.sessions.getActiveSession(mainId).id, bridge = f.bridge(b.sessions, b.terms, b.archive)
     release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
     const topics = await execute(f, main.agent, 'translation_list_topics')
     assert.equal(topics.isError, false); assert.deepEqual(topics.value.topics[0].sessionIds, [b.session.id])
@@ -238,7 +245,7 @@ test('Native主模型真实create_session tool-call：准确start/reason与实�
   let main, release
   try {
     main = await f.createAgent(mainId)
-    const bridge = f.bridge(b.sessions, b.terms); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
+    const bridge = f.bridge(b.sessions, b.terms, b.archive); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
     const active = b.sessions.getActiveSession(mainId).id
     const args = { start: { kind: 'parent_session', translationSessionId: b.session.id }, reason: 'Continue the user-assigned synthetic same-topic task' }
     let calls = 0
@@ -276,12 +283,13 @@ test('Native管理保存回执：saved须实际落盘，保存失败返回error�
     setItem(key, value) { if (failWrite) throw new Error('synthetic quota'); values.set(key, value) }, removeItem: key => values.delete(key) }
   const locks = { request: async (_name, action) => await action() }
   const sessions = new SessionStore(storage, undefined, locks), terms = new TopicMemoryStore(sessions, storage, undefined, locks)
+  const archive = new TopicArchiveStore(sessions, (sessionId, unitId) => terms.readEvidence(sessionId, unitId), storage, undefined, locks)
   const f = await createTopicToolsNativeFixture({ runtimeRoot })
   let main, release
   try {
     const parent = await sessions.createSessionAsync(mainId)
     main = await f.createAgent(mainId)
-    const bridge = f.bridge(sessions, terms); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
+    const bridge = f.bridge(sessions, terms, archive); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
     const created = await execute(f, main.agent, 'translation_create_session', { start: { kind: 'parent_session', translationSessionId: parent.id }, reason: 'Synthetic persisted same-topic task' })
     assert.equal(created.isError, false); assert.equal(created.value.persistence, 'saved')
     const id = created.value.session.id
@@ -297,5 +305,75 @@ test('Native管理保存回执：saved须实际落盘，保存失败返回error�
     assert.equal(listed.isError, false); assert.equal(listed.value.sessions.find(item => item.id === id).remark, sessions.getSession(id).remark)
     assert.ok(![...values.values()].some(raw => raw.includes('Synthetic unsaved remark')))
     assert.equal(f.host.provider.calls.length, 0)
-  } finally { failWrite = false; release?.(); await main?.dispose(); await f.close(); terms.dispose(); sessions.dispose() }
+  } finally { failWrite = false; release?.(); await main?.dispose(); await f.close(); archive.dispose(); terms.dispose(); sessions.dispose() }
+})
+
+test('Native档案三工具与AgentLoop：所属范围、quick空检索、关系子集回执、用户采用保护和孤立主题', async () => {
+  const f = await createTopicToolsNativeFixture({ runtimeRoot }), b = browser()
+  let main, release
+  try {
+    main = await f.createAgent(mainId)
+    const quick = b.sessions.createSession(mainId, b.session.id)
+    history(b.sessions, b.session.id); b.sessions.updateSession(b.session.id, { mode: 'normal', input: 'Unpublished current archive draft' })
+    const bridge = f.bridge(b.sessions, b.terms, b.archive); release = bridge.retain(mainId); await waitTopicReady(bridge, mainId, f.carrierErrors)
+    const source = { kind: 'source', sessionId: b.session.id, unitId: 'synthetic-unit', revisionId: null, selectionEventId: null, range: null, role: 'basis' }
+    const checked = archivePut(b.session.topicId, { origin: 'source_checked', status: 'active', evidence: [source] })
+    assert.equal((await execute(f, main.agent, 'translation_upsert_archive', checked)).isError, true)
+    assert.equal(bridge.publishUnit(mainId, b.session.id, 'synthetic-unit'), true)
+    const first = await execute(f, main.agent, 'translation_upsert_archive', checked)
+    assert.equal(first.isError, false); assert.equal(first.value.snapshot.entries[0].status, 'active')
+    const second = await execute(f, main.agent, 'translation_upsert_archive', archivePut(b.session.topicId,
+      { id: 'native-archive-second', name: 'DSH', aliases: [], origin: 'source_checked', status: 'active', evidence: [source] }, first.value.snapshot.version))
+    assert.equal(second.isError, false)
+    const relationEntry = { kind: 'relation', id: 'native-archive-relation', expectedEntryVersion: null, sourceEntityId: 'native-archive-entity',
+      relation: 'uses', targetEntityId: 'native-archive-second', description: 'Synthetic relation', origin: 'source_checked', status: 'active', evidence: [source] }
+    const relation = await execute(f, main.agent, 'translation_upsert_archive', { topicId: b.session.topicId, expectedVersion: second.value.snapshot.version, entry: relationEntry })
+    assert.equal(relation.isError, false)
+    const queryArgs = { translationSessionId: b.session.id, kinds: ['relation'], forms: ['API'] }
+    const selected = await execute(f, main.agent, 'translation_query_archive', queryArgs)
+    assert.equal(selected.isError, false); assert.equal(selected.value.kind, 'archive_query')
+    assert.deepEqual(selected.value.snapshot.entries.map(entry => entry.id), ['native-archive-relation'])
+    assert.equal((await execute(f, main.agent, 'translation_query_archive', { ...queryArgs, translationSessionId: quick.id })).value.snapshot.entries.length, 0)
+    assert.equal((await execute(f, main.agent, 'translation_query_archive', { ...queryArgs, mode: 'normal' })).isError, true)
+    const foreign = b.sessions.createSession(otherId)
+    assert.equal((await execute(f, main.agent, 'translation_list_topic_archive', { topicId: foreign.topicId })).isError, true)
+    assert.equal((await execute(f, main.agent, 'translation_upsert_archive', archivePut(foreign.topicId))).isError, true)
+    const fixed = await b.archive.apply(mainId, b.session.topicId, relation.value.snapshot.version,
+      { kind: 'adopt', id: 'native-archive-entity', expectedEntryVersion: first.value.snapshot.entries[0].version })
+    assert.equal(fixed.status, 'updated')
+    const entity = fixed.snapshot.entries.find(entry => entry.id === 'native-archive-entity')
+    const overwritten = await execute(f, main.agent, 'translation_upsert_archive', archivePut(b.session.topicId,
+      { expectedEntryVersion: entity.version, name: 'Model overwrite' }, fixed.snapshot.version))
+    assert.equal(overwritten.isError, true); assert.equal(b.archive.getSnapshot(mainId, b.session.topicId).entries.find(entry => entry.id === entity.id).name, 'API')
+    assert.equal(f.host.provider.calls.length, 0)
+
+    let calls = 0
+    f.host.provider.stream = async function* (options) {
+      this.calls.push(options); calls++
+      if (calls === 1) {
+        const call = { type: 'tool-call', id: 'native-archive-model-call', name: 'translation_query_archive', arguments: JSON.stringify(queryArgs) }
+        yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+        yield { type: 'tool-call-delta', index: 0, id: call.id, name: call.name, argumentsDelta: call.arguments }
+        yield { type: 'block-end', index: 0, block: call }
+      } else {
+        yield { type: 'block-start', index: 0, blockType: 'text' }; yield { type: 'text-delta', index: 0, text: 'Synthetic archive lookup complete' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Synthetic archive lookup complete' } }
+      }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+    main.agent.followup({ content: [{ type: 'text', text: 'Synthetic scoped archive lookup' }], source: { kind: 'user' } })
+    await main.agent.whenIdle()
+    assert.equal(calls, 2); assert.ok(f.requests.some(request => request.callId === 'native-archive-model-call' && request.command.kind === 'query_archive'))
+    assert.ok(JSON.stringify(f.host.provider.calls[1].messages).includes('native-archive-relation'))
+    assert.ok(!JSON.stringify(f.host.provider.calls).includes('Unpublished current archive draft'))
+    assert.equal(bridge.getStatus(mainId).ready, true)
+
+    await b.sessions.deleteHistoryAsync([b.session.id, quick.id])
+    const orphan = await execute(f, main.agent, 'translation_list_topic_archive', { topicId: b.session.topicId })
+    assert.equal(orphan.isError, false); assert.equal(orphan.value.snapshot.entries.length, 3)
+    const added = await execute(f, main.agent, 'translation_upsert_archive', archivePut(b.session.topicId,
+      { id: 'native-orphan-proposal', name: 'Orphan proposal' }, orphan.value.snapshot.version))
+    assert.equal(added.isError, false); assert.equal(added.value.snapshot.entries.at(-1).status, 'proposal')
+    assert.equal(b.sessions.getAvailableSessions(mainId).length, 0)
+  } finally { release?.(); await main?.dispose(); await f.close(); b.close() }
 })

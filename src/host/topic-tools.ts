@@ -41,6 +41,20 @@ const termFields = {
     role: { type: 'string', enum: ['basis', 'example'], required: true },
   } }, required: true },
 }
+const archiveKinds = ['entity', 'fact', 'relation'] as const
+const archiveFields = {
+  id: termFields.id, expectedEntryVersion: termFields.expectedEntryVersion, origin: termFields.origin,
+  status: termFields.status, evidence: termFields.evidence,
+}
+const archiveEntryParameter = { required: true, oneOf: [
+  { type: 'object', additionalProperties: false, properties: { ...archiveFields, kind: { type: 'string', enum: ['entity'], required: true },
+    name: { type: 'string', required: true }, aliases: termFields.aliases, description: { type: 'string', required: true } } },
+  { type: 'object', additionalProperties: false, properties: { ...archiveFields, kind: { type: 'string', enum: ['fact'], required: true },
+    title: { type: 'string', required: true }, body: { type: 'string', required: true }, entityIds: { type: 'array', items: { type: 'string' }, required: true } } },
+  { type: 'object', additionalProperties: false, properties: { ...archiveFields, kind: { type: 'string', enum: ['relation'], required: true },
+    sourceEntityId: { type: 'string', required: true }, relation: { type: 'string', required: true }, targetEntityId: { type: 'string', required: true },
+    description: { type: 'string', required: true } } },
+] }
 
 function hostToolLoader(ctx: TopicHostContext): TopicToolLoader {
   return async () => {
@@ -89,7 +103,8 @@ class ManagementConnection {
     if (!pending || reply.requestId !== pending.frame.requestId) throw bridgeError('invalid_reply', '主题管理回执与请求不一致。')
     if (reply.ok) {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
-        set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms' }[pending.frame.command.kind]
+        set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
+        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -175,6 +190,12 @@ export class TopicToolsService {
       { name: 'translation_list_terms', kind: 'list_terms', parameters: { translationSessionId: { type: 'string', description: sessionParameter.description }, topicId: { type: 'string', description: topicParameter.description } }, description: 'Read owned topic terminology, status, versions and evidence references. Supply exactly one translationSessionId or topicId; a topic id also works after its last Session was deleted. Source bodies are not included.' },
       { name: 'translation_query_terms', kind: 'query_terms', parameters: { translationSessionId: sessionParameter, sourceLanguage: termFields.sourceLanguage, targetLanguage: termFields.targetLanguage, forms: { type: 'array', items: { type: 'string' }, required: true } }, description: 'Select active topic terms by exact source language, target language and explicit forms or aliases. Invalid or outdated basis is excluded.' },
       { name: 'translation_upsert_term', kind: 'upsert_term', parameters: { translationSessionId: sessionParameter, expectedVersion: { type: 'integer', required: true }, entry: { type: 'object', additionalProperties: false, properties: termFields, required: true } }, description: 'Propose or source-check one topic term against the observed topic/entry versions. Source evidence must have been explicitly published. Cannot create user confirmation or rewrite a user-adopted rule.' },
+      { name: 'translation_list_topic_archive', kind: 'list_topic_archive', parameters: { topicId: topicParameter }, description: 'Read entity, fact and relation entries, statuses, versions and evidence references for one owned topic, including a retained topic without translation Sessions. Does not include source bodies or drafts.' },
+      { name: 'translation_query_archive', kind: 'query_archive', parameters: { translationSessionId: sessionParameter,
+        kinds: { type: 'array', items: { type: 'string', enum: archiveKinds }, required: true }, forms: { type: 'array', items: { type: 'string' }, required: true } },
+        description: 'Select active topic archive entries by explicit exact names, aliases, titles or relation forms. The translation Session fixes owner, topic and actual mode; Quick returns no entries. Outdated basis and unavailable entity references are excluded.' },
+      { name: 'translation_upsert_archive', kind: 'upsert_archive', parameters: { topicId: topicParameter, expectedVersion: { type: 'integer', required: true }, entry: archiveEntryParameter },
+        description: 'Propose or source-check one entity, fact or relation in an owned topic against observed topic and entry versions. Evidence must be explicitly published by the user; inferred entries stay proposals. Cannot create user confirmation, overwrite user-adopted entries, edit translation text or invoke translation. Retained topics without Sessions also accept proposals.' },
     ]
     const disposers: (() => void)[] = []
     try {
