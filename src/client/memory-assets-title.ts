@@ -11,8 +11,8 @@ export const MEMORY_ASSETS_TITLE_CURSOR_CSS = `
 const titleStyles = `
 .dsh-tp-assets-title { display: flex; align-items: baseline; gap: 8px; width: 100%; min-width: 0; max-width: 100%; }
 .dsh-tp-assets-title-label { flex: 0 0 auto; white-space: nowrap; font-size: 14px; font-weight: 700; }
-.dsh-tp-assets-title-session { flex: 0 1 auto; max-width: 40%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 700; }
-.dsh-tp-assets-title-picker { display: block; flex: 0 1 auto; min-width: 0; max-width: 35%; }
+.dsh-tp-assets-title-session { flex: 0 1 auto; max-width: 60%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 400; }
+.dsh-tp-assets-title-picker { display: block; flex: 0 1 auto; min-width: 0; max-width: 30%; }
 .dsh-tp-assets-title button.dsh-tp-assets-topic-trigger { display: flex; align-items: center; gap: 3px; min-width: 0; max-width: 100%; border: 0; border-radius: 4px; padding: 0 3px; background: transparent; color: var(--dsw-alias-label-caption, #888); font: inherit; font-size: 11px; cursor: pointer; }
 .dsh-tp-assets-topic-trigger span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-tp-assets-title button:hover { background: var(--dsw-alias-interactive-bg-hover, #8882); }
@@ -32,13 +32,12 @@ export function MemoryAssetsTitle({ store, scope, onSelectTopic }: {
     [scope?.ownerId, scope?.topicId, scope?.requestedTopicId, scope?.associatedSessionId, scope?.navigationRevision])
   const selection = scope ? resolveMemoryAssetsSelection(store, scope) : undefined
   const sessionName = selection?.session ? selection.session.remark || selection.session.name : '无关联会话'
-  const label = scope ? `记忆资产 · ${sessionName}` : '记忆资产'
   const filtered = selection?.availableTopics.filter(topic => topic.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())) ?? []
   const stopPropagation = (event: { stopPropagation(): void }) => event.stopPropagation()
   return h('span', { className: 'dsh-tp-assets-title', 'data-dsh-translation-assets-title': true, 'data-owner-id': scope?.ownerId, 'data-topic-id': selection?.topicId },
     h('style', { 'data-assets-cursor-style': true }, MEMORY_ASSETS_TITLE_CURSOR_CSS), h('style', null, titleStyles),
     h('span', { className: 'dsh-tp-assets-title-label' }, '记忆资产'),
-    scope ? h('span', { className: 'dsh-tp-assets-title-session', title: sessionName }, `· ${sessionName}`) : null,
+    scope ? h('span', { className: 'dsh-tp-assets-title-session', title: sessionName }, sessionName) : null,
     scope && onSelectTopic ? h('small', { className: 'dsh-tp-assets-title-picker',
       // The native caption and docked tab both initiate drag on bubbling pointerdown.
       onPointerDown: stopPropagation, onClick: stopPropagation, onContextMenu: stopPropagation,

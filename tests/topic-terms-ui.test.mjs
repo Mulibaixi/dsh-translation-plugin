@@ -299,6 +299,9 @@ test('资产UI：译文原文只读，人工候选及固定独立执行，草稿
   const f = await setup()
   try {
     await translate(f); await terms(f.ui); await f.ui.click('译文记录')
+    const recordsNote = f.ui.allNodes().find(node => node.props.className === 'dsh-tp-muted dsh-tp-asset-note' && node.props.title === '原文只读；人工修改保存为新版本，再明确设为最终。')
+    assert.ok(recordsNote)
+    assert.ok(f.ui.nodes().includes(recordsNote), 'the note is visible beside the active records heading')
     await f.ui.click(`${f.session.name} · 文本 1`)
     assert.match(f.ui.text(), /Synthetic API source/)
     await f.ui.click('编辑译文'); assert.equal(f.ui.button('保存新版本').props.disabled, true)

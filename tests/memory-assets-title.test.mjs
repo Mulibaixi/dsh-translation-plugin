@@ -23,7 +23,7 @@ test('owned host title combines the associated session and interactive topic; in
   const f = mountCaption(); t.after(() => f.app.dispose())
   const address = memoryAssetsAddress('owner-a', f.session.topicId)
   const title = f.render('owner-a', address, { topicId: f.session.topicId, sessionId: f.session.id })
-  assert.equal(f.ui.text(title), `记忆资产· ${f.session.name}${f.session.topicName}`)
+  assert.equal(f.ui.text(title), `记忆资产${f.session.name}${f.session.topicName}`)
   assert.equal(f.ui.nodes(title).find(node => node.props.className === 'dsh-tp-assets-title-label').children.join(''), '记忆资产')
   assert.equal(f.ui.nodes(title).find(node => node.props.className === 'dsh-tp-assets-title-session').props.title, f.session.name)
   assert.equal(f.ui.button('选择资产主题').props.title, f.session.topicName)
@@ -38,8 +38,8 @@ test('title text uses responsive per-name truncation with the fixed 14px bold as
   const node = f.render('owner-a', memoryAssetsAddress('owner-a', f.session.topicId), { topicId: f.session.topicId, sessionId: f.session.id })
   const styles = f.ui.nodes(node).find(child => child.type === 'style' && !child.props['data-assets-cursor-style']).children.join('')
   assert.match(styles, /\.dsh-tp-assets-title-label[^}]*font-size:\s*14px[^}]*font-weight:\s*700/u)
-  assert.match(styles, /\.dsh-tp-assets-title-session[^}]*max-width:\s*40%[^}]*text-overflow:\s*ellipsis/u)
-  assert.match(styles, /\.dsh-tp-assets-title-picker[^}]*max-width:\s*35%/u)
+  assert.match(styles, /\.dsh-tp-assets-title-session[^}]*max-width:\s*60%[^}]*text-overflow:\s*ellipsis[^}]*font-size:\s*14px[^}]*font-weight:\s*400/u)
+  assert.match(styles, /\.dsh-tp-assets-title-picker[^}]*max-width:\s*30%/u)
 })
 
 test('cursor rule still selects only the owned floating caption and excludes native controls', async t => {

@@ -35,9 +35,11 @@ export function MemoryTranslationRecordsView({ store, quick, ownerId, topicId }:
   async function copy(text: string): Promise<void> {
     try { await navigator.clipboard.writeText(text); setMessage('已复制。') } catch { setMessage('复制失败，请重试。') }
   }
+  const note = '原文只读；人工修改保存为新版本，再明确设为最终。'
   return h('section', { className: 'dsh-tp-terms', 'aria-label': '译文记录' },
-    h('div', { className: 'dsh-tp-asset-toolbar' }, h('h3', null, '译文记录'),
-      h('small', { className: 'dsh-tp-muted' }, '原文只读；人工修改保存为新版本，再明确设为最终。'), message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null),
+    h('div', { className: 'dsh-tp-asset-toolbar' },
+      h('div', { className: 'dsh-tp-asset-heading' }, h('h3', null, '译文记录'), h('small', { className: 'dsh-tp-muted dsh-tp-asset-note', title: note }, note)),
+      message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null),
     h('div', { className: 'dsh-tp-asset-columns' },
       h('div', { className: 'dsh-tp-asset-list', 'aria-label': '译文条目列表' },
         groups.length === 0 ? h('p', { className: 'dsh-tp-muted' }, '尚无译文记录。') : null,
