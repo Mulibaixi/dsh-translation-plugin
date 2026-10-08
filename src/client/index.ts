@@ -12,6 +12,7 @@ import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
+import { NormalTranslationClient } from './normal-translation.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
   openMemoryAssets, parseMemoryAssetsAddress, readMemoryAssetsNavigation, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
@@ -110,6 +111,8 @@ export function apply(ctx: ClientPluginContext): void {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationObjects')
     } : ctx.remote.translationObjects), ctx.fileUpload, store, objects, ownerId => topics.getStatus(ownerId))
+    const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), { isSessionBusy: sessionId => quick.isBusy(sessionId) })
+    topics.setNormalTranslation(normal)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
     ctx.effect(() => () => terms.dispose(), 'translation topic terms')
@@ -118,6 +121,7 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => async () => {
       remoteDisposed = true
       materials.dispose()
+      normal.dispose()
       quick.dispose()
       await topics.dispose()
       const unmountRemote = await mountedRemote

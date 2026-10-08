@@ -1,5 +1,6 @@
 import { decodeRoute, type ModelRoute } from './sessions.js'
 import { parseTranslationCallMetadata, type TranslationCallMetadata } from '../shared/translation-call.js'
+import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 
 export type TextRevisionStatus = 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted'
 export interface TextRevision {
@@ -9,6 +10,7 @@ export interface TextRevision {
   readonly kind: 'machine' | 'manual'
   readonly model: ModelRoute | null
   readonly draftVersion: number | null
+  readonly sourceVersion: number
   readonly baseRevisionId: string | null
   readonly callRecord: TranslationCallMetadata | null
   readonly createdAt: string
@@ -26,12 +28,30 @@ export interface FinalPointer {
 export interface TextUnit {
   readonly id: string
   readonly order: number
+  /** Compatibility projection of sourceVersions[sourceVersion - 1].text; never persisted twice. */
   readonly source: string
   readonly targetLanguage: string
   readonly instruction: string
+  readonly sourceVersion: number
+  readonly sourceVersions: readonly TextSourceVersion[]
+  readonly material: TextMaterialIdentity | null
   readonly createdAt: string
   readonly revisions: readonly TextRevision[]
   readonly final: FinalPointer | null
+}
+export interface TextSourceVersion {
+  readonly version: number
+  readonly text: string
+  readonly createdAt: string
+  readonly operationId: string | null
+}
+export interface TextMaterialIdentity {
+  readonly materialId: string
+  readonly mainSessionId: string
+  readonly requestId: string
+  readonly draftVersion: number
+  readonly model: ModelRoute | null
+  readonly maxInputChars: number
 }
 export interface TranslationEvent {
   readonly id: string
@@ -46,15 +66,15 @@ export interface TranslationEvent {
 }
 /** One browser snapshot; events and final pointers reference the sole revision body. */
 export interface TranslationHistory {
-  readonly schemaVersion: 2
+  readonly schemaVersion: 3
   readonly units: readonly TextUnit[]
   readonly events: readonly TranslationEvent[]
 }
 export type NewTextUnit = Pick<TextUnit, 'id' | 'source' | 'targetLanguage' | 'instruction' | 'createdAt'>
-export type NewTextRevision = Omit<TextRevision, 'order' | 'kind' | 'baseRevisionId' | 'callRecord'> & Partial<Pick<TextRevision, 'kind' | 'baseRevisionId' | 'callRecord'>>
+export type NewTextRevision = Omit<TextRevision, 'order' | 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'> & Partial<Pick<TextRevision, 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'>>
 export type TextRevisionPatch = Partial<Pick<TextRevision, 'status' | 'text' | 'message' | 'updatedAt' | 'callRecord'>>
 
-export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 2, units: [], events: [] } }
+export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 3, units: [], events: [] } }
 
 type Data = Record<string, unknown>
 const statuses: readonly TextRevisionStatus[] = ['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted']
@@ -75,14 +95,16 @@ export function canEditTextRevision(revision: TextRevision): boolean {
   return ['completed', 'failed', 'cancelled', 'interrupted'].includes(revision.status) && !!revision.text.trim()
 }
 
-function decodeRevision(value: unknown, legacy = false, parseCall = true): TextRevision | undefined {
+function decodeRevision(value: unknown, schemaVersion = 3, parseCall = true): TextRevision | undefined {
   const fields = ['id', 'operationId', 'order', 'model', 'draftVersion', 'createdAt', 'updatedAt', 'accepted', 'status', 'text', 'message']
-  if (!record(value) || !exact(value, legacy ? fields : [...fields, 'kind', 'baseRevisionId', 'callRecord']) ||
+  if (!record(value) || !exact(value, schemaVersion === 1 ? fields : [...fields, 'kind', 'baseRevisionId', 'callRecord', ...(schemaVersion >= 3 ? ['sourceVersion'] : [])]) ||
     !identity(value.id) || !identity(value.operationId) || !order(value.order) || !time(value.createdAt) || !time(value.updatedAt) ||
     typeof value.accepted !== 'boolean' || !status(value.status) || !text(value.text, 2_000_000) || !(value.message === null || text(value.message, 1000))) return undefined
-  const kind = legacy ? 'machine' : value.kind
-  const baseRevisionId = legacy ? null : value.baseRevisionId
-  let callRecord = legacy ? null : value.callRecord
+  const kind = schemaVersion === 1 ? 'machine' : value.kind
+  const baseRevisionId = schemaVersion === 1 ? null : value.baseRevisionId
+  let callRecord = schemaVersion === 1 ? null : value.callRecord
+  const sourceVersion = schemaVersion >= 3 ? value.sourceVersion : 1
+  if (!order(sourceVersion)) return undefined
   if (kind !== 'machine' && kind !== 'manual') return undefined
   const model = decodeRoute(value.model)
   if (kind === 'machine' ? (!model || !order(value.draftVersion) || baseRevisionId !== null) :
@@ -91,26 +113,49 @@ function decodeRevision(value: unknown, legacy = false, parseCall = true): TextR
   if (parseCall && callRecord !== null) {
     try { callRecord = parseTranslationCallMetadata(callRecord) } catch { return undefined }
   }
-  return { ...value, kind, model, baseRevisionId, callRecord } as unknown as TextRevision
+  return { ...value, kind, model, baseRevisionId, callRecord, sourceVersion } as unknown as TextRevision
+}
+
+function decodeMaterial(value: unknown): TextMaterialIdentity | null | undefined {
+  if (value === null) return null
+  if (!record(value) || !exact(value, ['materialId', 'mainSessionId', 'requestId', 'draftVersion', 'model', 'maxInputChars']) ||
+    !identity(value.materialId) || !identity(value.mainSessionId) || !identity(value.requestId) || !order(value.draftVersion) ||
+    !order(value.maxInputChars) || value.maxInputChars > 200000) return undefined
+  const model = decodeRoute(value.model)
+  return model === undefined ? undefined : { ...value, model } as unknown as TextMaterialIdentity
 }
 
 /** Validation does not turn live requests into restored requests. Unknown fields are rejected. */
 export function decodeTranslationHistory(value: unknown): TranslationHistory | undefined {
-  if (!record(value) || !exact(value, ['schemaVersion', 'units', 'events']) || ![1, 2].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events)) return undefined
+  if (!record(value) || !exact(value, ['schemaVersion', 'units', 'events']) || ![1, 2, 3].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events)) return undefined
   const units: TextUnit[] = [], revisionIds = new Set<string>(), operationIds = new Set<string>(), unitIds = new Set<string>()
   for (const item of value.units) {
-    if (!record(item) || !exact(item, ['id', 'order', 'source', 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final']) ||
-      !identity(item.id) || unitIds.has(item.id) || item.order !== units.length + 1 || !text(item.source, 200000, true) || !text(item.targetLanguage, 80, true) ||
-      !text(item.instruction, 4000) || !time(item.createdAt) || !Array.isArray(item.revisions) || !item.revisions.length) return undefined
+    if (!record(item) || !exact(item, ['id', 'order', ...((value.schemaVersion !== 3 || Object.hasOwn(item, 'source')) ? ['source'] : []), 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final', ...(value.schemaVersion === 3 ? ['sourceVersion', 'sourceVersions', 'material'] : [])]) ||
+      !identity(item.id) || unitIds.has(item.id) || item.order !== units.length + 1 || (value.schemaVersion !== 3 && !text(item.source, 200000, true)) || !text(item.targetLanguage, 80, true) ||
+      !text(item.instruction, 4000) || !time(item.createdAt) || !Array.isArray(item.revisions)) return undefined
+    const material = value.schemaVersion === 3 ? decodeMaterial(item.material) : null
+    const sourceVersion = value.schemaVersion === 3 ? item.sourceVersion : 1
+    const sourceVersions: TextSourceVersion[] = []
+    if (material === undefined || !order(sourceVersion) || (!item.revisions.length && material === null)) return undefined
+    if (value.schemaVersion === 3) {
+      if (!Array.isArray(item.sourceVersions) || !item.sourceVersions.length) return undefined
+      for (const raw of item.sourceVersions) {
+        if (!record(raw) || !exact(raw, ['version', 'text', 'createdAt', 'operationId']) || raw.version !== sourceVersions.length + 1 ||
+          !text(raw.text, 200000, true) || !time(raw.createdAt) || !(raw.operationId === null || identity(raw.operationId))) return undefined
+        sourceVersions.push({ ...raw } as unknown as TextSourceVersion)
+      }
+      if (sourceVersion !== sourceVersions.length || (Object.hasOwn(item, 'source') && item.source !== sourceVersions.at(-1)!.text)) return undefined
+    } else sourceVersions.push({ version: 1, text: item.source as string, createdAt: item.createdAt, operationId: null })
     const revisions: TextRevision[] = []
     for (const raw of item.revisions) {
-      const revision = decodeRevision(raw, value.schemaVersion === 1)
+      const revision = decodeRevision(raw, value.schemaVersion as number)
       if (!revision || revision.order !== revisions.length + 1 || revisionIds.has(revision.id) || operationIds.has(revision.operationId)) return undefined
-      if (revision.kind === 'manual' && !revisions.some(base => base.id === revision.baseRevisionId && canEditTextRevision(base))) return undefined
+      if (!sourceVersions.some(source => source.version === revision.sourceVersion)) return undefined
+      if (revision.kind === 'manual' && !revisions.some(base => base.id === revision.baseRevisionId && base.sourceVersion === revision.sourceVersion && canEditTextRevision(base))) return undefined
       revisions.push(revision); revisionIds.add(revision.id); operationIds.add(revision.operationId)
     }
     // Units are admitted material; unaccepted new drafts remain in the transient execution layer.
-    if (!revisions[0]!.accepted) return undefined
+    if (revisions.length && !revisions[0]!.accepted) return undefined
     let final: FinalPointer | null = null
     if (item.final !== null) {
       const pointer = item.final
@@ -120,7 +165,8 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       final = { revisionId: pointer.revisionId, selection: pointer.selection as FinalPointer['selection'], selectedAt: pointer.selectedAt }
     }
     unitIds.add(item.id)
-    units.push({ id: item.id, order: item.order as number, source: item.source, targetLanguage: item.targetLanguage, instruction: item.instruction, createdAt: item.createdAt, revisions, final })
+    units.push({ id: item.id, order: item.order as number, source: sourceVersions[sourceVersion - 1]!.text, targetLanguage: item.targetLanguage, instruction: item.instruction,
+      sourceVersion, sourceVersions, material, createdAt: item.createdAt, revisions, final })
   }
   const events: TranslationEvent[] = [], eventIds = new Set<string>()
   for (const item of value.events) {
@@ -134,7 +180,12 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
     }
     events.push({ ...item } as unknown as TranslationEvent); eventIds.add(item.id)
   }
-  return { schemaVersion: 2, units, events }
+  return { schemaVersion: 3, units, events }
+}
+
+/** Version records own source bodies; storage and full-record exports omit the compatibility projection. */
+export function persistedTranslationHistory(history: TranslationHistory): unknown {
+  return { ...history, units: history.units.map(({ source: _source, ...unit }) => unit) }
 }
 
 export function appendTranslationEvent(history: TranslationHistory, event: Omit<TranslationEvent, 'order'>): TranslationHistory {
@@ -151,7 +202,7 @@ function findUnit(history: TranslationHistory, unitId: string): TextUnit {
 }
 function replaceUnit(history: TranslationHistory, unit: TextUnit): TranslationHistory { return { ...history, units: history.units.map(old => old.id === unit.id ? unit : old) } }
 function newRevision(history: TranslationHistory, data: NewTextRevision, revisionOrder: number): TextRevision {
-  const revision = decodeRevision({ kind: 'machine', baseRevisionId: null, callRecord: null, ...data, order: revisionOrder }, false, false)
+  const revision = decodeRevision({ kind: 'machine', baseRevisionId: null, callRecord: null, sourceVersion: 1, ...data, order: revisionOrder }, 3, false)
   if (!revision || history.units.some(unit => unit.revisions.some(old => old.id === revision.id || old.operationId === revision.operationId))) throw new Error('Invalid or duplicate translation revision')
   return revision
 }
@@ -177,7 +228,7 @@ export function appendManualRevision(history: TranslationHistory, unitId: string
   const unit = findUnit(history, unitId), base = unit.revisions.find(revision => revision.id === data.baseRevisionId)
   if (!base || !canEditTextRevision(base) || !text(data.text, 2_000_000, true) || !time(data.at)) throw new Error('Manual revision requires nonempty ended source and body')
   const revision = newRevision(history, { id: data.id, operationId: `manual:${data.id}`, kind: 'manual', model: null, draftVersion: null,
-    baseRevisionId: base.id, callRecord: null, createdAt: data.at, updatedAt: data.at, accepted: true, status: 'completed', text: data.text, message: null }, unit.revisions.length + 1)
+    baseRevisionId: base.id, callRecord: null, sourceVersion: base.sourceVersion, createdAt: data.at, updatedAt: data.at, accepted: true, status: 'completed', text: data.text, message: null }, unit.revisions.length + 1)
   const updated: TextUnit = { ...unit, revisions: [...unit.revisions, revision] }
   return event(replaceUnit(history, updated), updated, revision, 'revision.manual_saved', data.at)
 }
@@ -186,15 +237,32 @@ export function appendManualRevision(history: TranslationHistory, unitId: string
 export function appendTextUnit(history: TranslationHistory, data: NewTextUnit, revision: NewTextRevision): TranslationHistory {
   if (!revision.accepted || revision.kind === 'manual' || !identity(data.id) || !text(data.source, 200000, true) || !text(data.targetLanguage, 80, true) || !text(data.instruction, 4000) || !time(data.createdAt) ||
     history.units.some(unit => unit.id === data.id)) throw new Error('New text unit requires unique admitted material')
-  const unit: TextUnit = { ...data, order: history.units.length + 1, revisions: [newRevision(history, revision, 1)], final: null }
+  const unit: TextUnit = { ...data, sourceVersion: 1, sourceVersions: [{ version: 1, text: data.source, createdAt: data.createdAt, operationId: null }], material: null,
+    order: history.units.length + 1, revisions: [newRevision(history, revision, 1)], final: null }
   let next = history.units.length ? advanceFinal(history, history.units.at(-1)!, revision.updatedAt) : history
   next = { ...next, units: [...next.units, unit] }
   return event(next, unit, unit.revisions[0]!, 'operation.accepted', revision.updatedAt)
 }
 
+/** Business admission is a material fact; an actual model invocation is appended separately. */
+export function appendAdmittedTextUnit(history: TranslationHistory, envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }, operationId: string, at: string): TranslationHistory {
+  const snapshot = envelope.material, unitId = `unit:${snapshot.materialId}`
+  if (!identity(operationId) || !time(at) || snapshot.sourceVersion !== 1 || history.units.some(unit => unit.id === unitId)) throw new Error('Invalid or duplicate admitted material')
+  const unit: TextUnit = { id: unitId, order: history.units.length + 1, source: snapshot.sourceText, targetLanguage: snapshot.targetLanguage,
+    instruction: snapshot.instruction, sourceVersion: snapshot.sourceVersion,
+    sourceVersions: [{ version: snapshot.sourceVersion, text: snapshot.sourceText, createdAt: at, operationId: envelope.operationId }],
+    material: { materialId: snapshot.materialId, mainSessionId: envelope.mainSessionId, requestId: envelope.requestId, draftVersion: snapshot.draftVersion,
+      model: snapshot.model, maxInputChars: snapshot.maxInputChars }, createdAt: at, revisions: [], final: null }
+  const previous = history.units.at(-1)
+  const next = previous ? advanceFinal(history, previous, at) : history
+  return appendTranslationEvent({ ...next, units: [...next.units, unit] }, { id: `text-event:${next.events.length + 1}`,
+    type: 'operation.accepted', at, unitId, revisionId: null, operationId, status: 'submitting', reason: null })
+}
+
 export function appendTextRevision(history: TranslationHistory, unitId: string, revision: NewTextRevision): TranslationHistory {
   if (revision.kind === 'manual') throw new Error('Use manual revision saving for local edits')
-  const unit = findUnit(history, unitId), added = newRevision(history, revision, unit.revisions.length + 1)
+  const unit = findUnit(history, unitId), added = newRevision(history, { sourceVersion: unit.sourceVersion, ...revision }, unit.revisions.length + 1)
+  if (!unit.sourceVersions.some(source => source.version === added.sourceVersion)) throw new Error('Translation source version unavailable')
   const updated: TextUnit = { ...unit, revisions: [...unit.revisions, added] }
   return event(replaceUnit(history, updated), updated, added, revision.accepted ? 'operation.accepted' : 'operation.submitted', revision.createdAt)
 }
@@ -213,7 +281,7 @@ export function acceptTextRevision(history: TranslationHistory, unitId: string, 
 export function updateTextRevision(history: TranslationHistory, unitId: string, revisionId: string, patch: TextRevisionPatch): TranslationHistory {
   const unit = findUnit(history, unitId), old = unit.revisions.find(revision => revision.id === revisionId)
   if (!old) throw new Error('Translation revision unavailable')
-  const revision = decodeRevision({ ...old, ...patch }, false, false)
+  const revision = decodeRevision({ ...old, ...patch }, 3, false)
   if (!revision) throw new Error('Invalid translation revision')
   if (old.status === revision.status && old.text === revision.text && old.message === revision.message && JSON.stringify(old.callRecord) === JSON.stringify(revision.callRecord)) return history
   // A completed body is a version: another translation belongs in a new revision.

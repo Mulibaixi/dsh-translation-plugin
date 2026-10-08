@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { buildFinalTextExport, buildBilingualExport, buildTopicFinalTextExport, buildTopicBilingualExport, buildFullRecordExport } from '../dist/client/translation-export.js'
-import { emptyTranslationHistory, appendTextUnit, appendTextRevision, appendManualRevision, finalizeLastUnit, selectFinalRevision } from '../dist/client/translation-history.js'
+import { emptyTranslationHistory, appendTextUnit, appendTextRevision, appendManualRevision, finalizeLastUnit, selectFinalRevision, decodeTranslationHistory, persistedTranslationHistory } from '../dist/client/translation-history.js'
 import { DEFAULT_SESSION_SETTINGS, newSession } from '../dist/client/sessions.js'
 import { QUICK_SYSTEM_PROMPT, reconstructTranslationContext } from '../dist/shared/translation-call.js'
 
@@ -54,12 +54,16 @@ test('完整JSON冻结浏览器来源与时间/全部版本事件/安全调用�
   history = appendManualRevision(history, 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: 'Synthetic manual', at })
   const result = buildFullRecordExport(session, history, at), json = JSON.parse(result.content)
   assert.equal(json.format, 'dsh-translation-session'); assert.equal(json.schemaVersion, 1); assert.equal(json.exportedAt, at)
-  assert.deepEqual(json.session, session); assert.deepEqual(json.history, history)
+  assert.deepEqual(json.session, session); assert.deepEqual(json.history, persistedTranslationHistory(history))
+  assert.equal(json.history.units[0].source, undefined); assert.equal(json.history.units[0].sourceVersions[0].text, 'Synthetic source 1')
+  assert.equal(result.content.split('Synthetic source 1').length - 1, 1)
+  const restored = decodeTranslationHistory(json.history)
+  assert.deepEqual(restored, history)
   assert.equal(json.history.units[0].revisions.length, 2); assert.equal(json.history.units[0].revisions[1].callRecord, null)
   assert.equal(json.history.units[0].revisions[0].callRecord.usage.inputTokens, 7); assert.equal(json.history.units[0].revisions[0].callRecord.usage.outputTokens, null)
   assert.equal(json.promptDefinitions.length, 1); assert.equal(json.promptDefinitions[0].systemPrompt, QUICK_SYSTEM_PROMPT)
   assert.deepEqual(json.promptDefinitions[0].userMessageFields, { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source' })
-  assert.deepEqual(JSON.parse(reconstructTranslationContext(json.history.units[0]).userMessage), { target_language: 'English', translation_requirements: 'Keep synthetic terms', source_text: 'Synthetic source 1' })
+  assert.deepEqual(JSON.parse(reconstructTranslationContext(restored.units[0]).userMessage), { target_language: 'English', translation_requirements: 'Keep synthetic terms', source_text: 'Synthetic source 1' })
   assert.equal(json.summary.complete, false); assert.equal(json.summary.missingUnits[0].order, 1)
   assert.ok(!result.content.includes('sessionKey')); assert.ok(!result.content.includes('credentials'))
 })

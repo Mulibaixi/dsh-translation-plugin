@@ -332,7 +332,10 @@ function TranslationUnit({ unit, quick, session, editor, topics, objects, object
   const latest = unit.revisions.at(-1)
   const edit = [...editor.drafts.values()].find(edit => edit.sessionId === session.id && edit.unitId === unit.id)
   react.useEffect(() => { if (edit && edit.baseRevisionId !== latest?.id) setExpanded(true) }, [edit?.baseRevisionId, latest?.id])
-  if (!latest) return null
+  if (!latest) return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
+    h('div', { className: 'dsh-tp-muted' }, '原文'),
+    h(RecordObjectText, { text: unit.source, target: { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
+    h('p', { className: 'dsh-tp-muted', role: 'status' }, '材料已受理，等待翻译执行。'))
   const final = unit.final ? unit.revisions.find(revision => revision.id === unit.final?.revisionId) : undefined
   const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : '待定稿'
   const blocked = quick.retranslateBlockedReason(session, unit.id)

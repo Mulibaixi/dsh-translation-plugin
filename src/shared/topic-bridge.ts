@@ -1,5 +1,6 @@
 import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
+import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, type NormalTranslationAcceptance, type NormalTranslationOperation } from './normal-translation.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
@@ -41,6 +42,7 @@ export interface TopicUnitFact {
   readonly final: { readonly revisionId: string; readonly selection: 'automatic' | 'user_fixed'; readonly selectionEventId: string } | null
 }
 export type TopicBridgeCommand =
+  | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
   | { readonly kind: 'list_sessions' }
   | { readonly kind: 'list_topics' }
   | { readonly kind: 'list_topic_terms'; readonly topicId: string }
@@ -56,6 +58,7 @@ export type TopicBridgeCommand =
   | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
+  | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
   | { readonly kind: 'sessions'; readonly sessions: readonly TopicSessionSummary[]; readonly persistence?: TopicPersistence }
   | { readonly kind: 'topics'; readonly topics: readonly TopicSummary[] }
   | { readonly kind: 'session_created'; readonly session: TopicSessionSummary; readonly reason: string; readonly persistence: TopicPersistence }
@@ -108,6 +111,11 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
 export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
   object(value)
   switch (value.kind) {
+      case 'normal_accept': {
+        exact(value, ['kind', 'envelope', 'operationId', 'organizedRequirements', 'termReferences'])
+        return { kind: 'normal_accept', ...parseNormalTranslationAcceptance({ envelope: value.envelope, operationId: value.operationId,
+          organizedRequirements: value.organizedRequirements, termReferences: value.termReferences }) }
+      }
       case 'list_sessions': case 'list_topics': exact(value, ['kind']); break
       case 'list_topic_terms': case 'list_topic_archive': exact(value, ['kind', 'topicId']); text(value.topicId); break
       case 'create_session': {
@@ -191,6 +199,12 @@ function sessionSummary(value: unknown): void {
 function parseValue(value: unknown): TopicBridgeValue {
   object(value)
   switch (value.kind) {
+    case 'normal_operation': {
+      exact(value, ['kind', 'operation', 'termSnapshot'])
+      const operation = parseNormalTranslationOperation(value.operation), termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)
+      if (!termSnapshot || termSnapshot.ownerId !== operation.mainSessionId || termSnapshot.topicId !== operation.topicId || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation term package')
+      return { kind: 'normal_operation', operation, termSnapshot }
+    }
     case 'sessions':
       exact(value, value.persistence === undefined ? ['kind', 'sessions'] : ['kind', 'sessions', 'persistence'])
       if (value.persistence !== undefined) persistence(value.persistence)

@@ -5,7 +5,7 @@ import {
 } from './sessions.js'
 import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKey, encodeModelPreference, decodeModelPreference } from './model-preferences.js'
 import { SESSION_ORDER_PREFIX, sessionOrderKey, encodeSessionOrder, decodeSessionOrder, reconcileSessionOrder, moveSessionOrder } from './session-order.js'
-import { decodeTranslationHistory, emptyTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
+import { decodeTranslationHistory, emptyTranslationHistory, persistedTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
 import {
   DELETED_SESSION_PREFIX, TOPIC_IDENTITY_PREFIX, TOPIC_NAME_PREFIX, TOPIC_LOCK_NAME,
   decodeDeletion, decodeTopicIdentity, decodeTopicName, deletedSessionKey, topicIdentityKey, topicNameKey,
@@ -46,11 +46,11 @@ interface SessionSnapshot { readonly session: LocalSession; readonly translation
 function readSnapshot(raw: string): SessionSnapshot | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    if (!value || ![2, 3, 4, 5].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
-    const hasTranslations = value.schemaVersion === 4 || value.schemaVersion === 5
+    if (!value || ![2, 3, 4, 5, 6].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    const hasTranslations = value.schemaVersion === 4 || value.schemaVersion === 5 || value.schemaVersion === 6
     const fields = hasTranslations ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
     if (Object.keys(value).length !== fields.length || fields.some(key => !Object.hasOwn(value, key))) return undefined
-    if (hasTranslations && (value.translationHistory as { schemaVersion?: unknown } | null)?.schemaVersion !== (value.schemaVersion === 4 ? 1 : 2)) return undefined
+    if (hasTranslations && (value.translationHistory as { schemaVersion?: unknown } | null)?.schemaVersion !== (value.schemaVersion === 4 ? 1 : value.schemaVersion === 5 ? 2 : 3)) return undefined
     const session = decodeSession(value.session)
     const translationHistory = hasTranslations ? decodeTranslationHistory(value.translationHistory) : emptyTranslationHistory()
     return session && translationHistory ? { session, translationHistory } : undefined
@@ -815,8 +815,8 @@ export class SessionStore {
         seat.status = 'conflict'; this.notice = '会话历史已在其他窗口修改或删除，当前输入保留。请选择读取本地副本或明确覆盖。'; return false
       }
       const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
-      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 5 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
-        ...(hasTranslations ? { translationHistory: seat.translationHistory } : {}) })
+      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 6 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
+        ...(hasTranslations ? { translationHistory: persistedTranslationHistory(seat.translationHistory) } : {}) })
       this.storage.setItem(historyKey(id), serialized)
       seat.stored = serialized; seat.savedSession = seat.session; seat.savedTranslationHistory = seat.translationHistory; seat.status = 'saved'
       return true

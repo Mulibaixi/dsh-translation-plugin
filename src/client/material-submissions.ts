@@ -37,6 +37,7 @@ interface Submission {
   finished: boolean
   started: boolean
   settling: boolean
+  consumed?: boolean
   preparation?: Promise<void>
 }
 export interface MaterialSubmissionStatus {
@@ -181,7 +182,8 @@ export class MaterialSubmissionsClient {
     if (busy) blocked = '正在提交材料…'
     if (unknown) blocked = '提交结果尚不确定，请先检查提交状态。'
     let message = latest?.reason
-    if (latest?.envelope.kind === 'material' && ['submitted', 'attached'].includes(latest.stage)) {
+    if (latest?.consumed) message = '翻译业务已受理；原提交材料已记录。'
+    else if (latest?.envelope.kind === 'material' && ['submitted', 'attached'].includes(latest.stage)) {
       const sent = latest.envelope.material.draftVersion, current = session ? this.draftVersion(session) : sent
       message = current === sent ? `已向主会话提交草稿版本 ${sent}；待译草稿保留。`
         : `已提交的是草稿版本 ${sent}；当前草稿为版本 ${current}。`
@@ -196,6 +198,26 @@ export class MaterialSubmissionsClient {
   private checkReceipt(item: Submission, receipt: TranslationMaterialReceipt): void {
     if (!sameScope(item.envelope, receipt) || item.envelope.kind !== receipt.kind) throw new Error('材料服务回执身份不匹配；提交结果尚不确定。')
     item.stage = receipt.stage
+  }
+  /** The bridge may only admit the exact browser snapshot that was prepared for this main submission. */
+  resolveSubmittedMaterial(envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }): TranslationMaterialEnvelope & { readonly kind: 'material' } | undefined {
+    const item = this.submissions.get(JSON.stringify([envelope.ownerId, envelope.requestId]))
+    if (this.disposed || !item || item.envelope.kind !== 'material' ||
+      !['prepared', 'submitted', 'attached', 'unknown'].includes(item.stage) ||
+      JSON.stringify(item.envelope) !== JSON.stringify(parseTranslationMaterialEnvelope(envelope))) return undefined
+    return structuredClone(item.envelope)
+  }
+  /** Business acceptance consumes only the unchanged submitted draft, including its edit history. */
+  consumeSubmittedMaterial(envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }): void {
+    const item = this.submissions.get(JSON.stringify([envelope.ownerId, envelope.requestId]))
+    if (!item || !this.resolveSubmittedMaterial(envelope) || item.consumed) return
+    item.consumed = true
+    const session = this.options.store.getSession(envelope.material.translationSessionId)
+    if (session && session.ownerId === envelope.ownerId && session.topicId === envelope.material.topicId &&
+      this.draftVersion(session) === envelope.material.draftVersion && signature(session) === signature({ ...session,
+        input: envelope.material.sourceText, targetLanguage: envelope.material.targetLanguage, instruction: envelope.material.instruction,
+        model: envelope.material.model, maxInputChars: envelope.material.maxInputChars })) this.options.store.updateSession(session.id, { input: '' })
+    this.reconcile(); this.emit()
   }
   private freeze(gesture: MaterialSubmissionGesture): ReturnType<MaterialSubmissionContribution['freeze']> {
     if (this.disposed || !this.retained.has(gesture.sessionId)) return undefined

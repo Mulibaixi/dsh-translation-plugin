@@ -12,7 +12,7 @@ if (!runtimeRoot) throw new Error('DSH_RUNTIME_ROOT is required with the install
 const at = '2026-10-06T00:00:00.000Z', mainId = 'synthetic-topic-main', otherId = 'synthetic-topic-neighbor'
 const toolNames = ['translation_list_sessions', 'translation_list_topics', 'translation_create_session', 'translation_rename_topic', 'translation_set_session_remark',
   'translation_archive_session', 'translation_read_unit', 'translation_list_terms', 'translation_query_terms', 'translation_upsert_term',
-  'translation_list_topic_archive', 'translation_query_archive', 'translation_upsert_archive']
+  'translation_list_topic_archive', 'translation_query_archive', 'translation_upsert_archive', 'translation_execute']
 function browser(ownerId = mainId) {
   const sessions = new SessionStore(), session = sessions.createSession(ownerId)
   const terms = new TopicMemoryStore(sessions)
@@ -39,7 +39,7 @@ function archivePut(topicId, edits = {}, expectedVersion = 0) {
     name: 'API', aliases: ['interface'], description: 'Synthetic archive entity', origin: 'inferred', status: 'proposal', evidence: [], ...edits } }
 }
 
-test('Native Agent/Tools + ClientRemoteService/Gateway：十三工具真实注册、metadata双向回执与邻Agent隔离，断开卸载', async () => {
+test('Native Agent/Tools + ClientRemoteService/Gateway：管理与普通工具真实注册、metadata双向回执与邻Agent隔离，断开卸载', async () => {
   const f = await createTopicToolsNativeFixture({ runtimeRoot }), b = browser()
   let main, neighbor, release
   try {
@@ -135,7 +135,7 @@ test('Native Session metadata可在Agent存在前绑定，created补装；同主
     await assert.rejects(duplicate[Symbol.asyncIterator]().next(), /占用/)
     duplicate.dispose(); detach()
     main = await f.createAgent(mainId)
-    assert.equal(f.host.ctx.tools.schemas(main.agent).filter(item => item.name.startsWith('translation_')).length, 13)
+    assert.equal(f.host.ctx.tools.schemas(main.agent).filter(item => item.name.startsWith('translation_')).length, 14)
     assert.equal((await execute(f, main.agent, 'translation_list_sessions')).isError, false)
     release(); release = undefined
     for (let i = 0; i < 100 && f.host.ctx.tools.schemas(main.agent).some(item => item.name.startsWith('translation_')); i++) await new Promise(resolve => setTimeout(resolve, 5))

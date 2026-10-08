@@ -1,5 +1,5 @@
 import type { LocalSession } from './sessions.js'
-import type { TextRevisionStatus, TranslationHistory } from './translation-history.js'
+import { persistedTranslationHistory, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
 import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION } from '../shared/translation-call.js'
 
 export interface MissingTextUnit {
@@ -127,7 +127,7 @@ export function buildFullRecordExport(session: LocalSession, history: Translatio
   const hasKnownPrompt = history.units.some(unit => unit.revisions.some(revision => revision.callRecord?.promptVersion === TRANSLATION_PROMPT_VERSION))
   const promptDefinitions = hasKnownPrompt ? [{ promptVersion: TRANSLATION_PROMPT_VERSION, systemPrompt: QUICK_SYSTEM_PROMPT,
     userMessageFields: { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source' } }] : []
-  const content = JSON.stringify({ format: 'dsh-translation-session', schemaVersion: 1, exportedAt, session, history,
+  const content = JSON.stringify({ format: 'dsh-translation-session', schemaVersion: 1, exportedAt, session, history: persistedTranslationHistory(history),
     summary: { complete, missingUnits, exportedUnitIds }, promptDefinitions }, null, 2)
   return { content, fileName: `${fileBase(session, exportedAt)}-records.json`, mimeType: 'application/json;charset=utf-8', complete, missingUnits, exportedUnitIds }
 }

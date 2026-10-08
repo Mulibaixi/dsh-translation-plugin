@@ -2,6 +2,7 @@ import { TranslationMaterialStore } from '../memory/translation-material-store.j
 import { TRANSLATION_MATERIAL_REMOTE, type TranslationMaterialCapability, type TranslationMaterialFinish,
   type TranslationMaterialQuery, type TranslationMaterialReceipt, type TranslationMaterialResult, type TranslationMaterialStage } from '../shared/translation-material-remote.js'
 import type { TranslationMaterialEnvelope, TranslationMaterialScope } from '../shared/translation-material.js'
+import type { NormalTranslationTarget } from '../shared/normal-translation.js'
 import { hostLlmLoader, type DshExecutionContext } from './dsh-text-adapter.js'
 
 interface Message {
@@ -117,6 +118,16 @@ export class TranslationMaterialsService {
   private ownedRecord(scope: TranslationMaterialScope): Submission | undefined {
     const record = this.submissions.get(key(scope))
     return record && record.peerId === this.ctx.invocation?.peer.id && record.scope.mainSessionId === scope.mainSessionId && record.scope.operationId === scope.operationId ? record : undefined
+  }
+  /** Only the actual main Agent may consume a material already included in its admitted step. */
+  deliveredForAgent(target: NormalTranslationTarget, agent: { readonly id: string; readonly session: { readonly id: string } }): TranslationMaterialResult<Extract<TranslationMaterialEnvelope, { kind: 'material' }>> {
+    if (this.disposed || agent.id !== target.mainSessionId || agent.session.id !== target.mainSessionId) return bad('scope_mismatch', '材料不属于此主 Agent。', 'resolve_material')
+    const record = this.submissions.get(key({ ownerId: target.mainSessionId, requestId: target.requestId }))
+    if (!record || record.stage !== 'attached' || !this.connections()?.ownsConnection(target.mainSessionId, record.peerId)) return bad('material_not_delivered', '材料尚未交付给此主 Agent，或所属连接已失效。', 'resolve_material')
+    const envelope = this.snapshots.get(target.mainSessionId, target.requestId)
+    if (!envelope || envelope.kind !== 'material' || envelope.material.materialId !== target.materialId) return bad('not_found', '未找到明确引用的待译材料。', 'resolve_material')
+    if (envelope.material.sourceVersion !== target.sourceVersion) return bad('stale_version', '引用的原文版本已失效。', 'resolve_material')
+    return ok(envelope)
   }
   query(request: TranslationMaterialScope): TranslationMaterialResult<TranslationMaterialQuery | null> {
     if (!this.owns(request.ownerId)) return bad('scope_mismatch', '材料查询不属于已建立的主会话连接。', 'query')

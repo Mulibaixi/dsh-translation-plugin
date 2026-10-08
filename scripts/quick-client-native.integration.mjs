@@ -7,6 +7,7 @@ import { ModelCatalog } from '../dist/client/models.js'
 import { SessionStore } from '../dist/client/session-store.js'
 import { DEFAULT_SESSION_SETTINGS, SETTINGS_KEY, historyKey } from '../dist/client/sessions.js'
 import { buildFinalTextExport, buildFullRecordExport } from '../dist/client/translation-export.js'
+import { decodeTranslationHistory, persistedTranslationHistory } from '../dist/client/translation-history.js'
 import { TRANSLATION_PROMPT_VERSION, reconstructTranslationContext } from '../dist/shared/translation-call.js'
 
 // Run after building the workspace plugin:
@@ -254,7 +255,12 @@ test('真实Gateway/LLM/Session + Client：调用证据落盘，旧base人工修
     const finalText = buildFinalTextExport(session, history, at)
     assert.equal(finalText.complete, true); assert.equal(finalText.content.trim(), 'Synthetic first manual final')
     const full = buildFullRecordExport(session, history, at), json = JSON.parse(full.content)
-    assert.deepEqual(json.history, history)
+    assert.deepEqual(json.history, persistedTranslationHistory(history))
+    assert.equal(json.history.units[0].source, undefined)
+    assert.equal(json.history.units[0].sourceVersions[0].text, history.units[0].source)
+    assert.equal(full.content.split(JSON.stringify(history.units[0].source)).length - 1, 1)
+    const decoded = decodeTranslationHistory(json.history)
+    assert.deepEqual(decoded, history)
     assert.deepEqual(json.history.units[0].revisions[0].callRecord, original.callRecord)
     assert.equal(json.history.units[0].revisions.at(-1).baseRevisionId, firstRevisionId)
     assert.equal(json.promptDefinitions.length, 1)
@@ -263,12 +269,14 @@ test('真实Gateway/LLM/Session + Client：调用证据落盘，旧base人工修
     assert.deepEqual(json.promptDefinitions[0].userMessageFields, {
       target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source',
     })
-    assert.equal(reconstructTranslationContext(json.history.units[0]).userMessage, sent.messages[1].content[0].text)
+    assert.equal(reconstructTranslationContext(decoded.units[0]).userMessage, sent.messages[1].content[0].text)
     assert.ok(!full.content.includes('sessionKey')); assert.ok(!full.content.includes('apiKey')); assert.ok(!full.content.includes('arbitraryProfile'))
     assert.equal(app.host.provider.calls.length, beforeExportCalls)
     await tick()
     const disk = JSON.parse(storage.getItem(historyKey(id)))
-    assert.equal(disk.schemaVersion, 5); assert.equal(disk.translationHistory.schemaVersion, 2)
+    assert.equal(disk.schemaVersion, 6); assert.equal(disk.translationHistory.schemaVersion, 3)
+    assert.equal(disk.translationHistory.units[0].source, undefined)
+    assert.equal(disk.translationHistory.units[0].sourceVersions[0].text, history.units[0].source)
     assert.equal(disk.translationHistory.units[0].revisions.at(-1).kind, 'manual')
     assert.deepEqual(disk.translationHistory.units[0].revisions.find(revision => revision.id === laterCall.id).callRecord.usage, { inputTokens: 0, outputTokens: 0 })
   } finally { gate.resolve(); await app.close() }

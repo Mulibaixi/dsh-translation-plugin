@@ -1,8 +1,9 @@
-import { TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
+import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
+import { parseNormalTranslationExecute } from '../shared/normal-translation.js'
 
-interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
-interface MainAgent {
+export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
+export interface MainAgent {
   readonly id: string
   readonly session: { readonly id: string }
   readonly ctx: { readonly tools: { register(definition: unknown): () => void } }
@@ -105,7 +106,7 @@ class ManagementConnection {
     if (reply.ok) {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
-        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive' }[pending.frame.command.kind]
+        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -135,6 +136,18 @@ export class TopicToolsService {
   ownsConnection(ownerId: string, peerId: string): boolean {
     const connection = this.connections.get(ownerId)
     return !this.disposed && !!connection?.ready && !connection.closed && connection.peerId === peerId
+  }
+  ownsAgent(ownerId: string, agent: MainAgent | undefined): boolean {
+    const connection = this.connections.get(ownerId)
+    return !this.disposed && !!connection?.ready && !connection.closed && !!agent && agent.id === ownerId &&
+      agent.session.id === ownerId && (this.ctx.get?.('agents') as Agents | undefined)?.get(ownerId) === agent
+  }
+  /** Host services use this existing owner channel; the browser remains the sole record authority. */
+  requestOwned(ownerId: string, command: TopicBridgeCommand, exec: ToolExecution): Promise<TopicBridgeValue> {
+    if (!this.ownsAgent(ownerId, exec.agent)) throw bridgeError('scope_mismatch', '翻译操作不属于已连接的主 Agent。')
+    const parsed = parseTopicBridgeCommand(command)
+    if (new TextEncoder().encode(JSON.stringify(parsed)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '本次业务材料和要求超过通道上限，未截断或受理。')
+    return this.connections.get(ownerId)!.request(parsed, exec)
   }
   async *connect(request: TopicBridgeOpen, signal: AbortSignal): AsyncGenerator<TopicBridgeDown> {
     request = parseTopicBridgeOpen(request)
@@ -218,6 +231,25 @@ export class TopicToolsService {
             return connection.request(parseTopicBridgeCommand(topic ? { kind: 'list_topic_terms', topicId: args.topicId } : { kind: 'list_terms', translationSessionId: args.translationSessionId }), exec)
           }
           return connection.request(parseTopicBridgeCommand({ ...args, kind: definition.kind }), exec)
+        },
+      })))
+      const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown> } | undefined
+      if (normal) disposers.push(agent.ctx.tools.register(helpers.defineTool({
+        name: 'translation_execute', description: 'Execute short normal translation only when the user task calls for translation. Discussion needs no call. Refer to the exact delivered material and source version. Supply organized translation requirements and relevant term ids/versions, never rewrite source or choose another model. Reuse operationId for the same operation; an explicit new revision uses a new operationId. Check the returned acceptance or unavailable error.',
+        parameters: {
+          target: { type: 'object', required: true, additionalProperties: false, properties: {
+            kind: { type: 'string', enum: ['material'], required: true }, mainSessionId: { type: 'string', required: true },
+            requestId: { type: 'string', required: true }, materialId: { type: 'string', required: true }, sourceVersion: { type: 'integer', required: true },
+          } },
+          operationId: { type: 'string', required: true }, organizedRequirements: { type: 'string', required: true },
+          termReferences: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
+            id: { type: 'string', required: true }, entryVersion: { type: 'integer', required: true },
+          } } },
+        },
+        output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+        execute: (args: unknown, exec: ToolExecution) => {
+          if (exec.agent !== agent) throw bridgeError('scope_mismatch', '翻译工具不属于此 Agent。')
+          return normal.execute(parseNormalTranslationExecute(args), exec)
         },
       })))
       return disposers

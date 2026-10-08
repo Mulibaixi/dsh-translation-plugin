@@ -6,6 +6,8 @@ import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceR
 import type { TopicArchiveSnapshot, TopicArchivePut, ArchiveMutationResult, TopicArchiveQuery } from '../memory/topic-archive.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
+import type { NormalTranslationAcceptance } from '../shared/normal-translation.js'
+import type { NormalTranslationReply } from './normal-translation.js'
 
 export interface TopicBridgeRemotePort {
   capabilities(): Promise<unknown>
@@ -34,21 +36,23 @@ interface Connection {
   reason: string | undefined
   requests: Set<string>
 }
-interface Publication { readonly sessionId: string; readonly topicId: string; readonly fact: TopicUnitFact }
+interface Publication { readonly sessionId: string; readonly topicId: string; readonly fact: TopicUnitFact; readonly automatic: boolean }
 function error(requestId: string, code: string, message: string): TopicBridgeReply { return { requestId, ok: false, error: { code, message } } }
 
-/** Browser facts remain authoritative. This bridge does not admit ordinary translation. */
+/** Browser facts remain authoritative for material, history and terminology. */
 export class TopicBridgeClient {
   private readonly connections = new Map<string, Connection>()
   private readonly publications = new Map<string, Publication>()
   private readonly listeners = new Set<() => void>()
   private readonly stopStore: () => void
   private disposed = false
+  private normal: { accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply } | undefined
   constructor(private readonly remote: TopicBridgeRemotePort | (() => Promise<TopicBridgeRemotePort | undefined>) | undefined,
     private readonly sessions: SessionStore, private readonly terms: TopicBridgeTermsPort, private readonly archive: TopicBridgeArchivePort) {
     this.stopStore = sessions.subscribe(() => this.reconcile())
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
+  setNormalTranslation(port: { accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply }): void { this.normal = port }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private key(ownerId: string, sessionId: string, unitId: string): string { return JSON.stringify([ownerId, sessionId, unitId]) }
   getStatus(ownerId: string): { readonly ready: boolean; readonly reason: string | undefined } {
@@ -141,6 +145,12 @@ export class TopicBridgeClient {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
+    if (command.kind === 'normal_accept') {
+      const { kind: _kind, ...acceptance } = command
+      const result = this.normal?.accept(ownerId, acceptance)
+      if (result?.ok) this.publishAdmittedUnit(ownerId, result.value.operation.translationSessionId, result.value.operation.unitId)
+      return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
+    }
     if (command.kind === 'list_sessions') return success({ kind: 'sessions', sessions: this.sessions.getAvailableSessions(ownerId).filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => this.sessionSummary(session)) })
     if (command.kind === 'list_topics') return success({ kind: 'topics', topics: this.sessions.getTopics(ownerId).map(topic => ({ ...topic,
       sessionIds: this.sessions.getAvailableSessions(ownerId).filter(session => session.topicId === topic.id && !this.sessions.isSessionDeleted(session.id)).map(session => session.id) })) })
@@ -215,8 +225,19 @@ export class TopicBridgeClient {
     // Include the largest allowed correlation ID so every future request fits without truncation.
     const reply: TopicBridgeReply = { requestId: 'x'.repeat(2048), ok: true, value: { kind: 'unit', unit: fact } }
     if (new TextEncoder().encode(JSON.stringify(reply)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) return false
-    this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact: structuredClone(fact) })
+    this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact: structuredClone(fact), automatic: false })
     this.emit(); return true
+  }
+  private publishAdmittedUnit(ownerId: string, sessionId: string, unitId: string): void {
+    const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
+    const unit = history?.units.find(unit => unit.id === unitId)
+    if (!session || session.ownerId !== ownerId || !unit || unit.material?.mainSessionId !== ownerId) return
+    const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
+    const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
+      revisions: unit.revisions.map(({ id, order, kind, status, text, baseRevisionId }) => ({ id, order, kind, status, text, baseRevisionId })),
+      final: unit.final && event?.revisionId === unit.final.revisionId ? { revisionId: unit.final.revisionId, selection: unit.final.selection, selectionEventId: event.id } : null }
+    this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact, automatic: true })
+    this.emit()
   }
   isPublished(ownerId: string, sessionId: string, unitId: string): boolean { return this.publications.has(this.key(ownerId, sessionId, unitId)) }
   revokeUnit(ownerId: string, sessionId: string, unitId: string): void { this.publications.delete(this.key(ownerId, sessionId, unitId)); this.emit() }
@@ -226,7 +247,7 @@ export class TopicBridgeClient {
       const session = this.sessions.getSession(publication.sessionId)
       if (!session || this.sessions.isSessionDeleted(publication.sessionId) || session.topicId !== publication.topicId || !this.sessions.getTranslationHistory(publication.sessionId)?.units.some(unit => unit.id === publication.fact.id)) {
         this.publications.delete(key); changed = true
-      }
+      } else if (publication.automatic) this.publishAdmittedUnit(session.ownerId, session.id, publication.fact.id)
     }
     if (changed) this.emit()
   }
