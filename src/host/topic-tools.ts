@@ -182,6 +182,8 @@ export class TopicToolsService {
     } finally {
       connection.close(); await uplink?.return?.(); await stop; created?.(); removed?.()
       signal.removeEventListener('abort', abort)
+      const materials = this.ctx.get?.('translationMaterials') as { releaseConnection(ownerId: string, peerId: string): void } | undefined
+      materials?.releaseConnection(request.ownerId, peerId)
       if (this.connections.get(request.mainSessionId) === connection) this.connections.delete(request.mainSessionId)
     }
   }

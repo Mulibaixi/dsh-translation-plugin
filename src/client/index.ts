@@ -1,4 +1,4 @@
-import { h } from './react.js'
+import { h, react } from './react.js'
 import { PanelRouter, SettingsView, MemoryAssetsView } from './views.js'
 import { createSessionStore } from './session-store.js'
 import { ModelCatalog, type ModelCatalogPort } from './models.js'
@@ -11,6 +11,7 @@ import { TopicArchiveStore } from './topic-archive-store.js'
 import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
+import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
   openMemoryAssets, parseMemoryAssetsAddress, readMemoryAssetsNavigation, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
@@ -39,12 +40,15 @@ interface ClientPluginContext {
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
   get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
   get(name: 'remote.translationObjects'): ObjectAssetsRemotePort | undefined
+  get(name: 'remote.translationMaterials'): TranslationMaterialsRemotePort | undefined
+  readonly conversation?: { readonly submissions?: MaterialSubmissionRegistry }
   readonly fileUpload: NativeFileUploadPort
   readonly remote: {
     readonly session: ModelCatalogPort
     readonly translationQuick?: QuickRemotePort
     readonly translationTopics?: TopicBridgeRemotePort
     readonly translationObjects?: ObjectAssetsRemotePort
+    readonly translationMaterials?: TranslationMaterialsRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
@@ -63,7 +67,7 @@ interface ClientPluginContext {
 
 const CLIENT_ID = 'dsh-translation-plugin'
 export const name = 'dsh-translation-client'
-export const inject = ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload'] as const
+export const inject = ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload', 'conversation'] as const
 
 function withClientDiagnostics<T>(stage: string, action: () => T): T {
   try { return action() } catch (error) {
@@ -95,6 +99,13 @@ export function apply(ctx: ClientPluginContext): void {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
     } : ctx.remote.translationTopics, store, terms, archive)
+    const materials = new MaterialSubmissionsClient({ store, topics, owner: ctx,
+      registry: typeof ctx.conversation?.submissions?.register === 'function' ? ctx.conversation.submissions : undefined,
+      remote: ctx.remote.$mount ? async () => {
+        const unmountRemote = await mountedRemote
+        return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationMaterials')
+      } : ctx.remote.translationMaterials,
+    })
     const objectAssets = new ObjectAssetsClient(adaptObjectAssetsRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationObjects')
@@ -106,6 +117,7 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => () => { objectAssets.dispose(); objects.dispose() }, 'translation record objects')
     ctx.effect(() => async () => {
       remoteDisposed = true
+      materials.dispose()
       quick.dispose()
       await topics.dispose()
       const unmountRemote = await mountedRemote
@@ -113,14 +125,14 @@ export function apply(ctx: ClientPluginContext): void {
     }, 'translation remote clients')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
-    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset(); void topics.reset() }), 'translation catalog connection')
+    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset(); materials.reset(); void topics.reset() }), 'translation catalog connection')
 
     const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
     const TranslationPanel: ClientComponent = (props = {}) => {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       return h(PanelRouter, {
-        store, models, quick, topics, terms, objects, objectAssets, onDeleteTerm, sessionId,
+        store, models, quick, topics, materials, terms, objects, objectAssets, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId },
@@ -155,6 +167,19 @@ export function apply(ctx: ClientPluginContext): void {
     const TranslationSettings: ClientComponent = (props = {}) => h(SettingsView, {
       store, terms, onClose: typeof props.close === 'function' ? props.close : undefined,
     })
+    const MaterialAttachmentMarker: ClientComponent = (props = {}) => {
+      const [, update] = react.useState(0)
+      react.useEffect(() => materials.subscribe(() => update(value => value + 1)), [])
+      const ownerId = typeof props.sessionId === 'string' ? props.sessionId : undefined
+      const attachment = ownerId ? materials.getAttachment(ownerId) : undefined
+      if (!attachment || !ownerId) return null
+      return h('span', { className: 'dsh-translation-material-marker', role: 'status' },
+        h('span', null, attachment.omitted ? '本次不附带待译稿' : attachment.label),
+        attachment.available ? h('button', { type: 'button', onClick: () => materials.setOmit(ownerId, !attachment.omitted) }, attachment.omitted ? '恢复附带' : '本次不附带') : null)
+    }
+    ctx.effect(() => ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
+      { name: 'conversation.input.left', id: `${CLIENT_ID}-material`, order: 40 }, MaterialAttachmentMarker,
+    )), 'translation material marker')
 
     ctx.effect(() => withClientDiagnostics('sidebarRightTabs.register', () => ctx.sidebarRightTabs.register({
       id: CLIENT_ID,

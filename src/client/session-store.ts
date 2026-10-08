@@ -344,6 +344,7 @@ export class SessionStore {
     return [...this.seats.values()].flatMap(seat => seat.savedSession && (ownerId === undefined || seat.savedSession.ownerId === ownerId) ? [seat.savedSession] : [])
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
+  getOwnerIds(): readonly string[] { return [...new Set([...this.seats.values()].map(seat => seat.session.ownerId))] }
   getAvailableSessions(ownerId: string): readonly LocalSession[] {
     return [...this.seats.values()].map(seat => seat.session).filter(session => session.ownerId === ownerId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))

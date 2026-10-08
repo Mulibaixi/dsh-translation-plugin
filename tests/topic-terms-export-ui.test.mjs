@@ -125,7 +125,7 @@ test('主题快照真实bundle：别的owner不出现保留档案入口；普通
     assert.ok(group); assert.ok(!f.ui.text(group).includes('Synthetic private topic'))
     title(f.ui).props.onClick(); f.ui.render()
     await f.ui.input('翻译模式', 'normal')
-    assert.equal(f.ui.button('发送快译').props.disabled, true)
+    assert.equal(f.ui.button('发送待译材料').props.disabled, true)
     assert.equal(f.calls.length, 0)
   } finally { await f.app.dispose() }
 })

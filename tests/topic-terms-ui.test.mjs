@@ -108,7 +108,7 @@ test('术语UI：历史主动参考仅normal，来源展开真实材料；confli
     assert.ok(!f.ui.nodes().some(node => node.props['aria-label'] === '文本 1供主模型参考'))
     await f.ui.input('翻译模式', 'normal')
     const listed = await f.request({ kind: 'list_sessions' }); assert.deepEqual(listed.value.sessions[0].publishedUnitIds, [])
-    assert.equal(f.ui.button('发送快译').props.disabled, true)
+    assert.equal(f.ui.button('发送待译材料').props.disabled, true)
     await f.ui.click('文本 1供主模型参考')
     const selected = (await f.request({ kind: 'list_sessions' })).value.sessions[0].publishedUnitIds[0]
     const fact = (await f.request({ kind: 'read_unit', translationSessionId: f.session.id, unitId: selected })).value.unit
@@ -209,7 +209,8 @@ test('资产UI：独立keyed Body首次浮出、重复复用，隐藏翻译的�
     await f.ui.click('编辑文本 1 版本 1'); await f.ui.input('编辑文本 1 版本 1译文', '工作区未保存人工稿')
     await terms(f.ui)
     assert.equal(f.app.resourceHost.definitions.size, 2)
-    assert.equal(f.app.resourceHost.registrations.size, 4)
+    assert.equal(f.app.resourceHost.registrations.size, 5)
+    assert.ok(f.app.resourceHost.registrations.has('conversation.input.left:dsh-translation-plugin-material'))
     assert.equal(f.app.resourceHost.floats.length, 1)
     assert.equal(f.app.resourceHost.sidebarRight.openTabs.getSnapshot().length, 1)
     assert.ok(!f.ui.text().includes('所属主会话：'))

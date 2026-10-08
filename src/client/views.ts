@@ -14,6 +14,7 @@ import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPan
 import { type TopicTermsViewPort } from './topic-terms-view.js'
 import { downloadExport } from './browser-download.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
+import type { MaterialSubmissionsClient } from './material-submissions.js'
 import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
 import type { TopicMemoryStore, TopicTermVersion } from './topic-memory-store.js'
 import { createSessionReorder, type SessionDrop, type SessionPointerEvent } from './session-reorder.js'
@@ -24,6 +25,7 @@ type CheckEvent = { currentTarget: { checked: boolean } }
 type FileEvent = { currentTarget: { files: FileList | null; value: string } }
 interface StoreProps { readonly store: SessionStore }
 interface TopicUiProps extends RecordObjectsProps {
+  readonly materials?: MaterialSubmissionsClient | undefined
   readonly topics?: TopicBridgeClient | undefined
   readonly terms?: (TopicTermsViewPort & TopicMemoryStore) | undefined
   readonly onDeleteTerm?: ((snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>) | undefined
@@ -80,7 +82,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, sessionId, topics, terms, objects, objectAssets, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, sessionId, topics, materials, terms, objects, objectAssets, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
     const reconcile = (): void => setDrafts(current => {
@@ -116,7 +118,7 @@ export function PanelRouter({ store, models, quick, sessionId, topics, terms, ob
     },
   }
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, topics, terms, objects, objectAssets, onDeleteTerm, onOpenAssets, ownerId: sessionId, key: sessionId })
+    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, editor, topics, materials, terms, objects, objectAssets, onDeleteTerm, onOpenAssets, ownerId: sessionId, key: sessionId })
       : h('p', { role: 'alert' }, '请在主窗口会话中打开翻译面板。'),
   )
 }
@@ -357,7 +359,7 @@ function TranslationUnit({ unit, quick, session, editor, topics, objects, object
   )
 }
 
-function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, objects, objectAssets, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
+function WorkspaceView({ store, models, quick, editor, ownerId, topics, materials, terms, objects, objectAssets, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   react.useEffect(() => quick.subscribe(() => refreshQuick(value => value + 1)), [quick])
@@ -366,6 +368,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   react.useEffect(() => { void quick.load() }, [quick])
   react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
   react.useEffect(() => topics?.subscribe(() => refreshQuick(value => value + 1)), [topics])
+  react.useEffect(() => materials?.subscribe(() => refreshQuick(value => value + 1)), [materials])
   const [sidebar, setSidebar] = react.useState(false)
   const [sessionPickerOpen, setSessionPickerOpen] = react.useState(false)
   const sorting = useSessionSorting(store, ownerId)
@@ -379,7 +382,10 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   const [exportRequest, setExportRequest] = react.useState<(FrozenTranslationExport & { readonly result: TranslationExport }) | undefined>(undefined)
   const [exportNotice, setExportNotice] = react.useState<{ readonly message: string; readonly failure: boolean } | undefined>(undefined)
   const [files, setFiles] = react.useState(() => new Map<string, File>())
+  const retainedFiles = react.useRef(files)
+  retainedFiles.current = files
   const fileInput = react.useRef<HTMLInputElement | null>(null)
+  react.useEffect(() => () => { for (const id of retainedFiles.current.keys()) materials?.setFileSelected(id, false) }, [materials])
   react.useEffect(() => store.subscribe(() => setFiles(currentFiles => {
     if ([...currentFiles.keys()].every(id => store.getSession(id))) return currentFiles
     return new Map([...currentFiles].filter(([id]) => store.getSession(id)))
@@ -401,8 +407,9 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
   const transient = records.filter(record => !represented.has(record.id))
   const historyNote = store.getSettings().rememberHistory ? undefined
     : store.getHistory().length ? '已保存的历史保留；后续内容仅保留在本次运行。' : '本次内容仅保留在本次运行。'
-  const blocked = current ? quick.blockedReason(current) : undefined
-  const busy = current ? quick.isBusy(current.id) : false
+  const materialStatus = current?.mode === 'normal' ? materials?.getStatus(current.id) : undefined
+  const blocked = current?.mode === 'normal' ? materialStatus?.blocked ?? (materials ? undefined : '普通模式暂不可用：当前 DSH 缺少同步发送材料接口。') : current ? quick.blockedReason(current) : undefined
+  const busy = current?.mode === 'normal' ? materialStatus?.busy ?? false : current ? quick.isBusy(current.id) : false
   const readiness = quick.getReadiness()
   const checking = readiness.status === 'loading' || readiness.status === 'idle'
   const serviceStatus = current?.mode === 'normal' ? blocked : readiness.status !== 'ready'
@@ -527,6 +534,8 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
         button('确认读取', () => { if (store.reloadSession(dialog.id)) setDialog(undefined) }, action.pending), button('取消', () => setDialog(undefined), action.pending),
       ) : null,
       current ? h('div', { className: 'dsh-tp-composer-area' },
+        current.mode === 'normal' ? h('p', { className: 'dsh-tp-muted', role: 'status' }, materialStatus?.message ?? '材料会进入主会话及模型请求记录；待译草稿保留。') : null,
+        current.mode === 'normal' && materialStatus?.unknown ? button('检查提交状态', () => { void materials?.query(current.id) }) : null,
         serviceStatus ? h('div', { className: 'dsh-tp-service-status' },
           h('span', { className: 'dsh-tp-service-status-text', role: 'status' }, serviceStatus),
           current.mode === 'quick' ? h('button', { type: 'button', className: 'dsh-tp-service-recheck', disabled: checking, 'aria-busy': checking,
@@ -540,7 +549,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
         current.mode === 'normal' && files.has(current.id) ? h('div', null,
           h('div', { className: 'dsh-tp-attachment' },
             h('span', { className: 'dsh-tp-attachment-name', title: files.get(current.id)!.name }, files.get(current.id)!.name),
-            h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => setFiles(currentFiles => { const next = new Map(currentFiles); next.delete(current.id); return next }) }, '×'),
+            h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => { materials?.setFileSelected(current.id, false); setFiles(currentFiles => { const next = new Map(currentFiles); next.delete(current.id); return next }) } }, '×'),
           ),
           h('p', { className: 'dsh-tp-attachment-note' }, '文件翻译尚未接入，所选文件仅暂存于本次打开的面板。'),
         ) : null,
@@ -550,7 +559,7 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
           h('input', { type: 'file', hidden: true, ref: fileInput, key: `file:${current.id}`, 'aria-label': '待译文件', disabled: current.mode === 'quick',
             onChange: (event: FileEvent) => {
               const file = event.currentTarget.files?.[0]
-              if (file && current.mode === 'normal') setFiles(currentFiles => new Map(currentFiles).set(current.id, file))
+              if (file && current.mode === 'normal') { materials?.setFileSelected(current.id, true); setFiles(currentFiles => new Map(currentFiles).set(current.id, file)) }
               event.currentTarget.value = ''
             },
           }),
@@ -560,8 +569,8 @@ function WorkspaceView({ store, models, quick, editor, ownerId, topics, terms, o
             h('path', { d: 'm8 12 7-7a4 4 0 0 1 6 6L10 22a6 6 0 0 1-8-8L13 3M6 15l9-9a2 2 0 0 1 3 3l-9 9' }),
           )),
           h(ModelPicker, { key: current.id, catalog: models, current: current.model, onSelect: (model: LocalSession['model']) => { store.updateSession(current.id, { model }) } }),
-          h('button', { type: 'button', className: 'dsh-tp-send', disabled: !busy && !!blocked, title: busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': busy ? '取消翻译' : '发送快译', 'aria-description': busy ? undefined : blocked,
-            onClick: () => { if (busy) quick.cancel(current.id); else void quick.send(current.id) },
+          h('button', { type: 'button', className: 'dsh-tp-send', disabled: current.mode === 'normal' ? busy || !!blocked : !busy && !!blocked, title: current.mode === 'normal' ? blocked ?? '发送待译材料' : busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': current.mode === 'normal' ? busy ? '正在提交材料' : '发送待译材料' : busy ? '取消翻译' : '发送快译', 'aria-description': busy ? undefined : blocked,
+            onClick: () => { if (current.mode === 'normal') void materials?.send(current.id); else if (busy) quick.cancel(current.id); else void quick.send(current.id) },
             style: { width: 38, height: 38, minWidth: 38, maxWidth: 38, minHeight: 38, maxHeight: 38, padding: 0, borderRadius: '50%', cornerShape: 'round', aspectRatio: '1 / 1', flex: '0 0 38px' },
           }, busy ? h('span', { 'aria-hidden': true, style: { fontSize: 18, lineHeight: 1 } }, '■') : h(IconSendOutlineMedium, { size: 20 })),
         ),

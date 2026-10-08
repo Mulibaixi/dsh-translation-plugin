@@ -116,7 +116,7 @@ export class TopicBridgeClient {
       if (current()) {
         const code = failure && typeof failure === 'object' && 'code' in failure ? failure.code : undefined
         connection.ready = false
-        connection.reason = code === 'connection_occupied' ? '此主会话的主题管理已由另一窗口连接；请关闭另一窗口的翻译面板后重试。' : '主题管理桥暂不可用；本地术语仍可查看。'
+        connection.reason = code === 'connection_occupied' ? '此主会话已由另一窗口连接；请在该窗口继续，或关闭该窗口后重试。' : '主题管理桥暂不可用；本地术语仍可查看。'
         this.emit()
       }
     } finally {

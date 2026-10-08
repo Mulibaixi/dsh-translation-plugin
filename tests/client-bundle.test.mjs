@@ -59,7 +59,7 @@ test('客户端 bundle 只登记一个包标识，初始化不读取本地存储
   assert.equal(bundle.registrations[0].id, packageJson.name)
   assert.equal(bundle.registrations[0].id, 'dsh-translation-plugin')
   assert.equal(typeof bundle.exports.apply, 'function')
-  assert.deepEqual(Array.from(bundle.exports.inject), ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload'])
+  assert.deepEqual(Array.from(bundle.exports.inject), ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload', 'conversation'])
   assert.ok(bundle.externalRequests.every(specifier => ['react', '@deepseek-ai/dsh-client-ui-primitives'].includes(specifier)))
   assert.equal(bundle.storageReads(), 0)
   assert.deepEqual(bundle.diagnostics, [])
@@ -134,6 +134,7 @@ test('客户端注册会话面板和全局设置页，并正常注销全部贡�
   assert.equal(definition.guide[0].id, 'translation-workspace')
   assert.equal(typeof definition.guide[0].title, 'function')
   assert.deepEqual(slots.map(entry => entry.options.name).sort(), [
+    'conversation.input.left',
     'settings.section',
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab',

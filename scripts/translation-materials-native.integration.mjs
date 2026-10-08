@@ -1,0 +1,131 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { createTopicToolsNativeFixture, waitTopicReady } from '../tests/topic-tools-native-fixture.mjs'
+import { SessionStore } from '../dist/client/session-store.js'
+import { TopicMemoryStore } from '../dist/client/topic-memory-store.js'
+import { TopicArchiveStore } from '../dist/client/topic-archive-store.js'
+
+const runtimeRoot = process.env.DSH_RUNTIME_ROOT
+if (!runtimeRoot) throw new Error('DSH_RUNTIME_ROOT is required for the actual installed rc.2 Agent/SessionController/Gateway components')
+const mainId = 'synthetic-material-main'
+function transport(result) { assert.equal(result.ok, true, JSON.stringify(result)); return result.value }
+function value(result) { const business = transport(result); assert.equal(business.ok, true, JSON.stringify(business)); return business.value }
+async function fixture() {
+  const f = await createTopicToolsNativeFixture({ runtimeRoot, managedObjects: true })
+  const apiRoot = join(resolve(runtimeRoot, 'dsh/node_modules'), '@deepseek-ai/dsh-api-session-controller/lib')
+  const [{ TYPERT }, { TYPERT_REMOTE }] = await Promise.all([
+    import(pathToFileURL(join(apiRoot, 'typert.host.js')).href), import(pathToFileURL(join(apiRoot, 'typert.remote-client.js')).href),
+  ])
+  const needed = descriptor => descriptor.namespace === 'session' && ['prompt', 'updateQueue'].includes(descriptor.method)
+  f.host.ctx.typert.register({ ...TYPERT, invocations: TYPERT.invocations.filter(needed) })
+  const unmountSession = await f.client.remote.$mount({ ...TYPERT_REMOTE, descriptors: TYPERT_REMOTE.descriptors.filter(needed) })
+  const main = await f.createAgent(mainId)
+  const sessions = new SessionStore(), session = sessions.createSession(mainId)
+  sessions.updateSession(session.id, { mode: 'normal', input: 'Private next draft' })
+  const terms = new TopicMemoryStore(sessions), archive = new TopicArchiveStore(sessions, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
+  const bridge = f.bridge(sessions, terms, archive), release = bridge.retain(mainId)
+  await waitTopicReady(bridge, mainId, f.carrierErrors)
+  const remote = f.client.remote.translationMaterials
+  const material = (requestId, patch = {}) => ({ ownerId: mainId, mainSessionId: mainId, requestId, operationId: `operation:${requestId}`, kind: 'material', material: {
+    materialId: `material:${requestId}`, sourceVersion: 1, topicId: session.topicId, translationSessionId: session.id, draftVersion: 7,
+    sourceText: `Synthetic frozen ${requestId}`, targetLanguage: '中文', instruction: '', model: null, maxInputChars: 20000, ...patch,
+  } })
+  const scope = request => ({ ownerId: request.ownerId, mainSessionId: request.mainSessionId, requestId: request.requestId, operationId: request.operationId })
+  const prompt = async (requestId, text = `Synthetic main ${requestId}`, mode = 'queue') => transport(await f.client.remote.session.prompt({ sessionId: mainId, requestId, mode, content: [{ type: 'text', text }] }))
+  const updateQueue = async request => transport(await f.client.remote.session.updateQueue(request))
+  return { f, main, sessions, session, bridge, remote, material, scope, prompt, updateQueue,
+    async close() { release(); await main.dispose(); archive.dispose(); terms.dispose(); sessions.dispose(); await unmountSession(); await f.close() } }
+}
+
+test('Native生产Host：正式prepare ACK后exact rpc材料入同轮，原主命令不改，多个peer不窃取', async () => {
+  const t = await fixture()
+  let outsider
+  try {
+    const request = t.material('native-main-a'), frozen = structuredClone(request)
+    assert.equal(value(await t.remote.capabilities()).directSubmit, true)
+    assert.equal(value(await t.remote.prepare(request)).stage, 'prepared')
+    request.material.sourceText = 'Edited next draft'; request.material.draftVersion++
+    const { OperatorPeer } = await t.f.host.native('@deepseek-ai/dsh-client-connection')
+    outsider = new OperatorPeer(t.f.host.ctx)
+    const denied = await t.f.host.ctx.typertGateway.dispatchRpc('translationMaterials/prepare', { args: { request: frozen } }, new AbortController().signal, outsider)
+    assert.equal(transport(denied).ok, false)
+    assert.equal(transport(denied).error.code, 'scope_mismatch')
+    const command = 'Synthetic explain first, do not translate'
+    assert.equal((await t.prompt(frozen.requestId, command)).accepted, true)
+    await t.main.agent.whenIdle()
+    const messages = t.f.host.provider.calls[0].messages
+    assert.equal(messages.find(message => message.source.kind === 'user' && message.source.rpcId === frozen.requestId).content[0].text, command)
+    const plugin = messages.filter(message => message.source.kind === 'translation-material' && message.source.requestId === frozen.requestId)
+    assert.equal(plugin.length, 1); assert.equal(plugin[0].source.form, 'notice'); assert.equal(plugin[0].source.summary, '待译材料')
+    assert.ok(plugin[0].content[0].text.includes(frozen.material.sourceText)); assert.ok(!plugin[0].content[0].text.includes('Edited next draft'))
+    assert.equal(value(await t.remote.query(t.scope(frozen))).receipt.stage, 'attached')
+    assert.equal(t.sessions.getSession(t.session.id).input, 'Private next draft')
+    assert.equal(t.sessions.getTranslationHistory(t.session.id).units.length, 0)
+  } finally { await outsider?.dispose(); await t.close() }
+})
+
+test('Native生产Host：none/omit与RPC早到原样通过；晚prepare不补读、不产生隐式重发', async () => {
+  const t = await fixture()
+  try {
+    for (const kind of ['none', 'omit']) {
+      const request = { ...t.scope(t.material(`native-${kind}`)), kind }
+      value(await t.remote.prepare(request)); await t.prompt(request.requestId); await t.main.agent.whenIdle()
+      assert.ok(!t.f.host.provider.calls.at(-1).messages.some(message => message.source.kind === 'translation-material' && message.source.requestId === request.requestId))
+      assert.equal(value(await t.remote.query(t.scope(request))).snapshot.kind, kind)
+    }
+    const late = t.material('native-late')
+    await t.prompt(late.requestId); await t.main.agent.whenIdle()
+    const calls = t.f.host.provider.calls.length
+    assert.equal(value(await t.remote.prepare(late)).stage, 'prepared')
+    assert.equal(value(await t.remote.finish({ ...t.scope(late), outcome: 'unknown' })).stage, 'unknown')
+    assert.equal(t.f.host.provider.calls.length, calls)
+    assert.equal(value(await t.remote.query(t.scope(late))).snapshot.material.sourceText, late.material.sourceText)
+    assert.equal(value(await t.remote.release(t.scope(late))).released, true)
+    assert.equal(value(await t.remote.query(t.scope(late))), null)
+  } finally { await t.close() }
+})
+
+test('Native生产Host：普通材料直发只准入一次plugin notice，不调用空native prompt或翻译执行器', async () => {
+  const t = await fixture()
+  try {
+    const request = t.material('native-direct')
+    const [first, repeated] = await Promise.all([t.remote.submit(request), t.remote.submit(request)])
+    assert.deepEqual(value(first), value(repeated)); assert.equal(value(first).stage, 'submitted'); assert.ok(value(first).mainMessageId)
+    await t.main.agent.whenIdle()
+    const transcript = t.main.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'translation-material' && event.data.source.requestId === request.requestId)
+    assert.equal(transcript.length, 1)
+    assert.equal(t.f.host.provider.calls.length, 1)
+    const messages = t.f.host.provider.calls[0].messages
+    assert.equal(messages.filter(message => message.source.kind === 'translation-material' && message.source.requestId === request.requestId).length, 1)
+    assert.ok(!messages.some(message => message.source.kind === 'user'))
+    assert.equal(t.sessions.getTranslationHistory(t.session.id).units.length, 0)
+    assert.equal(t.sessions.getSession(t.session.id).input, 'Private next draft')
+  } finally { await t.close() }
+})
+
+test('Native生产Host：真实queue edit保留发送时材料，queue remove释放并保留其他请求', async () => {
+  const t = await fixture()
+  let open
+  try {
+    t.f.host.provider.gate = new Promise(resolve => { open = resolve })
+    await t.prompt('native-busy')
+    for (let i = 0; i < 100 && !t.f.host.provider.calls.length; i++) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.equal(t.f.host.provider.calls.length, 1)
+    const edited = t.material('native-queued-edit'), removed = t.material('native-queued-remove')
+    for (const request of [edited, removed]) { value(await t.remote.prepare(request)); await t.prompt(request.requestId) }
+    const item = request => t.main.agent.inbox.nextTurn.find(message => message.source.rpcId === request.requestId)
+    await t.updateQueue({ sessionId: mainId, itemId: item(edited).id, action: { kind: 'edit', content: [{ type: 'text', text: 'Synthetic edited main command' }] } })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(value(await t.remote.query(t.scope(edited))).snapshot.material.sourceText, edited.material.sourceText)
+    await t.updateQueue({ sessionId: mainId, itemId: item(removed).id, action: { kind: 'remove' } })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(value(await t.remote.query(t.scope(removed))), null)
+    t.f.host.provider.gate = undefined; open(); await t.main.agent.whenIdle()
+    const messages = t.f.host.provider.calls.at(-1).messages
+    assert.equal(messages.find(message => message.source.kind === 'user' && message.source.rpcId === edited.requestId).content[0].text, 'Synthetic edited main command')
+    assert.equal(messages.filter(message => message.source.kind === 'translation-material' && message.source.requestId === edited.requestId).length, 1)
+    assert.ok(!messages.some(message => message.source.kind === 'translation-material' && message.source.requestId === removed.requestId))
+  } finally { t.f.host.provider.gate = undefined; open?.(); await t.close() }
+})
