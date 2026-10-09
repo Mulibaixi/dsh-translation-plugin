@@ -44,7 +44,7 @@
 
 记录提供**查询普通执行状态**与**取消普通翻译**，失败或取消保留部分输出及实际调用事实。重载后，Host 仍保留原操作时可补取缺失事件；无法确认的结果显示未知，查询不重复调用模型。本版支持每操作一次短文本调用，长文分批、文件翻译、并行执行及自动术语分析尚未开放。
 
-对于已交付并冻结的普通材料，主模型可调用 `translation_read_source({target, range})` 读取 `[start, end)` Unicode 码点范围，每次最多 4000 码点，完整序列化回复最多 32768 个 UTF-8 字节。工具要求精确的 `materialId`、`sourceVersion` 并核对所属 Agent/Peer；它只读取原文，不调用 LLM、不修改草稿或建立单元。超过 8000 码点的材料通知只携带配置、固定引用和长度，较短通知仍内联原文。冻结原文继续保存在现有 Hoststore，不改变历史 schema。
+对于已交付并冻结的普通材料，主模型可调用 `translation_read_source({target, range})` 读取 `[start, end)` Unicode 码点范围，每次最多 4000 码点，完整序列化回复最多 32768 个 UTF-8 字节。工具要求精确的 `materialId`、`sourceVersion` 并核对所属 Agent/Peer；它只读取原文，不调用 LLM、不修改草稿或建立单元。超过 8000 码点的材料通知只携带配置、固定引用和长度，较短通知仍内联原文。冻结原文继续保存在现有 Host 存储，不改变历史 schema。
 
 这只是先行的原文读取能力，不代表完整长 TXT 翻译；现有单次输入及执行上限不变。长文分批、文件/TXT 导入、复合单元与自动术语分析仍未开放。普通材料提交仍要求宿主 `ctx.conversation.submissions` 扩展，官方 DSH `0.2.0-rc.2` 不提供该扩展。
 
@@ -180,7 +180,7 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-在 DSH 插件管理器中将本目录作为 `dsh-translation-plugin` 本地 bundle 安装，启用后重启。构建产物位于 `dist/`，不进入 Git；目录链接安装修改后重建同一目录。升级至 v0.14.1 须加载同版本 Host/Client，刷新 Client 注册（没有刷新功能时重新安装）后重启。普通材料入口还需要宿主提交扩展，官方 DSH `0.2.0-rc.2` 不自带。文本历史保存为 schema8/history5，旧格式仍可读取；术语和档案 schema 仍为1，依据可携源版本；对象位置命名空间不变。降级前备份应用数据，v0.13.0 及更早版本不能读取新 schema8 历史或带新源版本依据的记忆资产。
+在 DSH 插件管理器中将本目录作为 `dsh-translation-plugin` 本地 bundle 安装，启用后重启。构建产物位于 `dist/`，不进入 Git；目录链接安装修改后重建同一目录。升级至 v0.14.2 须加载同版本 Host/Client，刷新 Client 注册（没有刷新功能时重新安装）后重启。普通材料入口还需要宿主提交扩展，官方 DSH `0.2.0-rc.2` 不自带。文本历史保存为 schema8/history5，旧格式仍可读取；术语和档案 schema 仍为1，依据可携源版本；对象位置命名空间不变。降级前备份应用数据，v0.13.0 及更早版本不能读取新 schema8 历史或带新源版本依据的记忆资产。
 
 从早期框架版升级时，需要在插件管理器刷新包含模型目录 RPC 的 bundle 元信息；没有刷新功能时卸载后重新安装，再重启 DSH。不要手动修改 profile。
 
@@ -200,6 +200,9 @@ pnpm build
 
 纯文本提交核心分别表达材料、草稿、源版本和业务操作身份。Host 在受理前准备有效术语及实际模型调用，短回执通过正式桥回写业务受理和有序流式事件，Client 历史保持权威。每个修订只保存一份实际调用上下文，源版本记录是唯一持久原文；状态查询和取消不重复调用模型。
 
-变化见 [CHANGELOG.md](CHANGELOG.md)。当前本地候选为 `v0.14.1`，新增主模型按范围读取已交付材料原文；这只是读取能力，不代表支持完整长 TXT 翻译。完整主发送联动需要宿主 Composer 扩展。快译、流式执行、查询/取消、人工修订、最终选择、档案、原件关联、导出与可选历史继续可用。文件及自动解析仍未开放。本地版本未远程发布，`private: true` 防止意外 npm 发布。
+Host 的 `translationSources` Remote 提供 `capabilities`、`importReceipt` 和 `readRange`，凭校验为实际所属主会话的 DSH 原件上传收据导入严格 UTF-8 TXT，最多 2 MiB。固定资产使用 `sourceId` 和版本 `1`；解码保留 BOM、CRLF 和非 BMP 字符，并记录 BOM 状态。`translationSources.readRange` 每页最多 4000 个 Unicode 码点，完整 Remote 回复（含 RemoteResult 外层包装与业务结果）最多 32768 个 UTF-8 字节。接口校验 Agent/Peer 所属，同范围重复收据幂等，取消或失败不发布半成品。源服务只在 Host 运行期存储解码文本，重启后不恢复；原始 DSH 附件遵循独立保留策略。这只是 Host 基础服务：`translation_read_source` 仍只读取已交付的内联材料，`translationSources.readRange` 尚未接成主模型文件读取工具。Client 文件提交与长文翻译仍未接通，现有文件选择器不能提交文件翻译。
+
+变化见 [CHANGELOG.md](CHANGELOG.md)。当前本地候选为 `v0.14.2`，提供 Host 端固定 TXT 原文资产导入与范围读取基础服务；尚未接入 Client 文件提交或长文翻译。完整主发送联动需要宿主 Composer 扩展。快译、流式执行、查询/取消、人工修订、最终选择、档案、原件关联、导出与可选历史继续可用。文件及自动解析仍未开放。本地版本未远程发布，`private: true` 防止意外 npm 发布。
+
 
 许可证：[MIT](LICENSE)。

@@ -305,7 +305,7 @@ export function mount(overrides = {}) {
   const remote = {
     async $mount(contribution) {
       assert.equal(contribution.package, 'dsh-translation-plugin')
-      assert.deepEqual([...new Set(contribution.descriptors.map(item => item.namespace))].sort(), ['translationMaterials', 'translationNormal', 'translationObjects', 'translationQuick', 'translationTopics'])
+      assert.deepEqual([...new Set(contribution.descriptors.map(item => item.namespace))].sort(), ['translationMaterials', 'translationNormal', 'translationObjects', 'translationQuick', 'translationSources', 'translationTopics'])
       mountCalls++; topicMountCalls++
       await overrides.mountGate
       if (overrides.mountError) throw overrides.mountError

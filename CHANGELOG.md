@@ -2,6 +2,19 @@
 
 记录影响安装、使用和兼容性的变化。使用中文描述，按新增、变更、修复、移除等类别整理。开发中的变化可先进入 `Unreleased`；本地版本提交时记录对应版本号与日期，不代表已发布到 npm 或远程发行页。
 
+## [0.14.2] - 2026-10-09
+
+本地 Host 固定 TXT 原文导入服务候选版本；未发布到 npm 或远程发行页。
+
+### 新增
+
+- Host `translationSources` Remote 提供 `capabilities`、`importReceipt` 和 `readRange`，凭校验为实际所属主会话的 DSH 原件上传收据导入严格 UTF-8 TXT，最多 2 MiB。固定资产使用 `sourceId` 与版本 `1`；解码保留 BOM、CRLF 和非 BMP 字符，并记录 BOM 状态。`translationSources.readRange` 每页最多 4000 个 Unicode 码点，完整 Remote 回复（含 RemoteResult 外层包装与业务结果）最多 32768 个 UTF-8 字节；校验 Agent/Peer 所属，同范围重复收据幂等，取消或失败不发布半成品。
+
+### 范围与兼容性
+
+- 这是 Host 底层能力，尚未接通 Client 文件提交或材料 `sourceRef`，不改 history/schema；长粘贴、自动术语分析和长文分批仍未开放，现有文件选择器仍不能提交文件翻译。`translation_read_source` 仍只读取已交付的内联材料；`translationSources.readRange` 是独立命名空间，尚未接成主模型文件读取工具。
+- 源服务只在 Host 运行期存储解码文本，重启后不恢复；原始 DSH 附件遵循其独立保留策略。
+
 ## [0.14.1] - 2026-10-09
 
 本地普通材料分段读取候选版本；未发布到 npm 或远程发行页。
@@ -12,7 +25,7 @@
 
 ### 变更
 
-- 超过 8000 码点的材料通知改为携带配置、固定材料引用和长度；较短通知继续内联原文。冻结原文仍保存在现有 Hoststore，不改变历史 schema。
+- 超过 8000 码点的材料通知改为携带配置、固定材料引用和长度；较短通知继续内联原文。冻结原文仍保存在现有 Host 存储，不改变历史 schema。
 
 ### 范围与兼容性
 

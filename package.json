@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "private": true,
   "license": "MIT",
   "description": "A DeepSeek Harness translation plugin framework (early development).",
@@ -32,7 +32,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
     "test": "npm run build && node --test",
-    "test:native": "npm run build && node --expose-internals --test scripts/quick-host-native.integration.mjs scripts/quick-client-native.integration.mjs scripts/quick-client-mount-native.integration.mjs scripts/topic-tools-native.integration.mjs scripts/object-assets-native.integration.mjs scripts/translation-materials-native.integration.mjs scripts/normal-translation-native.integration.mjs",
+    "test:native": "npm run build && node --expose-internals --test scripts/quick-host-native.integration.mjs scripts/quick-client-native.integration.mjs scripts/quick-client-mount-native.integration.mjs scripts/topic-tools-native.integration.mjs scripts/object-assets-native.integration.mjs scripts/translation-materials-native.integration.mjs scripts/normal-translation-native.integration.mjs scripts/translation-sources-native.integration.mjs",
     "hooks:install": "node scripts/install-git-hooks.mjs",
     "check:commit": "node scripts/check-commit-message.mjs",
     "check:policy": "node scripts/check-staged-files.mjs"
