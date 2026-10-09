@@ -386,11 +386,26 @@ function TranslationUnit({ unit, quick, normal, session, editor, topics, objects
 function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, materials, terms, objects, objectAssets, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
-  react.useEffect(() => quick.subscribe(() => refreshQuick(value => value + 1)), [quick])
+  react.useEffect(() => {
+    const refresh = () => {
+      refreshQuick(value => value + 1)
+      if (quick.getReadiness().status === 'idle') void quick.load()
+    }
+    const unsubscribe = quick.subscribe(refresh)
+    if (quick.getReadiness().status === 'idle') void quick.load()
+    return unsubscribe
+  }, [quick])
   react.useEffect(() => normal?.subscribe(() => refreshQuick(value => value + 1)), [normal])
   react.useEffect(() => objects?.subscribe(() => refreshQuick(value => value + 1)), [objects])
-  react.useEffect(() => models.subscribe(() => refreshQuick(value => value + 1)), [models])
-  react.useEffect(() => { void quick.load() }, [quick])
+  react.useEffect(() => {
+    const refresh = () => {
+      refreshQuick(value => value + 1)
+      if (models.getSnapshot().status === 'idle') void models.load()
+    }
+    const unsubscribe = models.subscribe(refresh)
+    if (models.getSnapshot().status === 'idle') void models.load()
+    return unsubscribe
+  }, [models])
   react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
   react.useEffect(() => topics?.subscribe(() => refreshQuick(value => value + 1)), [topics])
   react.useEffect(() => materials?.subscribe(() => refreshQuick(value => value + 1)), [materials])

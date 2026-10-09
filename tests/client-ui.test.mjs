@@ -380,7 +380,7 @@ test('设置外部变更自动同步，不需要重新读取按钮', async () =>
 test('模型采用分组目录与原生菜单材质，仅修改翻译会话模型', async () => {
   const app = mount({ settings: settings({ rememberHistory: true }) }); const ui = app.renderer; ui.render(app.panel, { sessionId: 'main-a' })
   await rename(ui, 'A')
-  assert.equal(app.catalogCalls, 0); await ui.click('模型：选择模型'); await tick(); ui.render(); assert.equal(app.catalogCalls, 1)
+  assert.equal(app.catalogCalls, 1); await ui.click('模型：选择模型'); await tick(); ui.render(); assert.equal(app.catalogCalls, 1)
   await ui.click('选择模型')
   assert.ok(ui.nodes().some(node => node.props['aria-label'] === 'Provider A')); await ui.input('搜索模型', 'md6'); await ui.click('Model 6')
   assert.equal(saved(app)[0].model.provider, 'provider-a'); assert.equal(saved(app)[0].model.model, 'm6'); assert.ok(ui.button('模型：Model 6'))
