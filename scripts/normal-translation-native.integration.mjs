@@ -26,7 +26,7 @@ function executionDetails(t, p) {
 function value(response) { assert.equal(response.ok, true, JSON.stringify(response)); assert.equal(response.value.ok, true, JSON.stringify(response)); return response.value.value }
 async function fixture({ dropAcceptance = false } = {}) {
   const f = await createTopicToolsNativeFixture({ runtimeRoot })
-  f.host.provider.catalog = ['model-a', 'model-b']
+  f.host.provider.catalog = ['model-a', 'model-b', 'model-c']
   if (dropAcceptance) {
     const original = f.client.connection.rpc.open
     let dropped = false
@@ -46,6 +46,7 @@ async function fixture({ dropAcceptance = false } = {}) {
   const materials = new MaterialSubmissionsClient({ store, topics: bridge, remote: f.client.remote.translationMaterials,
     owner: {}, registry: { register: () => () => {} } })
   const normal = new NormalTranslationClient(store, materials, terms, ownerId => bridge.retain(ownerId), { remote: f.client.remote.translationNormal,
+    canAccessUnit: (ownerId, sessionId, unitId) => bridge.isPublished(ownerId, sessionId, unitId),
     subscribeBridge: listener => bridge.subscribe(listener), bridgeReady: ownerId => bridge.getStatus(ownerId).ready })
   bridge.setNormalTranslation(normal)
   await waitTopicReady(bridge, mainId, f.carrierErrors); await materials.load()
@@ -98,27 +99,37 @@ test('Native 2A Host受理基础经正式Gateway取得Client短ACK，去重保�
 })
 
 function installExecutionProvider(t, { gate = false } = {}) {
-  let mainCalls = 0, translationCalls = 0, request
+  let mainCalls = 0, translationCalls = 0, request, resumeTranslation
+  const issued = new Set(), tools = []
   t.f.host.provider.stream = async function* (options) {
     this.calls.push(options)
-    if (options.model === 'model-b') {
+    if (options.model === 'model-b' || options.model === 'model-c') {
       translationCalls++
       assert.equal(t.store.getTranslationHistory(t.session.id).units.length, 1, 'Client acceptance precedes translator dispatch')
       assert.deepEqual(options.tools, [])
       yield { type: 'block-start', index: 0, blockType: 'text' }
       yield { type: 'text-delta', index: 0, text: '合成译文' }
-      if (gate) await new Promise(resolve => { if (options.signal.aborted) resolve(); else options.signal.addEventListener('abort', resolve, { once: true }) })
+      if (gate) await new Promise(resolve => { resumeTranslation = resolve; if (options.signal.aborted) resolve(); else options.signal.addEventListener('abort', resolve, { once: true }) })
       yield { type: 'block-end', index: 0, block: { type: 'text', text: '合成译文' } }
       yield { type: 'usage', usage: { inputTokens: 13, outputTokens: 4 } }
       yield { type: 'finish', reason: { kind: options.signal.aborted ? 'aborted' : 'stop' } }
       return
     }
     mainCalls++
-    if (mainCalls === 1) {
+    const unitNotice = options.messages.findLast(message => message.source.kind === 'translation-unit')
+    const unitRequest = unitNotice ? JSON.parse(unitNotice.content[0].text.split('\n').at(-1)) : undefined
+    const queued = tools.shift()
+    if (queued || mainCalls === 1 || (unitRequest && !issued.has(unitRequest.operationId))) {
+      let name = 'translation_execute', args
+      if (queued) { name = queued.name; args = queued.arguments }
+      else if (unitRequest) args = { ...unitRequest, organizedRequirements: '', termReferences: [] }
+      else {
       const notice = options.messages.find(message => message.source.kind === 'translation-material')
       const envelope = JSON.parse(notice.content[0].text.split('\n').at(-1))
-      request = t.executeRequest(envelope)
-      const call = { type: 'tool-call', id: 'native-main-execute-call', name: 'translation_execute', arguments: JSON.stringify(request) }
+        args = t.executeRequest(envelope)
+      }
+      request = args; issued.add(args.operationId)
+      const call = { type: 'tool-call', id: `native-main-tool-call:${mainCalls}`, name, arguments: JSON.stringify(args) }
       yield { type: 'block-start', index: 0, blockType: 'tool-call' }
       yield { type: 'tool-call-delta', index: 0, id: call.id, name: call.name, argumentsDelta: call.arguments }
       yield { type: 'block-end', index: 0, block: call }
@@ -129,7 +140,8 @@ function installExecutionProvider(t, { gate = false } = {}) {
     }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
-  return { get request() { return request }, get mainCalls() { return mainCalls }, get translationCalls() { return translationCalls } }
+  return { get request() { return request }, get mainCalls() { return mainCalls }, get translationCalls() { return translationCalls },
+    enqueueTool(name, args) { tools.push({ name, arguments: args }) }, finishTranslation() { resumeTranslation?.() } }
 }
 
 test('Native真实主Agent tool-call→Gateway→Client受理→独立译模型流式回写，重复不调用provider且旧A回原会话', async () => {
@@ -191,5 +203,102 @@ test('Native Client已经受理但ACK丢失，只读观察恢复零call失败，
     assert.equal(t.store.getTranslationHistory(t.session.id).units[0].revisions.length, 0)
     assert.equal(p.translationCalls, 0); assert.equal(t.f.requests.filter(frame => frame.command.kind === 'normal_accept').length, 1)
     assert.ok(t.f.requests.some(frame => frame.command.kind === 'normal_observe'))
+  } finally { await t.close() }
+})
+
+test('Native单元重译由一次RPC进入真实主Agent，冻结当前模型和effort、不新增单元、不清草稿', async () => {
+  const t = await fixture(), p = installExecutionProvider(t)
+  try {
+    await t.materials.send(t.session.id); await t.main.agent.whenIdle()
+    await waitFor(() => t.store.getTranslationHistory(t.session.id).units[0]?.revisions[0]?.status === 'completed', () => executionDetails(t, p))
+    const unit = t.store.getTranslationHistory(t.session.id).units[0]
+    t.store.updateSession(t.session.id, { input: 'Synthetic unrelated draft B', targetLanguage: 'English', model: { provider: 'synthetic', model: 'model-c', reasoningEffort: 'low' } })
+    const submission = { target: { kind: 'unit', mainSessionId: mainId, translationSessionId: t.session.id, unitId: unit.id, sourceVersion: 1 }, operationId: 'native-unit-retranslate' }
+    const resolve = t.normal.resolve
+    let frozenRoute = false
+    t.normal.resolve = function (ownerId, input) {
+      const result = resolve.call(this, ownerId, input)
+      if (input.operationId === submission.operationId && result.ok) {
+        frozenRoute = true
+        t.store.updateSession(t.session.id, { model: { provider: 'synthetic', model: 'model-b' } })
+      }
+      return result
+    }
+    assert.equal(value(await t.f.client.remote.translationNormal.requestUnit(submission)).status, 'submitted')
+    await t.main.agent.whenIdle()
+    await waitFor(() => t.store.getTranslationHistory(t.session.id).units[0]?.revisions[1]?.status === 'completed', () => executionDetails(t, p))
+    const history = t.store.getTranslationHistory(t.session.id), latest = history.units[0].revisions[1]
+    assert.equal(history.units.length, 1); assert.equal(history.units[0].sourceVersion, 1); assert.equal(latest.sourceVersion, 1)
+    assert.equal(latest.callRecord.model.model, 'model-c'); assert.equal(latest.callRecord.model.reasoningEffort, 'low')
+    assert.equal(frozenRoute, true); assert.equal(t.store.getSession(t.session.id).model.model, 'model-b')
+    assert.equal(history.units[0].targetLanguage, '中文'); assert.equal(t.store.getSession(t.session.id).input, 'Synthetic unrelated draft B')
+    const mainCalls = p.mainCalls
+    assert.equal(value(await t.f.client.remote.translationNormal.requestUnit(submission)).status, 'submitted')
+    assert.equal(p.mainCalls, mainCalls); assert.equal(p.translationCalls, 2)
+    assert.equal(t.f.requests.filter(frame => frame.command.kind === 'normal_accept').length, 2)
+    p.enqueueTool('translation_correct_source', { target: submission.target, operationId: 'native-correct-and-translate-source', sourceText: 'Synthetic corrected and translated source v2', reason: '' })
+    p.enqueueTool('translation_execute', { target: { ...submission.target, sourceVersion: 2 }, operationId: 'native-correct-and-translate-call', organizedRequirements: '', termReferences: [] })
+    const llm = await t.f.host.native('@deepseek-ai/dsh-llm')
+    t.main.agent.followup(llm.createUserMessage({ content: [{ type: 'text', text: 'Synthetic user requests correction and retranslation in this one turn.' }], source: { kind: 'user' } }))
+    await t.main.agent.whenIdle()
+    await waitFor(() => t.store.getTranslationHistory(t.session.id).units[0]?.revisions[2]?.status === 'completed', () => executionDetails(t, p))
+    const corrected = t.store.getTranslationHistory(t.session.id).units[0]
+    assert.equal(corrected.sourceVersion, 2); assert.equal(corrected.sourceVersions.length, 2); assert.equal(corrected.revisions[2].sourceVersion, 2)
+    assert.equal(corrected.revisions[0].sourceVersion, 1); assert.equal(corrected.revisions[1].sourceVersion, 1)
+    assert.equal(corrected.revisions[2].callRecord.model.model, 'model-b'); assert.equal(p.translationCalls, 3)
+    assert.equal(t.store.getSession(t.session.id).input, 'Synthetic unrelated draft B')
+  } finally { await t.close() }
+})
+
+test('Native真实主Agent源纠错只增版本，旧调用晚到写旧版而不选新final，纠错后模型准备失败保留事实', async () => {
+  const t = await fixture(), p = installExecutionProvider(t, { gate: true })
+  try {
+    await t.materials.send(t.session.id); await t.main.agent.whenIdle()
+    await waitFor(() => t.store.getTranslationHistory(t.session.id).units[0]?.revisions[0]?.text === '合成译文', () => executionDetails(t, p))
+    const unit = t.store.getTranslationHistory(t.session.id).units[0], target = { kind: 'unit', mainSessionId: mainId, translationSessionId: t.session.id,
+      unitId: unit.id, sourceVersion: 1 }
+    const correction = { target, operationId: 'native-source-correction', sourceText: 'Synthetic corrected source v2', reason: 'Synthetic correction' }
+    p.enqueueTool('translation_correct_source', correction)
+    const llm = await t.f.host.native('@deepseek-ai/dsh-llm')
+    t.main.agent.followup(llm.createUserMessage({ content: [{ type: 'text', text: 'Synthetic user requests correction of the provided unit.' }], source: { kind: 'user' } }))
+    await t.main.agent.whenIdle()
+    let current = t.store.getTranslationHistory(t.session.id).units[0]
+    assert.equal(current.sourceVersion, 2); assert.equal(current.source, correction.sourceText); assert.equal(current.sourceVersions[0].text, 'Synthetic source A')
+    const duplicate = await t.f.host.ctx.tools.execute({ agent: t.main.agent, name: 'translation_correct_source', arguments: correction,
+      callId: 'native-duplicate-correction', signal: new AbortController().signal })
+    assert.equal(duplicate.isError, false); assert.equal(duplicate.value.sourceVersion, 2)
+    assert.equal(t.f.requests.filter(frame => frame.command.kind === 'normal_correct_source').length, 1)
+    p.finishTranslation()
+    await waitFor(() => t.store.getTranslationHistory(t.session.id).units[0].revisions[0].status === 'completed', () => executionDetails(t, p))
+    current = t.store.getTranslationHistory(t.session.id).units[0]
+    assert.equal(current.revisions[0].sourceVersion, 1); assert.equal(current.final, null)
+    const read = await t.f.host.ctx.tools.execute({ agent: t.main.agent, name: 'translation_read_unit', arguments: { translationSessionId: t.session.id, unitId: unit.id },
+      callId: 'native-current-source-read', signal: new AbortController().signal })
+    assert.equal(read.value.unit.sourceVersion, 2); assert.equal(read.value.unit.revisions[0].sourceVersion, 1)
+    t.store.updateSession(t.session.id, { model: null, input: 'Synthetic draft B remains' })
+    p.enqueueTool('translation_execute', { target: { ...target, sourceVersion: 2 }, operationId: 'native-corrected-prepare-fail', organizedRequirements: '', termReferences: [] })
+    t.main.agent.followup(llm.createUserMessage({ content: [{ type: 'text', text: 'Synthetic user requests retranslation of corrected source.' }], source: { kind: 'user' } }))
+    await t.main.agent.whenIdle()
+    current = t.store.getTranslationHistory(t.session.id).units[0]
+    assert.equal(current.sourceVersion, 2); assert.equal(current.revisions.length, 1); assert.equal(p.translationCalls, 1)
+    assert.equal(t.store.getSession(t.session.id).input, 'Synthetic draft B remains')
+    assert.equal(t.f.requests.filter(frame => frame.command.kind === 'normal_accept').length, 1)
+  } finally { p.finishTranslation(); await t.close() }
+})
+
+test('Native单元引用范围校验拒绝猜测或未提供ID，主Agent纠错不改变其它历史', async () => {
+  const t = await fixture(), p = installExecutionProvider(t)
+  try {
+    await t.materials.send(t.session.id); await t.main.agent.whenIdle()
+    await waitFor(() => t.store.getTranslationHistory(t.session.id).units[0]?.revisions[0]?.status === 'completed')
+    const target = { kind: 'unit', mainSessionId: mainId, translationSessionId: t.session.id, unitId: 'synthetic-guessed-unit', sourceVersion: 1 }
+    const result = await t.f.host.ctx.tools.execute({ agent: t.main.agent, name: 'translation_execute', arguments: { target, operationId: 'guessed-retranslate', organizedRequirements: '', termReferences: [] },
+      callId: 'native-guessed-unit', signal: new AbortController().signal })
+    assert.equal(result.isError, true)
+    const correct = await t.f.host.ctx.tools.execute({ agent: t.main.agent, name: 'translation_correct_source', arguments: { target, operationId: 'guessed-correction', sourceText: 'Synthetic rewrite', reason: '' },
+      callId: 'native-guessed-source', signal: new AbortController().signal })
+    assert.equal(correct.isError, true); assert.equal(p.translationCalls, 1)
+    const unit = t.store.getTranslationHistory(t.session.id).units[0]
+    assert.equal(unit.sourceVersion, 1); assert.equal(unit.sourceVersions.length, 1)
   } finally { await t.close() }
 })

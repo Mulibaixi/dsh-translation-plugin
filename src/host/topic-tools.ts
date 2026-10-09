@@ -1,6 +1,6 @@
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
-import { parseNormalTranslationExecute } from '../shared/normal-translation.js'
+import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection } from '../shared/normal-translation.js'
 
 export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
 export interface MainAgent {
@@ -22,6 +22,10 @@ interface SessionController { list(request: Record<string, never>, signal: Abort
 interface ToolHelpers { defineTool(options: Record<string, unknown>): unknown }
 export type TopicToolLoader = () => Promise<ToolHelpers>
 const sessionParameter = { type: 'string', required: true, description: 'Exact translation Session id from translation_list_sessions.' }
+const unitTargetParameter = { type: 'object', additionalProperties: false, properties: {
+  kind: { type: 'string', enum: ['unit'], required: true }, mainSessionId: { type: 'string', required: true },
+  translationSessionId: sessionParameter, unitId: { type: 'string', required: true }, sourceVersion: { type: 'integer', required: true },
+} }
 const topicParameter = { type: 'string', required: true, description: 'Exact topic id from translation_list_topics or translation_list_sessions.' }
 const sessionStartParameter = { required: true, oneOf: [
   { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['new_topic'], required: true } } },
@@ -37,6 +41,7 @@ const termFields = {
   evidence: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['source', 'final'], required: true }, sessionId: { type: 'string', required: true }, unitId: { type: 'string', required: true },
     revisionId: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+    sourceVersion: { type: 'integer', description: 'Required for source versions after 1; omitted legacy references mean source version 1.' },
     selectionEventId: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
     range: { oneOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, properties: { start: { type: 'integer', required: true }, end: { type: 'integer', required: true } } }], required: true },
     role: { type: 'string', enum: ['basis', 'example'], required: true },
@@ -112,7 +117,7 @@ class ManagementConnection {
     if (reply.ok) {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
-        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_observe: 'normal_observed' }[pending.frame.command.kind]
+        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -261,14 +266,14 @@ export class TopicToolsService {
           return connection.request(parseTopicBridgeCommand({ ...args, kind: definition.kind }), exec)
         },
       })))
-      const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown> } | undefined
+      const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown>; correctSource(args: unknown, exec: ToolExecution): Promise<unknown> } | undefined
       if (normal) disposers.push(agent.ctx.tools.register(helpers.defineTool({
-        name: 'translation_execute', description: 'Execute short normal translation only when the user task calls for translation. Discussion needs no call. Refer to the exact delivered material and source version. Supply organized translation requirements and relevant term ids/versions, never rewrite source or choose another model. Reuse operationId for the same operation; an explicit new revision uses a new operationId. Check the returned acceptance or unavailable error.',
+        name: 'translation_execute', description: 'Execute short normal translation when the user requests it. Refer to delivered material or an explicitly provided unit and exact sourceVersion from translation_read_unit. An existing unit uses its session current translation model, with original language and requirements; the draft is untouched. Never rewrite source or choose a provider. Reuse operationId for the same operation; explicit retranslation uses a new operationId. If the user requested source correction and retranslation, first call translation_correct_source, then execute its returned sourceVersion with an independent operationId. Preparation failure preserves the correction.',
         parameters: {
-          target: { type: 'object', required: true, additionalProperties: false, properties: {
+          target: { required: true, oneOf: [{ type: 'object', additionalProperties: false, properties: {
             kind: { type: 'string', enum: ['material'], required: true }, mainSessionId: { type: 'string', required: true },
             requestId: { type: 'string', required: true }, materialId: { type: 'string', required: true }, sourceVersion: { type: 'integer', required: true },
-          } },
+          } }, unitTargetParameter] },
           operationId: { type: 'string', required: true }, organizedRequirements: { type: 'string', required: true },
           termReferences: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
             id: { type: 'string', required: true }, entryVersion: { type: 'integer', required: true },
@@ -278,6 +283,16 @@ export class TopicToolsService {
         execute: (args: unknown, exec: ToolExecution) => {
           if (exec.agent !== agent) throw bridgeError('scope_mismatch', '翻译工具不属于此 Agent。')
           return normal.execute(parseNormalTranslationExecute(args), exec)
+        },
+      })))
+      if (normal) disposers.push(agent.ctx.tools.register(helpers.defineTool({
+        name: 'translation_correct_source', description: 'Correct the full plain text source of an explicitly provided unit only when the user requests a source correction. Use its expected sourceVersion and a separate correction operationId. The returned sourceVersion is authoritative; old source and translations remain in history. This call does not translate. If retranslation was requested, call translation_execute in the same user turn with the returned version and a different operationId. A later model preparation failure does not undo the correction. Sources with managed objects cannot be corrected automatically.',
+        parameters: { target: { ...unitTargetParameter, required: true }, operationId: { type: 'string', required: true },
+          sourceText: { type: 'string', required: true }, reason: { type: 'string', required: true, description: 'Brief correction reason; may be empty.' } },
+        output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+        execute: (args: unknown, exec: ToolExecution) => {
+          if (exec.agent !== agent) throw bridgeError('scope_mismatch', '纠错工具不属于此 Agent。')
+          return normal.correctSource(parseNormalTranslationSourceCorrection(args), exec)
         },
       })))
       return disposers

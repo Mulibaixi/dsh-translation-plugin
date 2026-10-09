@@ -62,7 +62,7 @@ test('完整JSON冻结浏览器来源与时间/全部版本事件/安全调用�
   assert.equal(json.history.units[0].revisions.length, 2); assert.equal(json.history.units[0].revisions[1].callRecord, null)
   assert.equal(json.history.units[0].revisions[0].callRecord.usage.inputTokens, 7); assert.equal(json.history.units[0].revisions[0].callRecord.usage.outputTokens, null)
   assert.equal(json.promptDefinitions.length, 1); assert.equal(json.promptDefinitions[0].systemPrompt, QUICK_SYSTEM_PROMPT)
-  assert.deepEqual(json.promptDefinitions[0].userMessageFields, { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source' })
+  assert.deepEqual(json.promptDefinitions[0].userMessageFields, { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.sourceVersions[revision.sourceVersion-1].text' })
   assert.deepEqual(JSON.parse(reconstructTranslationContext(restored.units[0]).userMessage), { target_language: 'English', translation_requirements: 'Keep synthetic terms', source_text: 'Synthetic source 1' })
   assert.equal(json.summary.complete, false); assert.equal(json.summary.missingUnits[0].order, 1)
   assert.ok(!result.content.includes('sessionKey')); assert.ok(!result.content.includes('credentials'))

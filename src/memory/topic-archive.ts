@@ -41,9 +41,11 @@ function strings(value: unknown, maximum: number): value is readonly string[] {
   return Array.isArray(value) && value.length <= 100 && value.every(item => text(item, maximum)) && new Set(value).size === value.length
 }
 function evidence(value: unknown): value is TermEvidenceRef {
-  if (!record(value) || !exact(value, ['kind', 'sessionId', 'unitId', 'revisionId', 'selectionEventId', 'range', 'role']) ||
+  if (!record(value) || !(exact(value, ['kind', 'sessionId', 'unitId', 'revisionId', 'selectionEventId', 'range', 'role']) ||
+      (value.kind === 'source' && exact(value, ['kind', 'sessionId', 'unitId', 'sourceVersion', 'revisionId', 'selectionEventId', 'range', 'role']))) ||
     !text(value.sessionId, 2048) || !text(value.unitId, 2048) || !['basis', 'example'].includes(value.role as string)) return false
-  if (value.kind === 'source' ? value.revisionId !== null || value.selectionEventId !== null :
+  if (value.kind === 'source' ? value.revisionId !== null || value.selectionEventId !== null ||
+      (Object.hasOwn(value, 'sourceVersion') && !integer(value.sourceVersion, 1)) :
     value.kind !== 'final' || !text(value.revisionId, 2048) || !text(value.selectionEventId, 2048)) return false
   return value.range === null || (record(value.range) && exact(value.range, ['start', 'end']) && integer(value.range.start) && integer(value.range.end, 1) && value.range.end > value.range.start)
 }

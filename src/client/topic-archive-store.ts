@@ -43,7 +43,6 @@ export class TopicArchiveStore {
       const onChange = (event: StorageEvent): void => { if (event.storageArea === storage) this.externalChange(event.key) }
       window.addEventListener('storage', onChange); this.stopStorage = () => window.removeEventListener('storage', onChange)
     }
-    if (this.enabled) for (const seat of this.seats.values()) if (seat.dirty) this.queuePersist(seat)
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
@@ -175,7 +174,6 @@ export class TopicArchiveStore {
       if (!parsed || parsed.ownerId !== ownerId || parsed.topicId !== topicId) throw new Error('invalid topic archive')
       seat.snapshot = reconcileTopicArchive(parsed, this.resolver, now()); seat.stored = raw; seat.dirty = parsed !== seat.snapshot
       seat.status = seat.dirty ? 'memory' : raw === null ? 'memory' : 'saved'; this.notice = undefined
-      if (this.enabled && seat.dirty) this.queuePersist(seat)
       this.emit(); return true
     } catch { seat.status = 'conflict'; this.notice = '最新主题档案无法读取，当前内容保留。'; this.emit(); return false }
   }

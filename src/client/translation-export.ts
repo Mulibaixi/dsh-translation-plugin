@@ -1,5 +1,5 @@
 import type { LocalSession } from './sessions.js'
-import { persistedTranslationHistory, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
+import { persistedTranslationHistory, currentFinalRevision, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
 import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION, NORMAL_SYSTEM_PROMPT, NORMAL_TRANSLATION_PROMPT_VERSION } from '../shared/translation-call.js'
 
 export interface MissingTextUnit {
@@ -46,8 +46,8 @@ interface BilingualTextUnit {
 function finalSummary(history: TranslationHistory): { texts: string[]; units: BilingualTextUnit[]; missingUnits: MissingTextUnit[]; exportedUnitIds: string[] } {
   const texts: string[] = [], units: BilingualTextUnit[] = [], missingUnits: MissingTextUnit[] = [], exportedUnitIds: string[] = []
   for (const unit of [...history.units].sort((a, b) => a.order - b.order)) {
-    const revision = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
-    const translation = revision?.accepted && revision.status === 'completed' && revision.text.trim() ? revision.text : null
+    const revision = currentFinalRevision(unit)
+    const translation = revision?.text ?? null
     units.push({ unitId: unit.id, order: unit.order, source: unit.source, targetLanguage: unit.targetLanguage,
       status: translation === null ? 'missing' : 'final', translation })
     if (translation !== null) {
@@ -127,7 +127,7 @@ export function buildFullRecordExport(session: LocalSession, history: Translatio
   const hasKnownPrompt = history.units.some(unit => unit.revisions.some(revision => revision.callRecord?.promptVersion === TRANSLATION_PROMPT_VERSION))
   const hasNormalPrompt = history.units.some(unit => unit.revisions.some(revision => revision.callRecord?.promptVersion === NORMAL_TRANSLATION_PROMPT_VERSION))
   const promptDefinitions = [...(hasKnownPrompt ? [{ promptVersion: TRANSLATION_PROMPT_VERSION, systemPrompt: QUICK_SYSTEM_PROMPT,
-    userMessageFields: { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source' } }] : []),
+    userMessageFields: { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.sourceVersions[revision.sourceVersion-1].text' } }] : []),
     ...(hasNormalPrompt ? [{ promptVersion: NORMAL_TRANSLATION_PROMPT_VERSION, systemPrompt: NORMAL_SYSTEM_PROMPT, userMessageFields: {
       target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.sourceVersions[revision.sourceVersion-1].text',
       main_model_requirements: 'revision.callRecord.context.organizedRequirements', terminology: 'revision.callRecord.context.terms',

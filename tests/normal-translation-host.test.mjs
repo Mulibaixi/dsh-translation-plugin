@@ -3,7 +3,7 @@ import test from 'node:test'
 import { NormalTranslationService } from '../dist/host/normal-translation.js'
 import { TranslationMaterialsService } from '../dist/host/translation-materials.js'
 import { TopicToolsService } from '../dist/host/topic-tools.js'
-import { parseNormalTranslationExecute } from '../dist/shared/normal-translation.js'
+import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection } from '../dist/shared/normal-translation.js'
 import { parseTopicBridgeCommand, parseTopicBridgeReply } from '../dist/shared/topic-bridge.js'
 import { emptyTopicTerms } from '../dist/memory/topic-terms.js'
 
@@ -112,4 +112,48 @@ test('Host受理基础未知ACK保留操作去重，不自动重发；实际错�
     await f.stream.next(); waiting = f.stream.next()
     await f.close(waiting); await denied
   } finally { await f.close() }
+})
+
+const unitTarget = { kind: 'unit', mainSessionId: ownerId, translationSessionId: 'translation-a', unitId: 'client-authority-unit-a', sourceVersion: 1 }
+test('历史重译与源纠错协议要求明确单元和预期版本，source/revision事实兼容旧版1', () => {
+  assert.deepEqual(parseNormalTranslationExecute({ ...request, target: unitTarget }), { ...request, target: unitTarget })
+  const correction = { target: unitTarget, operationId: 'correct-source-a', sourceText: 'Synthetic corrected source', reason: '' }
+  assert.deepEqual(parseNormalTranslationSourceCorrection(correction), correction)
+  assert.throws(() => parseNormalTranslationSourceCorrection({ ...correction, target: request.target }))
+  assert.throws(() => parseNormalTranslationExecute({ ...request, target: unitTarget, sourceText: 'Replacement outside correction' }))
+  const fact = { id: unitTarget.unitId, order: 1, source: 'Synthetic current source', targetLanguage: '中文', instruction: '', revisions: [], final: null }
+  assert.equal(parseTopicBridgeReply({ requestId: 'r', ok: true, value: { kind: 'unit', unit: fact } }).value.unit.sourceVersion, 1)
+  assert.equal(parseTopicBridgeReply({ requestId: 'r', ok: true, value: { kind: 'unit', unit: { ...fact, sourceVersion: 2 } } }).value.unit.sourceVersion, 2)
+})
+
+test('Host纠错经Client短ACK保持独立operation，重复不再发请求且不调用provider', async () => {
+  const f = await fixture(); let waiting
+  try {
+    const correction = { target: unitTarget, operationId: 'source-correction-a', sourceText: 'Synthetic corrected source', reason: 'Synthetic correction' }
+    assert.throws(() => f.normal.correctSource(correction, { ...f.exec, agent: { ...f.agent } }), { code: 'scope_mismatch' })
+    const a = f.normal.correctSource(correction, f.exec), b = f.normal.correctSource(correction, f.exec), frame = (await f.stream.next()).value
+    assert.deepEqual(frame.command, { kind: 'normal_correct_source', ...correction })
+    const receipt = { operationId: correction.operationId, mainSessionId: ownerId, translationSessionId: unitTarget.translationSessionId,
+      unitId: unitTarget.unitId, previousSourceVersion: 1, sourceVersion: 2, persistence: 'runtime_only' }
+    f.uplink.push(parseTopicBridgeReply({ requestId: frame.requestId, ok: true, value: { kind: 'normal_source_corrected', correction: receipt } }))
+    waiting = f.stream.next()
+    assert.deepEqual(await a, receipt); assert.deepEqual(await b, receipt)
+    assert.deepEqual(await f.normal.correctSource(correction, f.exec), receipt)
+    assert.throws(() => f.normal.correctSource({ ...correction, sourceText: 'Changed correction' }, f.exec), { code: 'idempotency_conflict' })
+    assert.throws(() => f.normal.execute({ ...request, target: unitTarget, operationId: correction.operationId }, f.exec), { code: 'idempotency_conflict' })
+  } finally { await f.close(waiting) }
+})
+
+test('Host历史重译先受控读取Client当前路由，模型不可用时不受理不消费材料', async () => {
+  const f = await fixture(); let waiting
+  try {
+    const retranslate = { ...request, target: unitTarget, operationId: 'retranslate-existing-a' }
+    const execution = f.normal.execute(retranslate, f.exec), rejected = assert.rejects(execution, { code: 'execution_unavailable' })
+    const frame = (await f.stream.next()).value
+    assert.deepEqual(frame.command, { kind: 'normal_resolve', target: unitTarget, operationId: retranslate.operationId })
+    const resolved = { ...envelope, requestId: 'unit-freeze-a', material: { ...envelope.material, unitReference: { unitId: unitTarget.unitId, sourceVersion: 1 }, model: { provider: 'synthetic-current', model: 'current-route', reasoningEffort: 'low' } } }
+    f.uplink.push(parseTopicBridgeReply({ requestId: frame.requestId, ok: true, value: { kind: 'normal_resolved', envelope: resolved } }))
+    waiting = f.stream.next(); await rejected
+    await assert.rejects(f.normal.execute(retranslate, f.exec), { code: 'execution_unavailable' })
+  } finally { await f.close(waiting) }
 })

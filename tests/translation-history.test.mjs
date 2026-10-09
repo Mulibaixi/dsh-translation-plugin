@@ -122,12 +122,12 @@ test('schema2边界拒绝人工假调用/坏基准及敏感调用字段，旧his
     for (const revision of unit.revisions) for (const key of ['kind', 'baseRevisionId', 'callRecord', 'sourceVersion']) delete revision[key]
   }
   const decoded = decodeTranslationHistory(old)
-  assert.equal(decoded.schemaVersion, 4); assert.equal(decoded.units[0].revisions[0].kind, 'machine')
+  assert.equal(decoded.schemaVersion, 5); assert.equal(decoded.units[0].revisions[0].kind, 'machine')
   assert.equal(decoded.units[0].revisions[0].callRecord, null); assert.equal(decoded.units[0].revisions[0].baseRevisionId, null)
   assert.equal(old.schemaVersion, 1); assert.equal(old.units[0].revisions[0].kind, undefined)
 })
 
-test('旧schema4记录读取不改写，允许下一次保存才统一迁移schema7/history4', async () => {
+test('旧schema4记录读取不改写，允许下一次保存才统一迁移schema8/history5', async () => {
   const storage = enabled(), session = newSession(DEFAULT_SESSION_SETTINGS, 'owner', 'old:4')
   const old = clone(initial()); old.schemaVersion = 1
   for (const unit of old.units) {
@@ -137,24 +137,24 @@ test('旧schema4记录读取不改写，允许下一次保存才统一迁移sche
   const raw = JSON.stringify({ schemaVersion: 4, token: 'synthetic', session, translationHistory: old })
   storage.setItem(historyKey(session.id), raw)
   const store = makeStore(storage)
-  assert.equal(store.getTranslationHistory(session.id).schemaVersion, 4)
+  assert.equal(store.getTranslationHistory(session.id).schemaVersion, 5)
   assert.equal(storage.getItem(historyKey(session.id)), raw)
   assert.equal(await update(store, session.id, history => appendManualRevision(history, 'unit:1', { id: 'manual:1', baseRevisionId: 'revision:1', text: '合成新增人工', at })), true)
   const snapshot = JSON.parse(storage.getItem(historyKey(session.id)))
-  assert.equal(snapshot.schemaVersion, 7); assert.equal(snapshot.translationHistory.schemaVersion, 4)
+  assert.equal(snapshot.schemaVersion, 8); assert.equal(snapshot.translationHistory.schemaVersion, 5)
   const restarted = makeStore(storage); assert.deepEqual(restarted.getTranslationHistory(session.id), store.getTranslationHistory(session.id))
 })
 
-test('旧schema6/history3读取保持原文件，随后保存升级7/4；同业务operation可有不同call但不能跨unit', async () => {
+test('旧schema6/history3读取保持原文件，随后保存升级8/5；同业务operation可有不同call但不能跨unit', async () => {
   const storage = enabled(), session = newSession(DEFAULT_SESSION_SETTINGS, 'owner', 'old:6'), legacy = clone(initial())
   legacy.schemaVersion = 3; const raw = JSON.stringify({ schemaVersion: 6, token: 'old-snapshot', session, translationHistory: legacy })
   storage.setItem(historyKey(session.id), raw)
   const store = makeStore(storage)
-  assert.equal(storage.getItem(historyKey(session.id)), raw); assert.equal(store.getTranslationHistory(session.id).schemaVersion, 4)
+  assert.equal(storage.getItem(historyKey(session.id)), raw); assert.equal(store.getTranslationHistory(session.id).schemaVersion, 5)
   const operationId = legacy.units[0].revisions[0].operationId
   assert.equal(await update(store, session.id, history => appendTextRevision(history, 'unit:1', revision('independent-call:2', { operationId }))), true)
   const current = store.getTranslationHistory(session.id); assert.equal(current.units[0].revisions.length, 2)
-  assert.equal(JSON.parse(storage.getItem(historyKey(session.id))).schemaVersion, 7); assert.ok(decodeTranslationHistory(current))
+  assert.equal(JSON.parse(storage.getItem(historyKey(session.id))).schemaVersion, 8); assert.ok(decodeTranslationHistory(current))
   assert.throws(() => appendTextUnit(current, material('unit:2'), revision('call:3', { operationId })))
   const invalid = clone(current); invalid.units.push({ ...invalid.units[0], id: 'unit:2', order: 2, final: null,
     revisions: [{ ...invalid.units[0].revisions[0], id: 'call:3', order: 1 }] })
@@ -287,7 +287,7 @@ test('翻译记录与草稿共用一个历史快照，重启恢复不写入或�
   assert.equal(await update(store, session.id, () => initial()), true)
   store.updateSession(session.id, { input: '合成下一段草稿' }); await settle()
   const snapshot = JSON.parse(storage.getItem(historyKey(session.id)))
-  assert.equal(snapshot.schemaVersion, 7)
+  assert.equal(snapshot.schemaVersion, 8)
   assert.equal(snapshot.session.input, '合成下一段草稿')
   assert.equal(snapshot.translationHistory.units[0].source, undefined)
   assert.equal(snapshot.translationHistory.units[0].sourceVersions[0].text, '合成原文:unit:1')

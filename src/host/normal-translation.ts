@@ -1,11 +1,13 @@
 import { NORMAL_TRANSLATION_REMOTE, parseNormalTranslationExecute, parseNormalTranslationQuery, type NormalTranslationExecute,
   type NormalTranslationOperation, type NormalTranslationQuery, type NormalTranslationJob, type NormalTranslationResult,
-  type NormalTranslationUpdate, type NormalTranslationError, type NormalTranslationCapability } from '../shared/normal-translation.js'
+  type NormalTranslationUpdate, type NormalTranslationError, type NormalTranslationCapability,
+  parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt,
+  parseNormalTranslationUnitRequest, type NormalTranslationUnitRequest, type NormalTranslationUnitReceipt } from '../shared/normal-translation.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import type { NormalTranslationContext, TranslationCallMetadata } from '../shared/translation-call.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
-import { DshTextExecutionAdapter, type LlmModuleLoader, type NormalExecutionPacket } from './dsh-text-adapter.js'
+import { DshTextExecutionAdapter, hostLlmLoader, type LlmModuleLoader, type NormalExecutionPacket } from './dsh-text-adapter.js'
 import type { TopicHostContext, TopicToolsService, ToolExecution, MainAgent } from './topic-tools.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
 
@@ -43,6 +45,9 @@ export class NormalTranslationService {
   readonly adapter: DshTextExecutionAdapter
   private readonly admissions = new Map<string, Admission>()
   private readonly jobs = new Map<string, Job>()
+  private readonly resolved = new Map<string, { readonly signature: string; readonly result: Promise<Envelope> }>()
+  private readonly corrections = new Map<string, { readonly signature: string; readonly result: Promise<NormalTranslationCorrectionReceipt> }>()
+  private readonly unitRequests = new Map<string, { readonly signature: string; readonly result: Promise<NormalTranslationResult<NormalTranslationUnitReceipt>> }>()
   private readonly activeSessions = new Set<string>()
   private disposed = false
   constructor(readonly ctx: TopicHostContext, loadModule?: LlmModuleLoader) {
@@ -57,6 +62,7 @@ export class NormalTranslationService {
     exec.signal.throwIfAborted()
   }
   private source(request: NormalTranslationExecute, exec: ToolExecution): Envelope {
+    if (request.target.kind !== 'material') throw rejected('unsupported_target', '历史单元须先读取权威快照。', 'resolve_unit')
     const result = this.materials?.deliveredForAgent(request.target, exec.agent!)
     if (!result) throw rejected('execution_unavailable', '材料服务尚未就绪。', 'resolve_material')
     if (!result.ok) throw rejected(result.error.code, result.error.message, result.error.stage)
@@ -71,11 +77,33 @@ export class NormalTranslationService {
     const request = parseNormalTranslationExecute(input)
     this.owned(request, exec)
     const key = identity(request.target.mainSessionId, request.operationId), previous = this.jobs.get(key)
+    if (this.corrections.has(key)) throw rejected('idempotency_conflict', '原文纠错与翻译须使用独立的操作 ID。', 'prepare')
     if (previous) {
       if (JSON.stringify(previous.request) !== JSON.stringify(request)) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、版本或要求。', 'prepare')
       return previous.acceptance.then(() => structuredClone(previous.operation!))
     }
-    const envelope = this.source(request, exec), sessionId = identity(request.target.mainSessionId, envelope.material.translationSessionId)
+    if (request.target.kind === 'unit') {
+      const signature = JSON.stringify(request), previous = this.resolved.get(key)
+      if (previous && previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换单元、版本或要求。', 'resolve_unit')
+      if (!previous) {
+        const target = request.target
+        const result = this.topics.requestOwned(target.mainSessionId, { kind: 'normal_resolve', target, operationId: request.operationId }, exec).then(value => {
+          if (value.kind !== 'normal_resolved' || value.envelope.mainSessionId !== target.mainSessionId ||
+            value.envelope.material.translationSessionId !== target.translationSessionId || value.envelope.material.sourceVersion !== target.sourceVersion ||
+            value.envelope.material.unitReference?.unitId !== target.unitId || value.envelope.material.unitReference.sourceVersion !== target.sourceVersion) throw rejected('invalid_reply', '历史单元的权威源快照身份不符。', 'resolve_unit')
+          return value.envelope
+        })
+        this.resolved.set(key, { signature, result })
+      }
+      return this.resolved.get(key)!.result.then(envelope => this.executeEnvelope(request, exec, envelope))
+    }
+    return this.executeEnvelope(request, exec, this.source(request, exec))
+  }
+  private executeEnvelope(request: NormalTranslationExecute, exec: ToolExecution, envelope: Envelope): Promise<NormalTranslationOperation> {
+    this.owned(request, exec)
+    const key = identity(request.target.mainSessionId, request.operationId), previous = this.jobs.get(key)
+    if (previous) return previous.acceptance.then(() => structuredClone(previous.operation!))
+    const sessionId = identity(request.target.mainSessionId, envelope.material.translationSessionId)
     if (!envelope.material.model) throw rejected('model_required', '此提交材料未选择翻译模型，请选择后重新提交；草稿保留。', 'prepare')
     if (this.activeSessions.has(sessionId)) throw rejected('busy', '此普通翻译会话仍有未结算操作。', 'prepare')
     this.activeSessions.add(sessionId)
@@ -113,7 +141,7 @@ export class NormalTranslationService {
       job.metadata = this.adapter.preflightNormal(job.packet)
       job.controller.signal.throwIfAborted()
       job.acceptRequested = true
-      const accepted = await this.admit(request, exec, true)
+      const accepted = await this.admit(request, exec, true, envelope)
       job.operation = accepted.operation; job.status = accepted.operation.status
       if (JSON.stringify(accepted.termSnapshot.entries) !== JSON.stringify(terms.termSnapshot.entries)) throw rejected('invalid_reply', '业务受理时术语包与已准备版本不一致。', 'accept')
       queueMicrotask(() => { void this.run(job) })
@@ -122,7 +150,7 @@ export class NormalTranslationService {
       const unknown = job.acceptRequested && ['outcome_unknown', 'invalid_reply'].includes((error as { code?: string }).code ?? '')
       job.status = unknown ? 'unknown' : job.controller.signal.aborted ? 'cancelled' : 'failed'
       job.error = this.adapter.diagnostic(job.internalId) ?? { code: unknown ? 'OUTCOME_UNKNOWN' : (error as { code?: string }).code ?? 'PREPARE_FAILED',
-        message: unknown ? '业务受理回执尚未确认；保留此操作并查询，未派发翻译模型。' : job.status === 'cancelled' ? '普通翻译已在模型调用前取消。' : '普通翻译准备未完成，材料保留。', stage: (error as { stage?: string }).stage ?? 'prepare' }
+        message: unknown ? '业务受理回执尚未确认；保留此操作并查询，未派发翻译模型。' : job.status === 'cancelled' ? '普通翻译已在模型调用前取消。' : request.target.kind === 'unit' ? '重译准备未完成，原文及已完成的纠错保留。' : '普通翻译准备未完成，材料保留。', stage: (error as { stage?: string }).stage ?? 'prepare' }
       this.adapter.discard(job.internalId)
       if (job.operation && unknown) this.emit(job, 'unknown', '', null, job.error)
       if (!unknown) this.activeSessions.delete(job.sessionId)
@@ -131,7 +159,7 @@ export class NormalTranslationService {
   }
   /** Host foundation used only after the executor has prepared the full call. */
   acceptPrepared(input: NormalTranslationExecute, exec: ToolExecution): Promise<Accepted> { return this.admit(input, exec, false) }
-  private admit(input: NormalTranslationExecute, exec: ToolExecution, reserved: boolean): Promise<Accepted> {
+  private admit(input: NormalTranslationExecute, exec: ToolExecution, reserved: boolean, resolved?: Envelope): Promise<Accepted> {
     const request = parseNormalTranslationExecute(input)
     this.owned(request, exec)
     const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify(request), previous = this.admissions.get(key)
@@ -139,14 +167,15 @@ export class NormalTranslationService {
       if (previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、版本或要求。', 'accept')
       return previous.result.then(result => structuredClone(result))
     }
-    const envelope = this.source(request, exec), sessionId = identity(request.target.mainSessionId, envelope.material.translationSessionId)
+    const envelope = resolved ?? this.source(request, exec), sessionId = identity(request.target.mainSessionId, envelope.material.translationSessionId)
     if (!reserved && this.activeSessions.has(sessionId)) throw rejected('busy', '此普通翻译会话仍有未结算操作。', 'accept')
     this.activeSessions.add(sessionId)
     const result = Promise.resolve().then(async (): Promise<Accepted> => {
       const value = await this.topics.requestOwned(request.target.mainSessionId, { kind: 'normal_accept', envelope,
         operationId: request.operationId, organizedRequirements: request.organizedRequirements, termReferences: request.termReferences }, exec)
       if (value.kind !== 'normal_operation' || value.operation.operationId !== request.operationId || value.operation.mainSessionId !== request.target.mainSessionId ||
-        value.operation.materialId !== request.target.materialId || value.operation.sourceVersion !== request.target.sourceVersion ||
+        value.operation.materialId !== envelope.material.materialId || value.operation.sourceVersion !== request.target.sourceVersion ||
+        (request.target.kind === 'unit' && value.operation.unitId !== request.target.unitId) ||
         value.operation.translationSessionId !== envelope.material.translationSessionId || value.operation.topicId !== envelope.material.topicId ||
         value.operation.draftVersion !== envelope.material.draftVersion) throw rejected('invalid_reply', '普通翻译业务回执身份不一致。', 'accept')
       this.validateTerms(request, envelope, value.termSnapshot)
@@ -157,6 +186,52 @@ export class NormalTranslationService {
     })
     this.admissions.set(key, { signature, sessionId, result })
     return result.then(value => structuredClone(value))
+  }
+  correctSource(input: unknown, exec: ToolExecution): Promise<NormalTranslationCorrectionReceipt> {
+    const request = parseNormalTranslationSourceCorrection(input)
+    if (this.disposed || !this.topics.ownsAgent(request.target.mainSessionId, exec.agent)) throw rejected('scope_mismatch', '纠错工具不属于此主 Agent。', 'authorize')
+    exec.signal.throwIfAborted()
+    const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify(request), previous = this.corrections.get(key)
+    if (this.jobs.has(key) || this.resolved.has(key) || this.admissions.has(key)) throw rejected('idempotency_conflict', '原文纠错与翻译须使用独立的操作 ID。', 'correct_source')
+    if (previous && previous.signature !== signature) throw rejected('idempotency_conflict', '同一纠错操作 ID 不能更换原文或范围。', 'correct_source')
+    if (!previous) {
+      const result = this.topics.requestOwned(request.target.mainSessionId, { kind: 'normal_correct_source', ...request }, exec).then(value => {
+        if (value.kind !== 'normal_source_corrected' || value.correction.operationId !== request.operationId || value.correction.mainSessionId !== request.target.mainSessionId ||
+          value.correction.translationSessionId !== request.target.translationSessionId || value.correction.unitId !== request.target.unitId ||
+          value.correction.previousSourceVersion !== request.target.sourceVersion) throw rejected('invalid_reply', '原文纠错回执身份不符。', 'correct_source')
+        return value.correction
+      })
+      this.corrections.set(key, { signature, result })
+    }
+    return this.corrections.get(key)!.result.then(receipt => structuredClone(receipt))
+  }
+  requestUnit(input: NormalTranslationUnitRequest, signal = new AbortController().signal): Promise<NormalTranslationResult<NormalTranslationUnitReceipt>> {
+    const request = parseNormalTranslationUnitRequest(input), peerId = this.ctx.invocation?.peer.id
+    if (!peerId || this.disposed || !this.topics.ownsConnection(request.target.mainSessionId, peerId)) return Promise.resolve(bad('scope_mismatch', '重译请求不属于此主会话连接。', 'authorize'))
+    const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify(request), previous = this.unitRequests.get(key)
+    if (previous && previous.signature !== signature) return Promise.resolve(bad('idempotency_conflict', '同一重译请求不能更换单元或版本。', 'main_admission'))
+    if (!previous) this.unitRequests.set(key, { signature, result: this.submitUnitIntent(request, peerId, signal) })
+    return this.unitRequests.get(key)!.result
+  }
+  private async submitUnitIntent(request: NormalTranslationUnitRequest, peerId: string, signal: AbortSignal): Promise<NormalTranslationResult<NormalTranslationUnitReceipt>> {
+    try {
+      const controller = this.ctx.get?.('sessionController') as { resolveAgent(id: string): Promise<{ agent: MainAgent & { followup(message: unknown): void } } | { error: unknown }> }
+      const [found, helpers] = await Promise.all([controller.resolveAgent(request.target.mainSessionId), hostLlmLoader(this.ctx)()])
+      signal.throwIfAborted()
+      if ('error' in found) return bad('unavailable', '无法准备所属主会话。', 'resolve_main_agent')
+      const agent = found.agent
+      if (this.disposed || !this.topics.ownsConnection(request.target.mainSessionId, peerId) || !this.topics.ownsAgent(request.target.mainSessionId, agent)) return bad('scope_mismatch', '所属主会话连接已变化。', 'main_admission')
+      const value = await this.topics.requestOwned(request.target.mainSessionId, { kind: 'read_unit', translationSessionId: request.target.translationSessionId,
+        unitId: request.target.unitId }, { agent, callId: request.operationId, signal })
+      if (value.kind !== 'unit' || value.unit.id !== request.target.unitId || value.unit.sourceVersion !== request.target.sourceVersion) return bad('stale_version', '原文版本已变化，请读取当前单元再重译。', 'resolve_unit')
+      if (!this.topics.ownsConnection(request.target.mainSessionId, peerId)) return bad('scope_mismatch', '所属主会话连接已变化。', 'main_admission')
+      agent.followup(helpers.createUserMessage({ content: [{ type: 'text', text: [
+        'The user requests retranslation of this explicitly provided translation unit. Call translation_execute with this exact target and operationId; organize relevant requirements/term references first if needed. The program reads authoritative source, original target language and requirements, and the translation session current model. Do not translate in main chat or copy the translation back. No extra confirmation or user action is needed. The editable draft is unrelated and remains unchanged.',
+        JSON.stringify(request),
+      ].join('\n') }], source: { kind: 'translation-unit', form: 'notice', summary: '重译单元', plugin: 'dsh-translation-plugin', mainSessionId: request.target.mainSessionId,
+        translationSessionId: request.target.translationSessionId, unitId: request.target.unitId, sourceVersion: request.target.sourceVersion, operationId: request.operationId } }))
+      return ok({ ...request, status: 'submitted' })
+    } catch (error) { return bad((error as { code?: string }).code ?? 'main_admission_failed', '重译意图未能进入主会话；单元与草稿保留。', 'main_admission') }
   }
   private emit(job: Job, status: NormalTranslationUpdate['status'], textDelta = '', metadata: TranslationCallMetadata | null = null, error: NormalTranslationError | null = null): void {
     const operation = job.operation!
@@ -260,7 +335,7 @@ export class NormalTranslationService {
   dispose(): void {
     this.disposed = true
     for (const job of this.jobs.values()) { job.controller.abort(); job.delivery.abort(); this.adapter.discard(job.internalId) }
-    this.admissions.clear(); this.activeSessions.clear()
+    this.admissions.clear(); this.resolved.clear(); this.corrections.clear(); this.unitRequests.clear(); this.activeSessions.clear()
   }
 }
 export function installNormalTranslation(ctx: TopicHostContext, loadModule?: LlmModuleLoader, registerRemote = true): NormalTranslationService {

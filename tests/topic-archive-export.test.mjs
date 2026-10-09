@@ -6,7 +6,7 @@ import { emptyTopicTerms, putTopicTerm } from '../dist/memory/topic-terms.js'
 
 const at = '2026-10-07T00:00:00.000Z'
 const evidence = { kind: 'source', role: 'basis', sessionId: 'session', unitId: 'unit', revisionId: null, selectionEventId: null, range: { start: 1, end: 3 } }
-const resolver = () => ({ ownerId: 'owner', topicId: 'topic', source: 'SECRET SYNTHETIC EVIDENCE BODY', final: null })
+const resolver = () => ({ ownerId: 'owner', topicId: 'topic', sourceVersion: 1, source: 'SECRET SYNTHETIC EVIDENCE BODY', final: null })
 function fixture() {
   let archive = emptyTopicArchive('owner', 'topic', at)
   archive = putUserTopicArchive(archive, { kind: 'entity', id: 'alice', expectedEntryVersion: null, name: 'Alice *entity*', aliases: ['A'], description: 'Synthetic entity description' }, resolver, { eventId: 'adopt', at }).snapshot

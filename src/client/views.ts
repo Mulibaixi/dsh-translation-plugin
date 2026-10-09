@@ -3,7 +3,7 @@ import { h, react } from './react.js'
 import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
-import { type TextUnit, type TextRevision } from './translation-history.js'
+import { currentFinalRevision, type TextUnit, type TextRevision } from './translation-history.js'
 import { type TranslationExport, type TranslationExportTopic, type TranslationExportSession } from './translation-export.js'
 import { buildRecordObjectExport, recordObjectPlainText } from './record-object-export.js'
 import type { RecordObjectReference } from '../shared/record-objects.js'
@@ -276,7 +276,7 @@ function TranslationRevision({ unit, revision, quick, session, editor, objects, 
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断' }[revision.status]
   const record = quick.getRecords(session.id).find(record => record.id === revision.operationId)
-  const eligible = revision.accepted && revision.status === 'completed' && !!revision.text.trim()
+  const eligible = revision.sourceVersion === unit.sourceVersion && revision.accepted && revision.status === 'completed' && !!revision.text.trim()
   const fixed = unit.final?.revisionId === revision.id && unit.final.selection === 'user_fixed'
   const label = `文本 ${unit.order} 版本 ${revision.order}`
   const key = editKey(session.id, unit.id, revision.id)
@@ -294,7 +294,7 @@ function TranslationRevision({ unit, revision, quick, session, editor, objects, 
   }
   return h('section', { className: 'dsh-tp-version', 'aria-label': label },
     h('div', { className: 'dsh-tp-version-header' },
-      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.kind === 'manual' ? '人工修订' : status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}`),
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.kind === 'manual' ? '人工修订' : status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}${revision.sourceVersion === unit.sourceVersion ? '' : ` · 已过时（原文版本 ${revision.sourceVersion}）`}`),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
         h('button', { type: 'button', 'aria-label': `复制${label}`, disabled: !revision.text, onClick: () => { void copy() } }, copyState === 'copied' ? '已复制' : '复制'),
         h('button', { type: 'button', 'aria-label': `${label}设为最终`, disabled: !eligible || fixed, onClick: () => { quick.selectFinal(session.id, unit.id, revision.id) } }, fixed ? '已固定' : '设为最终'),
@@ -331,8 +331,15 @@ function TranslationRevision({ unit, revision, quick, session, editor, objects, 
 function TranslationUnit({ unit, quick, normal, session, editor, topics, objects, objectAssets }: RecordObjectsProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly normal?: NormalTranslationClient | undefined; readonly session: LocalSession; readonly editor: RevisionEditor; readonly topics?: TopicBridgeClient | undefined }): unknown {
   const [expanded, setExpanded] = react.useState(false)
   const [referenceFailure, setReferenceFailure] = react.useState(false)
+  const [sourcesExpanded, setSourcesExpanded] = react.useState(false)
   const latest = unit.revisions.at(-1)
-  const operation = unit.material ? normal?.getUnitStatus(session.id, unit.id) : undefined
+  const retranslation = normal?.getRetranslationStatus(session.id, unit.id)
+  const sourceHistory = unit.sourceVersions.length > 1 ? h('div', null,
+    h('small', { className: 'dsh-tp-muted' }, `当前原文版本 ${unit.sourceVersion}`),
+    h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文版本`, 'aria-expanded': sourcesExpanded, onClick: () => setSourcesExpanded(value => !value) }, sourcesExpanded ? '收起原文版本' : '查看原文版本'),
+    sourcesExpanded ? h('div', { className: 'dsh-tp-old-versions' }, ...unit.sourceVersions.map(source => h('section', { key: source.version },
+      h('small', { className: 'dsh-tp-muted' }, `原文版本 ${source.version}${source.version === unit.sourceVersion ? '（当前）' : '（历史）'}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null) : null
+  const operation = normal?.getUnitStatus(session.id, unit.id)
   const execution = operation && operation.status !== 'completed' ? h('div', { className: 'dsh-tp-muted' },
     h('p', { role: operation.status === 'failed' || operation.status === 'unknown' ? 'alert' : 'status' }, operation.message ?? {
       accepted: '材料已受理，等待翻译执行。', running: '正在翻译…', failed: '翻译失败。', cancelled: '已取消。', unknown: '执行结果未知，可查询本轮状态。',
@@ -346,18 +353,19 @@ function TranslationUnit({ unit, quick, normal, session, editor, topics, objects
   if (!latest) return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-muted' }, '原文'),
     h(RecordObjectText, { text: unit.source, target: { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
-    execution ?? h('p', { className: 'dsh-tp-muted', role: 'status' }, '材料已受理，等待翻译执行。'))
-  const final = unit.final ? unit.revisions.find(revision => revision.id === unit.final?.revisionId) : undefined
-  const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : '待定稿'
-  const blocked = quick.retranslateBlockedReason(session, unit.id)
+    sourceHistory, execution ?? h('p', { className: 'dsh-tp-muted', role: 'status' }, '材料已受理，等待翻译执行。'))
+  const final = currentFinalRevision(unit), pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
+  const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : pointed ? `原最终版本 ${pointed.order}已过时，待新原文定稿` : '待定稿'
+  const blocked = session.mode === 'normal' ? normal?.retranslateBlockedReason(session.id, unit.id) ?? (normal ? undefined : '普通重译入口未就绪。') : quick.retranslateBlockedReason(session, unit.id)
   const canReference = ['completed', 'failed', 'cancelled', 'interrupted'].includes(latest.status)
   const published = topics?.isPublished(session.ownerId, session.id, unit.id) ?? false
   return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-muted' }, '原文'),
     h(RecordObjectText, { text: unit.source, target: { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
+    sourceHistory,
     h('div', { className: 'dsh-tp-unit-header' },
       h('span', { className: 'dsh-tp-muted', role: 'status' }, finalLabel),
-      h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { void quick.retranslate(session.id, unit.id) } }, '重译'),
+      h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id); else void quick.retranslate(session.id, unit.id) } }, '重译'),
     ),
     topics ? h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
       h('button', { type: 'button', disabled: !canReference, 'aria-label': `文本 ${unit.order}供主模型参考`,
@@ -365,6 +373,7 @@ function TranslationUnit({ unit, quick, normal, session, editor, topics, objects
       published ? h('button', { type: 'button', 'aria-label': `取消文本 ${unit.order}参考`, onClick: () => { topics.revokeUnit(session.ownerId, session.id, unit.id); setReferenceFailure(false) } }, '取消参考') : null,
     ) : null,
     referenceFailure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '未能提供此参考，请核对单元状态及内容大小。') : null,
+    retranslation ? h('p', { className: 'dsh-tp-muted', role: 'status' }, retranslation.message) : null,
     execution,
     h(TranslationRevision, { key: latest.id, unit, revision: latest, quick, session, editor, objects, objectAssets }),
     unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, onClick: () => setExpanded(value => !value) }, `${expanded ? '收起' : '展开'}旧版本（${unit.revisions.length - 1}）`) : null,

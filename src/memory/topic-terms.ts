@@ -5,6 +5,8 @@ export interface TermEvidenceRef {
   readonly kind: 'source' | 'final'
   readonly sessionId: string
   readonly unitId: string
+  /** Source refs only. Missing legacy values identify source version 1. */
+  readonly sourceVersion?: number
   readonly revisionId: string | null
   readonly selectionEventId: string | null
   /** Half-open Unicode code point offsets; null selects the whole body. */
@@ -48,8 +50,10 @@ export interface TopicTermSnapshot {
 export interface TermEvidenceFact {
   readonly ownerId: string
   readonly topicId: string
+  /** Version of the current source body returned by the authoritative unit. */
+  readonly sourceVersion: number
   readonly source: string
-  readonly final: { readonly revisionId: string; readonly selectionEventId: string; readonly text: string } | null
+  readonly final: { readonly revisionId: string; readonly selectionEventId: string; readonly sourceVersion: number; readonly text: string } | null
 }
 export type TermEvidenceResolver = (sessionId: string, unitId: string) => TermEvidenceFact | undefined
 export interface TopicTermPut extends TopicTermContent {
@@ -90,9 +94,11 @@ function strings(value: unknown, maximum: number, required = false): value is re
   return Array.isArray(value) && value.length <= 100 && (!required || value.length > 0) && value.every(item => text(item, maximum)) && new Set(value).size === value.length
 }
 function evidence(value: unknown): value is TermEvidenceRef {
-  if (!record(value) || !exact(value, ['kind', 'sessionId', 'unitId', 'revisionId', 'selectionEventId', 'range', 'role']) ||
+  if (!record(value) || !(exact(value, ['kind', 'sessionId', 'unitId', 'revisionId', 'selectionEventId', 'range', 'role']) ||
+      (value.kind === 'source' && exact(value, ['kind', 'sessionId', 'unitId', 'sourceVersion', 'revisionId', 'selectionEventId', 'range', 'role']))) ||
     !text(value.sessionId, 2048) || !text(value.unitId, 2048) || !['basis', 'example'].includes(value.role as string)) return false
-  if (value.kind === 'source' ? value.revisionId !== null || value.selectionEventId !== null :
+  if (value.kind === 'source' ? value.revisionId !== null || value.selectionEventId !== null ||
+      (Object.hasOwn(value, 'sourceVersion') && !integer(value.sourceVersion, 1)) :
     value.kind !== 'final' || !text(value.revisionId, 2048) || !text(value.selectionEventId, 2048)) return false
   return value.range === null || (record(value.range) && exact(value.range, ['start', 'end']) && integer(value.range.start) && integer(value.range.end, 1) && value.range.end > value.range.start)
 }
@@ -146,11 +152,15 @@ export function emptyTopicTerms(ownerId: string, topicId: string, at: string): T
 
 export function resolveTermEvidence(snapshot: Pick<TopicTermSnapshot, 'ownerId' | 'topicId'>, ref: TermEvidenceRef, resolver: TermEvidenceResolver): string | undefined {
   const fact = resolver(ref.sessionId, ref.unitId)
-  if (!fact || fact.ownerId !== snapshot.ownerId || fact.topicId !== snapshot.topicId) return undefined
+  if (!fact || fact.ownerId !== snapshot.ownerId || fact.topicId !== snapshot.topicId || !integer(fact.sourceVersion, 1)) return undefined
   let body: string
-  if (ref.kind === 'source') body = fact.source
+  if (ref.kind === 'source') {
+    if ((ref.sourceVersion ?? 1) !== fact.sourceVersion) return undefined
+    body = fact.source
+  }
   else {
-    if (!fact.final || fact.final.revisionId !== ref.revisionId || fact.final.selectionEventId !== ref.selectionEventId) return undefined
+    if (!fact.final || !integer(fact.final.sourceVersion, 1) || fact.final.sourceVersion !== fact.sourceVersion ||
+      fact.final.revisionId !== ref.revisionId || fact.final.selectionEventId !== ref.selectionEventId) return undefined
     body = fact.final.text
   }
   if (ref.range !== null) {
@@ -182,6 +192,7 @@ function activeProjection(entry: TopicTerm): unknown {
 function copyContent(entry: TopicTermContent): TopicTermContent {
   return { sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sourceForms: [...entry.sourceForms], aliases: [...entry.aliases],
     sense: entry.sense, preferred: entry.preferred, forbidden: [...entry.forbidden], evidence: entry.evidence.map(ref => ({ kind: ref.kind, sessionId: ref.sessionId, unitId: ref.unitId,
+      ...(ref.kind === 'source' && ref.sourceVersion !== undefined ? { sourceVersion: ref.sourceVersion } : {}),
       revisionId: ref.revisionId, selectionEventId: ref.selectionEventId, range: ref.range ? { ...ref.range } : null, role: ref.role })) }
 }
 function replace(snapshot: TopicTermSnapshot, entry: TopicTerm, at: string): TopicTermSnapshot {

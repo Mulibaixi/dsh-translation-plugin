@@ -9,7 +9,7 @@ const at = '2026-10-06T01:00:00.000Z', later = '2026-10-06T02:00:00.000Z'
 const ownerId = 'synthetic-owner', topicId = 'synthetic-topic'
 const source = { kind: 'source', sessionId: 'synthetic-session', unitId: 'unit:1', revisionId: null, selectionEventId: null, range: null, role: 'basis' }
 const final = { ...source, kind: 'final', revisionId: 'revision:1', selectionEventId: 'text-event:1' }
-const fact = { ownerId, topicId, source: '合成 source 😀 API', final: { revisionId: 'revision:1', selectionEventId: 'text-event:1', text: '合成最终 API' } }
+const fact = { ownerId, topicId, sourceVersion: 1, source: '合成 source 😀 API', final: { revisionId: 'revision:1', selectionEventId: 'text-event:1', sourceVersion: 1, text: '合成最终 API' } }
 const resolver = (sessionId, unitId) => sessionId === source.sessionId && unitId === source.unitId ? fact : undefined
 const empty = () => emptyTopicTerms(ownerId, topicId, at)
 function input(id = 'term:1', edits = {}) {
@@ -30,6 +30,8 @@ test('术语边界只接受引用和合法语义，不接凭据、正文副本�
   assert.equal(decodeTopicTermPut(input('term:1', { origin: 'user_explicit' })), undefined)
   assert.equal(decodeTopicTermPut(input('term:1', { origin: 'inferred' })), undefined)
   assert.equal(decodeTopicTermPut(input('term:1', { evidence: [final] })), undefined)
+  assert.equal(decodeTopicTermPut(input('term:1', { evidence: [{ ...source, sourceVersion: 0 }] })), undefined)
+  assert.equal(decodeTopicTermPut(input('term:1', { evidence: [{ ...final, sourceVersion: 2 }] })), undefined)
   assert.equal(decodeTopicTermPut(input('term:1', { evidence: [{ ...source, range: { start: -1, end: 2 } }] })), undefined)
   assert.equal(decodeTopicTermPut(input('term:1', { evidence: [{ ...final, selectionEventId: null }] })), undefined)
   assert.equal(decodeTopicTermPut(input('term:1', { forbidden: ['接口'] })), undefined)
@@ -94,6 +96,34 @@ test('证据按Unicode码点半开范围解析，不复制正文且严格核对o
   assert.equal(resolveTermEvidence(stored, final, resolver), fact.final.text)
 })
 
+test('来源证据绑定source版本；同字串的source2不复活旧basis，source2与旧final均按版拒绝', () => {
+  const current2 = () => ({ ...fact, sourceVersion: 2, final: { ...fact.final, sourceVersion: 1 } })
+  const source2 = { ...source, sourceVersion: 2 }
+  assert.equal(resolveTermEvidence(empty(), source, current2), undefined, 'legacy source ref means version 1')
+  assert.equal(resolveTermEvidence(empty(), { ...source, sourceVersion: 1 }, current2), undefined)
+  assert.equal(resolveTermEvidence(empty(), source2, current2), fact.source, 'explicit version 2 resolves the same current text')
+  assert.equal(resolveTermEvidence(empty(), final, current2), undefined, 'a selected revision from source 1 is not current on source 2')
+  assert.equal(resolveTermEvidence(empty(), final, () => ({ ...fact, sourceVersion: 2, final: { ...fact.final, sourceVersion: 2 } })), fact.final.text)
+
+  const old = put().snapshot
+  assert.equal(old.entries[0].evidence[0].sourceVersion, undefined, 'legacy snapshot stays in its original shape')
+  assert.deepEqual(decodeTopicTermSnapshot(structuredClone(old)), old)
+  const reviewed = reconcileTopicTerms(old, current2, later)
+  assert.equal(reviewed.entries[0].status, 'review_required')
+  assert.equal(reviewed.entries[0].sourceForms[0], old.entries[0].sourceForms[0])
+  assert.equal(query(old, {}, current2).length, 0)
+  assert.equal(reconcileTopicTerms(reviewed, resolver, later), reviewed, 'invalidated basis does not silently revive')
+
+  const newBasis = putTopicTerm(empty(), input('term:source2', { evidence: [source2] }), current2, at)
+  assert.equal(newBasis.status, 'updated')
+  assert.equal(newBasis.entry.evidence[0].sourceVersion, 2, 'explicit source version survives domain copying')
+  assert.equal(query(newBasis.snapshot, {}, current2).length, 1)
+
+  const adopted = adoptTopicTerm(old, old.entries[0].id, old.entries[0].version, { eventId: 'user-adopt:source2', at: later }).snapshot
+  assert.equal(reconcileTopicTerms(adopted, current2, later), adopted, 'independently adopted rules remain active')
+  assert.equal(query(adopted, {}, current2).length, 1)
+})
+
 test('normal精确forms/aliases命中，Quick和不同owner/topic/语言为空', () => {
   const snapshot = put().snapshot
   assert.equal(query(snapshot, { forms: ['application programming interface'] }).length, 1)
@@ -116,7 +146,7 @@ test('失去basis立即检索不到并转待复核，重复失效不增加版本
 
 test('final依据含selection事件身份，r1→r2→r1不能复活旧事实', () => {
   const snapshot = put(empty(), { evidence: [source, final] }).snapshot
-  const replaced = () => ({ ...fact, final: { revisionId: 'revision:2', selectionEventId: 'text-event:2', text: '新合成最终' } })
+  const replaced = () => ({ ...fact, final: { revisionId: 'revision:2', selectionEventId: 'text-event:2', sourceVersion: 1, text: '新合成最终' } })
   assert.equal(query(snapshot, {}, replaced).length, 0)
   const returned = () => ({ ...fact, final: { ...fact.final, selectionEventId: 'text-event:3' } })
   assert.equal(resolveTermEvidence(snapshot, final, returned), undefined)

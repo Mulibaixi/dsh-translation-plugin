@@ -115,6 +115,9 @@ export function apply(ctx: ClientPluginContext): void {
     } : ctx.remote.translationObjects), ctx.fileUpload, store, objects, ownerId => topics.getStatus(ownerId))
     const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), {
       isSessionBusy: sessionId => quick.isBusy(sessionId), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
+      canAccessUnit: (ownerId, sessionId, unitId) => topics.isPublished(ownerId, sessionId, unitId),
+      publishUnit: (ownerId, sessionId, unitId) => topics.publishUnit(ownerId, sessionId, unitId),
+      canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationNormal')

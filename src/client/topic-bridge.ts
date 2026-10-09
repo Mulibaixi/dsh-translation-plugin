@@ -7,6 +7,8 @@ import type { TopicArchiveSnapshot, TopicArchivePut, ArchiveMutationResult, Topi
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { NormalTranslationAcceptance, NormalTranslationUpdate } from '../shared/normal-translation.js'
+import type { NormalTranslationUnitRequest, NormalTranslationSourceCorrection } from '../shared/normal-translation.js'
+import { currentFinalRevision } from './translation-history.js'
 import type { NormalTranslationReply } from './normal-translation.js'
 
 export interface TopicBridgeRemotePort {
@@ -32,6 +34,8 @@ interface NormalPort {
   accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
   update(ownerId: string, request: NormalTranslationUpdate): NormalTranslationReply
   observe(ownerId: string, request: { readonly translationSessionId: string; readonly operationId: string }): NormalTranslationReply
+  resolve(ownerId: string, request: NormalTranslationUnitRequest): NormalTranslationReply
+  correctSource(ownerId: string, request: NormalTranslationSourceCorrection): NormalTranslationReply
 }
 interface Connection {
   refs: number
@@ -140,7 +144,7 @@ export class TopicBridgeClient {
   private publishedEvidence(ownerId: string, topicId: string, ref: TermEvidenceRef): boolean {
     const publication = this.publications.get(this.key(ownerId, ref.sessionId, ref.unitId))
     if (!publication || publication.topicId !== topicId) return false
-    return ref.kind === 'source' || (publication.fact.final?.revisionId === ref.revisionId && publication.fact.final.selectionEventId === ref.selectionEventId)
+    return ref.kind === 'source' ? publication.fact.sourceVersion === (ref.sourceVersion ?? 1) : (publication.fact.final?.revisionId === ref.revisionId && publication.fact.final.selectionEventId === ref.selectionEventId)
   }
   private sessionSummary(session: LocalSession): TopicSessionSummary {
     return { id: session.id, topicId: session.topicId, name: session.name, mode: session.mode,
@@ -151,12 +155,21 @@ export class TopicBridgeClient {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
+    if (command.kind === 'normal_resolve' || command.kind === 'normal_correct_source') {
+      const target = command.target, publication = this.publications.get(this.key(ownerId, target.translationSessionId, target.unitId))
+      if (target.mainSessionId !== ownerId || !publication) return error(request.requestId, 'reference_not_published', '此单元尚未明确提供给当前主模型。')
+      const { kind, ...payload } = command
+      const result = kind === 'normal_resolve' ? this.normal?.resolve(ownerId, payload as NormalTranslationUnitRequest) : this.normal?.correctSource(ownerId, payload as NormalTranslationSourceCorrection)
+      if (result?.ok && result.value.kind === 'normal_source_corrected') this.publishAdmittedUnit(ownerId, target.translationSessionId, target.unitId, publication.automatic)
+      return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通单元处理通道尚未就绪。')
+    }
     if (command.kind === 'normal_observe') {
       const result = this.normal?.observe(ownerId, command)
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
     }
     if (command.kind === 'normal_accept' || command.kind === 'normal_prepare' || command.kind === 'normal_update') {
       const { kind, ...payload } = command
+      if (kind !== 'normal_update' && 'envelope' in payload && payload.envelope.material.unitReference && !this.isPublished(ownerId, payload.envelope.material.translationSessionId, payload.envelope.material.unitReference.unitId)) return error(request.requestId, 'reference_not_published', '此单元参考已撤回。')
       const result = kind === 'normal_update' ? this.normal?.update(ownerId, payload as NormalTranslationUpdate)
         : kind === 'normal_prepare' ? this.normal?.prepare(ownerId, payload as NormalTranslationAcceptance)
         : this.normal?.accept(ownerId, payload as NormalTranslationAcceptance)
@@ -231,24 +244,26 @@ export class TopicBridgeClient {
     const unit = history?.units.find(unit => unit.id === unitId), latest = unit?.revisions.at(-1)
     if (this.disposed || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || session.mode !== 'normal' || !unit || !latest || !['completed', 'failed', 'cancelled', 'interrupted'].includes(latest.status)) return false
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
-    const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      revisions: unit.revisions.map(({ id, order, kind, status, text, baseRevisionId }) => ({ id, order, kind, status, text, baseRevisionId })),
-      final: unit.final && event?.revisionId === unit.final.revisionId ? { revisionId: unit.final.revisionId, selection: unit.final.selection, selectionEventId: event.id } : null }
+    const final = currentFinalRevision(unit)
+    const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
+      revisions: unit.revisions.map(({ id, order, kind, status, text, baseRevisionId, sourceVersion }) => ({ id, order, kind, status, text, baseRevisionId, sourceVersion })),
+      final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
     // Include the largest allowed correlation ID so every future request fits without truncation.
     const reply: TopicBridgeReply = { requestId: 'x'.repeat(2048), ok: true, value: { kind: 'unit', unit: fact } }
     if (new TextEncoder().encode(JSON.stringify(reply)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) return false
     this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact: structuredClone(fact), automatic: false })
     this.emit(); return true
   }
-  private publishAdmittedUnit(ownerId: string, sessionId: string, unitId: string): void {
+  private publishAdmittedUnit(ownerId: string, sessionId: string, unitId: string, automatic = true): void {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     const unit = history?.units.find(unit => unit.id === unitId)
-    if (!session || session.ownerId !== ownerId || !unit || unit.material?.mainSessionId !== ownerId) return
+    if (!session || session.ownerId !== ownerId || !unit) return
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
-    const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      revisions: unit.revisions.map(({ id, order, kind, status, text, baseRevisionId }) => ({ id, order, kind, status, text, baseRevisionId })),
-      final: unit.final && event?.revisionId === unit.final.revisionId ? { revisionId: unit.final.revisionId, selection: unit.final.selection, selectionEventId: event.id } : null }
-    this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact, automatic: true })
+    const final = currentFinalRevision(unit)
+    const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
+      revisions: unit.revisions.map(({ id, order, kind, status, text, baseRevisionId, sourceVersion }) => ({ id, order, kind, status, text, baseRevisionId, sourceVersion })),
+      final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
+    this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact, automatic })
     this.emit()
   }
   isPublished(ownerId: string, sessionId: string, unitId: string): boolean { return this.publications.has(this.key(ownerId, sessionId, unitId)) }

@@ -9,7 +9,7 @@ import {
 const at = '2026-10-07T00:00:00.000Z'
 const source = { kind: 'source', sessionId: 'session', unitId: 'unit', revisionId: null, selectionEventId: null, range: null, role: 'basis' }
 const final = { ...source, kind: 'final', revisionId: 'revision', selectionEventId: 'selection' }
-const fact = { ownerId: 'owner', topicId: 'topic', source: 'Synthetic source 😀', final: { revisionId: 'revision', selectionEventId: 'selection', text: 'Synthetic final' } }
+const fact = { ownerId: 'owner', topicId: 'topic', sourceVersion: 1, source: 'Synthetic source 😀', final: { revisionId: 'revision', selectionEventId: 'selection', sourceVersion: 1, text: 'Synthetic final' } }
 const resolver = () => fact
 const action = { eventId: 'user-event', at }
 const empty = () => emptyTopicArchive('owner', 'topic', at)
@@ -72,6 +72,30 @@ test('最终依据变化立即复核并排除检索；选回旧版也不会自�
   assert.equal(reviewed.entries[0].description, snapshot.entries[0].description)
   assert.equal(reconcileTopicArchive(reviewed, resolver, at), reviewed); assert.deepEqual(query(reviewed), [])
   assert.equal(adoptTopicArchive(reviewed, 'alice', reviewed.entries[0].version, resolver, action).entry.status, 'active')
+})
+
+test('档案共用source版本resolver；source2同字串也复核，source2依据可重新核对', () => {
+  const current2 = () => ({ ...fact, sourceVersion: 2, final: { ...fact.final, sourceVersion: 1 } })
+  const legacy = putTopicArchive(empty(), entity(), resolver, at).snapshot
+  const rawLegacy = structuredClone(legacy)
+  assert.deepEqual(decodeTopicArchiveSnapshot(rawLegacy), rawLegacy, 'legacy archive ref remains readable without rewrite')
+  assert.deepEqual(query(legacy, {}, current2), [])
+  const reviewed = reconcileTopicArchive(legacy, current2, at)
+  assert.equal(reviewed.entries[0].status, 'review_required')
+  assert.equal(reviewed.entries[0].description, legacy.entries[0].description)
+  assert.equal(reconcileTopicArchive(reviewed, resolver, at), reviewed, 'old archive evidence cannot silently revive')
+
+  const source2 = { ...source, sourceVersion: 2 }
+  const current2Final2 = () => ({ ...fact, sourceVersion: 2, final: { ...fact.final, sourceVersion: 2 } })
+  const newBasis = putTopicArchive(empty(), entity({ id: 'version-two', evidence: [source2] }), current2, at)
+  assert.equal(newBasis.status, 'updated')
+  assert.equal(newBasis.entry.evidence[0].sourceVersion, 2)
+  assert.equal(query(newBasis.snapshot, { forms: ['Alice'] }, current2).length, 1)
+
+  const withOldFinal = putTopicArchive(empty(), entity({ id: 'old-final', evidence: [source2, final] }), current2Final2, at).snapshot
+  const staleFinal = () => ({ ...fact, sourceVersion: 2, final: { ...fact.final, sourceVersion: 1 } })
+  assert.deepEqual(query(withOldFinal, { forms: ['Alice'] }, staleFinal), [])
+  assert.equal(reconcileTopicArchive(withOldFinal, staleFinal, at).entries[0].status, 'review_required')
 })
 
 test('来源删除使模型依据复核，用户独立采用不受示例失效撤销', () => {

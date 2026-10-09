@@ -67,7 +67,7 @@ test('安全metadata随回执保存，单独usage变化更新指定版，相同�
     record.status = 'unknown'; app.quick.query(record); await tick()
     assert.deepEqual(app.quick.getUnits(app.id)[0].revisions[0].callRecord.usage, { inputTokens: 0, outputTokens: 0 })
     const snapshot = JSON.parse(app.storage.getItem(historyKey(app.id)))
-    assert.equal(snapshot.schemaVersion, 7); assert.equal(snapshot.translationHistory.schemaVersion, 4)
+    assert.equal(snapshot.schemaVersion, 8); assert.equal(snapshot.translationHistory.schemaVersion, 5)
     assert.ok(!JSON.stringify(snapshot).includes('sessionKey'))
   } finally { app.close() }
 })

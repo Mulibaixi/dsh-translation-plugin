@@ -5,7 +5,7 @@ import { TopicMemoryStore } from '../dist/client/topic-memory-store.js'
 import { SessionStore } from '../dist/client/session-store.js'
 import { DEFAULT_SESSION_SETTINGS, SETTINGS_KEY, historyKey } from '../dist/client/sessions.js'
 import { TOPIC_LOCK_NAME } from '../dist/client/topics.js'
-import { appendTextUnit, appendManualRevision, selectFinalRevision } from '../dist/client/translation-history.js'
+import { appendTextUnit, appendSourceCorrection, appendManualRevision, selectFinalRevision } from '../dist/client/translation-history.js'
 
 const at = '2026-10-07T00:00:00.000Z'
 const settle = async () => { await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve)) }
@@ -98,7 +98,34 @@ test('删除历史默认保留档案，失效source依据复核且历史开启�
   assert.equal(JSON.parse(f.storage.getItem(key)).entries[0].status, 'review_required')
 })
 
-test('恢复复核只在历史开启时排队保存；关闭保留旧raw；重启不重复增加已保存复核版本', async () => {
+test('source更正后ArchiveStore沿用同一版本resolver，旧basis失效且source2可重建', async () => {
+  const f = await fixture(); assert.equal((await put(f)).status, 'updated')
+  const source = input(f).evidence[0]
+  f.sessions.updateTranslationHistory(f.session.id, history => appendSourceCorrection(history, 'unit', {
+    operationId: 'archive-source-correction:1', expectedVersion: 1, text: 'SYNTHETIC SOURCE BODY 😀 corrected', reason: 'synthetic correction', at,
+  }))
+  assert.equal(snapshot(f).entries[0].status, 'review_required')
+  assert.equal(query(f).entries.length, 0)
+
+  const rebuilt = await put(f, { id: 'alice-source2', evidence: [{ ...source, sourceVersion: 2 }] })
+  assert.equal(rebuilt.status, 'updated')
+  assert.equal(rebuilt.entry.evidence[0].sourceVersion, 2)
+  assert.deepEqual(query(f).entries.map(entry => entry.id), ['alice-source2'])
+})
+
+test('source更正不撤销独立采用的用户档案', async () => {
+  const f = await fixture(); assert.equal((await put(f)).status, 'updated')
+  await f.archives.apply(f.session.ownerId, f.session.topicId, snapshot(f).version, { kind: 'adopt', id: 'alice', expectedEntryVersion: 1 })
+  const version = snapshot(f).version
+  f.sessions.updateTranslationHistory(f.session.id, history => appendSourceCorrection(history, 'unit', {
+    operationId: 'archive-user-source-correction:1', expectedVersion: 1, text: 'SYNTHETIC SOURCE BODY 😀 corrected', reason: 'synthetic correction', at,
+  }))
+  assert.equal(snapshot(f).version, version, 'independent adoption is not invalidated by evidence version changes')
+  assert.equal(snapshot(f).entries[0].origin, 'user_explicit')
+  assert.equal(query(f).entries.length, 1)
+})
+
+test('加载时恢复复核只留在内存；历史开启时明确采用才保存', async () => {
   for (const enabled of [true, false]) {
     const f = await fixture(); await put(f)
     const key = topicArchiveKey(f.session.topicId), saved = f.storage.getItem(key)
@@ -107,16 +134,49 @@ test('恢复复核只在历史开启时排队保存；关闭保留旧raw；重�
     const sessions = new SessionStore(f.storage, undefined, f.storage.locks), terms = new TopicMemoryStore(sessions, f.storage, undefined, f.storage.locks)
     const archives = new TopicArchiveStore(sessions, (s, u) => terms.readEvidence(s, u), f.storage, undefined, f.storage.locks)
     assert.equal(archives.getSnapshot(f.session.ownerId, f.session.topicId).entries[0].status, 'review_required')
+    assert.equal(archives.getStatus(f.session.ownerId, f.session.topicId), 'memory')
     assert.equal(f.storage.getItem(key), saved)
     await settle()
-    if (!enabled) assert.equal(f.storage.getItem(key), saved)
-    else {
+    assert.equal(f.storage.getItem(key), saved, 'reading/reconciling an old snapshot does not write it back')
+    if (enabled) {
+      const loaded = archives.getSnapshot(f.session.ownerId, f.session.topicId)
+      assert.equal((await archives.apply(f.session.ownerId, f.session.topicId, loaded.version,
+        { kind: 'adopt', id: 'alice', expectedEntryVersion: loaded.entries[0].version })).status, 'updated')
       const raw = f.storage.getItem(key), reviewed = JSON.parse(raw)
-      assert.equal(reviewed.entries[0].status, 'review_required'); assert.equal(archives.getStatus(f.session.ownerId, f.session.topicId), 'saved')
+      assert.equal(reviewed.entries[0].origin, 'user_explicit'); assert.equal(archives.getStatus(f.session.ownerId, f.session.topicId), 'saved')
       const restarted = new TopicArchiveStore(sessions, (s, u) => terms.readEvidence(s, u), f.storage, undefined, f.storage.locks)
       await settle(); assert.equal(restarted.getSnapshot(f.session.ownerId, f.session.topicId).version, reviewed.version); assert.equal(f.storage.getItem(key), raw)
     }
   }
+})
+
+test('冷加载source更正后的旧basis仅内存复核且不迁移写回；明确采用后才保存', async () => {
+  const f = await fixture()
+  const range = { start: 0, end: 4 }, evidence = { ...input(f).evidence[0], range }
+  assert.equal((await put(f, { evidence: [evidence] })).status, 'updated')
+  const key = topicArchiveKey(f.session.topicId), saved = f.storage.getItem(key)
+  assert.equal(JSON.parse(saved).entries[0].evidence[0].sourceVersion, undefined, 'legacy source ref stays version 1 without rewrite')
+
+  f.archives.dispose()
+  f.sessions.updateTranslationHistory(f.session.id, history => appendSourceCorrection(history, 'unit', {
+    operationId: 'archive-cold-source-correction:1', expectedVersion: 1, text: 'SYNTHETIC SOURCE BODY 😀 corrected', reason: 'synthetic correction', at,
+  }))
+  await settle()
+
+  const sessions = new SessionStore(f.storage, undefined, f.storage.locks)
+  const terms = new TopicMemoryStore(sessions, f.storage, undefined, f.storage.locks)
+  const archives = new TopicArchiveStore(sessions, (sessionId, unitId) => terms.readEvidence(sessionId, unitId), f.storage, undefined, f.storage.locks)
+  const loaded = archives.getSnapshot(f.session.ownerId, f.session.topicId)
+  assert.equal(loaded.entries[0].status, 'review_required', 'same range text remains present in source version 2')
+  assert.equal(archives.getStatus(f.session.ownerId, f.session.topicId), 'memory')
+  await settle()
+  assert.equal(f.storage.getItem(key), saved, 'startup reconciliation neither rewrites status nor migrates legacy evidence')
+
+  const adopted = await archives.apply(f.session.ownerId, f.session.topicId, loaded.version,
+    { kind: 'adopt', id: 'alice', expectedEntryVersion: loaded.entries[0].version })
+  assert.equal(adopted.status, 'updated')
+  assert.equal(archives.getStatus(f.session.ownerId, f.session.topicId), 'saved')
+  assert.equal(JSON.parse(f.storage.getItem(key)).entries[0].origin, 'user_explicit')
 })
 
 test('用户save生成稳定ID和采用事件，陈旧保存/删除保留已有内容', async () => {

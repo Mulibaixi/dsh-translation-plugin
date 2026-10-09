@@ -45,7 +45,7 @@ test('用户新术语一次保存即生效，候选与确认版本保持原schem
 
 test('用户原位编辑active规则保留id/createdAt，原证据仅转example且模型仍不能覆盖', () => {
   const evidence = [{ kind: 'source', sessionId: 'synthetic-source-session', unitId: 'synthetic-unit', revisionId: null, selectionEventId: null, range: { start: 0, end: 3 }, role: 'basis' }]
-  const checked = putTopicTerm(empty(), modelInput({ origin: 'source_checked', status: 'active', evidence }), () => ({ ownerId, topicId, source: 'API synthetic', final: null }), at)
+  const checked = putTopicTerm(empty(), modelInput({ origin: 'source_checked', status: 'active', evidence }), () => ({ ownerId, topicId, sourceVersion: 1, source: 'API synthetic', final: null }), at)
   const original = adoptTopicTerm(checked.snapshot, checked.entry.id, checked.entry.version, action)
   const changed = save(original.snapshot, { expectedEntryVersion: original.entry.version, preferred: '程序接口' }, { eventId: 'synthetic-user-save:2', at: later })
   assert.equal(changed.status, 'updated'); assert.equal(changed.entry.id, original.entry.id); assert.equal(changed.entry.createdAt, at)

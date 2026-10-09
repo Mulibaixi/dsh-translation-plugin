@@ -267,14 +267,16 @@ test('真实Gateway/LLM/Session + Client：调用证据落盘，旧base人工修
     assert.equal(json.promptDefinitions[0].promptVersion, TRANSLATION_PROMPT_VERSION)
     assert.equal(json.promptDefinitions[0].systemPrompt, sent.messages[0].content[0].text)
     assert.deepEqual(json.promptDefinitions[0].userMessageFields, {
-      target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source',
+      target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.sourceVersions[revision.sourceVersion-1].text',
     })
-    assert.equal(reconstructTranslationContext(decoded.units[0]).userMessage, sent.messages[1].content[0].text)
+    const recordedSource = decoded.units[0].sourceVersions[decoded.units[0].revisions[0].sourceVersion - 1].text
+    assert.equal(recordedSource, JSON.parse(sent.messages[1].content[0].text).source_text)
+    assert.equal(reconstructTranslationContext({ ...decoded.units[0], source: recordedSource }).userMessage, sent.messages[1].content[0].text)
     assert.ok(!full.content.includes('sessionKey')); assert.ok(!full.content.includes('apiKey')); assert.ok(!full.content.includes('arbitraryProfile'))
     assert.equal(app.host.provider.calls.length, beforeExportCalls)
     await tick()
     const disk = JSON.parse(storage.getItem(historyKey(id)))
-    assert.equal(disk.schemaVersion, 7); assert.equal(disk.translationHistory.schemaVersion, 4)
+    assert.equal(disk.schemaVersion, 8); assert.equal(disk.translationHistory.schemaVersion, 5)
     assert.equal(disk.translationHistory.units[0].source, undefined)
     assert.equal(disk.translationHistory.units[0].sourceVersions[0].text, history.units[0].source)
     assert.equal(disk.translationHistory.units[0].revisions.at(-1).kind, 'manual')

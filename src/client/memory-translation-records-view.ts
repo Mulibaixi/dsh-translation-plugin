@@ -2,7 +2,7 @@ import { h, react } from './react.js'
 import { downloadExport } from './browser-download.js'
 import type { SessionStore } from './session-store.js'
 import type { QuickTranslationClient } from './quick-translation.js'
-import type { TextRevision } from './translation-history.js'
+import { currentFinalRevision, type TextRevision } from './translation-history.js'
 import { type TopicTranslationExport, type TranslationExportSession, type TranslationExportTopic } from './translation-export.js'
 import { buildRecordObjectExport, recordObjectPlainText } from './record-object-export.js'
 import type { RecordObjectReference } from '../shared/record-objects.js'
@@ -121,7 +121,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
         ...units.map(unit => {
           const key = JSON.stringify([session.id, unit.id]), draft = drafts.get(key), open = expanded.has(key)
           const pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
-          const final = pointed?.accepted && pointed.status === 'completed' && pointed.text.trim() ? pointed : undefined
+          const final = currentFinalRevision(unit)
           const latest = unit.revisions.at(-1)
           const candidate = latest?.accepted && latest.status === 'completed' && latest.text.trim() && latest.id !== final?.id ? latest : undefined
           const base = final ?? [...unit.revisions].reverse().find(editable), archived = session.archivedAt !== null
@@ -132,16 +132,19 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
               h('button', { type: 'button', 'aria-label': `${session.name} · 文本 ${unit.order}`, 'aria-expanded': open, onClick: () => {
                 setExpanded(current => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
               } }, `文本 ${unit.order} · ${final ? '已定稿' : '待定稿'}`),
-              h('small', { className: 'dsh-tp-muted' }, `目标语言：${unit.targetLanguage}`)),
+              h('small', { className: 'dsh-tp-muted' }, `目标语言：${unit.targetLanguage}${unit.sourceVersion > 1 ? ` · 原文版本 ${unit.sourceVersion}` : ''}`)),
             h('div', { className: 'dsh-tp-record-pair' },
-              h('div', { className: 'dsh-tp-record-source', 'aria-label': '原文' }, h('h4', null, '原文'), h(RecordObjectText, { text: unit.source, target, objects, objectAssets })),
+              h('div', { className: 'dsh-tp-record-source', 'aria-label': '原文' }, h('h4', null, '原文'), h(RecordObjectText, { text: unit.source, target, objects, objectAssets }),
+                open && unit.sourceVersions.length > 1 ? h('div', null, ...unit.sourceVersions.slice(0, -1).map(source => h('section', { key: source.version },
+                  h('small', { className: 'dsh-tp-muted' }, `历史原文版本 ${source.version}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null),
               h('div', { className: 'dsh-tp-record-target', 'aria-label': '最终译文' }, h('h4', null, '最终译文'),
                 final ? h('div', null, h('small', { className: 'dsh-tp-muted' }, `版本 ${final.order} · ${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`),
                   h(RecordObjectText, { text: final.text, target: { ...target, side: 'revision', revisionId: final.id }, objects, objectAssets }), h('button', { type: 'button', onClick: () => { const scope = { ...target, side: 'revision' as const, revisionId: final.id }; void copy(recordObjectPlainText(final.text, scope, objects?.getReferences(scope) ?? [])) } }, '复制最终译文')) : h('p', { className: 'dsh-tp-muted' }, '尚无最终译文。'),
                 h('div', { className: 'dsh-tp-record-actions', hidden: !open },
-                  candidate ? h('div', { className: 'dsh-tp-asset-candidate' }, h('h4', null, `候选 · 版本 ${candidate.order}`),
+                  pointed && pointed.sourceVersion !== unit.sourceVersion ? h('p', { className: 'dsh-tp-muted' }, `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}`) : null,
+                  candidate ? h('div', { className: 'dsh-tp-asset-candidate' }, h('h4', null, `候选 · 版本 ${candidate.order}${candidate.sourceVersion === unit.sourceVersion ? '' : ` · 已过时（原文版本 ${candidate.sourceVersion}）`}`),
                     h(RecordObjectText, { text: candidate.text, target: { ...target, side: 'revision', revisionId: candidate.id }, objects, objectAssets }),
-                    h('button', { type: 'button', disabled: archived, onClick: () => setMessage(quick.selectFinal(session.id, unit.id, candidate.id) ? '已设为最终。' : '版本已变化，未设为最终。') }, '设为最终')) : null,
+                    h('button', { type: 'button', disabled: archived || candidate.sourceVersion !== unit.sourceVersion, onClick: () => setMessage(quick.selectFinal(session.id, unit.id, candidate.id) ? '已设为最终。' : '版本已变化，未设为最终。') }, '设为最终')) : null,
                   draft ? h('div', { className: 'dsh-tp-version-editor' },
                     h('small', { className: 'dsh-tp-muted' }, `基于版本 ${unit.revisions.find(revision => revision.id === draft.baseRevisionId)?.order ?? '已失效'}保存为新版本；未调用模型。`),
                     h('textarea', { 'aria-label': '编辑译文', value: draft.text, rows: 8, disabled: archived, onChange: (event: { currentTarget: { value: string } }) => {

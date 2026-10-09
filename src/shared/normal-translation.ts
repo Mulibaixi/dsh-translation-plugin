@@ -2,12 +2,37 @@ import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } fr
 import { parseTranslationCallMetadata, type TranslationCallMetadata } from './translation-call.js'
 
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
-export interface NormalTranslationTarget {
+export interface NormalTranslationMaterialTarget {
   readonly kind: 'material'
   readonly mainSessionId: string
   readonly requestId: string
   readonly materialId: string
   readonly sourceVersion: number
+}
+export interface NormalTranslationUnitTarget {
+  readonly kind: 'unit'
+  readonly mainSessionId: string
+  readonly translationSessionId: string
+  readonly unitId: string
+  readonly sourceVersion: number
+}
+export type NormalTranslationTarget = NormalTranslationMaterialTarget | NormalTranslationUnitTarget
+export interface NormalTranslationSourceCorrection {
+  readonly target: NormalTranslationUnitTarget
+  readonly operationId: string
+  readonly sourceText: string
+  readonly reason: string
+}
+export interface NormalTranslationUnitRequest { readonly target: NormalTranslationUnitTarget; readonly operationId: string }
+export interface NormalTranslationUnitReceipt extends NormalTranslationUnitRequest { readonly status: 'submitted' }
+export interface NormalTranslationCorrectionReceipt {
+  readonly operationId: string
+  readonly mainSessionId: string
+  readonly translationSessionId: string
+  readonly unitId: string
+  readonly previousSourceVersion: number
+  readonly sourceVersion: number
+  readonly persistence: 'saved' | 'runtime_only'
 }
 export interface NormalTranslationTermReference { readonly id: string; readonly entryVersion: number }
 export interface NormalTranslationExecute {
@@ -81,10 +106,34 @@ function version(value: unknown): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) throw new TypeError('Invalid normal translation version')
 }
 export function parseNormalTranslationTarget(value: unknown): NormalTranslationTarget {
-  object(value); exact(value, ['kind', 'mainSessionId', 'requestId', 'materialId', 'sourceVersion'])
-  if (value.kind !== 'material') throw new TypeError('Unsupported normal translation target')
-  text(value.mainSessionId); text(value.requestId); text(value.materialId); version(value.sourceVersion)
+  object(value)
+  if (value.kind === 'material') {
+    exact(value, ['kind', 'mainSessionId', 'requestId', 'materialId', 'sourceVersion']); text(value.requestId); text(value.materialId)
+  } else if (value.kind === 'unit') {
+    exact(value, ['kind', 'mainSessionId', 'translationSessionId', 'unitId', 'sourceVersion']); text(value.translationSessionId); text(value.unitId)
+  } else throw new TypeError('Unsupported normal translation target')
+  text(value.mainSessionId); version(value.sourceVersion)
   return structuredClone(value) as unknown as NormalTranslationTarget
+}
+export function parseNormalTranslationSourceCorrection(value: unknown): NormalTranslationSourceCorrection {
+  object(value); exact(value, ['target', 'operationId', 'sourceText', 'reason'])
+  const target = parseNormalTranslationTarget(value.target)
+  if (target.kind !== 'unit') throw new TypeError('Source correction requires a unit')
+  text(value.operationId); text(value.sourceText, 200000); text(value.reason, 1000, true)
+  return { target, operationId: value.operationId, sourceText: value.sourceText, reason: value.reason }
+}
+export function parseNormalTranslationUnitRequest(value: unknown): NormalTranslationUnitRequest {
+  object(value); exact(value, ['target', 'operationId']); text(value.operationId)
+  const target = parseNormalTranslationTarget(value.target)
+  if (target.kind !== 'unit') throw new TypeError('Retranslation requires a unit')
+  return { target, operationId: value.operationId }
+}
+export function parseNormalTranslationCorrectionReceipt(value: unknown): NormalTranslationCorrectionReceipt {
+  object(value); exact(value, ['operationId', 'mainSessionId', 'translationSessionId', 'unitId', 'previousSourceVersion', 'sourceVersion', 'persistence'])
+  for (const field of ['operationId', 'mainSessionId', 'translationSessionId', 'unitId']) text(value[field])
+  version(value.previousSourceVersion); version(value.sourceVersion)
+  if (value.sourceVersion !== (value.previousSourceVersion as number) + 1 || !['saved', 'runtime_only'].includes(value.persistence as string)) throw new TypeError('Invalid source correction receipt')
+  return structuredClone(value) as unknown as NormalTranslationCorrectionReceipt
 }
 function references(value: unknown): asserts value is readonly NormalTranslationTermReference[] {
   if (!Array.isArray(value) || value.length > 100) throw new TypeError('Invalid normal translation term references')
@@ -149,11 +198,16 @@ export function parseNormalTranslationJob(value: unknown): NormalTranslationJob 
   return { operation, callId: value.callId as string | null, status: value.status as NormalTranslationJob['status'], updates,
     lastSequence: value.lastSequence as number, more: value.more, error: value.error === null ? null : parseError(value.error) }
 }
-function parseResult(method: 'capabilities' | 'status' | 'cancel', value: unknown): unknown {
+function parseResult(method: 'capabilities' | 'status' | 'cancel' | 'requestUnit', value: unknown): unknown {
   object(value)
   if (value.ok === false) { exact(value, ['ok', 'error']); return { ok: false, error: parseError(value.error) } }
   if (value.ok !== true) throw new TypeError('Invalid normal translation result')
   exact(value, ['ok', 'value'])
+  if (method === 'requestUnit') {
+    object(value.value); exact(value.value, ['target', 'operationId', 'status'])
+    if (value.value.status !== 'submitted') throw new TypeError('Invalid unit submission state')
+    return { ok: true, value: { ...parseNormalTranslationUnitRequest({ target: value.value.target, operationId: value.value.operationId }), status: 'submitted' } }
+  }
   if (method !== 'capabilities') return { ok: true, value: parseNormalTranslationJob(value.value) }
   object(value.value)
   const capability = value.value
@@ -162,9 +216,9 @@ function parseResult(method: 'capabilities' | 'status' | 'cancel', value: unknow
   return structuredClone(value)
 }
 const packageName = 'dsh-translation-plugin'
-export const NORMAL_TRANSLATION_REMOTE = { package: packageName, descriptors: (['capabilities', 'status', 'cancel'] as const).map(method => ({
+export const NORMAL_TRANSLATION_REMOTE = { package: packageName, descriptors: (['capabilities', 'status', 'cancel', 'requestUnit'] as const).map(method => ({
   id: `${packageName}#translationNormal/${method}`, service: 'translationNormal', namespace: 'translationNormal', method,
   invocation: { kind: 'direct' as const }, parameters: method === 'capabilities' ? [] : [{ name: 'request', wire: 'request', source: 'json' as const,
-    codec: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Request`, create: () => ({ parse: parseNormalTranslationQuery }) } }],
+    codec: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Request`, create: () => ({ parse: (value: unknown) => method === 'requestUnit' ? parseNormalTranslationUnitRequest(value) : parseNormalTranslationQuery(value) }) } }],
   result: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Result`, create: () => ({ parse: (value: unknown) => parseResult(method, value) }) },
 })) }

@@ -86,8 +86,8 @@ export class TopicMemoryStore {
     if (!unit) return undefined
     const revision = unit.final && unit.revisions.find(revision => revision.id === unit.final?.revisionId)
     const event = [...history.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
-    return { ownerId: session.ownerId, topicId: session.topicId, source: unit.source,
-      final: revision && event?.revisionId === revision.id ? { revisionId: revision.id, selectionEventId: event.id, text: revision.text } : null }
+    return { ownerId: session.ownerId, topicId: session.topicId, sourceVersion: unit.sourceVersion, source: unit.source,
+      final: revision && event?.revisionId === revision.id ? { revisionId: revision.id, selectionEventId: event.id, sourceVersion: revision.sourceVersion, text: revision.text } : null }
   }
   query(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): TopicTermSnapshot {
     const snapshot = this.getSnapshot(ownerId, topicId)

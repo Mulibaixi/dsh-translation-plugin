@@ -37,3 +37,12 @@ test('缺最终不通过对象使空译文变有效，冻结引用快照不会�
   const missing = { ...history, units: history.units.map(unit => ({ ...unit, final: null })) }
   assert.equal(buildRecordObjectExport({ ...request('txt'), entries: [{ session, history: missing }] }, true).content, null)
 })
+
+test('部分对照JSON仍保留缺译文单元的原文对象位置，排除其无效译文引用', () => {
+  const added = appendTextUnit(history, { id: 'missing-unit', source: 'Missing source', targetLanguage: '中文', instruction: '', createdAt: at },
+    { id: 'missing-revision', operationId: 'missing-operation', model: { provider: 'synthetic', model: 'translator' }, draftVersion: 1, createdAt: at, updatedAt: at, accepted: true, status: 'failed', text: 'Partial', message: null })
+  const source = { ...ref, unitId: 'missing-unit', side: 'source', revisionId: null, offset: 0, refId: 'missing-source-ref' }
+  const invalid = { ...ref, unitId: 'missing-unit', revisionId: 'missing-revision', refId: 'missing-revision-ref' }
+  const json = JSON.parse(buildRecordObjectExport({ ...request('json'), entries: [{ session, history: added }], references: [source, invalid] }, true).content)
+  assert.equal(json.sessions[0].units[1].translation, null); assert.deepEqual(json.objectReferences, [source])
+})

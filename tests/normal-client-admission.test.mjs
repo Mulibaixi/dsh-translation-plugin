@@ -6,7 +6,7 @@ import { NormalTranslationClient } from '../dist/client/normal-translation.js'
 import { TopicBridgeClient } from '../dist/client/topic-bridge.js'
 import { TopicMemoryStore } from '../dist/client/topic-memory-store.js'
 import { TopicArchiveStore } from '../dist/client/topic-archive-store.js'
-import { appendAdmittedTextUnit, decodeTranslationHistory, persistedTranslationHistory } from '../dist/client/translation-history.js'
+import { appendAdmittedTextUnit, appendTextRevision, appendManualRevision, currentFinalRevision, finalizeLastUnit, selectFinalRevision, decodeTranslationHistory, persistedTranslationHistory } from '../dist/client/translation-history.js'
 import { buildFinalTextExport } from '../dist/client/translation-export.js'
 import { DEFAULT_SESSION_SETTINGS, SETTINGS_KEY, historyKey } from '../dist/client/sessions.js'
 import { mount } from './quick-client-fixture.mjs'
@@ -40,7 +40,10 @@ async function fixture(rememberHistory = false, options = {}) {
     async prepare(envelope) { frozen = structuredClone(envelope); return transport(receipt(envelope, 'prepared')) },
     async finish(request) { return transport(receipt(frozen, request.outcome === 'submitted' ? 'submitted' : 'released')) },
   } })
-  const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), options); topics.setNormalTranslation(normal)
+  const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), {
+    canAccessUnit: (ownerId, sessionId, unitId) => topics.isPublished(ownerId, sessionId, unitId),
+    publishUnit: (ownerId, sessionId, unitId) => topics.publishUnit(ownerId, sessionId, unitId), ...options,
+  }); topics.setNormalTranslation(normal)
   await materials.load(); await tick()
   let sequence = 0
   async function submit(target = session) {
@@ -129,7 +132,7 @@ test('普通流式/completed始终落冻结A会话；B、切换和模型语言�
   assert.deepEqual(JSON.parse(reconstructNormalTranslationContext(unit, call.context).userMessage), { target_language: '中文', translation_requirements: 'Keep symbols',
     main_model_requirements: 'Preserve punctuation', terminology: [], source_text: 'Frozen A' })
   await tick(); const disk = JSON.parse(f.storage.getItem(historyKey(f.session.id)))
-  assert.equal(disk.schemaVersion, 7); assert.equal(disk.translationHistory.events.at(-1).normalSequence, 3)
+  assert.equal(disk.schemaVersion, 8); assert.equal(disk.translationHistory.events.at(-1).normalSequence, 3)
   assert.deepEqual(decodeTranslationHistory(disk.translationHistory).units[0].revisions[0].callRecord, call)
 })
 
@@ -265,11 +268,11 @@ test('归属、快照、模型及术语版本拒绝均不消费原文', async t 
   assert.equal(f.store.getTranslationHistory(f.session.id).units.length, 0); assert.equal(f.store.getSession(f.session.id).input, 'Frozen A')
 })
 
-test('history4仅持久保存版本原文，关闭历史不落正文；重载零revision不创建调用', async t => {
+test('history5仅持久保存版本原文，关闭历史不落正文；重载零revision不创建调用', async t => {
   const f = await fixture(true); t.after(() => f.close())
   const envelope = await f.submit(); assert.equal(f.normal.accept(owner, f.acceptance(envelope)).ok, true); await tick()
   const raw = f.storage.getItem(historyKey(f.session.id)), saved = JSON.parse(raw)
-  assert.equal(saved.schemaVersion, 7); assert.equal(saved.translationHistory.schemaVersion, 4)
+  assert.equal(saved.schemaVersion, 8); assert.equal(saved.translationHistory.schemaVersion, 5)
   assert.equal(saved.translationHistory.units[0].source, undefined); assert.equal(saved.translationHistory.units[0].sourceVersions[0].text, 'Frozen A')
   assert.equal(decodeTranslationHistory(saved.translationHistory).units[0].source, 'Frozen A')
   const restarted = new SessionStore(f.storage, undefined, { async request(_name, action) { return action() } }); t.after(() => restarted.dispose())
@@ -306,10 +309,103 @@ test('生产bundle显示普通running/partial/未知查询与取消，重译保�
   const operation = app.normal.observe(owner, { translationSessionId: session.id, operationId: 'ui-business' }).value.operation
   const request = { envelope, operationId: operation.operationId, organizedRequirements: '', termReferences: [] }
   app.normal.update(owner, frame(operation, 1, { callId: 'ui-normal-call', metadata: metadata(request) })); app.normal.update(owner, frame(operation, 2, { callId: 'ui-normal-call', textDelta: '界面流式结果' })); ui.render()
+  // 升为普通的旧快译单元没有material，也应显示普通执行状态与取消/查询。
+  app.store.updateTranslationHistory(session.id, history => ({ ...history, units: history.units.map(unit => ({ ...unit, material: null })) })); ui.render()
   assert.match(ui.text(), /界面流式结果/); assert.equal(ui.button('重译文本 1').props.disabled, true)
   assert.equal(ui.button('取消普通翻译').props.disabled, false)
   await ui.click('查询普通执行状态'); await ui.flush(); assert.match(ui.text(), /合成服务重启/)
   await ui.click('取消普通翻译'); await ui.flush(); assert.equal(calls[1][0], 'cancel'); assert.match(ui.text(), /已取消/)
   assert.ok(!ui.nodes().some(node => node.type === 'button' && ui.text(node) === '取消普通翻译'))
   assert.equal(app.store.getTranslationHistory(session.id).units[0].revisions.length, 1)
+})
+
+async function completedUnit(f, t) {
+  const release = f.topics.retain(owner); t.after(release)
+  const { request, operation } = await admitted(f)
+  assert.equal(f.normal.update(owner, frame(operation, 1, { metadata: metadata(request) })).ok, true)
+  assert.equal(f.normal.update(owner, frame(operation, 2, { status: 'completed', textDelta: '源一译文' })).ok, true)
+  assert.equal(f.topics.publishUnit(owner, f.session.id, operation.unitId), true)
+  return { request, operation, target: { kind: 'unit', mainSessionId: owner, translationSessionId: f.session.id, unitId: operation.unitId, sourceVersion: 1 } }
+}
+
+test('原文纠错追加source2并保留旧fixed；新源定稿与旧源晚到、人工版和完整恢复一致', async t => {
+  const f = await fixture(true); t.after(() => f.close()); const { operation, target } = await completedUnit(f, t), at = new Date().toISOString()
+  f.store.updateTranslationHistory(f.session.id, history => selectFinalRevision(history, operation.unitId, 'ordinary-call:1', at))
+  const oldEnvelope = f.normal.resolve(owner, { target, operationId: 'old-source-retry' }).value.envelope
+  const oldRequest = { ...f.acceptance(oldEnvelope), operationId: 'old-source-retry' }, oldOperation = f.normal.accept(owner, oldRequest).value.operation
+  assert.equal(f.normal.update(owner, frame(oldOperation, 1, { callId: 'late-old-call', metadata: metadata(oldRequest) })).ok, true)
+  const correction = { target, operationId: 'source-correction', sourceText: 'Corrected source two', reason: '修正漏字' }
+  assert.equal(f.normal.correctSource(owner, correction).value.correction.sourceVersion, 2)
+  assert.equal(f.normal.correctSource(owner, correction).value.correction.sourceVersion, 2)
+  let history = f.store.getTranslationHistory(f.session.id), unit = history.units[0]
+  assert.equal(unit.final.revisionId, 'ordinary-call:1'); assert.equal(currentFinalRevision(unit), undefined)
+  assert.equal(buildFinalTextExport(f.store.getSession(f.session.id), history, at).content, null)
+  assert.throws(() => selectFinalRevision(history, unit.id, 'ordinary-call:1', at), /current-source/)
+  history = appendManualRevision(history, unit.id, { id: 'old-source-manual', baseRevisionId: 'ordinary-call:1', text: '旧源人工修订', at })
+  assert.equal(history.units[0].revisions.at(-1).sourceVersion, 1)
+  history = appendTextRevision(history, unit.id, { id: 'current-source-call', operationId: 'current-source-op', sourceVersion: 2,
+    model: { provider: 'synthetic', model: 'translator' }, draftVersion: 1, createdAt: at, updatedAt: at, accepted: true, status: 'completed', text: '源二译文', message: null })
+  history = finalizeLastUnit(history, at); assert.equal(currentFinalRevision(history.units[0]).id, 'current-source-call')
+  history = selectFinalRevision(history, unit.id, 'current-source-call', at); f.store.updateTranslationHistory(f.session.id, () => history)
+  assert.equal(f.normal.update(owner, frame(oldOperation, 2, { callId: 'late-old-call', status: 'completed', textDelta: '旧源晚到' })).ok, true)
+  history = f.store.getTranslationHistory(f.session.id); unit = history.units[0]
+  assert.equal(currentFinalRevision(unit).id, 'current-source-call'); assert.equal(unit.final.selection, 'user_fixed')
+  assert.equal(unit.revisions.find(revision => revision.id === 'late-old-call').sourceVersion, 1)
+  assert.equal(buildFinalTextExport(f.store.getSession(f.session.id), finalizeLastUnit(history, at), at).content, '源二译文')
+  assert.deepEqual(unit.sourceVersions.map(source => source.text), ['Frozen A', 'Corrected source two'])
+  const saved = persistedTranslationHistory(history); assert.equal(saved.units[0].source, undefined); assert.deepEqual(decodeTranslationHistory(saved), history)
+  await tick(); const restarted = new SessionStore(f.storage, undefined, { async request(_name, action) { return action() } }); t.after(() => restarted.dispose())
+  assert.equal(currentFinalRevision(restarted.getTranslationHistory(f.session.id).units[0]).id, 'current-source-call')
+})
+
+test('历史普通重译冻结当前模型effort，保留原单元语言要求与新草稿B', async t => {
+  const f = await fixture(); t.after(() => f.close()); const { target } = await completedUnit(f, t)
+  const route = { provider: 'synthetic-current', model: 'current-translator', reasoningEffort: 'low' }
+  f.store.updateSession(f.session.id, { input: 'Draft B', model: route, targetLanguage: '日本語', instruction: 'Later draft requirement' })
+  const requestId = { target, operationId: 'route-frozen-retry' }, frozen = f.normal.resolve(owner, requestId).value.envelope
+  assert.deepEqual(frozen.material.model, route); assert.equal(frozen.material.targetLanguage, '中文'); assert.equal(frozen.material.instruction, 'Keep symbols')
+  f.store.updateSession(f.session.id, { model: { provider: 'later', model: 'later', reasoningEffort: 'high' } })
+  assert.deepEqual(f.normal.resolve(owner, requestId).value.envelope, frozen)
+  const request = { ...f.acceptance(frozen), operationId: requestId.operationId }, accepted = f.normal.accept(owner, request)
+  assert.equal(accepted.ok, true); assert.equal(accepted.value.operation.unitId, target.unitId)
+  assert.equal(f.normal.update(owner, frame(accepted.value.operation, 1, { callId: 'route-frozen-call', metadata: metadata(request) })).ok, true)
+  assert.equal(f.normal.update(owner, frame(accepted.value.operation, 2, { callId: 'route-frozen-call', status: 'completed', textDelta: '本次重译' })).ok, true)
+  const history = f.store.getTranslationHistory(f.session.id); assert.equal(history.units.length, 1); assert.equal(history.units[0].revisions.length, 2)
+  assert.deepEqual(history.units[0].revisions.at(-1).callRecord.model, route); assert.equal(f.store.getSession(f.session.id).input, 'Draft B')
+})
+
+test('纠错和历史重译只接受明确授权单元，源对象阻止纠错而译文对象不阻止，旧准备不能覆盖新源', async t => {
+  let hasSourceObjects = true
+  const f = await fixture(false, { canCorrectSource: () => !hasSourceObjects }); t.after(() => f.close()); const { target } = await completedUnit(f, t)
+  const correction = { target, operationId: 'object-source-correction', sourceText: 'Source two', reason: '' }
+  assert.equal(f.normal.correctSource('other-owner', correction).error.code, 'reference_not_published')
+  assert.equal(f.normal.resolve(owner, { target: { ...target, unitId: 'guessed-unit' }, operationId: 'guessed' }).error.code, 'reference_not_published')
+  assert.equal(f.normal.correctSource(owner, correction).error.code, 'source_objects_linked'); assert.equal(f.store.getTranslationHistory(f.session.id).units[0].sourceVersion, 1)
+  const frozen = f.normal.resolve(owner, { target, operationId: 'stale-prepared-operation' }).value.envelope
+  hasSourceObjects = false // 仅译文有关联时，原文仍可纠错。
+  f.store.updateSession(f.session.id, { model: null })
+  assert.equal(f.normal.correctSource(owner, correction).ok, true)
+  assert.equal(f.normal.accept(owner, { ...f.acceptance(frozen), operationId: 'stale-prepared-operation' }).error.code, 'stale_version')
+  assert.equal(f.normal.correctSource(owner, { ...correction, operationId: 'stale-correction' }).error.code, 'stale_version')
+  assert.equal(f.store.getTranslationHistory(f.session.id).units[0].revisions.length, 1)
+})
+
+test('普通重译意图明确失败使用新op，传输未知复用原op；关闭面板前后租约持续到真正受理', async t => {
+  const f = await fixture(); t.after(() => f.close()); const { target } = await completedUnit(f, t), calls = []; let behavior = 'reject', retained = 0
+  const normal = new NormalTranslationClient(f.store, f.materials, f.terms, () => { retained++; return () => { retained-- } }, {
+    canAccessUnit: () => true, publishUnit: () => true, remote: { async requestUnit(request) { calls.push(request)
+      if (behavior === 'reject') return { ok: true, value: { ok: false, error: { code: 'rejected', message: '明确拒绝' } } }
+      if (behavior === 'unknown') throw new Error('transport unavailable')
+      return transport({ ...request, status: 'submitted' })
+    } },
+  }); t.after(() => normal.dispose())
+  f.store.updateSession(f.session.id, { input: 'Draft B' })
+  await normal.retranslate(f.session.id, target.unitId); assert.equal(retained, 0); assert.match(normal.getRetranslationStatus(f.session.id, target.unitId).message, /发送失败/)
+  behavior = 'unknown'; await normal.retranslate(f.session.id, target.unitId); assert.notEqual(calls[1].operationId, calls[0].operationId); assert.equal(retained, 1)
+  behavior = 'submitted'; await normal.retranslate(f.session.id, target.unitId); assert.equal(calls[2].operationId, calls[1].operationId); assert.equal(retained, 1)
+  await tick(); assert.equal(retained, 1) // 意图回执尚不是翻译受理，不依赖面板effect持有连接。
+  const requestId = calls[2], envelope = normal.resolve(owner, requestId).value.envelope, request = { ...f.acceptance(envelope), operationId: requestId.operationId }
+  const accepted = normal.accept(owner, request); assert.equal(accepted.ok, true); assert.equal(retained, 1)
+  assert.equal(normal.update(owner, frame(accepted.value.operation, 1, { callId: null, status: 'cancelled' })).ok, true)
+  await new Promise(resolve => setTimeout(resolve, 5)); assert.equal(retained, 0); assert.equal(f.store.getSession(f.session.id).input, 'Draft B')
 })

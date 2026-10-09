@@ -1,4 +1,5 @@
 import type { RecordObjectReference } from '../shared/record-objects.js'
+import { currentFinalRevision } from './translation-history.js'
 import { projectRecordObjects } from './record-object-projection.js'
 import { buildBilingualExport, buildFinalTextExport, buildTopicBilingualExport, buildTopicFinalTextExport, type TranslationExportTopic, type TranslationExportSession, type TopicTranslationExport } from './translation-export.js'
 
@@ -22,11 +23,11 @@ export function buildRecordObjectExport(request: RecordObjectExportRequest, allo
   if (!result.content || !refs.length) return result
   if (request.format === 'txt') {
     const texts = [...entries].sort((a, b) => a.session.sequence - b.session.sequence || a.session.id.localeCompare(b.session.id)).flatMap(({ session, history }) => [...history.units].sort((a, b) => a.order - b.order).flatMap(unit => {
-      const final = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
-      return final?.accepted && final.status === 'completed' && final.text.trim() ? [recordObjectPlainText(final.text, { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: final.id }, refs)] : []
+      const final = currentFinalRevision(unit)
+      return final ? [recordObjectPlainText(final.text, { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: final.id }, refs)] : []
     }))
     return { ...result, content: texts.join('\n\n') }
   }
-  const included = refs.filter(ref => entries.some(({ session, history }) => session.ownerId === ref.ownerId && session.topicId === ref.topicId && session.id === ref.sessionId && history.units.some(unit => unit.id === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : unit.revisions.some(revision => revision.id === unit.final?.revisionId && revision.id === ref.revisionId && revision.accepted && revision.status === 'completed' && revision.text.trim())))))
+  const included = refs.filter(ref => entries.some(({ session, history }) => session.ownerId === ref.ownerId && session.topicId === ref.topicId && session.id === ref.sessionId && history.units.some(unit => unit.id === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : currentFinalRevision(unit)?.id === ref.revisionId))))
   return included.length ? { ...result, content: JSON.stringify({ ...JSON.parse(result.content), schemaVersion: 2, objectReferences: included }, null, 2) } : result
 }

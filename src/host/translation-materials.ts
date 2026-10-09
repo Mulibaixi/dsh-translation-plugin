@@ -2,7 +2,7 @@ import { TranslationMaterialStore } from '../memory/translation-material-store.j
 import { TRANSLATION_MATERIAL_REMOTE, type TranslationMaterialCapability, type TranslationMaterialFinish,
   type TranslationMaterialQuery, type TranslationMaterialReceipt, type TranslationMaterialResult, type TranslationMaterialStage } from '../shared/translation-material-remote.js'
 import type { TranslationMaterialEnvelope, TranslationMaterialScope } from '../shared/translation-material.js'
-import type { NormalTranslationTarget } from '../shared/normal-translation.js'
+import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
 import { hostLlmLoader, type DshExecutionContext } from './dsh-text-adapter.js'
 
 interface Message {
@@ -120,7 +120,7 @@ export class TranslationMaterialsService {
     return record && record.peerId === this.ctx.invocation?.peer.id && record.scope.mainSessionId === scope.mainSessionId && record.scope.operationId === scope.operationId ? record : undefined
   }
   /** Only the actual main Agent may consume a material already included in its admitted step. */
-  deliveredForAgent(target: NormalTranslationTarget, agent: { readonly id: string; readonly session: { readonly id: string } }): TranslationMaterialResult<Extract<TranslationMaterialEnvelope, { kind: 'material' }>> {
+  deliveredForAgent(target: NormalTranslationMaterialTarget, agent: { readonly id: string; readonly session: { readonly id: string } }): TranslationMaterialResult<Extract<TranslationMaterialEnvelope, { kind: 'material' }>> {
     if (this.disposed || agent.id !== target.mainSessionId || agent.session.id !== target.mainSessionId) return bad('scope_mismatch', '材料不属于此主 Agent。', 'resolve_material')
     const record = this.submissions.get(key({ ownerId: target.mainSessionId, requestId: target.requestId }))
     if (!record || record.stage !== 'attached' || !this.connections()?.ownsConnection(target.mainSessionId, record.peerId)) return bad('material_not_delivered', '材料尚未交付给此主 Agent，或所属连接已失效。', 'resolve_material')

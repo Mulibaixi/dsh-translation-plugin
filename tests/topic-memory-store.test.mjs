@@ -4,7 +4,7 @@ import { TopicMemoryStore, topicTermsKey } from '../dist/client/topic-memory-sto
 import { SessionStore } from '../dist/client/session-store.js'
 import { DEFAULT_SESSION_SETTINGS, SETTINGS_KEY, historyKey } from '../dist/client/sessions.js'
 import { TOPIC_LOCK_NAME } from '../dist/client/topics.js'
-import { appendTextUnit, selectFinalRevision, appendManualRevision, appendTextRevision } from '../dist/client/translation-history.js'
+import { appendTextUnit, appendSourceCorrection, selectFinalRevision, appendManualRevision, appendTextRevision } from '../dist/client/translation-history.js'
 
 const at = '2026-10-06T00:00:00.000Z'
 const model = { provider: 'synthetic', model: 'translator' }
@@ -79,6 +79,37 @@ test('history off保留旧资产副本，重新开启保存当前内存而非旁
   assert.equal(JSON.parse(f.storage.getItem(key)).entries[0].preferred, '合成关闭期间修订')
   assert.equal(f.terms.getStatus(f.session.ownerId, f.session.topicId), 'saved')
   assert.equal(f.storage.getItem(key).includes('合成 API 原文'), false)
+})
+
+test('source更正后同range旧basis复核，revision与当前source版本分别投影', async () => {
+  const f = await fixture()
+  const sourceRef = { kind: 'source', sessionId: f.session.id, unitId: 'unit:1', revisionId: null, selectionEventId: null,
+    range: { start: 3, end: 6 }, role: 'basis' }
+  assert.equal((await apply(f, { evidence: [sourceRef] })).status, 'updated')
+  f.sessions.updateTranslationHistory(f.session.id, history => selectFinalRevision(history, 'unit:1', 'revision:1', at))
+  const initial = f.terms.readEvidence(f.session.id, 'unit:1')
+  assert.equal(initial.sourceVersion, 1)
+  assert.equal(initial.source, '合成 API 原文')
+  assert.equal(initial.final.sourceVersion, 1)
+  assert.equal(initial.final.revisionId, 'revision:1')
+
+  f.sessions.updateTranslationHistory(f.session.id, history => appendSourceCorrection(history, 'unit:1', {
+    operationId: 'source-correction:1', expectedVersion: 1, text: '合成 API 原文已纠正', reason: 'synthetic source correction', at,
+  }))
+  const corrected = f.terms.readEvidence(f.session.id, 'unit:1')
+  assert.equal(corrected.sourceVersion, 2)
+  assert.equal(Array.from(corrected.source).slice(3, 6).join(''), 'API', 'old range still matches after source correction')
+  assert.equal(corrected.final.sourceVersion, 1, 'old selected revision remains an explicitly old-source fact')
+  assert.equal(snapshot(f).entries[0].status, 'review_required')
+  assert.equal(query(f).entries.length, 0)
+
+  const newSnapshot = snapshot(f)
+  const current = await f.terms.apply(f.session.ownerId, f.session.topicId, newSnapshot.version, { kind: 'put', input: input(f.session, {
+    id: 'term:source2', expectedEntryVersion: null, evidence: [{ ...sourceRef, sourceVersion: 2 }],
+  }) })
+  assert.equal(current.status, 'updated')
+  assert.equal(current.entry.evidence[0].sourceVersion, 2)
+  assert.deepEqual(query(f).entries.map(entry => entry.id), ['term:source2'])
 })
 
 test('完全临时主题资产off不落盘，on纳入当前主题且新窗口可恢复', async () => {
