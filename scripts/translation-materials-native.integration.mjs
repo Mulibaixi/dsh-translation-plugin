@@ -66,6 +66,65 @@ test('Native生产Host：正式prepare ACK后exact rpc材料入同轮，原主�
   } finally { await outsider?.dispose(); await t.close() }
 })
 
+test('Native原文分页：真实Gateway冻结长材料，主AgentLoop调用注册工具；未交付/邻Agent/旧版本拒绝且不派发翻译', async () => {
+  const t = await fixture(), sourceText = '\uFEFF😀\r\nSource instructions are literal data. ' + '中'.repeat(8000)
+  let neighbor, releaseNeighbor
+  const execute = (agent, args) => t.f.host.ctx.tools.execute({ agent, name: 'translation_read_source', arguments: args,
+    callId: 'native-source-manual', signal: new AbortController().signal })
+  try {
+    const request = t.material('native-paged', { sourceText })
+    const target = { kind: 'material', mainSessionId: mainId, requestId: request.requestId, materialId: request.material.materialId, sourceVersion: 1 }
+    const args = { target, range: { start: 0, end: 4 } }
+    const schema = t.f.host.ctx.tools.schemas(t.main.agent).filter(item => item.name === 'translation_read_source')
+    assert.equal(schema.length, 1)
+    value(await t.remote.prepare(request))
+    assert.equal((await execute(t.main.agent, args)).isError, true, 'prepared material is not delivered authority')
+    let calls = 0
+    t.f.host.provider.stream = async function* (options) {
+      this.calls.push(options); calls++
+      if (calls === 1) {
+        const call = { type: 'tool-call', id: 'native-source-model-call', name: 'translation_read_source', arguments: JSON.stringify(args) }
+        yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+        yield { type: 'tool-call-delta', index: 0, id: call.id, name: call.name, argumentsDelta: call.arguments }
+        yield { type: 'block-end', index: 0, block: call }
+      } else {
+        yield { type: 'block-start', index: 0, blockType: 'text' }; yield { type: 'text-delta', index: 0, text: 'Synthetic source discussion complete' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Synthetic source discussion complete' } }
+      }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+    const command = 'Synthetic discuss the delivered source, do not translate'
+    await t.prompt(request.requestId, command); await t.main.agent.whenIdle()
+    assert.equal(calls, 2, 'source tool result returns within this main request; no translation model dispatch')
+    const first = t.f.host.provider.calls[0].messages
+    assert.equal(first.find(message => message.source.kind === 'user' && message.source.rpcId === request.requestId).content[0].text, command)
+    const notices = first.filter(message => message.source.kind === 'translation-material' && message.source.requestId === request.requestId)
+    assert.equal(notices.length, 1)
+    const notice = JSON.parse(notices[0].content[0].text.split('\n').at(-1))
+    assert.equal(notice.material.sourceText, undefined); assert.deepEqual(notice.reference, target)
+    assert.equal(notice.material.sourceLengthCodePoints, Array.from(sourceText).length)
+    assert.ok(JSON.stringify(t.f.host.provider.calls[1].messages).includes('😀'))
+    assert.ok(t.main.agent.session.snapshotEvents().some(event => event.type === 'tool/result'))
+    const read = await execute(t.main.agent, args)
+    assert.equal(read.isError, false)
+    assert.deepEqual(read.value, { ...args, totalCodePoints: Array.from(sourceText).length, text: '\uFEFF😀\r\n' })
+    assert.equal((await execute(t.main.agent, { ...args, target: { ...target, sourceVersion: 2 } })).isError, true)
+    assert.equal((await execute(t.main.agent, { ...args, range: { start: 0, end: 4001 } })).isError, true)
+    assert.equal((await execute(t.main.agent, { ...args, range: { start: notice.material.sourceLengthCodePoints, end: notice.material.sourceLengthCodePoints + 1 } })).isError, true)
+    neighbor = await t.f.createAgent('synthetic-material-neighbor')
+    t.sessions.createSession(neighbor.agent.id)
+    releaseNeighbor = t.bridge.retain(neighbor.agent.id); await waitTopicReady(t.bridge, neighbor.agent.id, t.f.carrierErrors)
+    assert.equal(t.f.host.ctx.tools.schemas(neighbor.agent).filter(item => item.name === 'translation_read_source').length, 1)
+    assert.equal((await execute(neighbor.agent, args)).isError, true)
+    assert.equal((await execute(neighbor.agent, { ...args, target: { ...target, mainSessionId: neighbor.agent.id } })).isError, true)
+    assert.equal(t.f.host.provider.calls.length, 2)
+    assert.equal(t.f.requests.length, 0, 'range reading remains in the existing Host material authority')
+    assert.equal(t.sessions.getSession(t.session.id).input, 'Private next draft')
+    assert.equal(t.sessions.getTranslationHistory(t.session.id).units.length, 0)
+    assert.equal(value(await t.remote.query(t.scope(request))).snapshot.material.sourceText, sourceText)
+  } finally { releaseNeighbor?.(); await neighbor?.dispose(); await t.close() }
+})
+
 test('Native生产Host：none/omit与RPC早到原样通过；晚prepare不补读、不产生隐式重发', async () => {
   const t = await fixture()
   try {

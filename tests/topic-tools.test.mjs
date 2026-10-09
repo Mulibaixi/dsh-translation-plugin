@@ -16,13 +16,13 @@ function queue() {
 }
 const tick = () => new Promise(resolve => setImmediate(resolve))
 const open = { ownerId: 'synthetic-main', mainSessionId: 'synthetic-main' }
-function fixture({ initialAgent = true, timeout = 1000 } = {}) {
+function fixture({ initialAgent = true, timeout = 1000, materials } = {}) {
   const inbox = queue(), listeners = new Map(), tools = new Map(), calls = []
   const agent = { id: open.mainSessionId, session: { id: open.mainSessionId }, ctx: { tools: {
     register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name) },
   } } }
   const ctx = { invocation: { peer: { id: 'synthetic-peer' }, uplink: () => inbox },
-    get(key) { return { agents: { get: () => initialAgent ? agent : undefined }, tools: {}, sessionController: {
+    get(key) { return { agents: { get: () => initialAgent ? agent : undefined }, tools: {}, translationMaterials: materials, sessionController: {
       async list(request, signal) { calls.push(request); signal.throwIfAborted(); return { items: [{ sessionId: open.mainSessionId }] } },
     } }[key] },
     on(event, listener) { listeners.set(event, listener); return () => listeners.delete(event) },
@@ -36,6 +36,33 @@ function fixture({ initialAgent = true, timeout = 1000 } = {}) {
 }
 const sessionsReply = id => ({ requestId: id, ok: true, value: { kind: 'sessions', sessions: [] } })
 const summary = { id: 's', topicId: 't', name: 'Synthetic 1', mode: 'quick', publishedUnitIds: [], topicName: 'Synthetic', sequence: 1, remark: '', archived: false }
+
+test('原文读取注册沿用连接生命周期，实际Agent/中断检查在读取前完成，不发桥接业务请求', async () => {
+  const reads = [], args = { target: { kind: 'material', mainSessionId: open.mainSessionId, requestId: 'r', materialId: 'm', sourceVersion: 1 }, range: { start: 0, end: 1 } }
+  const released = []
+  const f = fixture({ materials: {
+    readSource(request, agent) { reads.push({ request, agent }); return { ok: true, value: { ...request, totalCodePoints: 1, text: '😀' } } },
+    releaseConnection(ownerId, peerId) { released.push({ ownerId, peerId }) },
+  } })
+  let tool
+  try {
+    await f.stream.next(); assert.equal(f.tools.size, 14)
+    f.listeners.get('agent/created')({ agent: f.agent }); assert.equal(f.tools.size, 14)
+    tool = f.tools.get('translation_read_source')
+    assert.equal(tool.parameters.target.additionalProperties, false); assert.equal(tool.parameters.range.additionalProperties, false)
+    const page = tool.execute(args, f.exec)
+    assert.equal(page.text, '😀'); assert.equal(reads.length, 1); assert.equal(reads[0].agent, f.agent)
+    assert.deepEqual(tool.output.render(args, page), [{ type: 'text', text: JSON.stringify(page) }])
+    assert.throws(() => tool.execute(args, { ...f.exec, agent: { ...f.agent } }), { code: 'scope_mismatch' })
+    const aborted = new AbortController(); aborted.abort()
+    assert.throws(() => tool.execute(args, { ...f.exec, signal: aborted.signal }), { name: 'AbortError' })
+    assert.equal(reads.length, 1)
+  } finally { await f.close() }
+  assert.equal(f.tools.size, 0)
+  assert.deepEqual(released, [{ ownerId: open.ownerId, peerId: 'synthetic-peer' }])
+  assert.throws(() => tool.execute(args, f.exec), { code: 'scope_mismatch' })
+  assert.equal(reads.length, 1)
+})
 
 test('topic bridge仅公开管理/历史协议，严格拒绝凭据、伪造owner和普通材料命令', () => {
   assert.deepEqual(parseTopicBridgeOpen(open), open)
