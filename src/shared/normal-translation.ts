@@ -1,4 +1,5 @@
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
+import { parseTranslationCallMetadata, type TranslationCallMetadata } from './translation-call.js'
 
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
 export interface NormalTranslationTarget {
@@ -34,6 +35,37 @@ export interface NormalTranslationOperation {
   readonly status: 'accepted' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown'
   readonly persistence: 'saved' | 'runtime_only'
 }
+export interface NormalTranslationQuery {
+  readonly mainSessionId: string
+  readonly translationSessionId: string
+  readonly operationId: string
+  readonly afterSequence: number
+}
+export interface NormalTranslationError { readonly code: string; readonly message: string; readonly stage: string }
+export interface NormalTranslationUpdate {
+  readonly mainSessionId: string
+  readonly translationSessionId: string
+  readonly unitId: string
+  readonly operationId: string
+  readonly sourceVersion: number
+  readonly callId: string | null
+  readonly sequence: number
+  readonly status: Exclude<NormalTranslationOperation['status'], 'accepted'>
+  readonly textDelta: string
+  readonly metadata: TranslationCallMetadata | null
+  readonly error: NormalTranslationError | null
+}
+export interface NormalTranslationJob {
+  readonly operation: NormalTranslationOperation | null
+  readonly callId: string | null
+  readonly status: 'preparing' | NormalTranslationOperation['status']
+  readonly updates: readonly NormalTranslationUpdate[]
+  readonly lastSequence: number
+  readonly more: boolean
+  readonly error: NormalTranslationError | null
+}
+export interface NormalTranslationCapability { readonly ready: boolean; readonly reason?: string; readonly storage: 'runtime_only'; readonly mode: 'normal' }
+export type NormalTranslationResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: NormalTranslationError }
 
 type Data = Record<string, unknown>
 function object(value: unknown): asserts value is Data {
@@ -83,3 +115,56 @@ export function parseNormalTranslationOperation(value: unknown): NormalTranslati
   if (!['accepted', 'running', 'completed', 'failed', 'cancelled', 'unknown'].includes(value.status as string) || !['saved', 'runtime_only'].includes(value.persistence as string)) throw new TypeError('Invalid normal translation operation state')
   return structuredClone(value) as unknown as NormalTranslationOperation
 }
+export function parseNormalTranslationQuery(value: unknown): NormalTranslationQuery {
+  object(value); exact(value, ['mainSessionId', 'translationSessionId', 'operationId', 'afterSequence'])
+  text(value.mainSessionId); text(value.translationSessionId); text(value.operationId)
+  if (!Number.isSafeInteger(value.afterSequence) || (value.afterSequence as number) < 0) throw new TypeError('Invalid normal translation cursor')
+  return structuredClone(value) as unknown as NormalTranslationQuery
+}
+function parseError(value: unknown): NormalTranslationError {
+  object(value); exact(value, ['code', 'message', 'stage']); text(value.code, 80); text(value.message, 1000); text(value.stage, 80)
+  return structuredClone(value) as unknown as NormalTranslationError
+}
+export function parseNormalTranslationUpdate(value: unknown): NormalTranslationUpdate {
+  object(value); exact(value, ['mainSessionId', 'translationSessionId', 'unitId', 'operationId', 'sourceVersion', 'callId', 'sequence', 'status', 'textDelta', 'metadata', 'error'])
+  for (const field of ['mainSessionId', 'translationSessionId', 'unitId', 'operationId']) text(value[field])
+  if (value.callId !== null) text(value.callId)
+  version(value.sourceVersion); version(value.sequence); text(value.textDelta, 8192, true)
+  if (!['running', 'completed', 'failed', 'cancelled', 'unknown'].includes(value.status as string)) throw new TypeError('Invalid normal translation update state')
+  const metadata = value.metadata === null ? null : parseTranslationCallMetadata(value.metadata)
+  if (value.callId === null && (value.status === 'running' || value.status === 'completed' || value.textDelta !== '' || metadata !== null)) throw new TypeError('Unstarted operation cannot contain a model revision')
+  if (metadata && metadata.promptVersion !== 'normal-text-v1') throw new TypeError('Normal translation requires its own prompt')
+  const error = value.error === null ? null : parseError(value.error)
+  return { ...structuredClone(value), metadata, error } as unknown as NormalTranslationUpdate
+}
+export function parseNormalTranslationJob(value: unknown): NormalTranslationJob {
+  object(value); exact(value, ['operation', 'callId', 'status', 'updates', 'lastSequence', 'more', 'error'])
+  const operation = value.operation === null ? null : parseNormalTranslationOperation(value.operation)
+  if (value.callId !== null) text(value.callId)
+  if (!['preparing', 'accepted', 'running', 'completed', 'failed', 'cancelled', 'unknown'].includes(value.status as string) || !Array.isArray(value.updates) || typeof value.more !== 'boolean' || !Number.isSafeInteger(value.lastSequence) || (value.lastSequence as number) < 0) throw new TypeError('Invalid normal translation job')
+  const updates = value.updates.map(parseNormalTranslationUpdate)
+  if (updates.some((update, index) => !operation || update.operationId !== operation.operationId || update.mainSessionId !== operation.mainSessionId ||
+    update.translationSessionId !== operation.translationSessionId || update.unitId !== operation.unitId || update.sourceVersion !== operation.sourceVersion ||
+    (update.callId !== null && update.callId !== value.callId) || update.sequence > (value.lastSequence as number) || (index > 0 && update.sequence !== updates[index - 1]!.sequence + 1))) throw new TypeError('Invalid normal translation job events')
+  return { operation, callId: value.callId as string | null, status: value.status as NormalTranslationJob['status'], updates,
+    lastSequence: value.lastSequence as number, more: value.more, error: value.error === null ? null : parseError(value.error) }
+}
+function parseResult(method: 'capabilities' | 'status' | 'cancel', value: unknown): unknown {
+  object(value)
+  if (value.ok === false) { exact(value, ['ok', 'error']); return { ok: false, error: parseError(value.error) } }
+  if (value.ok !== true) throw new TypeError('Invalid normal translation result')
+  exact(value, ['ok', 'value'])
+  if (method !== 'capabilities') return { ok: true, value: parseNormalTranslationJob(value.value) }
+  object(value.value)
+  const capability = value.value
+  if (Object.keys(capability).some(field => !['ready', 'reason', 'storage', 'mode'].includes(field)) || typeof capability.ready !== 'boolean' || capability.storage !== 'runtime_only' || capability.mode !== 'normal') throw new TypeError('Invalid normal translation capability')
+  if (capability.reason !== undefined) text(capability.reason, 1000)
+  return structuredClone(value)
+}
+const packageName = 'dsh-translation-plugin'
+export const NORMAL_TRANSLATION_REMOTE = { package: packageName, descriptors: (['capabilities', 'status', 'cancel'] as const).map(method => ({
+  id: `${packageName}#translationNormal/${method}`, service: 'translationNormal', namespace: 'translationNormal', method,
+  invocation: { kind: 'direct' as const }, parameters: method === 'capabilities' ? [] : [{ name: 'request', wire: 'request', source: 'json' as const,
+    codec: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Request`, create: () => ({ parse: parseNormalTranslationQuery }) } }],
+  result: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Result`, create: () => ({ parse: (value: unknown) => parseResult(method, value) }) },
+})) }

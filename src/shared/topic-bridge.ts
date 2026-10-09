@@ -1,6 +1,6 @@
 import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
-import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, type NormalTranslationAcceptance, type NormalTranslationOperation } from './normal-translation.js'
+import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, parseNormalTranslationUpdate, type NormalTranslationAcceptance, type NormalTranslationOperation, type NormalTranslationUpdate } from './normal-translation.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
@@ -43,6 +43,9 @@ export interface TopicUnitFact {
 }
 export type TopicBridgeCommand =
   | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
+  | ({ readonly kind: 'normal_prepare' } & NormalTranslationAcceptance)
+  | ({ readonly kind: 'normal_update' } & NormalTranslationUpdate)
+  | { readonly kind: 'normal_observe'; readonly translationSessionId: string; readonly operationId: string }
   | { readonly kind: 'list_sessions' }
   | { readonly kind: 'list_topics' }
   | { readonly kind: 'list_topic_terms'; readonly topicId: string }
@@ -59,6 +62,9 @@ export type TopicBridgeCommand =
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
   | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
+  | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot }
+  | { readonly kind: 'normal_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
+  | { readonly kind: 'normal_observed'; readonly operation: NormalTranslationOperation | null }
   | { readonly kind: 'sessions'; readonly sessions: readonly TopicSessionSummary[]; readonly persistence?: TopicPersistence }
   | { readonly kind: 'topics'; readonly topics: readonly TopicSummary[] }
   | { readonly kind: 'session_created'; readonly session: TopicSessionSummary; readonly reason: string; readonly persistence: TopicPersistence }
@@ -111,11 +117,16 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
 export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
   object(value)
   switch (value.kind) {
-      case 'normal_accept': {
+      case 'normal_accept': case 'normal_prepare': {
         exact(value, ['kind', 'envelope', 'operationId', 'organizedRequirements', 'termReferences'])
-        return { kind: 'normal_accept', ...parseNormalTranslationAcceptance({ envelope: value.envelope, operationId: value.operationId,
+        return { kind: value.kind, ...parseNormalTranslationAcceptance({ envelope: value.envelope, operationId: value.operationId,
           organizedRequirements: value.organizedRequirements, termReferences: value.termReferences }) }
       }
+      case 'normal_update': {
+        const { kind, ...update } = value
+        return { kind: 'normal_update', ...parseNormalTranslationUpdate(update) }
+      }
+      case 'normal_observe': exact(value, ['kind', 'translationSessionId', 'operationId']); text(value.translationSessionId); text(value.operationId); break
       case 'list_sessions': case 'list_topics': exact(value, ['kind']); break
       case 'list_topic_terms': case 'list_topic_archive': exact(value, ['kind', 'topicId']); text(value.topicId); break
       case 'create_session': {
@@ -199,6 +210,17 @@ function sessionSummary(value: unknown): void {
 function parseValue(value: unknown): TopicBridgeValue {
   object(value)
   switch (value.kind) {
+    case 'normal_observed': exact(value, ['kind', 'operation']); return { kind: 'normal_observed', operation: value.operation === null ? null : parseNormalTranslationOperation(value.operation) }
+    case 'normal_prepared': {
+      exact(value, ['kind', 'termSnapshot'])
+      const termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)
+      if (!termSnapshot || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation preparation')
+      return { kind: 'normal_prepared', termSnapshot }
+    }
+    case 'normal_updated': {
+      exact(value, ['kind', 'operation', 'callId', 'sequence']); if (value.callId !== null) text(value.callId); integer(value.sequence, 1)
+      return { kind: 'normal_updated', operation: parseNormalTranslationOperation(value.operation), callId: value.callId, sequence: value.sequence }
+    }
     case 'normal_operation': {
       exact(value, ['kind', 'operation', 'termSnapshot'])
       const operation = parseNormalTranslationOperation(value.operation), termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)

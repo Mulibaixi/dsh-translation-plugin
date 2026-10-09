@@ -71,6 +71,7 @@ interface Pending {
   readonly resolve: (value: TopicBridgeValue) => void
   readonly reject: (error: Error) => void
   readonly clean: () => void
+  readonly settled: Promise<void>
 }
 /** One explicitly connected owner. It carries requests, never a shadow copy of browser records. */
 class ManagementConnection {
@@ -83,18 +84,23 @@ class ManagementConnection {
   constructor(readonly identity: TopicBridgeOpen, readonly peerId: string, readonly timeoutMs: number) {
     this.stopped = new Promise(resolve => { this.stop = resolve })
   }
-  async request(command: TopicBridgeCommand, exec: ToolExecution): Promise<TopicBridgeValue> {
-    if (this.closed || exec.agent?.id !== this.identity.mainSessionId || exec.agent.session.id !== this.identity.mainSessionId) throw bridgeError('scope_mismatch', '主题管理连接不属于此主会话。')
+  async request(command: TopicBridgeCommand, exec: ToolExecution, peerRead = false): Promise<TopicBridgeValue> {
+    if (this.closed || !(peerRead && command.kind === 'normal_observe') && (exec.agent?.id !== this.identity.mainSessionId || exec.agent.session.id !== this.identity.mainSessionId)) throw bridgeError('scope_mismatch', '主题管理连接不属于此主会话。')
     exec.signal.throwIfAborted()
     if (this.pending) throw bridgeError('busy', '上一项主题管理操作仍在等待回执。')
     return new Promise<TopicBridgeValue>((resolve, reject) => {
       const abort = () => this.close(bridgeError('outcome_unknown', '主题管理操作已中断，请查看当前记录后再明确操作。'))
       const timer = setTimeout(() => this.close(bridgeError('outcome_unknown', '未取得主题管理回执，请查看当前记录；操作不会自动重发。')), this.timeoutMs)
+      let finish!: () => void
+      const settled = new Promise<void>(resolve => { finish = resolve })
       exec.signal.addEventListener('abort', abort, { once: true })
       this.pending = { frame: { kind: 'request', requestId: crypto.randomUUID(), mainSessionId: this.identity.mainSessionId, callId: exec.callId, command }, resolve, reject,
-        clean: () => { clearTimeout(timer); exec.signal.removeEventListener('abort', abort) } }
+        settled, clean: () => { clearTimeout(timer); exec.signal.removeEventListener('abort', abort); finish() } }
       this.wake?.(); this.wake = undefined
     })
+  }
+  async waitIdle(signal: AbortSignal): Promise<void> {
+    while (this.pending) { await this.pending.settled; signal.throwIfAborted() }
   }
   async next(): Promise<Pending | undefined> {
     if (!this.closed && !this.pending) await new Promise<void>(resolve => { this.wake = resolve })
@@ -106,7 +112,7 @@ class ManagementConnection {
     if (reply.ok) {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
-        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation' }[pending.frame.command.kind]
+        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_observe: 'normal_observed' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -123,6 +129,7 @@ class ManagementConnection {
 export class TopicToolsService {
   readonly typertRemote: { readonly service: TopicToolsService; readonly serviceKey: 'translationTopics'; readonly namespace: 'translationTopics' }
   private readonly connections = new Map<string, ManagementConnection>()
+  private readonly ownedRequests = new Map<ManagementConnection, Promise<void>>()
   private disposed = false
   constructor(readonly ctx: TopicHostContext, private readonly loadTools: TopicToolLoader = hostToolLoader(ctx), private readonly timeoutMs = 15_000) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationTopics', property: 'ctx' } })
@@ -147,7 +154,27 @@ export class TopicToolsService {
     if (!this.ownsAgent(ownerId, exec.agent)) throw bridgeError('scope_mismatch', '翻译操作不属于已连接的主 Agent。')
     const parsed = parseTopicBridgeCommand(command)
     if (new TextEncoder().encode(JSON.stringify(parsed)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '本次业务材料和要求超过通道上限，未截断或受理。')
-    return this.connections.get(ownerId)!.request(parsed, exec)
+    const connection = this.connections.get(ownerId)!, before = this.ownedRequests.get(connection) ?? Promise.resolve()
+    const result = before.then(async () => {
+      exec.signal.throwIfAborted()
+      if (!this.ownsAgent(ownerId, exec.agent) || this.connections.get(ownerId) !== connection) throw bridgeError('scope_mismatch', '原业务连接已失效。')
+      await connection.waitIdle(exec.signal)
+      return connection.request(parsed, exec)
+    })
+    this.ownedRequests.set(connection, result.then(() => {}, () => {}))
+    return result
+  }
+  /** Recovery reads use the admitted RPC peer and never activate or prompt a main Agent. */
+  observeOperation(ownerId: string, peerId: string, command: Extract<TopicBridgeCommand, { kind: 'normal_observe' }>, signal: AbortSignal): Promise<TopicBridgeValue> {
+    if (!this.ownsConnection(ownerId, peerId)) throw bridgeError('scope_mismatch', '业务观察不属于此主会话连接。')
+    const parsed = parseTopicBridgeCommand(command), connection = this.connections.get(ownerId)!
+    const result = (this.ownedRequests.get(connection) ?? Promise.resolve()).then(async () => {
+      if (!this.ownsConnection(ownerId, peerId) || this.connections.get(ownerId) !== connection) throw bridgeError('scope_mismatch', '原业务观察连接已失效。')
+      await connection.waitIdle(signal)
+      return connection.request(parsed, { callId: `normal-observe:${crypto.randomUUID()}`, signal }, true)
+    })
+    this.ownedRequests.set(connection, result.then(() => {}, () => {}))
+    return result
   }
   async *connect(request: TopicBridgeOpen, signal: AbortSignal): AsyncGenerator<TopicBridgeDown> {
     request = parseTopicBridgeOpen(request)
@@ -198,6 +225,7 @@ export class TopicToolsService {
       const materials = this.ctx.get?.('translationMaterials') as { releaseConnection(ownerId: string, peerId: string): void } | undefined
       materials?.releaseConnection(request.ownerId, peerId)
       if (this.connections.get(request.mainSessionId) === connection) this.connections.delete(request.mainSessionId)
+      this.ownedRequests.delete(connection)
     }
   }
   private installTools(agent: MainAgent, connection: ManagementConnection, helpers: ToolHelpers): readonly (() => void)[] {
@@ -255,7 +283,7 @@ export class TopicToolsService {
       return disposers
     } catch (error) { disposers.forEach(dispose => dispose()); throw error }
   }
-  dispose(): void { this.disposed = true; for (const connection of this.connections.values()) connection.close(); this.connections.clear() }
+  dispose(): void { this.disposed = true; for (const connection of this.connections.values()) connection.close(); this.connections.clear(); this.ownedRequests.clear() }
 }
 export function installTopicTools(ctx: TopicHostContext, loadTools?: TopicToolLoader, registerRemote = true): TopicToolsService {
   if (ctx.root && !Object.hasOwn(ctx.root.reflect.props, 'invocation')) ctx.root.accessor('invocation', { get: () => undefined })

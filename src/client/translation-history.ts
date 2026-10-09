@@ -63,10 +63,12 @@ export interface TranslationEvent {
   readonly operationId: string | null
   readonly status: TextRevisionStatus | null
   readonly reason: 'advance' | 'user_selection' | 'restored' | 'export' | null
+  /** Last ordinary stream receipt applied to this history; absent on quick and legacy facts. */
+  readonly normalSequence?: number
 }
 /** One browser snapshot; events and final pointers reference the sole revision body. */
 export interface TranslationHistory {
-  readonly schemaVersion: 3
+  readonly schemaVersion: 4
   readonly units: readonly TextUnit[]
   readonly events: readonly TranslationEvent[]
 }
@@ -74,7 +76,7 @@ export type NewTextUnit = Pick<TextUnit, 'id' | 'source' | 'targetLanguage' | 'i
 export type NewTextRevision = Omit<TextRevision, 'order' | 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'> & Partial<Pick<TextRevision, 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'>>
 export type TextRevisionPatch = Partial<Pick<TextRevision, 'status' | 'text' | 'message' | 'updatedAt' | 'callRecord'>>
 
-export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 3, units: [], events: [] } }
+export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 4, units: [], events: [] } }
 
 type Data = Record<string, unknown>
 const statuses: readonly TextRevisionStatus[] = ['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted']
@@ -127,17 +129,17 @@ function decodeMaterial(value: unknown): TextMaterialIdentity | null | undefined
 
 /** Validation does not turn live requests into restored requests. Unknown fields are rejected. */
 export function decodeTranslationHistory(value: unknown): TranslationHistory | undefined {
-  if (!record(value) || !exact(value, ['schemaVersion', 'units', 'events']) || ![1, 2, 3].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events)) return undefined
-  const units: TextUnit[] = [], revisionIds = new Set<string>(), operationIds = new Set<string>(), unitIds = new Set<string>()
+  if (!record(value) || !exact(value, ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events)) return undefined
+  const units: TextUnit[] = [], revisionIds = new Set<string>(), operationUnits = new Map<string, string>(), unitIds = new Set<string>()
   for (const item of value.units) {
-    if (!record(item) || !exact(item, ['id', 'order', ...((value.schemaVersion !== 3 || Object.hasOwn(item, 'source')) ? ['source'] : []), 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final', ...(value.schemaVersion === 3 ? ['sourceVersion', 'sourceVersions', 'material'] : [])]) ||
-      !identity(item.id) || unitIds.has(item.id) || item.order !== units.length + 1 || (value.schemaVersion !== 3 && !text(item.source, 200000, true)) || !text(item.targetLanguage, 80, true) ||
+    if (!record(item) || !exact(item, ['id', 'order', ...(((value.schemaVersion as number) < 3 || Object.hasOwn(item, 'source')) ? ['source'] : []), 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final', ...((value.schemaVersion as number) >= 3 ? ['sourceVersion', 'sourceVersions', 'material'] : [])]) ||
+      !identity(item.id) || unitIds.has(item.id) || item.order !== units.length + 1 || ((value.schemaVersion as number) < 3 && !text(item.source, 200000, true)) || !text(item.targetLanguage, 80, true) ||
       !text(item.instruction, 4000) || !time(item.createdAt) || !Array.isArray(item.revisions)) return undefined
-    const material = value.schemaVersion === 3 ? decodeMaterial(item.material) : null
-    const sourceVersion = value.schemaVersion === 3 ? item.sourceVersion : 1
+    const material = (value.schemaVersion as number) >= 3 ? decodeMaterial(item.material) : null
+    const sourceVersion = (value.schemaVersion as number) >= 3 ? item.sourceVersion : 1
     const sourceVersions: TextSourceVersion[] = []
     if (material === undefined || !order(sourceVersion) || (!item.revisions.length && material === null)) return undefined
-    if (value.schemaVersion === 3) {
+    if ((value.schemaVersion as number) >= 3) {
       if (!Array.isArray(item.sourceVersions) || !item.sourceVersions.length) return undefined
       for (const raw of item.sourceVersions) {
         if (!record(raw) || !exact(raw, ['version', 'text', 'createdAt', 'operationId']) || raw.version !== sourceVersions.length + 1 ||
@@ -149,10 +151,11 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
     const revisions: TextRevision[] = []
     for (const raw of item.revisions) {
       const revision = decodeRevision(raw, value.schemaVersion as number)
-      if (!revision || revision.order !== revisions.length + 1 || revisionIds.has(revision.id) || operationIds.has(revision.operationId)) return undefined
+      if (!revision || revision.order !== revisions.length + 1 || revisionIds.has(revision.id) ||
+        (operationUnits.has(revision.operationId) && (value.schemaVersion !== 4 || operationUnits.get(revision.operationId) !== item.id))) return undefined
       if (!sourceVersions.some(source => source.version === revision.sourceVersion)) return undefined
       if (revision.kind === 'manual' && !revisions.some(base => base.id === revision.baseRevisionId && base.sourceVersion === revision.sourceVersion && canEditTextRevision(base))) return undefined
-      revisions.push(revision); revisionIds.add(revision.id); operationIds.add(revision.operationId)
+      revisions.push(revision); revisionIds.add(revision.id); operationUnits.set(revision.operationId, item.id)
     }
     // Units are admitted material; unaccepted new drafts remain in the transient execution layer.
     if (revisions.length && !revisions[0]!.accepted) return undefined
@@ -170,7 +173,8 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
   }
   const events: TranslationEvent[] = [], eventIds = new Set<string>()
   for (const item of value.events) {
-    if (!record(item) || !exact(item, ['id', 'order', 'type', 'at', 'unitId', 'revisionId', 'operationId', 'status', 'reason']) || !identity(item.id) || eventIds.has(item.id) ||
+    if (!record(item) || !exact(item, ['id', 'order', 'type', 'at', 'unitId', 'revisionId', 'operationId', 'status', 'reason', ...(value.schemaVersion === 4 && Object.hasOwn(item, 'normalSequence') ? ['normalSequence'] : [])]) ||
+      (Object.hasOwn(item, 'normalSequence') && (!order(item.normalSequence) || item.type !== 'operation.updated' || !units.find(unit => unit.id === item.unitId)?.material || !identity(item.operationId))) || !identity(item.id) || eventIds.has(item.id) ||
       item.order !== events.length + 1 || !['operation.submitted', 'operation.accepted', 'operation.updated', 'final.selected', 'operation.restored', 'revision.manual_saved'].includes(item.type as string) || !time(item.at) ||
       !(item.unitId === null || (identity(item.unitId) && unitIds.has(item.unitId))) || !(item.revisionId === null || (identity(item.revisionId) && revisionIds.has(item.revisionId))) ||
       !(item.operationId === null || identity(item.operationId)) || !(item.status === null || status(item.status)) || !(item.reason === null || ['advance', 'user_selection', 'restored', 'export'].includes(item.reason as string))) return undefined
@@ -178,9 +182,13 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       const unit = units.find(unit => unit.id === item.unitId), revision = unit?.revisions.find(revision => revision.id === item.revisionId)
       if (!revision || item.operationId !== revision.operationId) return undefined
     }
+    if (typeof item.operationId === 'string' && typeof item.unitId === 'string') {
+      if (operationUnits.has(item.operationId) && operationUnits.get(item.operationId) !== item.unitId) return undefined
+      operationUnits.set(item.operationId, item.unitId)
+    }
     events.push({ ...item } as unknown as TranslationEvent); eventIds.add(item.id)
   }
-  return { schemaVersion: 3, units, events }
+  return { schemaVersion: 4, units, events }
 }
 
 /** Version records own source bodies; storage and full-record exports omit the compatibility projection. */
@@ -201,9 +209,10 @@ function findUnit(history: TranslationHistory, unitId: string): TextUnit {
   return unit
 }
 function replaceUnit(history: TranslationHistory, unit: TextUnit): TranslationHistory { return { ...history, units: history.units.map(old => old.id === unit.id ? unit : old) } }
-function newRevision(history: TranslationHistory, data: NewTextRevision, revisionOrder: number): TextRevision {
+function newRevision(history: TranslationHistory, data: NewTextRevision, revisionOrder: number, unitId: string): TextRevision {
   const revision = decodeRevision({ kind: 'machine', baseRevisionId: null, callRecord: null, sourceVersion: 1, ...data, order: revisionOrder }, 3, false)
-  if (!revision || history.units.some(unit => unit.revisions.some(old => old.id === revision.id || old.operationId === revision.operationId))) throw new Error('Invalid or duplicate translation revision')
+  if (!revision || history.units.some(unit => unit.revisions.some(old => old.id === revision.id || (unit.id !== unitId && old.operationId === revision.operationId))) ||
+    history.events.some(event => event.operationId === revision.operationId && event.unitId !== unitId)) throw new Error('Invalid or duplicate translation revision')
   return revision
 }
 
@@ -228,7 +237,7 @@ export function appendManualRevision(history: TranslationHistory, unitId: string
   const unit = findUnit(history, unitId), base = unit.revisions.find(revision => revision.id === data.baseRevisionId)
   if (!base || !canEditTextRevision(base) || !text(data.text, 2_000_000, true) || !time(data.at)) throw new Error('Manual revision requires nonempty ended source and body')
   const revision = newRevision(history, { id: data.id, operationId: `manual:${data.id}`, kind: 'manual', model: null, draftVersion: null,
-    baseRevisionId: base.id, callRecord: null, sourceVersion: base.sourceVersion, createdAt: data.at, updatedAt: data.at, accepted: true, status: 'completed', text: data.text, message: null }, unit.revisions.length + 1)
+    baseRevisionId: base.id, callRecord: null, sourceVersion: base.sourceVersion, createdAt: data.at, updatedAt: data.at, accepted: true, status: 'completed', text: data.text, message: null }, unit.revisions.length + 1, unit.id)
   const updated: TextUnit = { ...unit, revisions: [...unit.revisions, revision] }
   return event(replaceUnit(history, updated), updated, revision, 'revision.manual_saved', data.at)
 }
@@ -238,7 +247,7 @@ export function appendTextUnit(history: TranslationHistory, data: NewTextUnit, r
   if (!revision.accepted || revision.kind === 'manual' || !identity(data.id) || !text(data.source, 200000, true) || !text(data.targetLanguage, 80, true) || !text(data.instruction, 4000) || !time(data.createdAt) ||
     history.units.some(unit => unit.id === data.id)) throw new Error('New text unit requires unique admitted material')
   const unit: TextUnit = { ...data, sourceVersion: 1, sourceVersions: [{ version: 1, text: data.source, createdAt: data.createdAt, operationId: null }], material: null,
-    order: history.units.length + 1, revisions: [newRevision(history, revision, 1)], final: null }
+    order: history.units.length + 1, revisions: [newRevision(history, revision, 1, data.id)], final: null }
   let next = history.units.length ? advanceFinal(history, history.units.at(-1)!, revision.updatedAt) : history
   next = { ...next, units: [...next.units, unit] }
   return event(next, unit, unit.revisions[0]!, 'operation.accepted', revision.updatedAt)
@@ -247,7 +256,7 @@ export function appendTextUnit(history: TranslationHistory, data: NewTextUnit, r
 /** Business admission is a material fact; an actual model invocation is appended separately. */
 export function appendAdmittedTextUnit(history: TranslationHistory, envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }, operationId: string, at: string): TranslationHistory {
   const snapshot = envelope.material, unitId = `unit:${snapshot.materialId}`
-  if (!identity(operationId) || !time(at) || snapshot.sourceVersion !== 1 || history.units.some(unit => unit.id === unitId)) throw new Error('Invalid or duplicate admitted material')
+  if (!identity(operationId) || !time(at) || snapshot.sourceVersion !== 1 || history.units.some(unit => unit.id === unitId) || history.events.some(event => event.operationId === operationId)) throw new Error('Invalid or duplicate admitted material')
   const unit: TextUnit = { id: unitId, order: history.units.length + 1, source: snapshot.sourceText, targetLanguage: snapshot.targetLanguage,
     instruction: snapshot.instruction, sourceVersion: snapshot.sourceVersion,
     sourceVersions: [{ version: snapshot.sourceVersion, text: snapshot.sourceText, createdAt: at, operationId: envelope.operationId }],
@@ -261,7 +270,7 @@ export function appendAdmittedTextUnit(history: TranslationHistory, envelope: Tr
 
 export function appendTextRevision(history: TranslationHistory, unitId: string, revision: NewTextRevision): TranslationHistory {
   if (revision.kind === 'manual') throw new Error('Use manual revision saving for local edits')
-  const unit = findUnit(history, unitId), added = newRevision(history, { sourceVersion: unit.sourceVersion, ...revision }, unit.revisions.length + 1)
+  const unit = findUnit(history, unitId), added = newRevision(history, { sourceVersion: unit.sourceVersion, ...revision }, unit.revisions.length + 1, unit.id)
   if (!unit.sourceVersions.some(source => source.version === added.sourceVersion)) throw new Error('Translation source version unavailable')
   const updated: TextUnit = { ...unit, revisions: [...unit.revisions, added] }
   return event(replaceUnit(history, updated), updated, added, revision.accepted ? 'operation.accepted' : 'operation.submitted', revision.createdAt)
@@ -301,6 +310,13 @@ export function selectFinalRevision(history: TranslationHistory, unitId: string,
 /** Restore facts without reconstructing an executable Host capability or replaying requests. */
 export function restoreTranslationHistory(history: TranslationHistory, at = new Date().toISOString()): TranslationHistory {
   let next = history
+  for (const unit of history.units) {
+    if (unit.revisions.length || !unit.material) continue
+    const admitted = [...history.events].reverse().find(event => event.unitId === unit.id && event.revisionId === null && event.operationId !== null)
+    if (!admitted || !['submitting', 'running', 'unknown'].includes(admitted.status ?? '')) continue
+    next = appendTranslationEvent(next, { id: `text-event:${next.events.length + 1}`, type: 'operation.restored', at,
+      unitId: unit.id, revisionId: null, operationId: admitted.operationId, status: 'interrupted', reason: 'restored' })
+  }
   for (const unit of history.units) for (const revision of unit.revisions) {
     if (!['submitting', 'running', 'unknown'].includes(revision.status)) continue
     const updated: TextRevision = { ...revision, status: 'interrupted', message: revision.status === 'unknown'

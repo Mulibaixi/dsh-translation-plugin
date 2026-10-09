@@ -23,7 +23,7 @@ export function apply(ctx: QuickHostContext): void {
   installTopicTools(ctx as TopicHostContext, undefined, false)
   installObjectAssets(ctx, {}, false)
   installTranslationMaterials(ctx as TranslationMaterialHostContext, undefined, false)
-  installNormalTranslation(ctx as TopicHostContext)
+  installNormalTranslation(ctx as TopicHostContext, undefined, false)
   const quick = installQuickTranslation(ctx, undefined, false)
   const register = (scope: QuickHostContext): void => {
     const registry = scope.get ? scope.get('typert') as QuickHostContext['typert'] : scope.typert

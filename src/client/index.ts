@@ -12,7 +12,7 @@ import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
-import { NormalTranslationClient } from './normal-translation.js'
+import { NormalTranslationClient, type NormalTranslationRemotePort } from './normal-translation.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
   openMemoryAssets, parseMemoryAssetsAddress, readMemoryAssetsNavigation, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
@@ -42,6 +42,7 @@ interface ClientPluginContext {
   get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
   get(name: 'remote.translationObjects'): ObjectAssetsRemotePort | undefined
   get(name: 'remote.translationMaterials'): TranslationMaterialsRemotePort | undefined
+  get(name: 'remote.translationNormal'): NormalTranslationRemotePort | undefined
   readonly conversation?: { readonly submissions?: MaterialSubmissionRegistry }
   readonly fileUpload: NativeFileUploadPort
   readonly remote: {
@@ -50,6 +51,7 @@ interface ClientPluginContext {
     readonly translationTopics?: TopicBridgeRemotePort
     readonly translationObjects?: ObjectAssetsRemotePort
     readonly translationMaterials?: TranslationMaterialsRemotePort
+    readonly translationNormal?: NormalTranslationRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
@@ -111,7 +113,13 @@ export function apply(ctx: ClientPluginContext): void {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationObjects')
     } : ctx.remote.translationObjects), ctx.fileUpload, store, objects, ownerId => topics.getStatus(ownerId))
-    const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), { isSessionBusy: sessionId => quick.isBusy(sessionId) })
+    const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), {
+      isSessionBusy: sessionId => quick.isBusy(sessionId), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
+      remote: ctx.remote.$mount ? async () => {
+        const unmountRemote = await mountedRemote
+        return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationNormal')
+      } : ctx.remote.translationNormal,
+    })
     topics.setNormalTranslation(normal)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
@@ -129,14 +137,14 @@ export function apply(ctx: ClientPluginContext): void {
     }, 'translation remote clients')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
-    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset(); materials.reset(); void topics.reset() }), 'translation catalog connection')
+    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset(); normal.reset(); materials.reset(); void topics.reset() }), 'translation catalog connection')
 
     const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
     const TranslationPanel: ClientComponent = (props = {}) => {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       return h(PanelRouter, {
-        store, models, quick, topics, materials, terms, objects, objectAssets, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, terms, objects, objectAssets, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId },

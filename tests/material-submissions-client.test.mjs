@@ -76,7 +76,12 @@ for (const outcome of ['accepted', 'failed']) test(`无面板${outcome}结算保
     const contribution = f.freeze(); await contribution.prepare(new AbortController().signal)
     f.store.updateSession(f.session.id, { input: '' }); contribution.finish(outcome); await tick()
     assert.equal(f.references.get(f.session.ownerId), 1)
-    gate.resolve(); await tick(); assert.equal(f.references.get(f.session.ownerId), 0)
+    gate.resolve(); await tick(); assert.equal(f.references.get(f.session.ownerId), outcome === 'accepted' ? 1 : 0)
+    if (outcome === 'accepted') {
+      const envelope = f.calls.prepare[0]
+      assert.ok(f.client.resolveSubmittedMaterial(envelope), 'submitted material remains available to business admission')
+      f.client.consumeSubmittedMaterial(envelope); assert.equal(f.references.get(f.session.ownerId), 0)
+    }
   } finally { gate.resolve(); f.close() }
 })
 

@@ -6,7 +6,7 @@ import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceR
 import type { TopicArchiveSnapshot, TopicArchivePut, ArchiveMutationResult, TopicArchiveQuery } from '../memory/topic-archive.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
-import type { NormalTranslationAcceptance } from '../shared/normal-translation.js'
+import type { NormalTranslationAcceptance, NormalTranslationUpdate } from '../shared/normal-translation.js'
 import type { NormalTranslationReply } from './normal-translation.js'
 
 export interface TopicBridgeRemotePort {
@@ -27,6 +27,12 @@ export interface TopicBridgeArchivePort {
   apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicArchivePut }): Promise<ArchiveMutationResult>
 }
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
+interface NormalPort {
+  prepare(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
+  accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
+  update(ownerId: string, request: NormalTranslationUpdate): NormalTranslationReply
+  observe(ownerId: string, request: { readonly translationSessionId: string; readonly operationId: string }): NormalTranslationReply
+}
 interface Connection {
   refs: number
   generation: number
@@ -46,13 +52,13 @@ export class TopicBridgeClient {
   private readonly listeners = new Set<() => void>()
   private readonly stopStore: () => void
   private disposed = false
-  private normal: { accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply } | undefined
+  private normal: NormalPort | undefined
   constructor(private readonly remote: TopicBridgeRemotePort | (() => Promise<TopicBridgeRemotePort | undefined>) | undefined,
     private readonly sessions: SessionStore, private readonly terms: TopicBridgeTermsPort, private readonly archive: TopicBridgeArchivePort) {
     this.stopStore = sessions.subscribe(() => this.reconcile())
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
-  setNormalTranslation(port: { accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply }): void { this.normal = port }
+  setNormalTranslation(port: NormalPort): void { this.normal = port }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private key(ownerId: string, sessionId: string, unitId: string): string { return JSON.stringify([ownerId, sessionId, unitId]) }
   getStatus(ownerId: string): { readonly ready: boolean; readonly reason: string | undefined } {
@@ -145,10 +151,16 @@ export class TopicBridgeClient {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
-    if (command.kind === 'normal_accept') {
-      const { kind: _kind, ...acceptance } = command
-      const result = this.normal?.accept(ownerId, acceptance)
-      if (result?.ok) this.publishAdmittedUnit(ownerId, result.value.operation.translationSessionId, result.value.operation.unitId)
+    if (command.kind === 'normal_observe') {
+      const result = this.normal?.observe(ownerId, command)
+      return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
+    }
+    if (command.kind === 'normal_accept' || command.kind === 'normal_prepare' || command.kind === 'normal_update') {
+      const { kind, ...payload } = command
+      const result = kind === 'normal_update' ? this.normal?.update(ownerId, payload as NormalTranslationUpdate)
+        : kind === 'normal_prepare' ? this.normal?.prepare(ownerId, payload as NormalTranslationAcceptance)
+        : this.normal?.accept(ownerId, payload as NormalTranslationAcceptance)
+      if (result?.ok && result.value.kind === 'normal_operation') this.publishAdmittedUnit(ownerId, result.value.operation.translationSessionId, result.value.operation.unitId)
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
     }
     if (command.kind === 'list_sessions') return success({ kind: 'sessions', sessions: this.sessions.getAvailableSessions(ownerId).filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => this.sessionSummary(session)) })
@@ -256,7 +268,7 @@ export class TopicBridgeClient {
       if (onlyOwnerId !== undefined && ownerId !== onlyOwnerId) continue
       connection.generation++; connection.controller.abort(); await this.closeHandle(connection.handle)
       if (this.disposed || this.connections.get(ownerId) !== connection) continue
-      connection.controller = new AbortController(); connection.handle = undefined; connection.ready = false; connection.requests.clear()
+      connection.controller = new AbortController(); connection.handle = undefined; connection.ready = false; connection.reason = undefined; connection.requests.clear()
       void this.open(ownerId, connection)
     }
     this.emit()

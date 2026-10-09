@@ -1,6 +1,6 @@
 import type { LocalSession } from './sessions.js'
 import { persistedTranslationHistory, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
-import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION } from '../shared/translation-call.js'
+import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION, NORMAL_SYSTEM_PROMPT, NORMAL_TRANSLATION_PROMPT_VERSION } from '../shared/translation-call.js'
 
 export interface MissingTextUnit {
   readonly unitId: string
@@ -125,8 +125,13 @@ export function buildTopicBilingualExport(topic: TranslationExportTopic, entries
 export function buildFullRecordExport(session: LocalSession, history: TranslationHistory, exportedAt: string): TranslationExport {
   const { missingUnits, exportedUnitIds } = finalSummary(history), complete = missingUnits.length === 0
   const hasKnownPrompt = history.units.some(unit => unit.revisions.some(revision => revision.callRecord?.promptVersion === TRANSLATION_PROMPT_VERSION))
-  const promptDefinitions = hasKnownPrompt ? [{ promptVersion: TRANSLATION_PROMPT_VERSION, systemPrompt: QUICK_SYSTEM_PROMPT,
-    userMessageFields: { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source' } }] : []
+  const hasNormalPrompt = history.units.some(unit => unit.revisions.some(revision => revision.callRecord?.promptVersion === NORMAL_TRANSLATION_PROMPT_VERSION))
+  const promptDefinitions = [...(hasKnownPrompt ? [{ promptVersion: TRANSLATION_PROMPT_VERSION, systemPrompt: QUICK_SYSTEM_PROMPT,
+    userMessageFields: { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.source' } }] : []),
+    ...(hasNormalPrompt ? [{ promptVersion: NORMAL_TRANSLATION_PROMPT_VERSION, systemPrompt: NORMAL_SYSTEM_PROMPT, userMessageFields: {
+      target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.sourceVersions[revision.sourceVersion-1].text',
+      main_model_requirements: 'revision.callRecord.context.organizedRequirements', terminology: 'revision.callRecord.context.terms',
+    } }] : [])]
   const content = JSON.stringify({ format: 'dsh-translation-session', schemaVersion: 1, exportedAt, session, history: persistedTranslationHistory(history),
     summary: { complete, missingUnits, exportedUnitIds }, promptDefinitions }, null, 2)
   return { content, fileName: `${fileBase(session, exportedAt)}-records.json`, mimeType: 'application/json;charset=utf-8', complete, missingUnits, exportedUnitIds }

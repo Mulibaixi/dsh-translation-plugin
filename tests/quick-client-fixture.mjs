@@ -237,7 +237,7 @@ export function mount(overrides = {}) {
   storage.failSet = !!overrides.failSet
   if (storage.failSet) storage.setItem = () => { throw new Error('quota') }
   const renderer = createRenderer({ deferFunctionalUpdates: overrides.deferFunctionalUpdates })
-  let store, objects, objectAssets, quick, materials
+  let store, objects, objectAssets, quick, materials, normal
   const createElement = renderer.react.createElement
   renderer.react.createElement = (type, props, ...children) => {
     if (props?.store) store = props.store
@@ -245,6 +245,7 @@ export function mount(overrides = {}) {
     if (props?.objectAssets) objectAssets = props.objectAssets
     if (props?.quick) quick = props.quick
     if (props?.materials) materials = props.materials
+    if (props?.normal) normal = props.normal
     return createElement(type, props, ...children)
   }
   const entries = []; const effects = []; const listeners = new Set()
@@ -304,7 +305,7 @@ export function mount(overrides = {}) {
   const remote = {
     async $mount(contribution) {
       assert.equal(contribution.package, 'dsh-translation-plugin')
-      assert.deepEqual([...new Set(contribution.descriptors.map(item => item.namespace))].sort(), ['translationMaterials', 'translationObjects', 'translationQuick', 'translationTopics'])
+      assert.deepEqual([...new Set(contribution.descriptors.map(item => item.namespace))].sort(), ['translationMaterials', 'translationNormal', 'translationObjects', 'translationQuick', 'translationTopics'])
       mountCalls++; topicMountCalls++
       await overrides.mountGate
       if (overrides.mountError) throw overrides.mountError
@@ -312,9 +313,10 @@ export function mount(overrides = {}) {
       remote.translationTopics = overrides.topics
       remote.translationObjects = overrides.objects
       remote.translationMaterials = overrides.materials
+      remote.translationNormal = overrides.normal
       return async () => {
         unmountCalls++; topicUnmountCalls++
-        delete remote.translationQuick; delete remote.translationTopics; delete remote.translationObjects; delete remote.translationMaterials
+        delete remote.translationQuick; delete remote.translationTopics; delete remote.translationObjects; delete remote.translationMaterials; delete remote.translationNormal
       }
     },
     session: { async modelCatalog() { catalogCalls++; return catalogResponse }, selectModel() { throw new Error('main chat selection must remain independent') } },
@@ -324,7 +326,7 @@ export function mount(overrides = {}) {
     remote,
     fileUpload: overrides.fileUpload ?? { async upload() { throw new Error('Synthetic upload not configured') } },
     conversation: overrides.conversation ?? {},
-    get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics', 'remote.translationObjects', 'remote.translationMaterials'].includes(name)); return remote[name.slice('remote.'.length)] },
+    get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics', 'remote.translationObjects', 'remote.translationMaterials', 'remote.translationNormal'].includes(name)); return remote[name.slice('remote.'.length)] },
     on() { return () => {} }, sidebarRightTabs: host.sidebarRightTabs, sidebarRight: host.sidebarRight, slots: host.slots,
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
   }
@@ -333,6 +335,7 @@ export function mount(overrides = {}) {
     get store() { return store },
     get objects() { return objects }, get objectAssets() { return objectAssets }, get quick() { return quick },
     get materials() { return materials },
+    get normal() { return normal },
     dispatchDocument(name, event, capture = true) { for (const callback of documentListeners.get(`${name}:${capture}`) ?? []) callback(event); renderer.render() },
     get downloadAnchorCount() { return anchors.size },
     get panel() { return host.panel },

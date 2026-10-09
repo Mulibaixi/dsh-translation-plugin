@@ -106,7 +106,8 @@ export class MaterialSubmissionsClient {
       if (session.mode === 'normal' && this.live(session) && (session.input.trim() || this.files.has(session.id))) needed.add(owner)
     }
     for (const sessionId of this.files) if (!this.options.store.getSession(sessionId)) this.files.delete(sessionId)
-    for (const item of this.submissions.values()) if (item.settling || ['frozen', 'preparing', 'prepared', 'unknown'].includes(item.stage)) needed.add(item.envelope.ownerId)
+    for (const item of this.submissions.values()) if (item.settling || ['frozen', 'preparing', 'prepared', 'unknown'].includes(item.stage) ||
+      (!item.consumed && item.envelope.kind === 'material' && ['submitted', 'attached'].includes(item.stage))) needed.add(item.envelope.ownerId)
     for (const owner of needed) if (!this.retained.has(owner)) this.retained.set(owner, this.options.topics.retain(owner))
     for (const [owner, release] of this.retained) if (!needed.has(owner)) { this.retained.delete(owner); release() }
   }

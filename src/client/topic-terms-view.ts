@@ -67,11 +67,12 @@ function mutationMessage(result: TermMutationResult): true | string {
   if (result.status === 'invalid') return '术语内容或来源无效，未修改此条目。'
   return result.status === 'updated' || result.status === 'unchanged' ? true : '操作未完成，请核对后重试。'
 }
-export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect, hideExport = false }: {
+export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect, hideExport = false, targetLanguage }: {
   readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly ownerId: string; readonly topicId: string; readonly topicName: string
   readonly onDelete: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>; readonly onExport: (result: TopicTermsExport) => void
   readonly bridgeReason?: string | undefined; readonly onReconnect?: (() => void) | undefined
   readonly hideExport?: boolean | undefined
+  readonly targetLanguage?: string | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => terms.subscribe(() => refresh(value => value + 1)), [terms])
@@ -81,6 +82,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
   const [selected, setSelected] = react.useState<string | undefined>(undefined)
   const [form, setForm] = react.useState<TermForm | undefined>(undefined)
   const [original, setOriginal] = react.useState<TermForm | undefined>(undefined)
+  const [descriptionOpen, setDescriptionOpen] = react.useState(false)
   const drafts = react.useRef(new Map<string | null, { form: TermForm; original: TermForm }>())
   const [pending, setPending] = react.useState(false)
   const [failure, setFailure] = react.useState<string | undefined>(undefined)
@@ -88,6 +90,9 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
   const alive = react.useRef(true), busy = react.useRef(false)
   react.useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   const snapshot = terms.getSnapshot(ownerId, topicId)
+  const scopedSession = sessions.getActiveSession(ownerId)
+  const scopedLanguage = targetLanguage ?? (scopedSession?.topicId === topicId ? scopedSession.targetLanguage :
+    sessions.getAvailableSessions(ownerId).find(session => session.topicId === topicId)?.targetLanguage) ?? sessions.getSettings().targetLanguage
   const note = [
     '同主题共用；快译不使用。',
     sessions.getSettings().rememberHistory ? '已开启历史保存；主题术语保存在此设备。' : '已保存的术语保留；后续修改仅保留在本次运行。',
@@ -102,11 +107,11 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
   function preserveForm(): void { if (form && original) drafts.current.set(form.id, { form, original }) }
   function showEntry(entry: TopicTerm): void {
     preserveForm(); const draft = drafts.current.get(entry.id)
-    setForm(draft?.form); setOriginal(draft?.original); setSelected(entry.id); setFailure(undefined)
+    setForm(draft?.form); setOriginal(draft?.original); setDescriptionOpen(!!draft?.form.sense.trim()); setSelected(entry.id); setFailure(undefined)
   }
   function startEdit(entry?: TopicTerm): void {
-    preserveForm(); const draft = drafts.current.get(entry?.id ?? null), value = draft?.form ?? formFrom(snapshot, entry, sessions.getSettings().targetLanguage)
-    setForm(value); setOriginal(draft?.original ?? value); setSelected(entry?.id); setFailure(undefined)
+    preserveForm(); const draft = drafts.current.get(entry?.id ?? null), value = draft?.form ?? formFrom(snapshot, entry, scopedLanguage)
+    setForm(value); setOriginal(draft?.original ?? value); setDescriptionOpen(!!value.sense.trim()); setSelected(entry?.id); setFailure(undefined)
   }
   react.useEffect(() => terms.subscribe(() => {
     const current = terms.getSnapshot(ownerId, topicId)
@@ -174,12 +179,13 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
       h('div', { className: 'dsh-tp-asset-details', 'aria-label': '术语详情' },
         form ? h('div', { className: 'dsh-tp-term-form', 'aria-label': form.id ? '编辑术语' : '新增术语表单' },
           h('h3', null, form.id ? '编辑术语' : '新增术语'),
-          formField('原文形式', 'sourceForms', true), formField('别名', 'aliases', true),
-          formField('源语言', 'sourceLanguage'), formField('目标语言', 'targetLanguage'), formField('首选译法', 'preferred'),
-          formField('避免译法', 'forbidden', true), formField('语境', 'sense', true),
+          formField('原词', 'sourceForms', true), formField('译法', 'preferred'),
+          h('small', { className: 'dsh-tp-muted' }, `目标语言：${form.targetLanguage}`),
+          h('button', { type: 'button', disabled: pending, 'aria-expanded': descriptionOpen, onClick: () => setDescriptionOpen(value => !value) }, descriptionOpen ? '收起说明' : '添加说明（可选）'),
+          descriptionOpen ? formField('说明', 'sense', true) : null,
           form.snapshotVersion !== snapshot.version ? h('button', { type: 'button', disabled: pending || (form.id !== null && !snapshot.entries.some(entry => entry.id === form.id)), onClick: () => {
             const current = form.id === null ? undefined : snapshot.entries.find(entry => entry.id === form.id)
-            const baseline = formFrom(snapshot, current, sessions.getSettings().targetLanguage)
+            const baseline = formFrom(snapshot, current, scopedLanguage)
             setForm({ ...form, snapshotVersion: snapshot.version, expectedEntryVersion: current?.version ?? null }); setOriginal(baseline); setFailure(undefined)
           } }, '继续基于最新版本编辑') : null,
           h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || !dirty || !validForm, onClick: () => { if (!form) return; const captured = form; void run(async () => {
@@ -193,7 +199,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
         ) : entry ? h('div', { className: 'dsh-tp-term-details' },
           h('h3', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`), h('div', { className: 'dsh-tp-muted' }, `${labels[entry.status]} · ${entry.sourceLanguage ?? '未指定源语言'} → ${entry.targetLanguage} · ${origins[entry.origin]} · 条目版本 ${entry.version}`),
           h('button', { type: 'button', disabled: pending, onClick: () => startEdit(entry) }, '编辑'),
-          entry.sense ? h('div', null, `语境：${entry.sense}`) : null, entry.aliases.length ? h('div', null, `别名：${entry.aliases.join('、')}`) : null,
+          entry.sense ? h('div', null, `说明：${entry.sense}`) : null, entry.aliases.length ? h('div', null, `别名：${entry.aliases.join('、')}`) : null,
           entry.forbidden.length ? h('div', null, `避免：${entry.forbidden.join('、')}`) : null,
           ...entry.evidence.map((reference, index) => h(TermEvidence, { key: `${entry.version}:${index}`, sessions, terms, snapshot, reference })),
         ) : h('p', { className: 'dsh-tp-muted' }, '选择术语查看详情。'),

@@ -9,6 +9,19 @@ import { appendTextUnit, appendManualRevision, selectFinalRevision } from '../di
 
 const at = '2026-10-06T00:00:00.000Z', owner = 'synthetic-bridge-main'
 const tick = () => new Promise(resolve => setImmediate(resolve))
+
+test('桥reset清除上一尝试reason，新的连接尝试仍报告自己的错误或ready', async () => {
+  const store = new SessionStore(), terms = new TopicMemoryStore(store), archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
+  let attempt = 0, releaseGate; const gate = new Promise(resolve => { releaseGate = resolve }), channel = new Channel()
+  const bridge = new TopicBridgeClient({ async capabilities() { if (++attempt === 1) throw new Error('first failed'); await gate; return { ok: true, value: { ready: true } } },
+    connect(identity) { channel.push({ kind: 'ready', ...identity }); return channel } }, store, terms, archive)
+  const release = bridge.retain(owner)
+  try {
+    await tick(); assert.ok(bridge.getStatus(owner).reason)
+    await bridge.reset(owner); assert.deepEqual(bridge.getStatus(owner), { ready: false, reason: undefined })
+    releaseGate(); await tick(); assert.deepEqual(bridge.getStatus(owner), { ready: true, reason: undefined })
+  } finally { releaseGate(); release(); await bridge.dispose(); archive.dispose(); terms.dispose(); store.dispose() }
+})
 class Channel {
   incoming = []; replies = []; wake; closed = false
   send(value) { this.replies.push(structuredClone(value)) }

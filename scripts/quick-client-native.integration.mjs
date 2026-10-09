@@ -274,7 +274,7 @@ test('真实Gateway/LLM/Session + Client：调用证据落盘，旧base人工修
     assert.equal(app.host.provider.calls.length, beforeExportCalls)
     await tick()
     const disk = JSON.parse(storage.getItem(historyKey(id)))
-    assert.equal(disk.schemaVersion, 6); assert.equal(disk.translationHistory.schemaVersion, 3)
+    assert.equal(disk.schemaVersion, 7); assert.equal(disk.translationHistory.schemaVersion, 4)
     assert.equal(disk.translationHistory.units[0].source, undefined)
     assert.equal(disk.translationHistory.units[0].sourceVersions[0].text, history.units[0].source)
     assert.equal(disk.translationHistory.units[0].revisions.at(-1).kind, 'manual')

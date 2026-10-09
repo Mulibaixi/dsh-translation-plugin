@@ -47,8 +47,8 @@ test('topic bridge仅公开管理/历史协议，严格拒绝凭据、伪造owne
   const descriptor = TOPIC_BRIDGE_REMOTE.descriptors.find(item => item.method === 'connect')
   assert.equal(descriptor.mode, 'stream'); assert.equal(descriptor.uplink.codec.mode, 'strict')
   assert.equal(PLUGIN_REMOTE.package, TOPIC_BRIDGE_REMOTE.package)
-  assert.equal(PLUGIN_REMOTE.descriptors.length, 16)
-  assert.deepEqual(new Set(PLUGIN_REMOTE.descriptors.map(item => item.namespace)), new Set(['translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials']))
+  assert.equal(PLUGIN_REMOTE.descriptors.length, 19)
+  assert.deepEqual(new Set(PLUGIN_REMOTE.descriptors.map(item => item.namespace)), new Set(['translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal']))
 })
 
 test('topic uplink预算拒绝超额，term query子集不会夹带非active条目', () => {

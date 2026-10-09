@@ -1,12 +1,14 @@
 import type { ModelSelection } from '../shared/contracts.js'
 import type { TextCapabilityEvidence, TextExecutionAdapter, TextExecutionEvent, TextExecutionPacket } from '../shared/domain-contracts.js'
-import { TRANSLATION_PROMPT_VERSION, reconstructTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
+import { NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION, reconstructTranslationContext, reconstructNormalTranslationContext,
+  type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
 export { QUICK_SYSTEM_PROMPT } from '../shared/translation-call.js'
 
 /** Narrow views of the 0.2.0-rc.2 public runtime, checked against the installed packages. */
 export interface DshPreparedCall {
   readonly config: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string; readonly maxTokens?: number }
   readonly adapterDefaults: Record<string, true>
+  readonly context?: { readonly contextWindow: number }
   stream(options: Record<string, unknown>): AsyncIterable<Record<string, unknown>>
 }
 export interface DshDetachedSession {
@@ -34,6 +36,15 @@ export interface DshLlmHelpers {
 }
 
 export interface SafeExecutionFailure { readonly code: string; readonly message: string; readonly stage: string }
+export interface NormalExecutionPacket {
+  readonly operationId: string
+  readonly callId: string
+  readonly model: ModelSelection
+  readonly sourceText: string
+  readonly targetLanguage: string
+  readonly instruction: string
+  readonly context: NormalTranslationContext
+}
 export type LlmModuleLoader = () => Promise<DshLlmHelpers>
 const llmModule = '@deepseek-ai/dsh-llm'
 /** Resolve from the host composition, including its native package hooks, rather than the external bundle directory. */
@@ -66,7 +77,7 @@ function code(error: unknown): string {
   // Provider-defined codes can contain body or credential data too. Only publish known classifications.
   const safe = ['EXECUTION_UNAVAILABLE', 'INVALID_PREPARED_CALL', 'MODEL_UNAVAILABLE', 'INVALID_STREAM', 'OUTPUT_LIMIT',
     'NO_ADAPTER', 'INVALID_MODEL_INFO', 'INVALID_MODEL_REASONING', 'UNSUPPORTED_REASONING_EFFORT', 'MISSING_CREDENTIAL',
-    'INVALID_CREDENTIAL', 'CONTEXT_WINDOW_EXCEEDED', 'QUOTA', 'ACCOUNT_QUOTA', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'EMPTY_RESPONSE']
+    'INVALID_CREDENTIAL', 'CONTEXT_WINDOW_EXCEEDED', 'INPUT_LIMIT', 'QUOTA', 'ACCOUNT_QUOTA', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'EMPTY_RESPONSE']
   return typeof value === 'string' && safe.includes(value) ? value : 'EXECUTION_FAILED'
 }
 function failure(error: unknown, stage: string): SafeExecutionFailure {
@@ -76,7 +87,7 @@ function failure(error: unknown, stage: string): SafeExecutionFailure {
 /** Calls the registered DSH adapter once, with a detached native Session and no tools. */
 export class DshTextExecutionAdapter implements TextExecutionAdapter {
   private readonly generation = `dsh-quick:${crypto.randomUUID()}`
-  private readonly prepared = new Map<string, { route: ModelSelection; call: DshPreparedCall }>()
+  private readonly prepared = new Map<string, { route: ModelSelection; call: DshPreparedCall; normalContext?: NormalTranslationContext }>()
   private readonly routes = new Map<string, ModelSelection>()
   private readonly failures = new Map<string, SafeExecutionFailure>()
   private readonly logs = new Map<string, readonly unknown[]>()
@@ -129,6 +140,23 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   discard(operationId: string): void { this.prepared.delete(operationId) }
   diagnostic(operationId: string): SafeExecutionFailure | undefined { return this.failures.get(operationId) }
   callMetadata(operationId: string): Omit<TranslationCallMetadata, 'usage'> | undefined { return this.calls.get(operationId) }
+  /** Full native prepared-call config and a conservative estimate, before business acceptance. */
+  preflightNormal(packet: NormalExecutionPacket): TranslationCallMetadata {
+    try {
+      const bound = this.prepared.get(packet.operationId)
+      if (!bound || key(bound.route) !== key(packet.model)) throw Object.assign(new Error('Normal preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
+      const context = reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context)
+      const bytes = new TextEncoder().encode(context.systemPrompt + context.userMessage).byteLength
+      // This is a conservative UTF-8 based estimate, not a tokenizer measurement.
+      if (bytes > 196_608) throw Object.assign(new Error('Normal execution package exceeds short-text budget'), { code: 'INPUT_LIMIT' })
+      if (bound.call.context && bound.call.config.maxTokens !== undefined && bytes + 16 + bound.call.config.maxTokens > bound.call.context.contextWindow) throw Object.assign(new Error('Estimated input plus output reservation exceeds model context'), { code: 'CONTEXT_WINDOW_EXCEEDED' })
+      const normalContext = frozen(structuredClone(packet.context))
+      this.prepared.set(packet.operationId, { ...bound, normalContext })
+      return { promptVersion: NORMAL_TRANSLATION_PROMPT_VERSION, model: { provider: bound.call.config.provider, model: bound.call.config.model,
+        reasoningEffort: bound.call.config.reasoningEffort ?? null }, configVersion: null, maxOutputTokens: bound.call.config.maxTokens ?? null,
+        usage: { inputTokens: null, outputTokens: null }, context: normalContext }
+    } catch (error) { this.failures.set(packet.operationId, failure(error, 'prepare')); throw error }
+  }
   /** Host diagnostics only; this is never registered as a Remote method. */
   inspectLog(operationId: string): readonly unknown[] | undefined { return this.logs.get(operationId) }
 
@@ -146,25 +174,36 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     if (!bound || key(bound.route) !== key(packet.model) || packet.mode !== 'quick' || packet.tool_names.length || packet.memory_refs.length || packet.main_history.length) {
       throw new Error('Quick execution preparation does not match')
     }
+    yield* this.executePrepared(packet.operation_id, packet.attempt_id, bound.call, 'quick',
+      reconstructTranslationContext({ source: packet.source_text, targetLanguage: packet.target_language, instruction: packet.instruction }), signal)
+  }
+  async *executeNormal(packet: NormalExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncIterable<TextExecutionEvent> {
+    const bound = this.prepared.get(packet.operationId)
+    this.prepared.delete(packet.operationId)
+    if (!bound || key(bound.route) !== key(packet.model) || !bound.normalContext || JSON.stringify(bound.normalContext) !== JSON.stringify(packet.context)) throw new Error('Normal execution preparation does not match')
+    yield* this.executePrepared(packet.operationId, packet.callId, bound.call, 'normal',
+      reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext), signal, bound.normalContext, onDispatch)
+  }
+  private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal',
+    context: { readonly systemPrompt: string; readonly userMessage: string }, signal: AbortSignal, normalContext?: NormalTranslationContext, onDispatch?: () => void): AsyncIterable<TextExecutionEvent> {
     const helpers = this.helpers!
-    const session = this.sessions!.prepare(`translation-quick:${packet.attempt_id}`)
+    const session = this.sessions!.prepare(`translation-${mode}:${attemptId}`)
     const events: unknown[] = []
     const append = (type: string, data: unknown, surface = false): void => {
       events.push(session.append(type, data, ...(surface ? [{ surfaceOp: 'append' as const }] : [])))
-      this.logs.set(packet.operation_id, Object.freeze([...events]))
+      this.logs.set(operationId, Object.freeze([...events]))
     }
-    const context = reconstructTranslationContext({ source: packet.source_text, targetLanguage: packet.target_language, instruction: packet.instruction })
     append('system/message', { message: helpers.createSystemMessage(context.systemPrompt) }, true)
     append('user/message', helpers.createUserMessage({
       content: [{ type: 'text', text: context.userMessage }], source: { kind: 'user' },
     }), true)
     append('request/header', {
       header: {
-        config: bound.call.config,
-        ...(Object.keys(bound.call.adapterDefaults).length ? { adapterDefaults: bound.call.adapterDefaults } : {}),
+        config: call.config,
+        ...(Object.keys(call.adapterDefaults).length ? { adapterDefaults: call.adapterDefaults } : {}),
       }, reason: 'initial', startsSeries: true,
     })
-    const options = Object.freeze({ ...bound.call.config, messages: frozen([...session.deriveMessages()]), signal })
+    const options = Object.freeze({ ...call.config, messages: frozen([...session.deriveMessages()]), signal, ...(mode === 'normal' ? { tools: Object.freeze([]) } : {}) })
     const stream = new helpers.AssistantStreamAccumulator()
     const assembler = new helpers.BlockAssembler()
     const blocks = new Map<number, { type: 'text' | 'reasoning'; declared: boolean; text: string }>()
@@ -175,10 +214,11 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     let settlementDone = false
     try {
       signal.throwIfAborted()
-      this.calls.set(packet.operation_id, Object.freeze({ promptVersion: TRANSLATION_PROMPT_VERSION,
-        model: Object.freeze({ provider: bound.call.config.provider, model: bound.call.config.model, reasoningEffort: bound.call.config.reasoningEffort ?? null }),
-        configVersion: null, maxOutputTokens: bound.call.config.maxTokens ?? null }))
-      for await (const chunk of bound.call.stream(options)) {
+      this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal' ? NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION,
+        model: Object.freeze({ provider: call.config.provider, model: call.config.model, reasoningEffort: call.config.reasoningEffort ?? null }),
+        configVersion: null, maxOutputTokens: call.config.maxTokens ?? null, ...(normalContext ? { context: normalContext } : {}) }))
+      onDispatch?.()
+      for await (const chunk of call.stream(options)) {
         if (finish) throw Object.assign(new Error('Chunk after terminal'), { code: 'INVALID_STREAM' })
         if (!chunk || typeof chunk !== 'object' || typeof chunk.type !== 'string') throw new Error('Invalid stream chunk')
         stream.push({ time: Date.now(), chunk })
@@ -233,10 +273,10 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       if (finish.kind === 'stop' && !complete) throw Object.assign(new Error('Incomplete blocks'), { code: 'INVALID_STREAM' })
       if (finish.kind === 'stop' || finish.kind === 'max-tokens') {
         const content = assembler.blocks()
-        append('assistant/message', { turn: 0, step: 0, message: helpers.createAssistantMessage({ content, source: { provider: bound.call.config.provider, model: bound.call.config.model } }), stream: stream.snapshot() }, true)
+        append('assistant/message', { turn: 0, step: 0, message: helpers.createAssistantMessage({ content, source: { provider: call.config.provider, model: call.config.model } }), stream: stream.snapshot() }, true)
       } else {
         append('assistant/attempt', { turn: 0, step: 0, stream: stream.snapshot() })
-        this.failures.set(packet.operation_id, failure(finish.failure, 'stream'))
+        this.failures.set(operationId, failure(finish.failure, 'stream'))
       }
       settlementDone = true
       yield {
@@ -245,7 +285,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         provider_state: finish.kind === 'aborted' || signal.aborted ? 'stopped' : 'finished',
       }
     } catch (error) {
-      this.failures.set(packet.operation_id, failure(error, code(error) === 'INVALID_STREAM' || code(error) === 'OUTPUT_LIMIT' ? 'protocol' : 'stream'))
+      this.failures.set(operationId, failure(error, code(error) === 'INVALID_STREAM' || code(error) === 'OUTPUT_LIMIT' ? 'protocol' : 'stream'))
       throw error
     } finally {
       if (!settlementDone) append('assistant/attempt', { turn: 0, step: 0, stream: stream.snapshot() })

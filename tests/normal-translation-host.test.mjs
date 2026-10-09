@@ -62,13 +62,13 @@ test('普通执行工具只接受材料引用、独立operation和术语版本�
   assert.throws(() => parseTopicBridgeCommand({ kind: 'normal_accept', envelope: { ...envelope, kind: 'none', material: undefined }, operationId: 'business-a', organizedRequirements: '', termReferences: [] }))
 })
 
-test('2A公开执行门槛返回unavailable，零业务受理且材料保留；伪造同id Agent拒绝', async () => {
+test('普通执行缺模型时零业务受理且材料保留；伪造同id Agent拒绝', async () => {
   const f = await fixture()
   try {
     await f.deliver()
     assert.ok(f.registered.has('translation_execute'))
-    await assert.rejects(f.registered.get('translation_execute').execute(request, f.exec), { code: 'execution_unavailable', stage: 'prepare' })
-    await assert.rejects(f.normal.execute(request, { ...f.exec, agent: { ...f.agent } }), { code: 'scope_mismatch' })
+    assert.throws(() => f.registered.get('translation_execute').execute(request, f.exec), { code: 'model_required', stage: 'prepare' })
+    assert.throws(() => f.normal.execute(request, { ...f.exec, agent: { ...f.agent } }), { code: 'scope_mismatch' })
     assert.equal(f.materials.deliveredForAgent(request.target, f.agent).value.material.sourceText, envelope.material.sourceText)
   } finally { await f.close() }
 })
