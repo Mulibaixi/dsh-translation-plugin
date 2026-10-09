@@ -35,7 +35,8 @@ async function fixture(rememberHistory = false, options = {}) {
     connect(identity) { const selected = channels.get(identity.ownerId) ?? new Channel(); channels.set(identity.ownerId, selected); selected.push({ kind: 'ready', ...identity }); return selected } }, store, terms, archive)
   let contribution, frozen
   const receipt = (envelope, stage) => { const { ownerId, mainSessionId, requestId, operationId, kind } = envelope; return { ownerId, mainSessionId, requestId, operationId, kind, stage } }
-  const materials = new MaterialSubmissionsClient({ store, topics, owner: 'synthetic-root', registry: { register(_owner, value) { contribution = value; return () => {} } }, remote: {
+  const materials = new MaterialSubmissionsClient({ store, topics, owner: 'synthetic-root', upload: options.upload, sources: options.materialSources,
+    registry: { register(_owner, value) { contribution = value; return () => {} } }, remote: {
     async capabilities() { return transport({ ready: true, directSubmit: true, storage: 'runtime_only' }) },
     async prepare(envelope) { frozen = structuredClone(envelope); return transport(receipt(envelope, 'prepared')) },
     async finish(request) { return transport(receipt(frozen, request.outcome === 'submitted' ? 'submitted' : 'released')) },
@@ -317,6 +318,27 @@ test('生产bundle显示普通running/partial/未知查询与取消，重译保�
   await ui.click('取消普通翻译'); await ui.flush(); assert.equal(calls[1][0], 'cancel'); assert.match(ui.text(), /已取消/)
   assert.ok(!ui.nodes().some(node => node.type === 'button' && ui.text(node) === '取消普通翻译'))
   assert.equal(app.store.getTranslationHistory(session.id).units[0].revisions.length, 1)
+})
+
+test('TXT引用普通prepare/accept明确requires_batch，不建假单元或消费File/草稿', async t => {
+  const file = new File(['F'], 'fixed.txt'), source = { sourceId: 'source-11111111-1111-1111-1111-111111111111', version: 1, name: file.name,
+    bytes: 1, totalCodePoints: 1, encoding: 'utf-8', bom: false, sha256: 'a'.repeat(64), persistence: 'runtime_only' }
+  const f = await fixture(false, { upload: { async upload(_ownerId, frozen) { assert.equal(frozen, file); return { ok: true, value: { receiptId: 'native-fixed' } } } }, materialSources: {
+    async capabilities() { return { ok: true, value: { ready: true, storage: 'runtime_only', encoding: 'utf-8', maxBytes: 2 * 1024 * 1024, maxPageCodePoints: 4000, maxPageBytes: 32768 } } },
+    async importReceipt() { return { ok: true, value: source } },
+  } }); t.after(() => f.close())
+  f.materials.setFileSelected(f.session.id, file)
+  f.store.updateSession(f.session.id, { input: '' })
+  await tick(); assert.equal(f.topics.getStatus(owner).ready, true)
+  const envelope = await f.submit(); assert.ok(f.materials.resolveSubmittedMaterial(envelope))
+  f.store.updateSession(f.session.id, { input: 'new draft B' })
+  f.terms.getSnapshot = () => assert.fail('asset material must reject before term preparation')
+  const request = f.acceptance(envelope)
+  assert.equal(f.normal.prepare(owner, request).error.code, 'requires_batch')
+  assert.equal(f.normal.accept(owner, request).error.code, 'requires_batch')
+  assert.throws(() => appendAdmittedTextUnit(f.store.getTranslationHistory(f.session.id), envelope, 'blocked-business', new Date().toISOString()), error => error.code === 'requires_batch')
+  assert.equal(f.store.getTranslationHistory(f.session.id).units.length, 0)
+  assert.equal(f.store.getSession(f.session.id).input, 'new draft B'); assert.equal(f.materials.getSelectedFile(f.session.id), file)
 })
 
 async function completedUnit(f, t) {

@@ -4,6 +4,8 @@ import { MAX_TOPIC_BRIDGE_REPLY_BYTES } from '../shared/topic-bridge.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
+import { MAX_TRANSLATION_SOURCE_BYTES, type TranslationSourcesPort, type TranslationSourceCapability } from '../shared/translation-sources.js'
+import type { NativeFileUploadPort } from './object-assets-client.js'
 
 /** Projection of the proposed public Composer contract; absent on official DSH rc.2. */
 export interface MaterialSubmissionGesture {
@@ -27,9 +29,17 @@ interface Options {
   readonly remote: Remote
   readonly registry?: MaterialSubmissionRegistry | undefined
   readonly owner: unknown
+  readonly upload?: NativeFileUploadPort
+  readonly sources?: TranslationSourcesPort
 }
+interface SelectedFile { readonly file: File; readonly version: number }
+interface FrozenDraft { readonly session: LocalSession; readonly draftVersion: number; readonly materialId: string; readonly signature: string; readonly selected?: SelectedFile }
 interface Submission {
-  readonly envelope: TranslationMaterialEnvelope
+  readonly identity: TranslationMaterialScope
+  readonly kind: TranslationMaterialEnvelope['kind']
+  readonly draft: FrozenDraft | undefined
+  readonly generation: number
+  envelope: TranslationMaterialEnvelope | undefined
   readonly sessionId: string | undefined
   readonly direct: boolean
   stage: 'frozen' | 'preparing' | 'prepared' | 'submitted' | 'attached' | 'unknown' | 'released' | 'failed'
@@ -39,6 +49,8 @@ interface Submission {
   settling: boolean
   consumed?: boolean
   preparation?: Promise<void>
+  controller?: AbortController
+  hostStarted: boolean
 }
 export interface MaterialSubmissionStatus {
   readonly busy: boolean
@@ -47,18 +59,14 @@ export interface MaterialSubmissionStatus {
   readonly unknown: boolean
 }
 const SEAM_MISSING = '普通模式暂不可用：当前 DSH 缺少同步发送材料接口。'
-const FILE_BLOCKED = '文件材料尚未接入。请移除待译文件，或在主输入区选择“本次不附带”。'
+const FILE_AND_TEXT = '待译原文与 TXT 请选择一种；请移除文件或清空待译原文，翻译要求仍在主输入区发送。'
 const BYTE_BLOCKED = `材料超过传输上限（${MAX_TOPIC_BRIDGE_REPLY_BYTES} 字节）。请缩短待译稿；内容未截断。`
 function id(): string { return crypto.randomUUID() }
-function scope(envelope: TranslationMaterialEnvelope): TranslationMaterialScope {
-  const { ownerId, mainSessionId, requestId, operationId } = envelope
-  return { ownerId, mainSessionId, requestId, operationId }
-}
 function sameScope(a: TranslationMaterialScope, b: TranslationMaterialScope): boolean {
   return a.ownerId === b.ownerId && a.mainSessionId === b.mainSessionId && a.requestId === b.requestId && a.operationId === b.operationId
 }
-function signature(session: LocalSession): string {
-  return JSON.stringify([session.input, session.targetLanguage, session.instruction, session.model, session.maxInputChars])
+function signature(session: LocalSession, fileVersion: number): string {
+  return JSON.stringify([session.input, session.targetLanguage, session.instruction, session.model, session.maxInputChars, fileVersion])
 }
 function detail(error: unknown): string { return error instanceof Error ? error.message : '材料提交未完成，草稿保留。' }
 
@@ -66,7 +74,8 @@ function detail(error: unknown): string { return error instanceof Error ? error.
 export class MaterialSubmissionsClient {
   private readonly submissions = new Map<string, Submission>()
   private readonly versions = new Map<string, { signature: string; version: number }>()
-  private readonly files = new Set<string>()
+  private readonly files = new Map<string, SelectedFile>()
+  private readonly fileVersions = new Map<string, number>()
   private readonly omitted = new Map<string, { revision: number; selected: boolean }>()
   private readonly retained = new Map<string, () => void>()
   private readonly listeners = new Set<() => void>()
@@ -74,6 +83,8 @@ export class MaterialSubmissionsClient {
   private readonly stopTopics: () => void
   private readonly unregister: (() => void) | undefined
   private capability: TranslationMaterialCapability | undefined
+  private sourceCapability: TranslationSourceCapability | undefined
+  private sourceReason: string | undefined
   private serviceReason: string | undefined
   private loading: Promise<void> | undefined
   private generation = 0
@@ -88,7 +99,7 @@ export class MaterialSubmissionsClient {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private draftVersion(session: LocalSession): number {
-    const current = signature(session), old = this.versions.get(session.id)
+    const current = signature(session, this.fileVersions.get(session.id) ?? 0), old = this.versions.get(session.id)
     if (old?.signature === current) return old.version
     const version = (old?.version ?? 0) + 1
     this.versions.set(session.id, { signature: current, version })
@@ -105,15 +116,21 @@ export class MaterialSubmissionsClient {
       this.draftVersion(session)
       if (session.mode === 'normal' && this.live(session) && (session.input.trim() || this.files.has(session.id))) needed.add(owner)
     }
-    for (const sessionId of this.files) if (!this.options.store.getSession(sessionId)) this.files.delete(sessionId)
+    for (const sessionId of this.files.keys()) if (!this.options.store.getSession(sessionId)) this.files.delete(sessionId)
     for (const item of this.submissions.values()) if (item.settling || ['frozen', 'preparing', 'prepared', 'unknown'].includes(item.stage) ||
-      (!item.consumed && item.envelope.kind === 'material' && ['submitted', 'attached'].includes(item.stage))) needed.add(item.envelope.ownerId)
+      (!item.consumed && item.kind === 'material' && ['submitted', 'attached'].includes(item.stage))) needed.add(item.identity.ownerId)
     for (const owner of needed) if (!this.retained.has(owner)) this.retained.set(owner, this.options.topics.retain(owner))
     for (const [owner, release] of this.retained) if (!needed.has(owner)) { this.retained.delete(owner); release() }
   }
-  setFileSelected(sessionId: string, selected: boolean): void {
-    if (selected) this.files.add(sessionId); else this.files.delete(sessionId)
+  setFileSelected(sessionId: string, file: File | undefined): void {
+    const version = (this.fileVersions.get(sessionId) ?? 0) + 1
+    this.fileVersions.set(sessionId, version)
+    if (file) this.files.set(sessionId, { file, version }); else this.files.delete(sessionId)
     this.reconcile(); this.emit()
+  }
+  getSelectedFile(sessionId: string): File | undefined { return this.files.get(sessionId)?.file }
+  clearSelectedFiles(ownerId: string): void {
+    for (const sessionId of [...this.files.keys()]) if (this.options.store.getSession(sessionId)?.ownerId === ownerId) this.setFileSelected(sessionId, undefined)
   }
   setOmit(ownerId: string, omitted: boolean): void {
     this.omitted.set(ownerId, { revision: (this.omitted.get(ownerId)?.revision ?? 0) + 1, selected: omitted })
@@ -130,8 +147,9 @@ export class MaterialSubmissionsClient {
     if (!remote) throw new Error('材料提交服务尚未就绪。')
     return remote
   }
-  private async call<T>(method: keyof TranslationMaterialsPort, request?: TranslationMaterialEnvelope | TranslationMaterialScope | Parameters<TranslationMaterialsPort['finish']>[0]): Promise<T> {
+  private async call<T>(method: keyof TranslationMaterialsPort, request?: TranslationMaterialEnvelope | TranslationMaterialScope | Parameters<TranslationMaterialsPort['finish']>[0], guard?: () => void): Promise<T> {
     const port = await this.port()
+    guard?.()
     const response = await (method === 'capabilities' ? port.capabilities() : (port[method] as (request: unknown) => Promise<unknown>).call(port, request))
     if (!response || typeof response !== 'object' || (response as { ok?: unknown }).ok !== true) throw new Error('未取得材料服务传输回执；提交结果尚不确定。')
     const result = parseTranslationMaterialResult(method, (response as { value?: unknown }).value) as TranslationMaterialResult<T>
@@ -141,69 +159,95 @@ export class MaterialSubmissionsClient {
   load(): Promise<void> {
     if (this.loading) return this.loading
     const generation = this.generation
-    this.loading = this.call<TranslationMaterialCapability>('capabilities').then(value => {
+    const material = this.call<TranslationMaterialCapability>('capabilities').then(value => {
       if (!this.disposed && generation === this.generation) { this.capability = value; this.serviceReason = value.reason }
     }).catch(error => { if (!this.disposed && generation === this.generation) { this.capability = undefined; this.serviceReason = detail(error) } })
-      .finally(() => { if (generation === this.generation) { this.loading = undefined; this.emit() } })
+    const source = this.options.sources?.capabilities().then(result => {
+      if (!this.disposed && generation === this.generation) {
+        this.sourceCapability = result.ok ? result.value : undefined
+        this.sourceReason = result.ok ? result.value.reason : result.error.message
+      }
+    }).catch(error => { if (!this.disposed && generation === this.generation) { this.sourceCapability = undefined; this.sourceReason = detail(error) } })
+    this.loading = Promise.all([material, source]).then(() => {}).finally(() => { if (generation === this.generation) { this.loading = undefined; this.emit() } })
     return this.loading
   }
   private inputReason(session: LocalSession): string | undefined {
     if (!this.live(session)) return '会话已归档、删除或主题不可用，草稿保留。'
-    if (this.files.has(session.id)) return FILE_BLOCKED
+    const file = this.files.get(session.id)?.file
+    if (file) {
+      if (session.input.trim()) return FILE_AND_TEXT
+      if (!/\.txt$/iu.test(file.name)) return '首版只支持 UTF-8 TXT 原稿，请选择 .txt 文件。'
+      if (!file.size) return 'TXT 原稿为空，请选择有内容的文件。'
+      if (file.size > MAX_TRANSLATION_SOURCE_BYTES) return 'TXT 原稿超过 2 MiB 上限；所选文件保留。'
+      return undefined
+    }
     if (!session.input.trim()) return '请输入待译材料。'
     if (Array.from(session.input).length > session.maxInputChars) return `已超过单次上限 ${session.maxInputChars} 个字符；内容保持完整。`
     return undefined
   }
-  private readiness(ownerId: string): string | undefined {
+  private readiness(ownerId: string, file = false): string | undefined {
     if (!this.unregister) return SEAM_MISSING
     if (!this.capability?.ready || !this.capability.directSubmit) return this.serviceReason ?? '正在检查材料提交服务…'
     const topic = this.options.topics.getStatus(ownerId)
     if (!topic.ready) return topic.reason ?? '正在连接此主会话的材料通道…'
+    if (file && (!this.options.upload || !this.sourceCapability?.ready)) return this.sourceReason ?? 'TXT 原稿上传或导入服务尚未就绪。'
     return undefined
   }
-  private envelope(session: LocalSession | undefined, ownerId: string, requestId: string, kind: 'material' | 'none' | 'omit', preview = false): TranslationMaterialEnvelope {
-    const identity = (): string => preview ? '00000000-0000-0000-0000-000000000000' : id()
-    const base = { ownerId, mainSessionId: ownerId, requestId, operationId: identity() }
-    const value = parseTranslationMaterialEnvelope(kind === 'material' && session ? { ...base, kind, material: {
-      materialId: identity(), sourceVersion: 1, topicId: session.topicId, translationSessionId: session.id,
-      draftVersion: this.draftVersion(session), sourceText: session.input, targetLanguage: session.targetLanguage,
-      instruction: session.instruction, model: session.model, maxInputChars: session.maxInputChars,
-    } } : { ...base, kind })
+  private boundedEnvelope(value: unknown): TranslationMaterialEnvelope {
+    const envelope = parseTranslationMaterialEnvelope(value)
     // Shared bounded bridge margin leaves room for Gateway's RPC wrapper (256 KiB uplink).
-    if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw new Error(BYTE_BLOCKED)
-    return value
+    if (new TextEncoder().encode(JSON.stringify(envelope)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw new Error(BYTE_BLOCKED)
+    return envelope
+  }
+  private config(draft: FrozenDraft) {
+    const session = draft.session
+    return { materialId: draft.materialId, sourceVersion: 1, topicId: session.topicId, translationSessionId: session.id,
+      draftVersion: draft.draftVersion, targetLanguage: session.targetLanguage, instruction: session.instruction,
+      model: session.model, maxInputChars: session.maxInputChars }
   }
   getStatus(sessionId: string): MaterialSubmissionStatus {
     const session = this.options.store.getSession(sessionId)
     const latest = [...this.submissions.values()].filter(item => item.sessionId === sessionId).at(-1)
     const busy = !!latest && ['frozen', 'preparing', 'prepared'].includes(latest.stage)
     const unknown = latest?.stage === 'unknown'
-    let blocked = session ? this.readiness(session.ownerId) ?? this.inputReason(session) : '翻译会话不存在。'
-    if (!blocked && session) { try { this.envelope(session, session.ownerId, '00000000-0000-0000-0000-000000000000', 'material', true) } catch (error) { blocked = detail(error) } }
+    let blocked = session ? this.inputReason(session) ?? this.readiness(session.ownerId, this.files.has(session.id)) : '翻译会话不存在。'
+    if (!blocked && session && !this.files.has(session.id)) { try { this.textEnvelope(session) } catch (error) { blocked = detail(error) } }
     if (busy) blocked = '正在提交材料…'
     if (unknown) blocked = '提交结果尚不确定，请先检查提交状态。'
     let message = latest?.reason
     if (latest?.consumed) message = '翻译业务已受理；原提交材料已记录。'
-    else if (latest?.envelope.kind === 'material' && ['submitted', 'attached'].includes(latest.stage)) {
-      const sent = latest.envelope.material.draftVersion, current = session ? this.draftVersion(session) : sent
+    else if (latest?.draft && ['submitted', 'attached'].includes(latest.stage)) {
+      const sent = latest.draft.draftVersion, current = session ? this.draftVersion(session) : sent
       message = current === sent ? `已向主会话提交草稿版本 ${sent}；待译草稿保留。`
         : `已提交的是草稿版本 ${sent}；当前草稿为版本 ${current}。`
     }
     return { busy, blocked, message, unknown }
   }
-  private record(envelope: TranslationMaterialEnvelope, sessionId: string | undefined, direct: boolean): Submission {
-    const item: Submission = { envelope, sessionId, direct, stage: 'frozen', reason: undefined, started: false, finished: false, settling: false }
-    this.submissions.set(JSON.stringify([envelope.ownerId, envelope.requestId]), item); this.reconcile(); this.emit()
+  private textEnvelope(session: LocalSession): TranslationMaterialEnvelope {
+    const identity = { ownerId: session.ownerId, mainSessionId: session.ownerId, requestId: 'preview', operationId: 'preview' }
+    return this.boundedEnvelope({ ...identity, kind: 'material', material: { ...this.config({ session, materialId: 'preview', draftVersion: this.draftVersion(session),
+      signature: signature(session, this.fileVersions.get(session.id) ?? 0) }), sourceText: session.input } })
+  }
+  private record(session: LocalSession | undefined, ownerId: string, requestId: string, kind: TranslationMaterialEnvelope['kind'], direct: boolean): Submission {
+    const identity = { ownerId, mainSessionId: ownerId, requestId, operationId: id() }
+    const selected = session ? this.files.get(session.id) : undefined
+    const draft: FrozenDraft | undefined = kind === 'material' && session ? { session: structuredClone(session), draftVersion: this.draftVersion(session),
+      materialId: id(), signature: signature(session, this.fileVersions.get(session.id) ?? 0), ...(selected ? { selected } : {}) } : undefined
+    const envelope = draft ? selected ? undefined : this.boundedEnvelope({ ...identity, kind: 'material', material: { ...this.config(draft), sourceText: draft.session.input } })
+      : this.boundedEnvelope({ ...identity, kind })
+    const item: Submission = { identity, kind, draft, generation: this.generation, envelope, sessionId: session?.id, direct,
+      stage: 'frozen', reason: undefined, started: false, finished: false, settling: false, hostStarted: false }
+    this.submissions.set(JSON.stringify([ownerId, requestId]), item); this.reconcile(); this.emit()
     return item
   }
   private checkReceipt(item: Submission, receipt: TranslationMaterialReceipt): void {
-    if (!sameScope(item.envelope, receipt) || item.envelope.kind !== receipt.kind) throw new Error('材料服务回执身份不匹配；提交结果尚不确定。')
+    if (!sameScope(item.identity, receipt) || item.kind !== receipt.kind) throw new Error('材料服务回执身份不匹配；提交结果尚不确定。')
     item.stage = receipt.stage
   }
   /** The bridge may only admit the exact browser snapshot that was prepared for this main submission. */
   resolveSubmittedMaterial(envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }): TranslationMaterialEnvelope & { readonly kind: 'material' } | undefined {
     const item = this.submissions.get(JSON.stringify([envelope.ownerId, envelope.requestId]))
-    if (this.disposed || !item || item.envelope.kind !== 'material' ||
+    if (this.disposed || !item || item.envelope?.kind !== 'material' ||
       !['prepared', 'submitted', 'attached', 'unknown'].includes(item.stage) ||
       JSON.stringify(item.envelope) !== JSON.stringify(parseTranslationMaterialEnvelope(envelope))) return undefined
     return structuredClone(item.envelope)
@@ -211,14 +255,56 @@ export class MaterialSubmissionsClient {
   /** Business acceptance consumes only the unchanged submitted draft, including its edit history. */
   consumeSubmittedMaterial(envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }): void {
     const item = this.submissions.get(JSON.stringify([envelope.ownerId, envelope.requestId]))
-    if (!item || !this.resolveSubmittedMaterial(envelope) || item.consumed) return
+    if (!item || !this.resolveSubmittedMaterial(envelope) || item.consumed || envelope.material.sourceRef) return
     item.consumed = true
     const session = this.options.store.getSession(envelope.material.translationSessionId)
     if (session && session.ownerId === envelope.ownerId && session.topicId === envelope.material.topicId &&
-      this.draftVersion(session) === envelope.material.draftVersion && signature(session) === signature({ ...session,
-        input: envelope.material.sourceText, targetLanguage: envelope.material.targetLanguage, instruction: envelope.material.instruction,
-        model: envelope.material.model, maxInputChars: envelope.material.maxInputChars })) this.options.store.updateSession(session.id, { input: '' })
+      this.draftVersion(session) === envelope.material.draftVersion && signature(session, this.fileVersions.get(session.id) ?? 0) === item.draft?.signature)
+      this.options.store.updateSession(session.id, { input: '' })
     this.reconcile(); this.emit()
+  }
+  private active(item: Submission, signal: AbortSignal): void {
+    if (signal.aborted || item.finished || this.disposed || item.generation !== this.generation) throw new Error('材料准备已取消。')
+  }
+  private async materialEnvelope(item: Submission, signal: AbortSignal): Promise<TranslationMaterialEnvelope> {
+    this.active(item, signal)
+    if (item.envelope) return item.envelope
+    const draft = item.draft, file = draft?.selected?.file, sources = this.options.sources, upload = this.options.upload
+    if (!draft || !file || !sources || !upload) throw new Error('TXT 原稿上传或导入服务尚未就绪。')
+    const receipt = await upload.upload(item.identity.ownerId, file, file.name, signal, () => {})
+    this.active(item, signal)
+    if (!receipt || typeof receipt !== 'object' || (receipt as { ok?: unknown }).ok !== true) throw new Error('TXT 原稿上传未完成；草稿与文件保留。')
+    const value = (receipt as { value?: { receiptId?: unknown } }).value
+    if (!value || typeof value.receiptId !== 'string' || !value.receiptId) throw new Error('TXT 原稿上传收据无效。')
+    const source = await sources.importReceipt({ scope: { ownerId: item.identity.ownerId, mainSessionId: item.identity.mainSessionId,
+      topicId: draft.session.topicId, translationSessionId: draft.session.id }, receiptId: value.receiptId, idempotencyKey: draft.materialId }, signal)
+    this.active(item, signal)
+    if (!source.ok) throw new MaterialRejected(source.error.message, source.error.code)
+    item.envelope = this.boundedEnvelope({ ...item.identity, kind: 'material', material: { ...this.config(draft), sourceRef: source.value } })
+    return item.envelope
+  }
+  private prepare(item: Submission, signal: AbortSignal, method: 'prepare' | 'submit'): Promise<void> {
+    if (item.preparation) return item.preparation
+    this.active(item, signal)
+    const reason = this.readiness(item.identity.ownerId, !!item.draft?.selected)
+    if (reason) { item.stage = 'failed'; item.reason = reason; this.reconcile(); this.emit(); return Promise.reject(new Error(reason)) }
+    const controller = new AbortController(), cancel = () => controller.abort()
+    signal.addEventListener('abort', cancel, { once: true }); item.controller = controller
+    item.started = true; item.stage = 'preparing'; this.emit()
+    item.preparation = (async () => {
+      try {
+        const envelope = await this.materialEnvelope(item, controller.signal)
+        const receipt = await this.call<TranslationMaterialReceipt>(method, envelope, () => { this.active(item, controller.signal); item.hostStarted = true })
+        this.active(item, controller.signal)
+        if (!sameScope(item.identity, receipt) || item.kind !== receipt.kind || receipt.stage !== (method === 'prepare' ? 'prepared' : 'submitted')) throw new Error('材料准备回执身份或阶段无效。')
+        this.checkReceipt(item, receipt)
+      } catch (error) {
+        item.reason = detail(error)
+        item.stage = !item.hostStarted || error instanceof MaterialRejected ? 'failed' : 'unknown'
+        throw error
+      } finally { signal.removeEventListener('abort', cancel); delete item.controller; this.reconcile(); this.emit() }
+    })()
+    return item.preparation
   }
   private freeze(gesture: MaterialSubmissionGesture): ReturnType<MaterialSubmissionContribution['freeze']> {
     if (this.disposed || !this.retained.has(gesture.sessionId)) return undefined
@@ -228,10 +314,9 @@ export class MaterialSubmissionsClient {
     let item: Submission | undefined = old, failure: string | undefined
     if (!item) {
       try {
-        const kind = omit ? 'omit' : session?.mode === 'normal' && session.input.trim() ? 'material' : 'none'
-        if (kind !== 'omit' && session?.mode === 'normal' && this.files.has(session.id)) throw new Error(FILE_BLOCKED)
+        const kind = omit ? 'omit' : session?.mode === 'normal' && (session.input.trim() || this.files.has(session.id)) ? 'material' : 'none'
         if (kind === 'material' && session) { const reason = this.inputReason(session); if (reason) throw new Error(reason) }
-        item = this.record(this.envelope(session, gesture.sessionId, gesture.requestId, kind), session?.id, false)
+        item = this.record(session, gesture.sessionId, gesture.requestId, kind, false)
         if (omit) this.omitted.set(gesture.sessionId, { revision: omit, selected: false })
       } catch (error) { failure = detail(error) }
     }
@@ -240,31 +325,21 @@ export class MaterialSubmissionsClient {
       prepare: async signal => {
         if (failure) throw new Error(failure)
         if (!frozen || signal.aborted || this.disposed) throw new Error('材料提交已取消。')
-        if (frozen.preparation) return frozen.preparation
-        const reason = this.readiness(gesture.sessionId)
-        if (reason) throw new Error(reason)
-        frozen.started = true; frozen.stage = 'preparing'; this.emit()
-        frozen.preparation = (async () => {
-          try {
-            const receipt = await this.call<TranslationMaterialReceipt>('prepare', frozen.envelope)
-            if (!sameScope(frozen.envelope, receipt) || frozen.envelope.kind !== receipt.kind || receipt.stage !== 'prepared') throw new Error('材料准备回执身份或阶段无效。')
-            if (signal.aborted || frozen.finished || this.disposed) throw new Error('材料准备已取消。')
-            this.checkReceipt(frozen, receipt)
-          } catch (error) { frozen.reason = detail(error); throw error }
-          finally { this.emit() }
-        })()
-        return frozen.preparation
+        return this.prepare(frozen, signal, 'prepare')
       },
       finish: outcome => {
         if (!frozen || frozen.finished) return
         frozen.finished = true
+        if (outcome !== 'accepted') frozen.controller?.abort()
         if (omit && outcome !== 'accepted' && this.omitted.get(gesture.sessionId)?.revision === omit) this.omitted.set(gesture.sessionId, { revision: omit, selected: true })
         const result = outcome === 'accepted' ? 'submitted' : outcome === 'handled' || outcome === 'cancelled' ? 'no_prompt' : outcome
         if (!frozen.started) { frozen.stage = result === 'unknown' ? 'unknown' : 'released'; this.reconcile(); this.emit(); return }
         frozen.stage = result === 'submitted' ? 'submitted' : result === 'unknown' ? 'unknown' : 'released'
         frozen.settling = true
         // A disposal can finish while prepare is in flight. Cleanup must follow its ACK.
-        void Promise.resolve(frozen.preparation).catch(() => {}).then(() => this.call<TranslationMaterialReceipt>('finish', { ...scope(frozen.envelope), outcome: result })).then(receipt => this.checkReceipt(frozen, receipt))
+        void Promise.resolve(frozen.preparation).catch(() => {}).then(() => frozen.hostStarted
+          ? this.call<TranslationMaterialReceipt>('finish', { ...frozen.identity, outcome: result })
+          : undefined).then(receipt => { if (receipt) this.checkReceipt(frozen, receipt) })
           .catch(error => {
             // A typed missing record after a confirmed no-prompt outcome is released.
             frozen.stage = error instanceof MaterialRejected && error.code === 'not_found' && (result === 'no_prompt' || result === 'failed') ? 'released' : 'unknown'
@@ -277,17 +352,16 @@ export class MaterialSubmissionsClient {
   async send(sessionId: string): Promise<void> {
     const status = this.getStatus(sessionId), session = this.options.store.getSession(sessionId)
     if (this.disposed || !session || session.mode !== 'normal' || status.blocked) return
-    const item = this.record(this.envelope(session, session.ownerId, id(), 'material'), sessionId, true)
-    item.started = true; item.stage = 'preparing'; this.emit()
-    try { this.checkReceipt(item, await this.call<TranslationMaterialReceipt>('submit', item.envelope)) }
-    catch (error) { item.stage = error instanceof MaterialRejected ? 'failed' : 'unknown'; item.reason = detail(error) }
+    const item = this.record(session, session.ownerId, id(), 'material', true)
+    try { await this.prepare(item, new AbortController().signal, 'submit') }
+    catch (error) { item.reason = detail(error) }
     finally { item.finished = true; this.reconcile(); this.emit() }
   }
   async query(sessionId: string): Promise<void> {
     const item = [...this.submissions.values()].filter(value => value.sessionId === sessionId && value.stage === 'unknown').at(-1)
     if (!item || this.disposed) return
     try {
-      const result = await this.call<TranslationMaterialQuery | null>('query', scope(item.envelope))
+      const result = await this.call<TranslationMaterialQuery | null>('query', item.identity)
       if (result && result.receipt.stage === 'prepared') item.reason = '材料已准备，主会话接收状态仍未确认。'
       else if (result) { this.checkReceipt(item, result.receipt); item.reason = undefined }
       else item.reason = '服务中尚无此提交记录；不能据此确认主会话未收到材料。'
@@ -295,16 +369,20 @@ export class MaterialSubmissionsClient {
     this.reconcile(); this.emit()
   }
   reset(): void {
-    this.generation++; this.loading = undefined; this.capability = undefined
-    for (const item of this.submissions.values()) if (['preparing', 'prepared', 'submitted'].includes(item.stage)) { item.stage = 'unknown'; item.reason = '连接已重置，请检查原提交状态。' }
+    this.generation++; this.loading = undefined; this.capability = undefined; this.sourceCapability = undefined
+    for (const item of this.submissions.values()) if (['frozen', 'preparing', 'prepared', 'submitted'].includes(item.stage)) {
+      item.controller?.abort(); item.stage = item.hostStarted ? 'unknown' : 'failed'
+      item.reason = item.hostStarted ? '连接已重置，请检查原提交状态。' : '连接已重置，材料尚未发送；草稿保留。'
+    }
     this.reconcile(); this.emit(); void this.load()
   }
   dispose(): void {
     if (this.disposed) return
     this.unregister?.(); this.stopStore(); this.stopTopics()
     this.disposed = true; this.generation++
+    for (const item of this.submissions.values()) item.controller?.abort()
     for (const release of this.retained.values()) release()
-    this.retained.clear(); this.listeners.clear(); this.files.clear(); this.omitted.clear(); this.submissions.clear(); this.versions.clear()
+    this.retained.clear(); this.listeners.clear(); this.files.clear(); this.fileVersions.clear(); this.omitted.clear(); this.submissions.clear(); this.versions.clear()
   }
 }
 class MaterialRejected extends Error { constructor(message: string, readonly code: string) { super(message) } }

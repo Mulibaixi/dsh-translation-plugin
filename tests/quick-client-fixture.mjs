@@ -313,10 +313,11 @@ export function mount(overrides = {}) {
       remote.translationTopics = overrides.topics
       remote.translationObjects = overrides.objects
       remote.translationMaterials = overrides.materials
+      remote.translationSources = overrides.sources
       remote.translationNormal = overrides.normal
       return async () => {
         unmountCalls++; topicUnmountCalls++
-        delete remote.translationQuick; delete remote.translationTopics; delete remote.translationObjects; delete remote.translationMaterials; delete remote.translationNormal
+        delete remote.translationQuick; delete remote.translationTopics; delete remote.translationObjects; delete remote.translationMaterials; delete remote.translationNormal; delete remote.translationSources
       }
     },
     session: { async modelCatalog() { catalogCalls++; return catalogResponse }, selectModel() { throw new Error('main chat selection must remain independent') } },
@@ -326,7 +327,7 @@ export function mount(overrides = {}) {
     remote,
     fileUpload: overrides.fileUpload ?? { async upload() { throw new Error('Synthetic upload not configured') } },
     conversation: overrides.conversation ?? {},
-    get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics', 'remote.translationObjects', 'remote.translationMaterials', 'remote.translationNormal'].includes(name)); return remote[name.slice('remote.'.length)] },
+    get(name) { assert.ok(['remote.translationQuick', 'remote.translationTopics', 'remote.translationObjects', 'remote.translationMaterials', 'remote.translationNormal', 'remote.translationSources'].includes(name)); return remote[name.slice('remote.'.length)] },
     on() { return () => {} }, sidebarRightTabs: host.sidebarRightTabs, sidebarRight: host.sidebarRight, slots: host.slots,
     effect(effect) { const cleanup = effect(); effects.push(cleanup); return cleanup },
   }

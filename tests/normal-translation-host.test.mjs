@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { NormalTranslationService } from '../dist/host/normal-translation.js'
 import { TranslationMaterialsService } from '../dist/host/translation-materials.js'
+import { TranslationSourcesService } from '../dist/host/translation-sources.js'
 import { TopicToolsService } from '../dist/host/topic-tools.js'
 import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection } from '../dist/shared/normal-translation.js'
 import { parseTopicBridgeCommand, parseTopicBridgeReply } from '../dist/shared/topic-bridge.js'
@@ -28,7 +29,7 @@ async function fixture() {
   } } }
   const ctx = { invocation: { peer: { id: 'synthetic-peer' }, uplink: () => uplink },
     get(name) { return services[name] ?? { agents: { get: id => id === ownerId ? agent : undefined }, tools: {},
-      sessionController: { list: async () => ({ items: [{ sessionId: ownerId }] }) } }[name] },
+      sessionController: { list: async () => ({ items: [{ sessionId: ownerId }] }), resolveAgent: async () => ({ agent }) } }[name] },
     on(name, listener) { const listeners = hooks.get(name) ?? []; listeners.push(listener); hooks.set(name, listeners); return () => {} },
   }
   const topics = services.translationTopics = new TopicToolsService(ctx, async () => ({ defineTool: options => options }), 1000)
@@ -37,10 +38,10 @@ async function fixture() {
   const controller = new AbortController(), stream = topics.connect({ ownerId, mainSessionId: ownerId }, controller.signal)
   await stream.next()
   const exec = { agent, callId: 'actual-main-tool-call', signal: new AbortController().signal }
-  return { normal, materials, topics, stream, uplink, registered, agent, exec,
-    async deliver() {
-      assert.equal(materials.prepare(envelope).ok, true)
-      const message = { id: 'synthetic-main-message', role: 'user', source: { kind: 'user', rpcId: envelope.requestId }, content: [] }
+  return { normal, materials, topics, stream, uplink, registered, agent, exec, ctx, services,
+    async deliver(input = envelope) {
+      assert.equal(materials.prepare(input).ok, true)
+      const message = { id: 'synthetic-main-message', role: 'user', source: { kind: 'user', rpcId: input.requestId }, content: [] }
       await hooks.get('agent/pre-step')[0]({ agent, messages: [message], signal: exec.signal }, async () => ({ kind: 'enter', messages: [message] }))
     },
     reply(frame, patch = {}) {
@@ -71,6 +72,30 @@ test('普通执行缺模型时零业务受理且材料保留；伪造同id Agent
     assert.throws(() => f.normal.execute(request, { ...f.exec, agent: { ...f.agent } }), { code: 'scope_mismatch' })
     assert.equal(f.materials.deliveredForAgent(request.target, f.agent).value.material.sourceText, envelope.material.sourceText)
   } finally { await f.close() }
+})
+
+test('已交付文件在普通execute和prepared受理前明确requires_batch，不创建job或访问译模型', async () => {
+  const f = await fixture(), bytes = Buffer.from('Synthetic file beyond the single-call limit')
+  f.services.fileUploads = { resolve: () => ({ attachmentId: 'synthetic-file', name: 'synthetic.txt', bytes: bytes.length }) }
+  f.services.attachments = { async *readFileStream() { yield bytes } }
+  const sources = f.services.translationSources = new TranslationSourcesService(f.ctx)
+  try {
+    const imported = await sources.importReceipt({ scope: { ownerId, mainSessionId: ownerId, topicId: 'topic-a', translationSessionId: 'translation-a' },
+      receiptId: 'synthetic-file-receipt', idempotencyKey: 'synthetic-import' }, f.exec.signal)
+    assert.equal(imported.ok, true)
+    const file = structuredClone(envelope); delete file.material.sourceText
+    file.material.sourceRef = imported.value; file.material.maxInputChars = 1
+    let modelChecks = 0, businessRequests = 0
+    f.normal.adapter.ready = async () => { modelChecks++; return true }
+    const originalRequest = f.topics.requestOwned.bind(f.topics)
+    f.topics.requestOwned = (...args) => { businessRequests++; return originalRequest(...args) }
+    await f.deliver(file)
+    assert.throws(() => f.normal.execute(request, f.exec), { code: 'requires_batch', stage: 'prepare' })
+    assert.throws(() => f.normal.acceptPrepared(request, f.exec), { code: 'requires_batch', stage: 'prepare' })
+    assert.equal(modelChecks, 0); assert.equal(businessRequests, 0)
+    assert.equal(f.normal.jobs.size, 0); assert.equal(f.normal.admissions.size, 0); assert.equal(f.normal.activeSessions.size, 0)
+    assert.deepEqual(f.materials.deliveredForAgent(request.target, f.agent).value, file)
+  } finally { sources.dispose(); await f.close() }
 })
 
 test('Host受理基础拒绝prepared/submitted/错误源版本，不能用任意ID取得材料', async () => {

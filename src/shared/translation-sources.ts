@@ -89,7 +89,8 @@ export function parseTranslationSourceAsset(value: unknown): TranslationSourceAs
   integer(value.bytes, 1, MAX_TRANSLATION_SOURCE_BYTES); integer(value.totalCodePoints, 1, value.bytes)
   if (value.version !== 1 || value.encoding !== 'utf-8' || typeof value.bom !== 'boolean' || value.persistence !== 'runtime_only' ||
     typeof value.sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sha256)) throw new TypeError('Invalid immutable source descriptor')
-  return structuredClone(value) as unknown as TranslationSourceAsset
+  return { sourceId: value.sourceId, version: value.version, name: value.name, bytes: value.bytes, totalCodePoints: value.totalCodePoints,
+    encoding: value.encoding, bom: value.bom, sha256: value.sha256, persistence: value.persistence }
 }
 export function parseTranslationSourceRequest(method: 'importReceipt' | 'readRange', value: unknown): TranslationSourceImport | TranslationSourceAssetRead {
   if (method === 'importReceipt') {

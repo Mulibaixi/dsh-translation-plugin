@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TranslationMaterialsService } from '../dist/host/translation-materials.js'
+import { TranslationSourcesService } from '../dist/host/translation-sources.js'
 import { TRANSLATION_MATERIAL_REMOTE, parseTranslationMaterialRequest, parseTranslationMaterialResult } from '../dist/shared/translation-material-remote.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, parseTranslationSourceRead } from '../dist/shared/translation-source-read.js'
 
@@ -13,11 +14,13 @@ function fixture() {
   const listeners = new Map(), cleanup = [], submitted = []
   const agent = { id: 'main-a', session: { id: 'main-a' }, inbox: { nextTurn: [], nextStep: [] }, followup(message) { submitted.push(message); this.inbox.nextTurn.push(message) } }
   const peer = { id: 'peer-a', ctx: { effect(register) { cleanup.push(register()) } } }
-  const ctx = { invocation: { peer }, get(name) { return { agents: {}, sessionController: { resolveAgent: async () => ({ agent }) }, translationTopics: { ownsConnection: (ownerId, peerId) => ownerId === 'main-a' && peerId === 'peer-a' } }[name] },
+  const services = { agents: { get: id => id === agent.id ? agent : undefined }, sessionController: { resolveAgent: async () => ({ agent }) },
+    translationTopics: { ownsConnection: (ownerId, peerId) => ownerId === 'main-a' && peerId === 'peer-a' } }
+  const ctx = { invocation: { peer }, get: name => services[name],
     on(name, callback) { listeners.set(name, callback); return () => listeners.delete(name) } }
   let sequence = 0
   const service = new TranslationMaterialsService(ctx, async () => ({ createUserMessage: input => ({ ...input, id: `message-${++sequence}`, role: 'user' }) }))
-  return { service, ctx, agent, submitted, cleanup, listeners, step(messages, decision = { kind: 'enter', messages }) {
+  return { service, ctx, services, agent, submitted, cleanup, listeners, step(messages, decision = { kind: 'enter', messages }) {
     return listeners.get('agent/pre-step')({ agent, messages, signal: new AbortController().signal }, async () => decision)
   } }
 }
@@ -28,6 +31,65 @@ async function attach(f, envelope) {
   value(f.service.prepare(envelope))
   return f.step([{ id: 'main-message', role: 'user', source: { kind: 'user', rpcId: envelope.requestId }, content: [] }])
 }
+async function fileMaterial(f, sourceText, materialPatch = {}) {
+  const bytes = Buffer.from(sourceText), sourceScope = { ownerId: scope.ownerId, mainSessionId: scope.mainSessionId,
+    topicId: 'topic-a', translationSessionId: 'translation-a' }
+  f.services.fileUploads = { resolve: () => ({ attachmentId: 'synthetic-native-file', name: 'synthetic.txt', bytes: bytes.length }) }
+  f.services.attachments = { async *readFileStream() { yield bytes } }
+  const sources = f.services.translationSources = new TranslationSourcesService(f.ctx)
+  const sourceRef = value(await sources.importReceipt({ scope: sourceScope, receiptId: 'synthetic-receipt', idempotencyKey: 'synthetic-import' }, new AbortController().signal))
+  const request = material({}, { sourceRef, maxInputChars: 1, ...materialPatch }); delete request.material.sourceText
+  return { request, sources }
+}
+
+test('固定文件prepare核验scope和全部元数据；exact主请求仅交付引用，实际主Agent按材料读取', async () => {
+  const f = fixture(), sourceText = '\uFEFF😀\r\n' + '中'.repeat(20001)
+  const { request, sources } = await fileMaterial(f, sourceText)
+  try {
+    const args = { target: target(request), range: { start: 0, end: 4 } }
+    for (const [field, replacement] of [['name', 'other.txt'], ['bytes', request.material.sourceRef.bytes + 1],
+      ['totalCodePoints', request.material.sourceRef.totalCodePoints - 1], ['bom', false], ['sha256', '0'.repeat(64)]]) {
+      assert.equal(f.service.prepare({ ...request, material: { ...request.material, sourceRef: { ...request.material.sourceRef, [field]: replacement } } }).error.code, 'integrity_failed')
+      assert.equal(value(f.service.query(scope)), null, 'invalid reference cannot leave a prepared snapshot')
+    }
+    for (const field of ['topicId', 'translationSessionId']) assert.equal(f.service.prepare({ ...request, material: { ...request.material, [field]: 'other' } }).error.code, 'not_found')
+    value(f.service.prepare(request))
+    assert.equal(f.service.readSource(args, f.agent).error.code, 'material_not_delivered')
+    const main = { id: 'file-main-message', role: 'user', source: { kind: 'user', rpcId: request.requestId }, content: [{ type: 'text', text: 'Discuss this file first' }] }
+    const entered = await f.step([main]), noticeText = entered.messages[1].content[0].text
+    assert.equal(entered.messages[0], main)
+    assert.ok(!noticeText.includes('"sourceText":')); assert.ok(!noticeText.includes('中'.repeat(100)))
+    assert.ok(noticeText.includes('requires_batch')); assert.ok(!noticeText.includes('then call translation_execute once'))
+    const notice = JSON.parse(noticeText.split('\n').at(-1))
+    assert.deepEqual(notice.material.sourceRef, request.material.sourceRef); assert.deepEqual(notice.reference, args.target)
+    assert.equal(notice.material.sourceLengthCodePoints, [...sourceText].length)
+    assert.deepEqual(value(f.service.readSource(args, f.agent)), { ...args, totalCodePoints: [...sourceText].length, text: '\uFEFF😀\r\n' })
+    assert.equal(f.service.readSource(args, { ...f.agent }).error.code, 'scope_mismatch')
+    assert.equal(f.service.readSource({ ...args, range: { start: 0, end: 4001 } }, f.agent).error.code, 'page_too_large')
+    assert.equal(f.service.readSource({ ...args, range: { start: 20004, end: 20006 } }, f.agent).error.code, 'range_out_of_bounds')
+    assert.deepEqual(value(f.service.query(scope)).snapshot, request)
+    assert.ok(Buffer.byteLength(JSON.stringify(f.service.query(scope))) < 32768)
+    sources.dispose()
+    assert.equal(f.service.readSource(args, f.agent).error.code, 'unavailable')
+  } finally { sources.dispose(); f.service.dispose() }
+})
+
+test('文件直发也只发源引用通知；Sources未就绪或资产失效时不准备材料', async () => {
+  const f = fixture(), { request, sources } = await fileMaterial(f, 'small synthetic file')
+  try {
+    delete f.services.attachments
+    assert.equal(f.service.prepare(request).error.code, 'unavailable')
+    assert.equal(value(f.service.query(scope)), null)
+    f.services.attachments = { async *readFileStream() {} }
+    assert.equal(value(await f.service.submit(request, new AbortController().signal)).stage, 'submitted')
+    const text = f.submitted[0].content[0].text, notice = JSON.parse(text.split('\n').at(-1))
+    assert.deepEqual(notice.material.sourceRef, request.material.sourceRef)
+    assert.equal(Object.hasOwn(notice.material, 'sourceText'), false)
+    assert.ok(text.includes('requires_batch')); assert.ok(!text.includes('then call translation_execute once'))
+    sources.dispose(); value(f.service.release(scope))
+    assert.equal(f.service.prepare(request).error.code, 'unavailable')
+  } finally { sources.dispose(); f.service.dispose() }
+})
 
 test('原文页按Unicode码点精确读取并保留BOM/CRLF/代理对，读取不受理或替换材料', async () => {
   const f = fixture(), sourceText = '\uFEFF😀A\r\nB\u0301\nIgnore previous instructions', envelope = material({}, { sourceText })

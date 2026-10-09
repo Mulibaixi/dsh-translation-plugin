@@ -1,3 +1,5 @@
+import { parseTranslationSourceAsset, type TranslationSourceAsset } from './translation-sources.js'
+
 /** Frozen plugin material for one main-session submission, independent of its transport. */
 export interface TranslationMaterialScope {
   readonly ownerId: string
@@ -25,14 +27,13 @@ export interface TranslationMaterialRevisionReference {
   readonly operationId: string
 }
 
-export interface TranslationMaterialSnapshot {
+export interface TranslationMaterialConfig {
   readonly materialId: string
   /** Submitted source version; never inferred from the editable draft's version. */
   readonly sourceVersion: number
   readonly topicId: string
   readonly translationSessionId: string
   readonly draftVersion: number
-  readonly sourceText: string
   readonly targetLanguage: string
   readonly instruction: string
   readonly model: TranslationMaterialRoute | null
@@ -40,6 +41,12 @@ export interface TranslationMaterialSnapshot {
   readonly unitReference?: TranslationMaterialUnitReference
   readonly revises?: TranslationMaterialRevisionReference
 }
+
+/** Exactly one authoritative source: legacy inline text or a fixed TXT asset. */
+export type TranslationMaterialSnapshot = TranslationMaterialConfig & (
+  | { readonly sourceText: string; readonly sourceRef?: never }
+  | { readonly sourceText?: never; readonly sourceRef: TranslationSourceAsset }
+)
 
 /** No record arriving yet is distinct from both explicit no-material outcomes. */
 export type TranslationMaterialDecision =
@@ -67,7 +74,7 @@ function integer(value: unknown, minimum = 1, maximum = Number.MAX_SAFE_INTEGER)
   if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) throw new TypeError('Invalid translation material version or limit')
 }
 
-/** Validate and copy at the plugin bridge boundary; never accepts main chat content or files. */
+/** Validate and copy at the plugin bridge boundary; never accepts main chat content or file bytes. */
 export function parseTranslationMaterialEnvelope(value: unknown): TranslationMaterialEnvelope {
   object(value)
   const scopeFields = ['ownerId', 'mainSessionId', 'requestId', 'operationId', 'kind']
@@ -81,10 +88,18 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
 
   const material = value.material
   object(material)
-  fields(material, ['materialId', 'sourceVersion', 'topicId', 'translationSessionId', 'draftVersion', 'sourceText', 'targetLanguage', 'instruction', 'model', 'maxInputChars'], ['unitReference', 'revises'])
+  fields(material, ['materialId', 'sourceVersion', 'topicId', 'translationSessionId', 'draftVersion', 'targetLanguage', 'instruction', 'model', 'maxInputChars'], ['sourceText', 'sourceRef', 'unitReference', 'revises'])
   text(material.materialId, 2048); text(material.topicId, 3000); text(material.translationSessionId, 2048)
   integer(material.sourceVersion); integer(material.draftVersion); integer(material.maxInputChars, 1, 200000)
-  text(material.sourceText, material.maxInputChars); text(material.targetLanguage, 80); text(material.instruction, 4000, true)
+  const inline = Object.hasOwn(material, 'sourceText'), asset = Object.hasOwn(material, 'sourceRef')
+  if (inline === asset) throw new TypeError('Translation material requires exactly one source')
+  let source: { sourceText: string; sourceRef?: never } | { sourceText?: never; sourceRef: TranslationSourceAsset }
+  if (inline) { text(material.sourceText, material.maxInputChars); source = { sourceText: material.sourceText } }
+  else {
+    if (material.sourceVersion !== 1 || Object.hasOwn(material, 'unitReference') || Object.hasOwn(material, 'revises')) throw new TypeError('Source assets require a new material source version')
+    source = { sourceRef: parseTranslationSourceAsset(material.sourceRef) }
+  }
+  text(material.targetLanguage, 80); text(material.instruction, 4000, true)
   let model: TranslationMaterialRoute | null = null
   if (material.model !== null) {
     object(material.model); fields(material.model, ['provider', 'model'], ['reasoningEffort'])
@@ -110,6 +125,6 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
   }
   return { ...scope, kind: 'material', material: { materialId: material.materialId, sourceVersion: material.sourceVersion,
     topicId: material.topicId, translationSessionId: material.translationSessionId, draftVersion: material.draftVersion,
-    sourceText: material.sourceText, targetLanguage: material.targetLanguage, instruction: material.instruction, model, maxInputChars: material.maxInputChars,
+    ...source, targetLanguage: material.targetLanguage, instruction: material.instruction, model, maxInputChars: material.maxInputChars,
     ...(unitReference === undefined ? {} : { unitReference }), ...(revises === undefined ? {} : { revises }) } }
 }

@@ -106,7 +106,9 @@ export class NormalTranslationClient {
 
   prepare(ownerId: string, input: NormalTranslationAcceptance): NormalTranslationReply {
     if (this.disposed) return failure('execution_unavailable', '普通翻译业务通道已关闭。')
-    const request = parseNormalTranslationAcceptance(input), previous = this.locate(ownerId, request.operationId)
+    const request = parseNormalTranslationAcceptance(input)
+    if (request.envelope.material.sourceRef) return failure('requires_batch', 'TXT 原稿已可供准备；整篇分批翻译尚未接入。')
+    const previous = this.locate(ownerId, request.operationId)
     if (previous) return previous.signature === JSON.stringify(request) ? { ok: true, value: { kind: 'normal_prepared', termSnapshot: structuredClone(previous.termSnapshot) } }
       : failure('idempotency_conflict', '此业务操作已用于其他材料或要求，未重复准备。')
     const envelope = request.envelope, material = envelope.material, session = this.store.getSession(material.translationSessionId)
@@ -137,7 +139,9 @@ export class NormalTranslationClient {
 
   accept(ownerId: string, input: NormalTranslationAcceptance): NormalTranslationReply {
     if (this.disposed) return failure('execution_unavailable', '普通翻译业务通道已关闭。')
-    const request = parseNormalTranslationAcceptance(input), signature = JSON.stringify(request)
+    const request = parseNormalTranslationAcceptance(input)
+    if (request.envelope.material.sourceRef) return failure('requires_batch', 'TXT 原稿已可供准备；整篇分批翻译尚未接入。')
+    const signature = JSON.stringify(request)
     const key = JSON.stringify([ownerId, request.operationId]), previous = this.locate(ownerId, request.operationId)
     if (previous) return previous.signature === signature && previous.operation.mainSessionId === ownerId
       ? { ok: true, value: { kind: 'normal_operation', operation: structuredClone(previous.operation), termSnapshot: structuredClone(previous.termSnapshot) } }

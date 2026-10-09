@@ -66,7 +66,7 @@ test('快译禁用文件入口，普通可选移除文件且会话隔离、不�
     let pickerClicks = 0; fileInput(ui).props.ref.current = { click() { pickerClicks++ } }
     await ui.click('选择待译文件'); assert.equal(pickerClicks, 1)
     await chooseFile(ui, a); assert.match(ui.text(), /synthetic-a.txt/)
-    assert.match(ui.text(), /文件翻译尚未接入，所选文件仅暂存于本次打开的面板/)
+    assert.match(ui.text(), /TXT 可交付主模型准备，分批翻译尚未接入/)
     assert.equal(ui.button('发送待译材料').props.disabled, true)
     await create(ui, 'B'); assert.ok(!ui.text().includes(a.name)); assert.equal(ui.button('选择待译文件').props.disabled, true)
     await ui.input('翻译模式', 'normal'); await chooseFile(ui, b)

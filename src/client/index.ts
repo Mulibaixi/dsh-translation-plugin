@@ -13,6 +13,7 @@ import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePor
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
 import { NormalTranslationClient, type NormalTranslationRemotePort } from './normal-translation.js'
+import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
   openMemoryAssets, parseMemoryAssetsAddress, readMemoryAssetsNavigation, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
@@ -43,6 +44,7 @@ interface ClientPluginContext {
   get(name: 'remote.translationObjects'): ObjectAssetsRemotePort | undefined
   get(name: 'remote.translationMaterials'): TranslationMaterialsRemotePort | undefined
   get(name: 'remote.translationNormal'): NormalTranslationRemotePort | undefined
+  get(name: 'remote.translationSources'): TranslationSourcesRemotePort | undefined
   readonly conversation?: { readonly submissions?: MaterialSubmissionRegistry }
   readonly fileUpload: NativeFileUploadPort
   readonly remote: {
@@ -52,6 +54,7 @@ interface ClientPluginContext {
     readonly translationObjects?: ObjectAssetsRemotePort
     readonly translationMaterials?: TranslationMaterialsRemotePort
     readonly translationNormal?: NormalTranslationRemotePort
+    readonly translationSources?: TranslationSourcesRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
@@ -103,6 +106,11 @@ export function apply(ctx: ClientPluginContext): void {
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
     } : ctx.remote.translationTopics, store, terms, archive)
     const materials = new MaterialSubmissionsClient({ store, topics, owner: ctx,
+      upload: ctx.fileUpload,
+      sources: adaptTranslationSourcesRemote(ctx.remote.$mount ? async () => {
+        const unmountRemote = await mountedRemote
+        return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationSources')
+      } : ctx.remote.translationSources),
       registry: typeof ctx.conversation?.submissions?.register === 'function' ? ctx.conversation.submissions : undefined,
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote

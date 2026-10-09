@@ -11,6 +11,35 @@ function material(patch = {}) {
 }
 function envelope(scopePatch = {}, materialPatch = {}) { return { ...scope, ...scopePatch, kind: 'material', material: material(materialPatch) } }
 function accepted(result) { assert.equal(result.ok, true); return result.value }
+const sourceRef = { sourceId: 'source-00000000-0000-0000-0000-000000000001', version: 1, name: 'synthetic.txt', bytes: 250000,
+  totalCodePoints: 250000, encoding: 'utf-8', bom: false, sha256: 'a'.repeat(64), persistence: 'runtime_only' }
+function fileEnvelope(patch = {}) {
+  const request = envelope({}, { sourceRef, maxInputChars: 1, ...patch })
+  delete request.material.sourceText
+  return request
+}
+
+test('固定文件材料只带完整sourceRef；整篇长度不受单次上限且同字段顺序复用原快照', () => {
+  const request = fileEnvelope(), store = new TranslationMaterialStore()
+  assert.deepEqual(parseTranslationMaterialEnvelope(request), request)
+  assert.equal(Object.hasOwn(accepted(store.receive(request)).material, 'sourceText'), false)
+  const reordered = fileEnvelope({ sourceRef: Object.fromEntries(Object.entries(sourceRef).reverse()) })
+  assert.deepEqual(accepted(store.receive(reordered)), request)
+  reordered.material.sourceRef.name = 'caller.txt'
+  assert.equal(store.get(scope.ownerId, scope.requestId).material.sourceRef.name, 'synthetic.txt')
+  assert.equal(Object.hasOwn(parseTranslationMaterialEnvelope(envelope()).material, 'sourceRef'), false)
+})
+
+test('材料来源必须互斥且完整；固定文件不冒充历史源纠错或单元', () => {
+  const noSource = envelope(); delete noSource.material.sourceText
+  const invalid = [noSource, envelope({}, { sourceRef }), fileEnvelope({ sourceVersion: 2 }),
+    fileEnvelope({ unitReference: { unitId: 'unit-a', sourceVersion: 1 } }),
+    fileEnvelope({ revises: { materialId: 'material-a', sourceVersion: 1, operationId: 'old-operation' } }),
+    fileEnvelope({ sourceRef: { ...sourceRef, version: 2 } }), fileEnvelope({ sourceRef: { ...sourceRef, encoding: 'utf-16' } }),
+    fileEnvelope({ sourceRef: { ...sourceRef, sha256: 'invalid' } }), fileEnvelope({ sourceRef: { ...sourceRef, attachmentId: 'native-file' } }),
+    fileEnvelope({ sourceRef: undefined })]
+  for (const request of invalid) assert.throws(() => parseTranslationMaterialEnvelope(request), TypeError)
+})
 
 test('同一主提交只同步冻结一次；当前草稿编辑和调用者修改不能回写已提交快照', () => {
   const store = new TranslationMaterialStore(), draft = material()

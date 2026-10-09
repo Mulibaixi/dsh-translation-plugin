@@ -4,7 +4,7 @@ import { NORMAL_TRANSLATION_REMOTE, parseNormalTranslationExecute, parseNormalTr
   parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt,
   parseNormalTranslationUnitRequest, type NormalTranslationUnitRequest, type NormalTranslationUnitReceipt } from '../shared/normal-translation.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
-import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
+import type { TranslationMaterialEnvelope, TranslationMaterialSnapshot } from '../shared/translation-material.js'
 import type { NormalTranslationContext, TranslationCallMetadata } from '../shared/translation-call.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
 import { DshTextExecutionAdapter, hostLlmLoader, type LlmModuleLoader, type NormalExecutionPacket } from './dsh-text-adapter.js'
@@ -13,10 +13,11 @@ import type { TranslationMaterialsService } from './translation-materials.js'
 
 type Accepted = Extract<TopicBridgeValue, { kind: 'normal_operation' }>
 type Envelope = Extract<TranslationMaterialEnvelope, { kind: 'material' }>
+type InlineEnvelope = Envelope & { readonly material: Extract<TranslationMaterialSnapshot, { readonly sourceText: string }> }
 interface Admission { readonly signature: string; readonly sessionId: string; readonly result: Promise<Accepted> }
 interface Job {
   readonly request: NormalTranslationExecute
-  readonly envelope: Envelope
+  readonly envelope: InlineEnvelope
   readonly agent: MainAgent
   readonly sessionId: string
   readonly controller: AbortController
@@ -38,6 +39,9 @@ function rejected(code: string, message: string, stage: string): Error { return 
 function ok<T>(value: T): NormalTranslationResult<T> { return { ok: true, value: structuredClone(value) } }
 function bad<T>(code: string, message: string, stage: string): NormalTranslationResult<T> { return { ok: false, error: { code, message, stage } } }
 function identity(ownerId: string, operationId: string): string { return JSON.stringify([ownerId, operationId]) }
+function requireInline(envelope: Envelope): asserts envelope is InlineEnvelope {
+  if (envelope.material.sourceRef !== undefined) throw rejected('requires_batch', '文件原稿已固定，可供准备和讨论；完整文件翻译需要后续分批执行支持，材料保留。', 'prepare')
+}
 
 /** Transient calls and short receipts only. The Client owns all source and revision history. */
 export class NormalTranslationService {
@@ -66,6 +70,7 @@ export class NormalTranslationService {
     const result = this.materials?.deliveredForAgent(request.target, exec.agent!)
     if (!result) throw rejected('execution_unavailable', '材料服务尚未就绪。', 'resolve_material')
     if (!result.ok) throw rejected(result.error.code, result.error.message, result.error.stage)
+    requireInline(result.value)
     if (result.value.material.unitReference || result.value.material.revises) throw rejected('unsupported_target', '已有单元的重译和原文修改尚未接入。', 'resolve_material')
     return result.value
   }
@@ -101,6 +106,7 @@ export class NormalTranslationService {
   }
   private executeEnvelope(request: NormalTranslationExecute, exec: ToolExecution, envelope: Envelope): Promise<NormalTranslationOperation> {
     this.owned(request, exec)
+    requireInline(envelope)
     const key = identity(request.target.mainSessionId, request.operationId), previous = this.jobs.get(key)
     if (previous) return previous.acceptance.then(() => structuredClone(previous.operation!))
     const sessionId = identity(request.target.mainSessionId, envelope.material.translationSessionId)
@@ -167,7 +173,9 @@ export class NormalTranslationService {
       if (previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、版本或要求。', 'accept')
       return previous.result.then(result => structuredClone(result))
     }
-    const envelope = resolved ?? this.source(request, exec), sessionId = identity(request.target.mainSessionId, envelope.material.translationSessionId)
+    const envelope = resolved ?? this.source(request, exec)
+    requireInline(envelope)
+    const sessionId = identity(request.target.mainSessionId, envelope.material.translationSessionId)
     if (!reserved && this.activeSessions.has(sessionId)) throw rejected('busy', '此普通翻译会话仍有未结算操作。', 'accept')
     this.activeSessions.add(sessionId)
     const result = Promise.resolve().then(async (): Promise<Accepted> => {

@@ -265,6 +265,7 @@ export function appendTextUnit(history: TranslationHistory, data: NewTextUnit, r
 /** Business admission is a material fact; an actual model invocation is appended separately. */
 export function appendAdmittedTextUnit(history: TranslationHistory, envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }, operationId: string, at: string): TranslationHistory {
   const snapshot = envelope.material, unitId = `unit:${snapshot.materialId}`
+  if (snapshot.sourceText === undefined) throw Object.assign(new Error('Asset material requires batch admission'), { code: 'requires_batch' })
   if (!identity(operationId) || !time(at) || snapshot.sourceVersion !== 1 || history.units.some(unit => unit.id === unitId) || history.events.some(event => event.operationId === operationId)) throw new Error('Invalid or duplicate admitted material')
   const unit: TextUnit = { id: unitId, order: history.units.length + 1, source: snapshot.sourceText, targetLanguage: snapshot.targetLanguage,
     instruction: snapshot.instruction, sourceVersion: snapshot.sourceVersion,

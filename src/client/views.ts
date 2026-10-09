@@ -406,21 +406,15 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const [remark, setRemark] = react.useState('')
   const [exportRequest, setExportRequest] = react.useState<(FrozenTranslationExport & { readonly result: TranslationExport }) | undefined>(undefined)
   const [exportNotice, setExportNotice] = react.useState<{ readonly message: string; readonly failure: boolean } | undefined>(undefined)
-  const [files, setFiles] = react.useState(() => new Map<string, File>())
-  const retainedFiles = react.useRef(files)
-  retainedFiles.current = files
   const fileInput = react.useRef<HTMLInputElement | null>(null)
-  react.useEffect(() => () => { for (const id of retainedFiles.current.keys()) materials?.setFileSelected(id, false) }, [materials])
-  react.useEffect(() => store.subscribe(() => setFiles(currentFiles => {
-    if ([...currentFiles.keys()].every(id => store.getSession(id))) return currentFiles
-    return new Map([...currentFiles].filter(([id]) => store.getSession(id)))
-  })), [store])
+  react.useEffect(() => () => { materials?.clearSelectedFiles(ownerId) }, [materials, ownerId])
   const action = useAsyncAction()
   react.useEffect(() => { store.ensureWorkspace(ownerId) }, [store, ownerId])
   const displayed = store.getDisplaySessions(ownerId)
   const sessions = displayed.filter(session => session.archivedAt === null)
   const archived = displayed.filter(session => session.archivedAt !== null)
   const current = store.getActiveSession(ownerId)
+  const selectedFile = current ? materials?.getSelectedFile(current.id) : undefined
   const target = context ? store.getSession(context.id) : undefined
   const targetTopicSessions = target ? store.getAvailableSessions(ownerId).filter(session => session.topicId === target.topicId) : []
   const targetTopicHasRecords = targetTopicSessions.some(session => store.getTranslationHistory(session.id)?.units.length)
@@ -571,25 +565,25 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
           )) : null,
         ) : null,
         h('div', { className: 'dsh-tp-composer' },
-        current.mode === 'normal' && files.has(current.id) ? h('div', null,
+        current.mode === 'normal' && selectedFile ? h('div', null,
           h('div', { className: 'dsh-tp-attachment' },
-            h('span', { className: 'dsh-tp-attachment-name', title: files.get(current.id)!.name }, files.get(current.id)!.name),
-            h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => { materials?.setFileSelected(current.id, false); setFiles(currentFiles => { const next = new Map(currentFiles); next.delete(current.id); return next }) } }, '×'),
+            h('span', { className: 'dsh-tp-attachment-name', title: selectedFile.name }, selectedFile.name),
+            h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => { materials?.setFileSelected(current.id, undefined) } }, '×'),
           ),
-          h('p', { className: 'dsh-tp-attachment-note' }, '文件翻译尚未接入，所选文件仅暂存于本次打开的面板。'),
+          h('p', { className: 'dsh-tp-attachment-note' }, 'TXT 可交付主模型准备，分批翻译尚未接入。'),
         ) : null,
         h('textarea', { value: current.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(current.id, { input: event.currentTarget.value }) } }),
         Array.from(current.input).length > current.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${current.maxInputChars} 个字符；内容保持完整。`) : null,
         h('div', { className: 'dsh-tp-composer-toolbar' },
-          h('input', { type: 'file', hidden: true, ref: fileInput, key: `file:${current.id}`, 'aria-label': '待译文件', disabled: current.mode === 'quick',
+          h('input', { type: 'file', accept: '.txt', hidden: true, ref: fileInput, key: `file:${current.id}`, 'aria-label': '待译文件', disabled: current.mode === 'quick',
             onChange: (event: FileEvent) => {
               const file = event.currentTarget.files?.[0]
-              if (file && current.mode === 'normal') { materials?.setFileSelected(current.id, true); setFiles(currentFiles => new Map(currentFiles).set(current.id, file)) }
+              if (file && current.mode === 'normal') materials?.setFileSelected(current.id, file)
               event.currentTarget.value = ''
             },
           }),
           h('button', { type: 'button', className: 'dsh-tp-attach', 'aria-label': '选择待译文件', disabled: current.mode === 'quick',
-            title: current.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择待译文件（文件翻译尚未接入）', onClick: () => fileInput.current?.click(),
+            title: current.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择 UTF-8 TXT 原稿（最多 2 MiB）', onClick: () => fileInput.current?.click(),
           }, h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
             h('path', { d: 'm8 12 7-7a4 4 0 0 1 6 6L10 22a6 6 0 0 1-8-8L13 3M6 15l9-9a2 2 0 0 1 3 3l-9 9' }),
           )),

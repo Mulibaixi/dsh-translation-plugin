@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { readFile } from 'node:fs/promises'
 import { createTopicToolsNativeFixture, waitTopicReady } from '../tests/topic-tools-native-fixture.mjs'
 import { SessionStore } from '../dist/client/session-store.js'
 import { TopicMemoryStore } from '../dist/client/topic-memory-store.js'
@@ -123,6 +124,84 @@ test('Native原文分页：真实Gateway冻结长材料，主AgentLoop调用注�
     assert.equal(t.sessions.getTranslationHistory(t.session.id).units.length, 0)
     assert.equal(value(await t.remote.query(t.scope(request))).snapshot.material.sourceText, sourceText)
   } finally { releaseNeighbor?.(); await neighbor?.dispose(); await t.close() }
+})
+
+test('Native固定文件：真实upload→asset→prepare→exact主请求引用notice→实际主工具分页，短文执行拒绝且无假单元', async () => {
+  const t = await fixture(), sourceText = '\uFEFF😀\r\n' + '中'.repeat(70001), bytes = Buffer.from(sourceText)
+  const previousDshHome = process.env.DSH_HOME; process.env.DSH_HOME = join(t.f.host.directory, 'home')
+  const executeRead = args => t.f.host.ctx.tools.execute({ agent: t.main.agent, name: 'translation_read_source', arguments: args,
+    callId: 'native-file-read-manual', signal: new AbortController().signal })
+  try {
+    const upload = transport(await t.f.client.remote.fileUploads.upload(mainId, { data: bytes.toString('base64'), name: 'synthetic-file.txt' }, new AbortController().signal))
+    const sourceRef = value(await t.f.client.remote.translationSources.importReceipt({ scope: { ownerId: mainId, mainSessionId: mainId,
+      topicId: t.session.topicId, translationSessionId: t.session.id }, receiptId: upload.receiptId, idempotencyKey: 'native-file-import' }, new AbortController().signal))
+    const request = t.material('native-file-material', { sourceRef, maxInputChars: 1 }); delete request.material.sourceText
+    const target = { kind: 'material', mainSessionId: mainId, requestId: request.requestId, materialId: request.material.materialId, sourceVersion: 1 }
+    const args = { target, range: { start: 0, end: 4 } }
+    for (const patch of [{ topicId: 'synthetic-other-topic' }, { sourceRef: { ...sourceRef, sha256: '0'.repeat(64) } }]) {
+      const denied = transport(await t.remote.prepare({ ...request, material: { ...request.material, ...patch } }))
+      assert.equal(denied.ok, false); assert.ok(['not_found', 'integrity_failed'].includes(denied.error.code))
+      assert.equal(value(await t.remote.query(t.scope(request))), null)
+    }
+    value(await t.remote.prepare(request))
+    assert.equal((await executeRead(args)).isError, true)
+    let calls = 0
+    t.f.host.provider.stream = async function* (options) {
+      this.calls.push(options); calls++
+      if (calls === 1) {
+        const call = { type: 'tool-call', id: 'native-file-model-read', name: 'translation_read_source', arguments: JSON.stringify(args) }
+        yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+        yield { type: 'tool-call-delta', index: 0, id: call.id, name: call.name, argumentsDelta: call.arguments }
+        yield { type: 'block-end', index: 0, block: call }
+      } else {
+        yield { type: 'block-start', index: 0, blockType: 'text' }; yield { type: 'text-delta', index: 0, text: 'Synthetic file preparation complete' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: 'Synthetic file preparation complete' } }
+      }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+    const command = 'Synthetic discuss this fixed file first'
+    await t.prompt(request.requestId, command); await t.main.agent.whenIdle()
+    assert.equal(calls, 2)
+    assert.ok(JSON.stringify(t.f.host.provider.calls[1].messages).includes('😀'), 'the actual main loop receives the file read tool result within this request')
+    const messages = t.f.host.provider.calls[0].messages
+    assert.equal(messages.find(message => message.source.kind === 'user' && message.source.rpcId === request.requestId).content[0].text, command)
+    const notices = messages.filter(message => message.source.kind === 'translation-material' && message.source.requestId === request.requestId)
+    assert.equal(notices.length, 1)
+    const noticeText = notices[0].content[0].text, notice = JSON.parse(noticeText.split('\n').at(-1))
+    assert.ok(!noticeText.includes('"sourceText":')); assert.ok(!noticeText.includes('中'.repeat(100)))
+    assert.ok(noticeText.includes('requires_batch')); assert.ok(!noticeText.includes('then call translation_execute once'))
+    assert.ok(Buffer.byteLength(noticeText) < 4096)
+    assert.deepEqual(notice.material.sourceRef, sourceRef); assert.deepEqual(notice.reference, target)
+    assert.equal(notice.material.sourceLengthCodePoints, sourceRef.totalCodePoints)
+    const read = await executeRead(args)
+    assert.equal(read.isError, false); assert.deepEqual(read.value, { ...args, totalCodePoints: sourceRef.totalCodePoints, text: '\uFEFF😀\r\n' })
+    let joined = ''
+    for (let start = 0; start < sourceRef.totalCodePoints; start += 4000) {
+      const result = await executeRead({ target, range: { start, end: Math.min(start + 4000, sourceRef.totalCodePoints) } })
+      assert.equal(result.isError, false); assert.ok(Buffer.byteLength(JSON.stringify(result.value)) <= 32768); joined += result.value.text
+    }
+    assert.equal(joined, sourceText)
+    assert.equal(t.f.host.ctx.translationMaterials.readSource(args, { ...t.main.agent }).error.code, 'scope_mismatch')
+    assert.ok(t.main.agent.session.snapshotEvents().some(event => event.type === 'tool/result'))
+    assert.equal((await executeRead({ ...args, target: { ...target, sourceVersion: 2 } })).isError, true)
+    assert.equal((await executeRead({ ...args, range: { start: 0, end: 4001 } })).isError, true)
+    const execution = { target, operationId: 'native-file-business', organizedRequirements: '', termReferences: [] }
+    const exec = { agent: t.main.agent, callId: 'native-file-execute', signal: new AbortController().signal }
+    assert.throws(() => t.f.host.ctx.translationNormal.execute(execution, exec), { code: 'requires_batch', stage: 'prepare' })
+    assert.throws(() => t.f.host.ctx.translationNormal.acceptPrepared(execution, exec), { code: 'requires_batch', stage: 'prepare' })
+    assert.equal(t.f.host.ctx.translationNormal.jobs.size, 0)
+    assert.equal(t.f.requests.length, 0); assert.equal(t.f.host.provider.calls.length, 2)
+    const queried = await t.remote.query(t.scope(request))
+    assert.deepEqual(value(queried).snapshot.material.sourceRef, sourceRef)
+    assert.equal(Object.hasOwn(value(queried).snapshot.material, 'sourceText'), false)
+    assert.ok(Buffer.byteLength(JSON.stringify(queried)) < 32768)
+    assert.deepEqual(await readFile(t.f.host.ctx.attachments.fileHostPath(upload.file)), bytes)
+    assert.equal(t.sessions.getTranslationHistory(t.session.id).units.length, 0)
+    assert.equal(t.sessions.getSession(t.session.id).input, 'Private next draft')
+  } finally {
+    if (previousDshHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previousDshHome
+    await t.close()
+  }
 })
 
 test('Native生产Host：none/omit与RPC早到原样通过；晚prepare不补读、不产生隐式重发', async () => {

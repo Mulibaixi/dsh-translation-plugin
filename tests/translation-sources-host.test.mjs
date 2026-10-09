@@ -144,3 +144,20 @@ test('严格source Remote descriptors与Host卸载沿用同一DSH生命周期', 
   cleanups.forEach(cleanup => cleanup()); assert.equal(service.disposed, true)
   f.service.dispose()
 })
+
+test('in-process源引用核验复用现存资产与索引；按捕获Peer和实际Agent读取，不需要Remote invocation', async () => {
+  const f = fixture(), text = '\uFEFF😀\r\nSynthetic fixed source'; f.add('receipt-a', Buffer.from(text))
+  try {
+    const source = value(await f.service.importReceipt(f.request(), signal()))
+    assert.deepEqual(value(f.service.validateReference(scope, Object.fromEntries(Object.entries(source).reverse()), 'source-peer')), source)
+    f.state.peerId = undefined
+    assert.deepEqual(value(f.service.readForAgent(scope, source, { start: 0, end: 4 }, 'source-peer', f.agent)), { totalCodePoints: [...text].length, text: '\uFEFF😀\r\n' })
+    assert.equal(f.state.reads, 1, 'material preparation/read does not reopen or copy the original')
+    assert.equal(f.service.validateReference({ ...scope, topicId: 'other-topic' }, source, 'source-peer').error.code, 'not_found')
+    assert.equal(f.service.validateReference(scope, { ...source, sha256: '0'.repeat(64) }, 'source-peer').error.code, 'integrity_failed')
+    assert.equal(f.service.readForAgent(scope, source, { start: 0, end: 4 }, 'source-peer', { ...f.agent }).error.code, 'scope_mismatch')
+    assert.equal(f.service.readForAgent(scope, source, { start: 0, end: 4 }, 'other-peer', f.agent).error.code, 'scope_mismatch')
+    f.state.agent = { ...f.agent }
+    assert.equal(f.service.validateReference(scope, source, 'source-peer').error.code, 'scope_mismatch')
+  } finally { f.service.dispose() }
+})

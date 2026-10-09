@@ -1,8 +1,8 @@
-import { MAX_TRANSLATION_SOURCE_BYTES, TRANSLATION_SOURCES_REMOTE, parseTranslationSourceAsset, parseTranslationSourceRequest,
+import { MAX_TRANSLATION_SOURCE_BYTES, TRANSLATION_SOURCES_REMOTE, parseTranslationSourceAsset, parseTranslationSourceRequest, parseTranslationSourceScope,
   translationSourceResultBytes, type TranslationSourceAsset, type TranslationSourceAssetPage, type TranslationSourceAssetRead,
   type TranslationSourceCapability, type TranslationSourceErrorCode, type TranslationSourceImport, type TranslationSourceResult,
   type TranslationSourceScope } from '../shared/translation-sources.js'
-import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength } from '../shared/translation-source-read.js'
+import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength, type TranslationSourceRange } from '../shared/translation-source-read.js'
 import type { QuickHostContext } from './quick-translation.js'
 
 interface Agent { readonly id: string; readonly session: { readonly id: string }; readonly ctx: unknown }
@@ -30,19 +30,58 @@ export class TranslationSourcesService {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationSources', property: 'ctx' } })
     this.typertRemote = Object.freeze({ service: this, serviceKey: 'translationSources', namespace: 'translationSources' })
   }
-  private owns(scope: TranslationSourceScope, peerId: string | undefined, agent?: Agent): boolean {
+  private owns(scope: TranslationSourceScope, peerId: string | undefined, agent?: Pick<Agent, 'id' | 'session'>): boolean {
     const topics = this.ctx.get?.('translationTopics') as { ownsConnection(ownerId: string, peerId: string): boolean } | undefined
     const agents = this.ctx.get?.('agents') as { get(id: string): Agent | undefined } | undefined
     return !this.disposed && !!peerId && !!topics?.ownsConnection(scope.ownerId, peerId) && (!agent ||
       agent.id === scope.mainSessionId && agent.session.id === scope.mainSessionId && agents?.get(scope.mainSessionId) === agent)
   }
-  async capabilities(): Promise<TranslationSourceResult<TranslationSourceCapability>> {
+  private ready(): boolean {
     const attachments = this.ctx.get?.('attachments') as Attachments | undefined, uploads = this.ctx.get?.('fileUploads') as Uploads | undefined
     const controller = this.ctx.get?.('sessionController') as Controller | undefined
-    const ready = !this.disposed && typeof attachments?.readFileStream === 'function' && typeof uploads?.resolve === 'function' && typeof controller?.resolveAgent === 'function'
+    return !this.disposed && typeof attachments?.readFileStream === 'function' && typeof uploads?.resolve === 'function' && typeof controller?.resolveAgent === 'function'
+  }
+  async capabilities(): Promise<TranslationSourceResult<TranslationSourceCapability>> {
+    const ready = this.ready()
     return ok({ ready, storage: 'runtime_only', encoding: 'utf-8', maxBytes: MAX_TRANSLATION_SOURCE_BYTES,
       maxPageCodePoints: MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, maxPageBytes: MAX_TRANSLATION_SOURCE_PAGE_BYTES,
       ...(ready ? {} : { reason: '宿主 TXT 上传及附件读取服务尚未就绪。' }) })
+  }
+  private referenceRecord(scope: TranslationSourceScope, source: TranslationSourceAsset, peerId: string,
+    agent?: Pick<Agent, 'id' | 'session'>): TranslationSourceResult<SourceRecord> {
+    if (!this.ready()) return bad('unavailable', '宿主固定源资产服务尚未就绪。', 'resolve_source')
+    if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', '固定源资产不属于此主会话连接或 Agent。', 'resolve_source')
+    const record = this.sources.get(source.sourceId)
+    if (!record || !sameScope(record.scope, scope)) return bad('not_found', '此范围的固定源资产不存在。', 'resolve_source')
+    if (record.peerId !== peerId || !this.owns(scope, peerId, record.agent) || (agent && record.agent !== agent)) return bad('scope_mismatch', '固定源资产所属连接或主 Agent 已失效。', 'resolve_source')
+    if (source.version !== record.source.version) return bad('stale_version', '引用的固定源资产版本不一致。', 'resolve_source')
+    if (source.name !== record.source.name || source.bytes !== record.source.bytes || source.totalCodePoints !== record.source.totalCodePoints ||
+      source.encoding !== record.source.encoding || source.bom !== record.source.bom || source.sha256 !== record.source.sha256 ||
+      source.persistence !== record.source.persistence) return bad('integrity_failed', '固定源引用的元数据与原资产不一致。', 'resolve_source')
+    return { ok: true, value: record }
+  }
+  /** In-process material preparation; no new Remote or unrestricted Agent tool is exposed. */
+  validateReference(scope: TranslationSourceScope, source: TranslationSourceAsset, peerId: string): TranslationSourceResult<TranslationSourceAsset> {
+    let fixedScope: TranslationSourceScope, reference: TranslationSourceAsset
+    try { fixedScope = parseTranslationSourceScope(scope); reference = parseTranslationSourceAsset(source) }
+    catch { return bad('invalid_input', '固定源引用格式无效。', 'resolve_source') }
+    const found = this.referenceRecord(fixedScope, reference, peerId)
+    return found.ok ? ok(found.value.source) : found
+  }
+  /** Called only after Materials confirms this exact material was delivered to the actual main Agent. */
+  readForAgent(scope: TranslationSourceScope, source: TranslationSourceAsset, range: TranslationSourceRange, peerId: string,
+    agent: Pick<Agent, 'id' | 'session'>): TranslationSourceResult<{ readonly totalCodePoints: number; readonly text: string }> {
+    const found = this.referenceRecord(scope, source, peerId, agent)
+    if (!found.ok) return found
+    return this.slice(found.value, range)
+  }
+  private slice(record: SourceRecord, range: TranslationSourceRange): TranslationSourceResult<{ readonly totalCodePoints: number; readonly text: string }> {
+    const { start, end } = range
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start) return bad('invalid_range', '原文读取范围无效。', 'read_source')
+    if (end - start > MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS) return bad('page_too_large', '每页最多 4000 个 Unicode 码点，未截断。', 'read_source')
+    if (end > record.source.totalCodePoints) return bad('range_out_of_bounds', '范围超出固定原文长度，未截断。', 'read_source')
+    return { ok: true, value: { totalCodePoints: record.source.totalCodePoints,
+      text: record.text.slice(record.codePointOffsets[start]!, record.codePointOffsets[end]!) } }
   }
   async importReceipt(input: TranslationSourceImport, signal: AbortSignal): Promise<TranslationSourceResult<TranslationSourceAsset>> {
     let request: TranslationSourceImport
@@ -134,11 +173,9 @@ export class TranslationSourcesService {
     if (!record || !sameScope(record.scope, request.scope)) return bad('not_found', '此范围的固定源资产不存在。', 'read_source')
     if (record.peerId !== peerId || !this.owns(request.scope, peerId, record.agent)) return bad('scope_mismatch', '原文所属连接或主 Agent 已失效。', 'read_source')
     if (request.version !== record.source.version) return bad('stale_version', '引用的固定源资产版本不一致。', 'read_source')
-    const { start, end } = request.range
-    if (end - start > MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS) return bad('page_too_large', '每页最多 4000 个 Unicode 码点，未截断。', 'read_source')
-    if (end > record.source.totalCodePoints) return bad('range_out_of_bounds', '范围超出固定原文长度，未截断。', 'read_source')
-    const text = record.text.slice(record.codePointOffsets[start]!, record.codePointOffsets[end]!)
-    const result = ok({ scope: request.scope, source: record.source, range: request.range, text })
+    const page = this.slice(record, request.range)
+    if (!page.ok) return page
+    const result = ok({ scope: request.scope, source: record.source, range: request.range, text: page.value.text })
     return translationSourceResultBytes(result) > MAX_TRANSLATION_SOURCE_PAGE_BYTES ? bad('page_too_large', '完整分页回复超过 32768 UTF-8 字节，未截断。', 'read_source') : result
   }
   dispose(): void { this.disposed = true; this.sources.clear(); this.receipts.clear(); this.bindings.clear(); this.pending.clear() }
