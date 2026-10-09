@@ -58,6 +58,7 @@ export const styles = `
 .dsh-tp-attachment-note { margin: 2px 0 5px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }
 /* DSH 主题全局使用 superellipse；普通圆形必须同时指定 corner-shape。 */
 .dsh-tp .dsh-tp-send { display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; flex: 0 0 38px; border-radius: 50% !important; corner-shape: round !important; background: var(--dsw-alias-interactive-bg-accent, #4d7df3); color: #fff; padding: 0; }
+.dsh-tp button.dsh-tp-send:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-accent, #4d7df3); opacity: .5; }
 .dsh-tp-muted { color: var(--dsw-alias-label-caption, #888); font-size: 12px; font-weight: 400; }
 .dsh-tp-message { border-left: 3px solid #c68b32; padding: 6px 10px; margin: 6px 12px; font-size: 12px; overflow-wrap: anywhere; }
 .dsh-tp-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
