@@ -134,6 +134,8 @@ export const styles = `
 .dsh-tp-record-source, .dsh-tp-record-target { min-width: 0; padding: 8px 10px; }
 .dsh-tp-record-source { border-right: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-record-pair h4 { margin: 0 0 4px; font-size: 12px; }
+.dsh-tp-record-revision + .dsh-tp-record-revision { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-l2, #8883); }
+.dsh-tp-record-version-actions { margin: 6px 0; }
 .dsh-tp-record-actions { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-record-actions[hidden] { display: none; }
 /* Managed originals: plain body segments with explicit, immutable links. */

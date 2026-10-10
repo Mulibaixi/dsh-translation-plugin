@@ -79,7 +79,7 @@ interface RevisionEditor {
   readonly drafts: ReadonlyMap<string, RevisionEdit>
   start(sessionId: string, unitId: string, baseRevisionId: string, text: string): void
   change(key: string, text: string): void
-  save(key: string): void
+  save(key: string, finalize?: boolean): void
   cancel(key: string): void
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
@@ -105,11 +105,11 @@ export function PanelRouter({ store, models, quick, normal, sessionId, topics, m
     },
     change(key, text) { setDrafts(current => { const draft = current.get(key); return draft ? new Map(current).set(key, { ...draft, text, failure: null }) : current }) },
     cancel(key) { setDrafts(current => { const next = new Map(current); next.delete(key); return next }) },
-    save(key) {
+    save(key, finalize = false) {
       const draft = drafts.get(key)
       if (!draft) return
       let saved = false
-      try { saved = quick.saveManualRevision(draft.sessionId, draft.unitId, draft.baseRevisionId, draft.text) } catch { /* Keep the local edit available for retry. */ }
+      try { saved = quick.saveManualRevision(draft.sessionId, draft.unitId, draft.baseRevisionId, draft.text, finalize) } catch { /* Keep the local edit available for retry. */ }
       setDrafts(current => {
         if (current.get(key) !== draft) return current
         const next = new Map(current)
@@ -276,6 +276,7 @@ function TranslationRevision({ unit, revision, quick, session, editor, objects, 
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断' }[revision.status]
   const record = quick.getRecords(session.id).find(record => record.id === revision.operationId)
+  const currentSource = revision.sourceVersion === unit.sourceVersion
   const eligible = revision.sourceVersion === unit.sourceVersion && revision.accepted && revision.status === 'completed' && !!revision.text.trim()
   const fixed = unit.final?.revisionId === revision.id && unit.final.selection === 'user_fixed'
   const label = `文本 ${unit.order} 版本 ${revision.order}`
@@ -316,7 +317,8 @@ function TranslationRevision({ unit, revision, quick, session, editor, objects, 
       h('small', { className: 'dsh-tp-muted' }, `基于版本 ${revision.order}保存为新版本`),
       h('textarea', { 'aria-label': `编辑${label}译文`, value: draft.text, rows: 4, onChange: (event: TextEvent) => { const text = event.currentTarget.value; editor.change(key, text) } }),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
-        h('button', { type: 'button', 'aria-label': `保存${label}编辑`, disabled: !!editBlocked || !draft.text.trim(), title: editBlocked, onClick: () => editor.save(key) }, '保存为新版本'),
+        h('button', { type: 'button', 'aria-label': `保存${label}编辑`, disabled: !!editBlocked || !draft.text.trim(), title: editBlocked, onClick: () => editor.save(key) }, '保存最新版本'),
+        h('button', { type: 'button', 'aria-label': `保存${label}并定稿`, disabled: !!editBlocked || !draft.text.trim() || !currentSource, title: editBlocked ?? (!currentSource ? '原文版本已变化，不能将此修订设为最终。' : undefined), onClick: () => editor.save(key, true) }, '保存并定稿'),
         h('button', { type: 'button', 'aria-label': `取消${label}编辑`, onClick: () => editor.cancel(key) }, '取消'),
       ),
       draft.failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, draft.failure) : null,

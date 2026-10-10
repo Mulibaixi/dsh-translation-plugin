@@ -124,41 +124,69 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
           const final = currentFinalRevision(unit)
           const latest = unit.revisions.at(-1)
           const candidate = latest?.accepted && latest.status === 'completed' && latest.text.trim() && latest.id !== final?.id ? latest : undefined
-          const base = final ?? [...unit.revisions].reverse().find(editable), archived = session.archivedAt !== null
-          const blockedEdit = quick.manualEditBlockedReason(session.id, unit.id, draft?.baseRevisionId ?? base?.id ?? '')
+          const archived = session.archivedAt !== null
           const target = { ownerId, topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
+          function startEditing(revision: TextRevision): void {
+            setDrafts(current => {
+              const existing = current.get(key)
+              if (existing) return current
+              return new Map(current).set(key, { baseRevisionId: revision.id, original: revision.text, text: revision.text })
+            })
+          }
+          function revisionView(revision: TextRevision, kind: 'final' | 'candidate'): unknown {
+            const isCandidate = kind === 'candidate'
+            const revisionDraft = draft?.baseRevisionId === revision.id ? draft : undefined
+            const otherDraft = Boolean(draft && !revisionDraft)
+            const blockedEdit = quick.manualEditBlockedReason(session.id, unit.id, revision.id)
+            const revisionTarget = { ...target, side: 'revision' as const, revisionId: revision.id }
+            const stale = revision.sourceVersion !== unit.sourceVersion
+            const canSave = Boolean(revisionDraft && revisionDraft.text.trim() && revisionDraft.text !== revisionDraft.original && !archived && !blockedEdit)
+            function saveDraft(finalize: boolean): void {
+              if (!revisionDraft) return
+              if (quick.saveManualRevision(session.id, unit.id, revision.id, revisionDraft.text, finalize)) {
+                setDrafts(current => { const next = new Map(current); next.delete(key); return next })
+                setMessage(finalize ? '已保存并设为最终。' : '已保存为最新候选。')
+              } else setMessage('保存失败，编辑内容仍保留。')
+            }
+            return h('div', { className: 'dsh-tp-record-revision', 'data-revision-kind': kind, 'data-revision-id': revision.id },
+              h('small', { className: 'dsh-tp-muted' }, isCandidate
+                ? `候选 · 版本 ${revision.order}${stale ? ` · 已过时（原文版本 ${revision.sourceVersion}）` : ''}`
+                : `版本 ${revision.order} · ${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`),
+              h(RecordObjectText, { text: revision.text, target: revisionTarget, objects, objectAssets }),
+              h('div', { className: 'dsh-tp-actions dsh-tp-record-version-actions' },
+                h('button', { type: 'button', 'aria-label': `${isCandidate ? '复制候选版本' : '复制最终译文'} ${revision.order}`, onClick: () => { void copy(recordObjectPlainText(revision.text, revisionTarget, objects?.getReferences(revisionTarget) ?? [])) } }, '复制'),
+                h('button', { type: 'button', 'aria-label': `编辑${isCandidate ? '候选版本' : '最终版本'} ${revision.order}`, disabled: archived || !!blockedEdit || !editable(revision) || otherDraft || !!revisionDraft, title: blockedEdit ?? (otherDraft ? '请先保存或取消此段的当前编辑。' : undefined), onClick: () => startEditing(revision) }, revisionDraft ? '编辑中' : '编辑'),
+                isCandidate ? h('button', { type: 'button', 'aria-label': `将候选版本 ${revision.order} 设为最终`, disabled: archived || stale || Boolean(draft), title: draft ? '请先保存或取消此段的当前编辑。' : undefined,
+                  onClick: () => setMessage(quick.selectFinal(session.id, unit.id, revision.id) ? '已设为最终。' : '版本已变化，未设为最终。') }, '设为最终') : null),
+              blockedEdit ? h('small', { className: 'dsh-tp-muted' }, blockedEdit) : null,
+              revisionDraft ? h('div', { className: 'dsh-tp-version-editor dsh-tp-record-inline-editor' },
+                h('small', { className: 'dsh-tp-muted' }, `基于版本 ${unit.revisions.find(item => item.id === revisionDraft.baseRevisionId)?.order ?? '已失效'}保存为新版本；未调用模型。`),
+                h('textarea', { 'aria-label': `编辑版本 ${revision.order} 的译文`, value: revisionDraft.text, rows: 8, disabled: archived || !!blockedEdit, onChange: (event: { currentTarget: { value: string } }) => {
+                  const text = event.currentTarget.value
+                  setDrafts(current => new Map(current).set(key, { ...revisionDraft, text }))
+                } }),
+                h('div', { className: 'dsh-tp-actions' },
+                  h('button', { type: 'button', disabled: !canSave, title: blockedEdit, onClick: () => saveDraft(false) }, '保存最新版本'),
+                  h('button', { type: 'button', disabled: !canSave || (isCandidate && stale), title: isCandidate && stale ? '原文版本已变化，不能将此候选设为最终。' : blockedEdit, onClick: () => saveDraft(true) }, '保存并定稿'),
+                  h('button', { type: 'button', onClick: () => setDrafts(current => { const next = new Map(current); next.delete(key); return next }) }, '取消编辑')),
+              ) : null)
+          }
           return h('article', { key: unit.id, className: 'dsh-tp-record-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'aria-label': `文本 ${unit.order}` },
             h('div', { className: 'dsh-tp-record-unit-heading' },
               h('button', { type: 'button', 'aria-label': `${session.name} · 文本 ${unit.order}`, 'aria-expanded': open, onClick: () => {
                 setExpanded(current => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
-              } }, `文本 ${unit.order} · ${final ? '已定稿' : '待定稿'}`),
+              } }, `文本 ${unit.order} · ${candidate || !final ? '待定稿' : '已定稿'}`),
               h('small', { className: 'dsh-tp-muted' }, `目标语言：${unit.targetLanguage}${unit.sourceVersion > 1 ? ` · 原文版本 ${unit.sourceVersion}` : ''}`)),
             h('div', { className: 'dsh-tp-record-pair' },
               h('div', { className: 'dsh-tp-record-source', 'aria-label': '原文' }, h('h4', null, '原文'), h(RecordObjectText, { text: unit.source, target, objects, objectAssets }),
                 open && unit.sourceVersions.length > 1 ? h('div', null, ...unit.sourceVersions.slice(0, -1).map(source => h('section', { key: source.version },
                   h('small', { className: 'dsh-tp-muted' }, `历史原文版本 ${source.version}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null),
               h('div', { className: 'dsh-tp-record-target', 'aria-label': '最终译文' }, h('h4', null, '最终译文'),
-                final ? h('div', null, h('small', { className: 'dsh-tp-muted' }, `版本 ${final.order} · ${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`),
-                  h(RecordObjectText, { text: final.text, target: { ...target, side: 'revision', revisionId: final.id }, objects, objectAssets }), h('button', { type: 'button', onClick: () => { const scope = { ...target, side: 'revision' as const, revisionId: final.id }; void copy(recordObjectPlainText(final.text, scope, objects?.getReferences(scope) ?? [])) } }, '复制最终译文')) : h('p', { className: 'dsh-tp-muted' }, '尚无最终译文。'),
+                final ? revisionView(final, 'final') : null,
+                candidate ? revisionView(candidate, 'candidate') : null,
+                !final && !candidate ? h('p', { className: 'dsh-tp-muted' }, '尚无最终译文。') : null,
                 h('div', { className: 'dsh-tp-record-actions', hidden: !open },
-                  pointed && pointed.sourceVersion !== unit.sourceVersion ? h('p', { className: 'dsh-tp-muted' }, `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}`) : null,
-                  candidate ? h('div', { className: 'dsh-tp-asset-candidate' }, h('h4', null, `候选 · 版本 ${candidate.order}${candidate.sourceVersion === unit.sourceVersion ? '' : ` · 已过时（原文版本 ${candidate.sourceVersion}）`}`),
-                    h(RecordObjectText, { text: candidate.text, target: { ...target, side: 'revision', revisionId: candidate.id }, objects, objectAssets }),
-                    h('button', { type: 'button', disabled: archived || candidate.sourceVersion !== unit.sourceVersion, onClick: () => setMessage(quick.selectFinal(session.id, unit.id, candidate.id) ? '已设为最终。' : '版本已变化，未设为最终。') }, '设为最终')) : null,
-                  draft ? h('div', { className: 'dsh-tp-version-editor' },
-                    h('small', { className: 'dsh-tp-muted' }, `基于版本 ${unit.revisions.find(revision => revision.id === draft.baseRevisionId)?.order ?? '已失效'}保存为新版本；未调用模型。`),
-                    h('textarea', { 'aria-label': '编辑译文', value: draft.text, rows: 8, disabled: archived, onChange: (event: { currentTarget: { value: string } }) => {
-                      const text = event.currentTarget.value; setDrafts(current => new Map(current).set(key, { ...draft, text }))
-                    } }),
-                    h('div', { className: 'dsh-tp-actions' },
-                      h('button', { type: 'button', disabled: archived || !!blockedEdit || !draft.text.trim() || draft.text === draft.original, title: blockedEdit, onClick: () => {
-                        if (quick.saveManualRevision(session.id, unit.id, draft.baseRevisionId, draft.text)) {
-                          setDrafts(current => { const next = new Map(current); next.delete(key); return next }); setMessage('已保存新候选版本；可设为最终。')
-                        } else setMessage('保存失败，编辑内容仍保留。')
-                      } }, '保存新版本'),
-                      h('button', { type: 'button', onClick: () => setDrafts(current => { const next = new Map(current); next.delete(key); return next }) }, '取消编辑')),
-                  ) : h('button', { type: 'button', disabled: archived || !!blockedEdit || !base || !editable(base), title: blockedEdit, onClick: () => { if (base && !blockedEdit) setDrafts(current => new Map(current).set(key, { baseRevisionId: base.id, original: base.text, text: base.text })) } }, '编辑译文'),
-                  blockedEdit ? h('small', { className: 'dsh-tp-muted' }, blockedEdit) : null))),
+                  pointed && pointed.sourceVersion !== unit.sourceVersion ? h('p', { className: 'dsh-tp-muted' }, `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}`) : null))),
             h('div', { className: 'dsh-tp-record-actions', hidden: !open }, h(RecordObjectEditor, { session, unit, objects, objectAssets }))
           )
         })))))

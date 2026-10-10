@@ -96,11 +96,15 @@ export class QuickTranslationClient {
     if (this.disposed || !session || session.archivedAt !== null) return false
     return this.store.updateTranslationHistory(id, history => selectFinalRevision(history, unitId, revisionId, new Date().toISOString()))
   }
-  saveManualRevision(id: string, unitId: string, baseRevisionId: string, text: string): boolean {
+  saveManualRevision(id: string, unitId: string, baseRevisionId: string, text: string, finalize = false): boolean {
     const session = this.store.getSession(id)
     if (this.disposed || !session || session.archivedAt !== null || this.manualEditBlockedReason(id, unitId, baseRevisionId)) return false
     const revisionId = `manual-revision:${this.options.makeId?.() ?? globalThis.crypto?.randomUUID?.() ?? `${Date.now()}:${++this.sequence}:${Math.random().toString(36).slice(2)}`}`
-    return this.store.updateTranslationHistory(id, history => appendManualRevision(history, unitId, { id: revisionId, baseRevisionId, text, at: new Date().toISOString() }))
+    const at = new Date().toISOString()
+    return this.store.updateTranslationHistory(id, history => {
+      const next = appendManualRevision(history, unitId, { id: revisionId, baseRevisionId, text, at })
+      return finalize ? selectFinalRevision(next, unitId, revisionId, at) : next
+    })
   }
   manualEditBlockedReason(id: string, unitId: string, revisionId: string): string | undefined {
     const session = this.store.getSession(id)
