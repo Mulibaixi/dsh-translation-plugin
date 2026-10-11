@@ -1,6 +1,7 @@
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope, type TranslationMaterialScope } from '../shared/translation-material.js'
 import { parseTranslationMaterialResult, type TranslationMaterialsPort, type TranslationMaterialCapability, type TranslationMaterialReceipt, type TranslationMaterialQuery, type TranslationMaterialResult } from '../shared/translation-material-remote.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES } from '../shared/topic-bridge.js'
+import { INLINE_TRANSLATION_SOURCE_CODE_POINTS } from '../shared/translation-source-read.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
@@ -35,7 +36,9 @@ interface Options {
   readonly sources?: TranslationSourcesPort
 }
 interface SelectedFile { readonly file: File; readonly version: number }
-interface FrozenDraft { readonly session: LocalSession; readonly draftVersion: number; readonly materialId: string; readonly signature: string; readonly selected?: SelectedFile }
+interface PastedTextCarrier { readonly kind: 'pasted_text'; readonly text: string; readonly name: string; readonly bytes: number; readonly totalCodePoints: number }
+type SourceCarrier = { readonly kind: 'selected_file'; readonly selected: SelectedFile } | PastedTextCarrier
+interface FrozenDraft { readonly session: LocalSession; readonly draftVersion: number; readonly materialId: string; readonly signature: string; readonly carrier?: SourceCarrier }
 interface Submission {
   readonly identity: TranslationMaterialScope
   readonly kind: TranslationMaterialEnvelope['kind']
@@ -60,6 +63,7 @@ export interface MaterialSubmissionStatus {
   readonly message: string | undefined
   readonly unknown: boolean
 }
+export interface LongDraftSource { readonly name: string; readonly bytes: number; readonly totalCodePoints: number }
 const SEAM_MISSING = '普通模式暂不可用：当前 DSH 缺少同步发送材料接口。'
 const FILE_AND_TEXT = '待译原文与 TXT 请选择一种；请移除文件或清空待译原文，翻译要求仍在主输入区发送。'
 const BYTE_BLOCKED = `材料超过传输上限（${MAX_TOPIC_BRIDGE_REPLY_BYTES} 字节）。请缩短待译稿；内容未截断。`
@@ -71,6 +75,18 @@ function signature(session: LocalSession, fileVersion: number): string {
   return JSON.stringify([session.input, session.targetLanguage, session.instruction, session.model, session.maxInputChars, fileVersion])
 }
 function detail(error: unknown): string { return error instanceof Error ? error.message : '材料提交未完成，草稿保留。' }
+/** Reject lone UTF-16 surrogates before any UTF-8 encoder can replace them. */
+function pastedTextSize(text: string): { readonly bytes: number; readonly totalCodePoints: number } {
+  let bytes = 0, totalCodePoints = 0
+  for (const character of text) {
+    const code = character.codePointAt(0)!
+    if (code >= 0xd800 && code <= 0xdfff) throw new Error('待译原文含有不完整的 Unicode 字符，请修正后重试；正文保留。')
+    totalCodePoints++
+    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4
+  }
+  if (bytes > MAX_TRANSLATION_SOURCE_BYTES) throw new Error('待译原文超过 2 MiB UTF-8 上限；正文保持完整。')
+  return { bytes, totalCodePoints }
+}
 function composerReasonLabel(reason?: string): string { return reason === 'composer_protocol_undeclared'
   ? `当前 DSH 的同步提交接口未声明协议版本（${reason}）。`
   : reason?.startsWith('composer_protocol_unsupported:') ? `当前 DSH 的同步提交协议版本不受支持（${reason}）。`
@@ -192,7 +208,7 @@ export class MaterialSubmissionsClient {
       return undefined
     }
     if (!session.input.trim()) return '请输入待译材料。'
-    if (Array.from(session.input).length > session.maxInputChars) return `已超过单次上限 ${session.maxInputChars} 个字符；内容保持完整。`
+    try { pastedTextSize(session.input) } catch (error) { return detail(error) }
     return undefined
   }
   private readiness(ownerId: string, file = false): string | undefined {
@@ -220,8 +236,11 @@ export class MaterialSubmissionsClient {
     const latest = [...this.submissions.values()].filter(item => item.sessionId === sessionId).at(-1)
     const busy = !!latest && ['frozen', 'preparing', 'prepared'].includes(latest.stage)
     const unknown = latest?.stage === 'unknown'
-    let blocked = session ? this.inputReason(session) ?? this.readiness(session.ownerId, this.files.has(session.id)) : '翻译会话不存在。'
-    if (!blocked && session && !this.files.has(session.id)) { try { this.textEnvelope(session) } catch (error) { blocked = detail(error) } }
+    let blocked = session ? this.inputReason(session) : '翻译会话不存在。'
+    if (!blocked && session) {
+      try { blocked = this.readiness(session.ownerId, this.files.has(session.id) || !!this.previewPastedCarrier(session)) }
+      catch (error) { blocked = detail(error) }
+    }
     if (busy) blocked = '正在提交材料…'
     if (unknown) blocked = '提交结果尚不确定，请先检查提交状态。'
     let message = latest?.reason
@@ -233,17 +252,40 @@ export class MaterialSubmissionsClient {
     }
     return { busy, blocked, message, unknown }
   }
-  private textEnvelope(session: LocalSession): TranslationMaterialEnvelope {
-    const identity = { ownerId: session.ownerId, mainSessionId: session.ownerId, requestId: 'preview', operationId: 'preview' }
-    return this.boundedEnvelope({ ...identity, kind: 'material', material: { ...this.config({ session, materialId: 'preview', draftVersion: this.draftVersion(session),
-      signature: signature(session, this.fileVersions.get(session.id) ?? 0) }), sourceText: session.input } })
+  private pastedCarrier(draft: FrozenDraft, identity: TranslationMaterialScope): PastedTextCarrier | undefined {
+    const text = draft.session.input, size = pastedTextSize(text)
+    const inline = { ...identity, kind: 'material', material: { ...this.config(draft), sourceText: text } }
+    if (size.totalCodePoints > INLINE_TRANSLATION_SOURCE_CODE_POINTS || size.totalCodePoints > draft.session.maxInputChars ||
+      new TextEncoder().encode(JSON.stringify(inline)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) {
+      // Check the frozen config and scope before starting any upload; only the source transport changes.
+      this.boundedEnvelope({ ...inline, material: { ...this.config(draft), sourceText: 'x' } })
+      return { kind: 'pasted_text', text, name: '长原稿.txt', ...size }
+    }
+    this.boundedEnvelope(inline)
+    return undefined
+  }
+  private previewPastedCarrier(session: LocalSession): PastedTextCarrier | undefined {
+    const previewId = '00000000-0000-0000-0000-000000000000'
+    return this.pastedCarrier({ session, materialId: previewId, draftVersion: this.draftVersion(session), signature: '' },
+      { ownerId: session.ownerId, mainSessionId: session.ownerId, requestId: previewId, operationId: previewId })
+  }
+  /** Editable draft projection; actual capture uses the exact submission identity in record(). */
+  getLongDraft(sessionId: string): LongDraftSource | undefined {
+    const session = this.options.store.getSession(sessionId)
+    if (!session || session.mode !== 'normal' || this.files.has(session.id) || !session.input.trim()) return undefined
+    try {
+      const carrier = this.previewPastedCarrier(session)
+      return carrier ? { name: carrier.name, bytes: carrier.bytes, totalCodePoints: carrier.totalCodePoints } : undefined
+    } catch { return undefined }
   }
   private record(session: LocalSession | undefined, ownerId: string, requestId: string, kind: TranslationMaterialEnvelope['kind'], direct: boolean): Submission {
     const identity = { ownerId, mainSessionId: ownerId, requestId, operationId: id() }
     const selected = session ? this.files.get(session.id) : undefined
-    const draft: FrozenDraft | undefined = kind === 'material' && session ? { session: structuredClone(session), draftVersion: this.draftVersion(session),
-      materialId: id(), signature: signature(session, this.fileVersions.get(session.id) ?? 0), ...(selected ? { selected } : {}) } : undefined
-    const envelope = draft ? selected ? undefined : this.boundedEnvelope({ ...identity, kind: 'material', material: { ...this.config(draft), sourceText: draft.session.input } })
+    const captured: FrozenDraft | undefined = kind === 'material' && session ? { session: structuredClone(session), draftVersion: this.draftVersion(session),
+      materialId: id(), signature: signature(session, this.fileVersions.get(session.id) ?? 0) } : undefined
+    const carrier = captured ? selected ? { kind: 'selected_file' as const, selected } : this.pastedCarrier(captured, identity) : undefined
+    const draft = captured && carrier ? { ...captured, carrier } : captured
+    const envelope = draft ? carrier ? undefined : this.boundedEnvelope({ ...identity, kind: 'material', material: { ...this.config(draft), sourceText: draft.session.input } })
       : this.boundedEnvelope({ ...identity, kind })
     const item: Submission = { identity, kind, draft, generation: this.generation, envelope, sessionId: session?.id, direct,
       stage: 'frozen', reason: undefined, started: false, finished: false, settling: false, hostStarted: false }
@@ -279,8 +321,11 @@ export class MaterialSubmissionsClient {
   private async materialEnvelope(item: Submission, signal: AbortSignal): Promise<TranslationMaterialEnvelope> {
     this.active(item, signal)
     if (item.envelope) return item.envelope
-    const draft = item.draft, file = draft?.selected?.file, sources = this.options.sources, upload = this.options.upload
-    if (!draft || !file || !sources || !upload) throw new Error('TXT 原稿上传或导入服务尚未就绪。')
+    const draft = item.draft, carrier = draft?.carrier, sources = this.options.sources, upload = this.options.upload
+    if (!draft || !carrier || !sources || !upload) throw new Error('TXT 原稿上传或导入服务尚未就绪。')
+    // Generated TXT is a carrier for this frozen text, never a second user-selected material.
+    const file = carrier.kind === 'selected_file' ? carrier.selected.file
+      : new File([new TextEncoder().encode(carrier.text)], carrier.name, { type: 'text/plain;charset=utf-8' })
     const receipt = await upload.upload(item.identity.ownerId, file, file.name, signal, () => {})
     this.active(item, signal)
     if (!receipt || typeof receipt !== 'object' || (receipt as { ok?: unknown }).ok !== true) throw new Error('TXT 原稿上传未完成；草稿与文件保留。')
@@ -296,7 +341,7 @@ export class MaterialSubmissionsClient {
   private prepare(item: Submission, signal: AbortSignal, method: 'prepare' | 'submit'): Promise<void> {
     if (item.preparation) return item.preparation
     this.active(item, signal)
-    const reason = this.readiness(item.identity.ownerId, !!item.draft?.selected)
+    const reason = this.readiness(item.identity.ownerId, !!item.draft?.carrier)
     if (reason) { item.stage = 'failed'; item.reason = reason; this.reconcile(); this.emit(); return Promise.reject(new Error(reason)) }
     const controller = new AbortController(), cancel = () => controller.abort()
     signal.addEventListener('abort', cancel, { once: true }); item.controller = controller

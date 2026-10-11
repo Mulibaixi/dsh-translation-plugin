@@ -1,4 +1,5 @@
 import { decodeDraft, decodeSettings } from './legacy-state.js'
+import { MAX_TRANSLATION_SOURCE_BYTES } from '../shared/translation-sources.js'
 
 export type Mode = 'normal' | 'quick'
 export interface SessionSettings {
@@ -113,7 +114,7 @@ export function decodeSession(value: unknown): LocalSession | undefined {
   if (!(value.archivedAt === undefined || value.archivedAt === null || (text(value.archivedAt, 40, true) && Number.isFinite(Date.parse(value.archivedAt))))) return undefined
   if (!mode(value.mode) || !text(value.targetLanguage, 80) || !text(value.instruction, 4000) || !limit(value.maxInputChars)) return undefined
   const route = decodeRoute(value.model)
-  if (route === undefined || !text(value.input, 200000) || !text(value.legacyManualText, 200000)) return undefined
+  if (route === undefined || !text(value.input, value.mode === 'normal' ? MAX_TRANSLATION_SOURCE_BYTES : 200000) || !text(value.legacyManualText, 200000)) return undefined
   if (!(value.legacyKey === null || (text(value.legacyKey, 2000) && value.legacyKey.startsWith(LEGACY_DRAFT_PREFIX)))) return undefined
   if (value.schemaVersion === 3) {
     if (!text(value.topicId, 3000, true) || !text(value.sequenceNamespaceId, 3000, true) || !text(value.topicName, 120, true) ||

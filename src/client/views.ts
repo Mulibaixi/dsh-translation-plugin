@@ -439,6 +439,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const [exportRequest, setExportRequest] = react.useState<(FrozenTranslationExport & { readonly result: TranslationExport }) | undefined>(undefined)
   const [exportNotice, setExportNotice] = react.useState<{ readonly message: string; readonly failure: boolean } | undefined>(undefined)
   const fileInput = react.useRef<HTMLInputElement | null>(null)
+  const sourceInput = react.useRef<HTMLTextAreaElement | null>(null)
   react.useEffect(() => () => { materials?.clearSelectedFiles(ownerId) }, [materials, ownerId])
   const action = useAsyncAction()
   react.useEffect(() => { store.ensureWorkspace(ownerId) }, [store, ownerId])
@@ -447,6 +448,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const archived = displayed.filter(session => session.archivedAt !== null)
   const current = store.getActiveSession(ownerId)
   const selectedFile = current ? materials?.getSelectedFile(current.id) : undefined
+  const longDraft = current?.mode === 'normal' ? materials?.getLongDraft(current.id) : undefined
   const target = context ? store.getSession(context.id) : undefined
   const targetTopicSessions = target ? store.getAvailableSessions(ownerId).filter(session => session.topicId === target.topicId) : []
   const targetTopicHasRecords = targetTopicSessions.some(session => store.getTranslationHistory(session.id)?.units.length)
@@ -604,8 +606,15 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
           ),
           h('p', { className: 'dsh-tp-attachment-note' }, 'TXT 可交付主模型准备，分批翻译尚未接入。'),
         ) : null,
-        h('textarea', { value: current.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(current.id, { input: event.currentTarget.value }) } }),
-        Array.from(current.input).length > current.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${current.maxInputChars} 个字符；内容保持完整。`) : null,
+        current.mode === 'normal' && longDraft ? h('div', null,
+          h('div', { className: 'dsh-tp-attachment' },
+            h('button', { type: 'button', className: 'dsh-tp-attachment-name', 'aria-label': '编辑长原稿', title: `${longDraft.totalCodePoints} 个字符 · ${longDraft.bytes} 字节`,
+              onClick: () => sourceInput.current?.focus() }, '长原稿'),
+          ),
+          h('p', { className: 'dsh-tp-attachment-note' }, '发送时将固定为 UTF-8 原稿，正文可继续编辑；分批翻译尚未接入。'),
+        ) : null,
+        h('textarea', { ref: sourceInput, value: current.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(current.id, { input: event.currentTarget.value }) } }),
+        current.mode === 'quick' && Array.from(current.input).length > current.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${current.maxInputChars} 个字符；内容保持完整。`) : null,
         h('div', { className: 'dsh-tp-composer-toolbar' },
           h('input', { type: 'file', accept: '.txt', hidden: true, ref: fileInput, key: `file:${current.id}`, 'aria-label': '待译文件', disabled: current.mode === 'quick',
             onChange: (event: FileEvent) => {
