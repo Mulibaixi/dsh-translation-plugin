@@ -7,8 +7,11 @@ const internalDocument = /^docs\/(?:p0-upstream-contracts|translation-plugin-fra
 
 export function forbiddenStagedPaths(paths) {
   return paths.filter(path => forbiddenDirectory.test(path) || internalDocument.test(path)
+    || /(?:^|\/)(?:tests?|__tests__|fixtures|__fixtures__|__snapshots__|test-results|sdk-consumer)(?:\/|$)/u.test(path)
+    || /(?:^|\/)[^/]+\.(?:test|spec|integration)(?:\.[^/]+)?$/u.test(path)
+    || /^\.cache\//u.test(path)
     || /(?:^|\/)\.env(?:\.|$)/u.test(path) && !path.endsWith('/.env.example') && path !== '.env.example'
-    || /\.(?:log|tgz)$/u.test(path) || /(?:^|\/)cordis\.patch\.yml\.bak/u.test(path))
+    || /\.(?:log|tgz|snap)(?:\.json)?$/u.test(path) || /(?:^|\/)cordis\.patch\.yml\.bak/u.test(path))
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

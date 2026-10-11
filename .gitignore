@@ -29,3 +29,22 @@ coverage/
 /logs/
 /data/
 cordis.patch.yml.bak*
+
+# 测试文件只在本地验证；已跟踪文件的修改也不得提交。
+.cache/
+tests/
+test/
+fixtures/
+test-results/
+sdk-consumer/
+**/__tests__/
+**/__fixtures__/
+**/__snapshots__/
+*.test.*
+*.spec.*
+*.integration.*
+*.test
+*.spec
+*.integration
+*.snap
+*.snap.json
