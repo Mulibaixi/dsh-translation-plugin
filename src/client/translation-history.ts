@@ -3,6 +3,11 @@ import { parseTranslationCallMetadata, type TranslationCallMetadata } from '../s
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
 import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
+import { advanceDocumentFinal, createDocumentUnit, currentDocumentFinal, parseDocumentUnit, reduceDocumentUnit,
+  restoreDocumentUnit, type DocumentMutation, type NewDocumentUnit } from '../memory/document-task.js'
+import type { DocumentRevision, DocumentUnit } from '../shared/translation-batch.js'
+export type { DocumentRevision, DocumentSourceVersion, DocumentSourceHistoryCommit, DocumentUnit } from '../shared/translation-batch.js'
+export type { DocumentMutation, NewDocumentUnit } from '../memory/document-task.js'
 
 export type TextRevisionStatus = 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted' | 'context_requested'
 export interface TextRevision {
@@ -47,6 +52,9 @@ export interface TextSourceVersion {
   readonly createdAt: string
   readonly operationId: string | null
 }
+export type TranslationUnit = TextUnit | DocumentUnit
+export function isDocumentUnit(unit: TranslationUnit): unit is DocumentUnit { return 'kind' in unit && unit.kind === 'document' }
+export function isTextUnit(unit: TranslationUnit): unit is TextUnit { return !isDocumentUnit(unit) }
 export interface TextMaterialIdentity {
   readonly materialId: string
   readonly mainSessionId: string
@@ -58,7 +66,7 @@ export interface TextMaterialIdentity {
 export interface TranslationEvent {
   readonly id: string
   readonly order: number
-  readonly type: 'operation.submitted' | 'operation.accepted' | 'operation.retranslation_accepted' | 'operation.updated' | 'operation.call_event' | 'final.selected' | 'operation.restored' | 'revision.manual_saved' | 'source.corrected' | 'exchange.needs_context' | 'exchange.resolution_registered' | 'exchange.resume_registered' | 'exchange.control' | 'exchange.call_started' | 'exchange.resolved' | 'exchange.invalidated'
+  readonly type: 'operation.submitted' | 'operation.accepted' | 'operation.retranslation_accepted' | 'operation.updated' | 'operation.call_event' | 'final.selected' | 'operation.restored' | 'revision.manual_saved' | 'source.corrected' | 'exchange.needs_context' | 'exchange.resolution_registered' | 'exchange.resume_registered' | 'exchange.control' | 'exchange.call_started' | 'exchange.resolved' | 'exchange.invalidated' | 'document.admitted' | 'document.updated' | 'document.restored'
   readonly at: string
   readonly unitId: string | null
   readonly revisionId: string | null
@@ -100,8 +108,8 @@ export interface TranslationExchangeRecord {
 }
 /** One browser snapshot; events and final pointers reference the sole revision body. */
 export interface TranslationHistory {
-  readonly schemaVersion: 6
-  readonly units: readonly TextUnit[]
+  readonly schemaVersion: 7
+  readonly units: readonly TranslationUnit[]
   readonly events: readonly TranslationEvent[]
   readonly exchanges: readonly TranslationExchangeRecord[]
 }
@@ -109,7 +117,7 @@ export type NewTextUnit = Pick<TextUnit, 'id' | 'source' | 'targetLanguage' | 'i
 export type NewTextRevision = Omit<TextRevision, 'order' | 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'> & Partial<Pick<TextRevision, 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'>>
 export type TextRevisionPatch = Partial<Pick<TextRevision, 'status' | 'text' | 'message' | 'updatedAt' | 'callRecord'>>
 
-export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 6, units: [], events: [], exchanges: [] } }
+export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 7, units: [], events: [], exchanges: [] } }
 
 type Data = Record<string, unknown>
 const statuses: readonly TextRevisionStatus[] = ['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted', 'context_requested']
@@ -126,8 +134,12 @@ function time(value: unknown): value is string { return text(value, 40, true) &&
 function order(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) >= 1 }
 function status(value: unknown): value is TextRevisionStatus { return typeof value === 'string' && statuses.includes(value as TextRevisionStatus) }
 function eligible(revision: TextRevision): boolean { return revision.accepted && revision.status === 'completed' && !!revision.text.trim() }
-export function currentFinalRevision(unit: TextUnit): TextRevision | undefined {
+export function currentFinalRevision(unit: TranslationUnit): TextRevision | undefined {
+  if (!isTextUnit(unit)) return undefined
   return unit.revisions.find(revision => revision.id === unit.final?.revisionId && revision.sourceVersion === unit.sourceVersion && eligible(revision))
+}
+export function currentDocumentFinalRevision(unit: TranslationUnit): DocumentRevision | undefined {
+  return isDocumentUnit(unit) ? currentDocumentFinal(unit) : undefined
 }
 export function canEditTextRevision(revision: TextRevision): boolean {
   return ['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(revision.status) && !!revision.text.trim()
@@ -182,12 +194,12 @@ function decodeExchangeResolution(value: unknown): TranslationExchangeResolution
   return { resolutionId: value.resolutionId, observedVersion: value.observedVersion as number, kind: value.kind, reason: value.reason }
 }
 
-function decodeExchange(value: unknown, units: readonly TextUnit[]): TranslationExchangeRecord | undefined {
+function decodeExchange(value: unknown, units: readonly TranslationUnit[]): TranslationExchangeRecord | undefined {
   if (!record(value) || !exact(value, ['mainSessionId', 'topicId', 'translationSessionId', 'unitId', 'sourceVersion', 'operationId', 'callId', 'contextVersion', 'exchangeId', 'version', 'status', 'questions', 'resolutions', 'resumeIntent']) ||
     !identity(value.mainSessionId) || !identity(value.topicId) || !identity(value.translationSessionId) || !identity(value.unitId) || !order(value.sourceVersion) ||
     !identity(value.operationId) || !identity(value.callId) || !order(value.contextVersion) || !identity(value.exchangeId) || !order(value.version) ||
     !['open', 'waiting_user', 'resuming', 'resolved', 'cancelled', 'unknown'].includes(value.status as string) || !Array.isArray(value.resolutions) || value.resolutions.length > 20) return undefined
-  const unit = units.find(item => item.id === value.unitId), source = unit?.sourceVersions.find(item => item.version === value.sourceVersion)
+  const unit = units.filter(isTextUnit).find(item => item.id === value.unitId), source = unit?.sourceVersions.find(item => item.version === value.sourceVersion)
   const revision = unit?.revisions.find(item => item.id === value.callId)
   if (!unit || !source || !revision || revision.operationId !== value.operationId || revision.sourceVersion !== value.sourceVersion ||
     revision.callRecord?.promptVersion !== 'normal-text-exchange-v1') return undefined
@@ -213,10 +225,29 @@ function decodeExchange(value: unknown, units: readonly TextUnit[]): Translation
 
 /** Validation does not turn live requests into restored requests. Unknown fields are rejected. */
 export function decodeTranslationHistory(value: unknown): TranslationHistory | undefined {
-  if (!record(value) || !exact(value, value.schemaVersion === 6 ? ['schemaVersion', 'units', 'events', 'exchanges'] : ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5, 6].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events) ||
-    (value.schemaVersion === 6 && !Array.isArray(value.exchanges))) return undefined
-  const units: TextUnit[] = [], revisionIds = new Set<string>(), operationUnits = new Map<string, string>(), unitIds = new Set<string>()
+  if (!record(value) || !exact(value, (value.schemaVersion as number) >= 6 ? ['schemaVersion', 'units', 'events', 'exchanges'] : ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5, 6, 7].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events) ||
+    ((value.schemaVersion as number) >= 6 && !Array.isArray(value.exchanges))) return undefined
+  const units: TranslationUnit[] = [], revisionIds = new Set<string>(), callIds = new Set<string>(), operationUnits = new Map<string, string>(), unitIds = new Set<string>()
   for (const item of value.units) {
+    if (record(item) && item.kind === 'document') {
+      if (value.schemaVersion !== 7) return undefined
+      let unit: DocumentUnit
+      try { unit = parseDocumentUnit(item) } catch { return undefined }
+      if (unitIds.has(unit.id) || unit.order !== units.length + 1) return undefined
+      for (const revision of [...unit.chunkRevisions, ...unit.revisions]) {
+        if (revisionIds.has(revision.id)) return undefined
+        revisionIds.add(revision.id)
+      }
+      for (const chunk of unit.chunkRevisions.filter(chunk => chunk.callId !== null)) {
+        if (callIds.has(chunk.callId!)) return undefined
+        callIds.add(chunk.callId!)
+      }
+      for (const operationId of documentOperationIds(unit)) {
+        if (operationUnits.has(operationId) && operationUnits.get(operationId) !== unit.id) return undefined
+        operationUnits.set(operationId, unit.id)
+      }
+      unitIds.add(unit.id); units.push(unit); continue
+    }
     if (!record(item) || !exact(item, ['id', 'order', ...(((value.schemaVersion as number) < 3 || Object.hasOwn(item, 'source')) ? ['source'] : []), 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final', ...((value.schemaVersion as number) >= 3 ? ['sourceVersion', 'sourceVersions', 'material'] : [])]) ||
       !identity(item.id) || unitIds.has(item.id) || item.order !== units.length + 1 || ((value.schemaVersion as number) < 3 && !text(item.source, 200000, true)) || !text(item.targetLanguage, 80, true) ||
       !text(item.instruction, 4000) || !time(item.createdAt) || !Array.isArray(item.revisions)) return undefined
@@ -238,6 +269,8 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       const revision = decodeRevision(raw, value.schemaVersion as number)
       if (!revision || revision.order !== revisions.length + 1 || revisionIds.has(revision.id) ||
         (operationUnits.has(revision.operationId) && ((value.schemaVersion as number) < 4 || operationUnits.get(revision.operationId) !== item.id))) return undefined
+      if (revision.kind === 'machine' && callIds.has(revision.id)) return undefined
+      if (revision.kind === 'machine') callIds.add(revision.id)
       if (!sourceVersions.some(source => source.version === revision.sourceVersion)) return undefined
       if (revision.kind === 'manual' && !revisions.some(base => base.id === revision.baseRevisionId && base.sourceVersion === revision.sourceVersion && canEditTextRevision(base))) return undefined
       revisions.push(revision); revisionIds.add(revision.id); operationUnits.set(revision.operationId, item.id)
@@ -266,16 +299,23 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       (Object.hasOwn(item, 'sourceVersion') && (!order(item.sourceVersion) || !units.find(unit => unit.id === item.unitId)?.sourceVersions.some(source => source.version === item.sourceVersion))) ||
       (Object.hasOwn(item, 'sourceReason') && (item.type !== 'source.corrected' || !text(item.sourceReason, 1000))) ||
       (item.type === 'source.corrected' && (!order(item.sourceVersion) || item.revisionId !== null || !identity(item.operationId) || !text(item.sourceReason, 1000))) || !identity(item.id) || eventIds.has(item.id) ||
-      item.order !== events.length + 1 || !['operation.submitted', 'operation.accepted', 'operation.retranslation_accepted', 'operation.updated', 'operation.call_event', 'final.selected', 'operation.restored', 'revision.manual_saved', 'source.corrected', 'exchange.needs_context', 'exchange.resolution_registered', 'exchange.resume_registered', 'exchange.control', 'exchange.call_started', 'exchange.resolved', 'exchange.invalidated'].includes(item.type as string) || !time(item.at) ||
+      item.order !== events.length + 1 || !['operation.submitted', 'operation.accepted', 'operation.retranslation_accepted', 'operation.updated', 'operation.call_event', 'final.selected', 'operation.restored', 'revision.manual_saved', 'source.corrected', 'exchange.needs_context', 'exchange.resolution_registered', 'exchange.resume_registered', 'exchange.control', 'exchange.call_started', 'exchange.resolved', 'exchange.invalidated', ...((value.schemaVersion as number) >= 7 ? ['document.admitted', 'document.updated', 'document.restored'] : [])].includes(item.type as string) || !time(item.at) ||
       !(item.unitId === null || (identity(item.unitId) && unitIds.has(item.unitId))) || !(item.revisionId === null || (identity(item.revisionId) && revisionIds.has(item.revisionId))) ||
       !(item.operationId === null || identity(item.operationId)) || !(item.status === null || status(item.status)) || !(item.reason === null || ['advance', 'user_selection', 'restored', 'export'].includes(item.reason as string))) return undefined
     const exchangeEvent = String(item.type).startsWith('exchange.')
-    if (exchangeEvent ? (value.schemaVersion !== 6 || !identity(item.exchangeId) || !identity(item.callId) || !order(item.contextVersion) ||
+    if (String(item.type).startsWith('document.')) {
+      const unit = units.find(unit => unit.id === item.unitId)
+      if (!unit || !isDocumentUnit(unit) || item.status !== null || !order(item.sourceVersion) ||
+        (item.operationId !== null && !documentOperationIds(unit).includes(item.operationId as string)) ||
+        (item.type === 'document.restored' ? item.operationId !== null || item.revisionId !== null || item.reason !== 'restored' : item.reason !== null) ||
+        (item.type === 'document.admitted' && (item.revisionId !== null || !unit.tasks.some(task => task.operationId === item.operationId && task.sourceVersion === item.sourceVersion)))) return undefined
+    }
+    if (exchangeEvent ? ((value.schemaVersion as number) < 6 || !identity(item.exchangeId) || !identity(item.callId) || !order(item.contextVersion) ||
       !(item.resolutionId === null || identity(item.resolutionId)) || !identity(item.operationId) || !identity(item.unitId)) :
       ['exchangeId', 'resolutionId'].some(field => Object.hasOwn(item, field)) || (item.type !== 'operation.call_event' && ['callId', 'contextVersion'].some(field => Object.hasOwn(item, field)))) return undefined
     if (item.revisionId !== null) {
       const unit = units.find(unit => unit.id === item.unitId), revision = unit?.revisions.find(revision => revision.id === item.revisionId)
-      if (!revision || item.operationId !== revision.operationId || (item.sourceVersion !== undefined && item.sourceVersion !== revision.sourceVersion)) return undefined
+      if (!revision || !unit || item.operationId !== revisionOperationId(unit, revision) || (item.sourceVersion !== undefined && item.sourceVersion !== revision.sourceVersion)) return undefined
     }
     if (typeof item.operationId === 'string' && typeof item.unitId === 'string') {
       if (operationUnits.has(item.operationId) && operationUnits.get(item.operationId) !== item.unitId) return undefined
@@ -283,24 +323,24 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
     }
     events.push({ ...item } as unknown as TranslationEvent); eventIds.add(item.id)
   }
-  const exchanges = (value.schemaVersion as number) === 6 ? (value.exchanges as unknown[]).map(item => decodeExchange(item, units)) : []
+  const exchanges = (value.schemaVersion as number) >= 6 ? (value.exchanges as unknown[]).map(item => decodeExchange(item, units)) : []
   if (exchanges.some(item => !item) || new Set(exchanges.map(item => item!.exchangeId)).size !== exchanges.length ||
     new Set(exchanges.map(item => JSON.stringify([item!.operationId, item!.callId]))).size !== exchanges.length) return undefined
   for (const event of events.filter(event => event.type.startsWith('exchange.'))) {
     const exchange = exchanges.find(item => item!.exchangeId === event.exchangeId)
-    const linkedCall = exchange && units.find(unit => unit.id === exchange.unitId)?.revisions.find(revision => revision.id === event.callId)
+    const linkedCall = exchange && units.filter(isTextUnit).find(unit => unit.id === exchange.unitId)?.revisions.find(revision => revision.id === event.callId)
     const registeredCandidate = event.type === 'exchange.resume_registered' && exchange?.resumeIntent?.candidateCallId === event.callId
     if (!exchange || exchange.operationId !== event.operationId || exchange.unitId !== event.unitId || (!linkedCall && !registeredCandidate) || (linkedCall && linkedCall.operationId !== exchange.operationId) ||
       (!['exchange.call_started', 'exchange.resume_registered'].includes(event.type) && (exchange.callId !== event.callId || exchange.contextVersion !== event.contextVersion)) ||
       (['exchange.call_started', 'exchange.resume_registered'].includes(event.type) && event.contextVersion !== exchange.contextVersion + 1) ||
       (event.resolutionId !== null && !exchange.resolutions.some(resolution => resolution.resolutionId === event.resolutionId))) return undefined
   }
-  return { schemaVersion: 6, units, events, exchanges: exchanges as TranslationExchangeRecord[] }
+  return { schemaVersion: 7, units, events, exchanges: exchanges as TranslationExchangeRecord[] }
 }
 
 /** Version records own source bodies; storage and full-record exports omit the compatibility projection. */
 export function persistedTranslationHistory(history: TranslationHistory): unknown {
-  return { ...history, units: history.units.map(({ source: _source, ...unit }) => unit) }
+  return { ...history, units: history.units.map(unit => { if (isDocumentUnit(unit)) return unit; const { source: _source, ...stored } = unit; return stored }) }
 }
 
 export function appendTranslationEvent(history: TranslationHistory, event: Omit<TranslationEvent, 'order'>): TranslationHistory {
@@ -379,7 +419,7 @@ export function bindTranslationExchangeId(history: TranslationHistory, pendingId
 }
 
 export function recordTranslationResumeStarted(history: TranslationHistory, exchangeId: string, callId: string, contextVersion: number, at: string): TranslationHistory {
-  const exchange = history.exchanges.find(item => item.exchangeId === exchangeId), unit = exchange && history.units.find(item => item.id === exchange.unitId)
+  const exchange = history.exchanges.find(item => item.exchangeId === exchangeId), unit = exchange && history.units.filter(isTextUnit).find(item => item.id === exchange.unitId)
   const revision = unit?.revisions.find(item => item.id === callId), resolution = exchange?.resolutions.at(-1)
   if (!exchange || !unit || !revision || !resolution || resolution.kind !== 'answer' || exchange.status !== 'resuming' || !time(at) ||
     contextVersion !== exchange.contextVersion + 1 || revision.operationId !== exchange.operationId || revision.sourceVersion !== exchange.sourceVersion ||
@@ -404,13 +444,14 @@ function event(history: TranslationHistory, unit: TextUnit, revision: TextRevisi
 }
 function findUnit(history: TranslationHistory, unitId: string): TextUnit {
   const unit = history.units.find(unit => unit.id === unitId)
-  if (!unit) throw new Error('Translation unit unavailable')
+  if (!unit || !isTextUnit(unit)) throw new Error('Text translation unit unavailable')
   return unit
 }
-function replaceUnit(history: TranslationHistory, unit: TextUnit): TranslationHistory { return { ...history, units: history.units.map(old => old.id === unit.id ? unit : old) } }
+function replaceUnit(history: TranslationHistory, unit: TranslationUnit): TranslationHistory { return { ...history, units: history.units.map(old => old.id === unit.id ? unit : old) } }
 function newRevision(history: TranslationHistory, data: NewTextRevision, revisionOrder: number, unitId: string): TextRevision {
   const revision = decodeRevision({ kind: 'machine', baseRevisionId: null, callRecord: null, sourceVersion: 1, ...data, order: revisionOrder }, 3, false)
-  if (!revision || history.units.some(unit => unit.revisions.some(old => old.id === revision.id || (unit.id !== unitId && old.operationId === revision.operationId))) ||
+  if (!revision || history.units.some(unit => isTextUnit(unit) ? unit.revisions.some(old => old.id === revision.id || (unit.id !== unitId && old.operationId === revision.operationId)) :
+    [...unit.chunkRevisions, ...unit.revisions].some(old => old.id === revision.id) || documentOperationIds(unit).includes(revision.operationId)) ||
     history.events.some(event => event.operationId === revision.operationId && event.unitId !== unitId)) throw new Error('Invalid or duplicate translation revision')
   return revision
 }
@@ -423,12 +464,19 @@ function advanceFinal(history: TranslationHistory, unit: TextUnit, at: string, r
   const updated: TextUnit = { ...unit, final: { revisionId: latest.id, selection: 'automatic', selectedAt: at } }
   return event(replaceUnit(history, updated), updated, latest, 'final.selected', at, reason)
 }
+function advanceUnitFinal(history: TranslationHistory, unit: TranslationUnit, at: string, reason: 'advance' | 'export' = 'advance'): TranslationHistory {
+  if (isTextUnit(unit)) return advanceFinal(history, unit, at, reason)
+  const updated = advanceDocumentFinal(unit, at)
+  if (updated === unit) return history
+  const revision = updated.revisions.find(item => item.id === updated.final!.revisionId)!
+  return documentEvent(replaceUnit(history, updated), updated, 'final.selected', at, revision.id, revisionOperationId(updated, revision), reason)
+}
 
 /** Explicit export closes only the last unit; earlier missing finals remain visible. */
 export function finalizeLastUnit(history: TranslationHistory, at: string): TranslationHistory {
   if (!time(at)) throw new Error('Invalid final selection time')
   const unit = history.units.at(-1)
-  return unit ? advanceFinal(history, unit, at, 'export') : history
+  return unit ? advanceUnitFinal(history, unit, at, 'export') : history
 }
 
 /** Editing saves a new complete local fact and leaves the existing final pointer alone. */
@@ -447,7 +495,7 @@ export function appendTextUnit(history: TranslationHistory, data: NewTextUnit, r
     history.units.some(unit => unit.id === data.id)) throw new Error('New text unit requires unique admitted material')
   const unit: TextUnit = { ...data, sourceVersion: 1, sourceVersions: [{ version: 1, text: data.source, createdAt: data.createdAt, operationId: null }], material: null,
     order: history.units.length + 1, revisions: [newRevision(history, revision, 1, data.id)], final: null }
-  let next = history.units.length ? advanceFinal(history, history.units.at(-1)!, revision.updatedAt) : history
+  let next = history.units.length ? advanceUnitFinal(history, history.units.at(-1)!, revision.updatedAt) : history
   next = { ...next, units: [...next.units, unit] }
   return event(next, unit, unit.revisions[0]!, 'operation.accepted', revision.updatedAt)
 }
@@ -463,7 +511,7 @@ export function appendAdmittedTextUnit(history: TranslationHistory, envelope: Tr
     material: { materialId: snapshot.materialId, mainSessionId: envelope.mainSessionId, requestId: envelope.requestId, draftVersion: snapshot.draftVersion,
       model: snapshot.model, maxInputChars: snapshot.maxInputChars }, createdAt: at, revisions: [], final: null }
   const previous = history.units.at(-1)
-  const next = previous ? advanceFinal(history, previous, at) : history
+  const next = previous ? advanceUnitFinal(history, previous, at) : history
   return appendTranslationEvent({ ...next, units: [...next.units, unit] }, { id: `text-event:${next.events.length + 1}`,
     type: 'operation.accepted', at, unitId, revisionId: null, operationId, status: 'submitting', reason: null, sourceVersion: snapshot.sourceVersion })
 }
@@ -533,8 +581,10 @@ export function selectFinalRevision(history: TranslationHistory, unitId: string,
 
 /** Restore facts without reconstructing an executable Host capability or replaying requests. */
 export function restoreTranslationHistory(history: TranslationHistory, at = new Date().toISOString()): TranslationHistory {
+  if (!time(at)) throw new TypeError('Invalid history restoration time')
   let next = history
   for (const admitted of history.events.filter(event => ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null && event.operationId !== null)) {
+    if (!history.units.some(unit => unit.id === admitted.unitId && isTextUnit(unit))) continue
     const unit = findUnit(history, admitted.unitId!)
     if (unit.revisions.some(revision => revision.operationId === admitted.operationId)) continue
     const last = [...history.events].reverse().find(event => event.operationId === admitted.operationId)
@@ -542,13 +592,75 @@ export function restoreTranslationHistory(history: TranslationHistory, at = new 
     next = appendTranslationEvent(next, { id: `text-event:${next.events.length + 1}`, type: 'operation.restored', at,
       unitId: unit.id, revisionId: null, operationId: admitted.operationId, status: 'interrupted', reason: 'restored', sourceVersion: admitted.sourceVersion ?? 1 })
   }
-  for (const unit of history.units) for (const revision of unit.revisions) {
+  for (const unit of history.units) {
+    if (isDocumentUnit(unit)) {
+      const restored = restoreDocumentUnit(unit)
+      if (restored !== unit) next = documentEvent(replaceUnit(next, restored), restored, 'document.restored', at, null, null, 'restored')
+      continue
+    }
+    for (const revision of unit.revisions) {
     if (!['submitting', 'running', 'unknown'].includes(revision.status)) continue
     const updated: TextRevision = { ...revision, status: 'interrupted', message: revision.status === 'unknown'
       ? '重启前执行结果未知，请核对；未自动重发。' : '上次运行已中断，未自动重发。' }
     const current = findUnit(next, unit.id)
     const restored: TextUnit = { ...current, revisions: current.revisions.map(old => old.id === revision.id ? updated : old) }
     next = event(replaceUnit(next, restored), restored, updated, 'operation.restored', at, 'restored')
+    }
   }
+  return next
+}
+
+function documentOperationIds(unit: DocumentUnit): readonly string[] {
+  return [...unit.tasks.map(task => task.operationId), ...unit.plans.map(plan => plan.operationId),
+    ...unit.sourceVersions.flatMap(source => source.operationId === null ? [] : [source.operationId]), ...unit.chunkRevisions.map(chunk => chunk.childOperationId)]
+}
+function revisionOperationId(unit: TranslationUnit, revision: TextRevision | DocumentRevision): string | undefined {
+  return 'operationId' in revision ? revision.operationId : isDocumentUnit(unit) ? unit.tasks.find(task => task.taskId === revision.taskId)?.operationId : undefined
+}
+function documentEvent(history: TranslationHistory, unit: DocumentUnit, type: TranslationEvent['type'], at: string,
+  revisionId: string | null = null, operationId: string | null | undefined = null, reason: TranslationEvent['reason'] = null, sourceVersion = unit.sourceVersion): TranslationHistory {
+  return appendTranslationEvent(history, { id: `text-event:${history.events.length + 1}`, type, at, unitId: unit.id, revisionId,
+    operationId: operationId ?? null, status: null, reason, sourceVersion })
+}
+/** Explicit admitted-document domain entry; ordinary material execution still rejects assets. */
+export function appendDocumentUnit(history: TranslationHistory, data: NewDocumentUnit): TranslationHistory {
+  const old = history.units.find(unit => unit.id === data.id)
+  const unit = createDocumentUnit(data, old?.order ?? history.units.length + 1)
+  if (old) {
+    if (isDocumentUnit(old)) {
+      const { historyCommit: _commit, ...source } = old.sourceVersions[0]!
+      const { historyCommit: _inputCommit, ...inputSource } = unit.sourceVersions[0]!
+      const oldTask = old.tasks.find(task => task.taskId === data.task.taskId)
+      if (old.targetLanguage === unit.targetLanguage && old.instruction === unit.instruction && old.createdAt === unit.createdAt &&
+        JSON.stringify(source) === JSON.stringify(inputSource) && old.preparations.some(item => JSON.stringify(item) === JSON.stringify(data.preparation)) &&
+        old.plans.some(item => JSON.stringify(item) === JSON.stringify(data.plan)) && oldTask &&
+        JSON.stringify({ ...oldTask, status: 'running' }) === JSON.stringify(data.task)) return history
+    }
+    throw new TypeError('Document unit already has different facts')
+  }
+  const previous = history.units.at(-1), advanced = previous ? advanceUnitFinal(history, previous, data.createdAt) : history
+  const next = documentEvent({ ...advanced, units: [...advanced.units, unit] }, unit, 'document.admitted', data.createdAt, null, data.task.operationId)
+  if (!decodeTranslationHistory(persistedTranslationHistory(next))) throw new TypeError('Document identities collide with existing history')
+  return next
+}
+export function applyDocumentMutation(history: TranslationHistory, unitId: string, mutation: DocumentMutation, at: string): TranslationHistory {
+  if (!time(at)) throw new TypeError('Invalid document event time')
+  const unit = history.units.find(item => item.id === unitId)
+  if (!unit || !isDocumentUnit(unit)) throw new TypeError('Document unit unavailable')
+  const updated = reduceDocumentUnit(unit, mutation)
+  if (updated === unit) return history
+  const revision = mutation.kind === 'manifest' ? updated.revisions.find(item => item.id === mutation.revision.id)
+    : mutation.kind === 'final' ? updated.revisions.find(item => item.id === mutation.revisionId) : undefined
+  const operationId = revision ? revisionOperationId(updated, revision) : mutation.kind === 'task' ? mutation.task.operationId
+    : mutation.kind === 'task_update' ? updated.tasks.find(item => item.taskId === mutation.taskId)?.operationId
+    : mutation.kind === 'source' ? mutation.source.operationId : mutation.kind === 'plan' ? mutation.plan.operationId
+    : mutation.kind === 'chunk' ? mutation.revision.childOperationId : mutation.kind === 'chunk_update' ? updated.chunkRevisions.find(item => item.id === mutation.revisionId)?.childOperationId : null
+  const sourceVersion = revision?.sourceVersion ?? (mutation.kind === 'chunk' ? mutation.revision.sourceVersion
+    : mutation.kind === 'chunk_update' ? updated.chunkRevisions.find(item => item.id === mutation.revisionId)!.sourceVersion
+    : mutation.kind === 'task' ? mutation.task.sourceVersion : mutation.kind === 'task_update' ? updated.tasks.find(item => item.taskId === mutation.taskId)!.sourceVersion
+    : mutation.kind === 'plan' ? mutation.plan.sourceVersion : mutation.kind === 'preparation' ? mutation.preparation.sourceVersion : updated.sourceVersion)
+  const next = documentEvent(replaceUnit(history, updated), updated, mutation.kind === 'final' ? 'final.selected' : 'document.updated', at,
+    revision?.id ?? null, operationId, mutation.kind === 'final' ? 'user_selection' : null, sourceVersion)
+  if (!decodeTranslationHistory(persistedTranslationHistory(next))) throw new TypeError('Document mutation conflicts with saved history')
   return next
 }

@@ -9,7 +9,7 @@ import type { LocalSession } from './sessions.js'
 import type { NormalTranslationAcceptance, NormalTranslationUpdate } from '../shared/normal-translation.js'
 import type { NormalTranslationUnitRequest, NormalTranslationSourceCorrection } from '../shared/normal-translation.js'
 import type { NormalTranslationResolution, NormalTranslationV2Event } from '../shared/normal-translation-v2.js'
-import { currentFinalRevision } from './translation-history.js'
+import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import type { NormalTranslationReply } from './normal-translation.js'
 
 export interface TopicBridgeRemotePort {
@@ -269,7 +269,9 @@ export class TopicBridgeClient {
   }
   publishUnit(ownerId: string, sessionId: string, unitId: string): boolean {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
-    const unit = history?.units.find(unit => unit.id === unitId), latest = unit?.revisions.at(-1)
+    const unit = history?.units.find(unit => unit.id === unitId)
+    if (!unit || !isTextUnit(unit)) return false
+    const latest = unit.revisions.at(-1)
     if (this.disposed || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || session.mode !== 'normal' || !unit || !latest || !['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(latest.status)) return false
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
     const final = currentFinalRevision(unit)
@@ -285,7 +287,7 @@ export class TopicBridgeClient {
   private publishAdmittedUnit(ownerId: string, sessionId: string, unitId: string, automatic = true): void {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     const unit = history?.units.find(unit => unit.id === unitId)
-    if (!session || session.ownerId !== ownerId || !unit) return
+    if (!session || session.ownerId !== ownerId || !unit || !isTextUnit(unit)) return
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
     const final = currentFinalRevision(unit)
     const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,

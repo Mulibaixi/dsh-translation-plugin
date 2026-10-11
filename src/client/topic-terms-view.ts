@@ -1,6 +1,8 @@
 import { h, react } from './react.js'
 import { resolveTermEvidence, type TopicTermSnapshot, type TopicTerm, type TopicTermUserInput, type TermMutationResult, type TermEvidenceRef, type TermEvidenceFact } from '../memory/topic-terms.js'
 import type { SessionStore, HistoryStatus } from './session-store.js'
+import { isTextUnit } from './translation-history.js'
+import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 import { buildTopicTermsJsonExport, buildTopicTermsMarkdownExport, type TopicTermsExport, type TopicTermsExportSnapshot } from './topic-terms-export.js'
 
 /** User editing and adoption record real browser actions, separate from model commands. */
@@ -26,12 +28,13 @@ function TermEvidence({ sessions, terms, snapshot, reference }: { readonly sessi
   const candidate = sessions.getSession(reference.sessionId)
   const session = candidate?.ownerId === snapshot.ownerId && candidate.topicId === snapshot.topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
   const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === reference.unitId) : undefined
-  const revision = reference.revisionId && unit?.revisions.find(revision => revision.id === reference.revisionId)
+  const revision = reference.revisionId && unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === reference.revisionId) : undefined
   const body = evidenceBody(terms, snapshot, reference)
-  const title = `${session?.name ?? '已删除会话'} · ${unit ? `文本 ${unit.order}` : '来源不可用'}${revision ? ` · 版本 ${revision.order}` : ''} · ${reference.kind === 'source' ? '原文' : '最终译文'}${reference.role === 'example' ? '（示例）' : ''}`
+  const unloaded = isDocumentEvidenceUnloaded(sessions, snapshot, reference)
+  const title = `${session?.name ?? '已删除会话'} · ${unit ? `${isTextUnit(unit) ? '文本' : '文档'} ${unit.order}` : '来源不可用'}${revision ? ` · 版本 ${revision.order}` : ''} · ${reference.kind === 'source' ? '原文' : '最终译文'}${reference.role === 'example' ? '（示例）' : ''}`
   return h('div', { className: 'dsh-tp-term-evidence' },
     h('span', { className: 'dsh-tp-muted' }, title),
-    h('button', { type: 'button', disabled: body === undefined, 'aria-expanded': open, onClick: () => setOpen(value => !value) }, body === undefined ? '依据已变化或不可用' : open ? '收起来源' : '查看来源'),
+    h('button', { type: 'button', disabled: body === undefined, 'aria-expanded': open, onClick: () => setOpen(value => !value) }, unloaded ? '文档依据尚未加载' : body === undefined ? '依据已变化或不可用' : open ? '收起来源' : '查看来源'),
     open && body !== undefined ? h('div', { className: 'dsh-tp-translation-text' }, body) : null,
   )
 }
@@ -136,7 +139,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
           const candidate = sessions.getSession(ref.sessionId)
           const session = candidate?.ownerId === ownerId && candidate.topicId === topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
           const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined
-          const revision = unit?.revisions.find(revision => revision.id === ref.revisionId)
+          const revision = unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === ref.revisionId) : undefined
           return { entryId: entry.id, evidenceIndex, sessionName: session?.name ?? null, unitOrder: unit?.order ?? null,
             revisionOrder: revision?.order ?? null, readable: evidenceBody(terms, frozen, ref) !== undefined }
         })),

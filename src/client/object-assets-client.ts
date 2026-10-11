@@ -2,7 +2,7 @@ import { parseObjectAssetResult, type ObjectAssetPort, type ObjectAssetResult, t
 import type { RecordObjectReferenceInput, RecordObjectTarget } from '../shared/record-objects.js'
 import type { SessionStore } from './session-store.js'
 import type { RecordObjectStore } from './record-object-store.js'
-import { canEditTextRevision } from './translation-history.js'
+import { canEditTextRevision, isTextUnit } from './translation-history.js'
 
 export type ObjectAssetsRemotePort = { [K in keyof ObjectAssetPort]: (...args: Parameters<ObjectAssetPort[K]>) => Promise<unknown> }
 export interface NativeFileUploadPort {
@@ -29,6 +29,7 @@ export class ObjectAssetsClient {
   private validate(target: RecordObjectTarget, offset: number): void {
     const session = this.sessions.getSession(target.sessionId)
     const unit = this.sessions.getTranslationHistory(target.sessionId)?.units.find(unit => unit.id === target.unitId)
+    if (unit && !isTextUnit(unit)) throw new Error('文档的原件位置关联尚未接通。')
     const revision = unit?.revisions.find(revision => revision.id === target.revisionId)
     const text = target.side === 'source' && target.revisionId === null ? unit?.source : target.side === 'revision' && revision && canEditTextRevision(revision) ? revision.text : undefined
     if (this.disposed || !session || this.sessions.isSessionDeleted(session.id) || session.ownerId !== target.ownerId || session.topicId !== target.topicId || session.archivedAt !== null || text === undefined || !Number.isSafeInteger(offset) || offset < 0 || offset > Array.from(text).length) throw new Error('记录或关联位置已不可用，请重新选择。')

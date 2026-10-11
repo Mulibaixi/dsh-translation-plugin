@@ -3,7 +3,7 @@ import { catalogAllowsRoute, type ModelCatalog } from './models.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession, ModelRoute } from './sessions.js'
 import { appendTextUnit, appendTextRevision, acceptTextRevision, updateTextRevision, selectFinalRevision,
-  appendManualRevision, finalizeLastUnit, type NewTextRevision, type TextUnit } from './translation-history.js'
+  appendManualRevision, finalizeLastUnit, isTextUnit, type NewTextRevision, type TextUnit, type TranslationUnit } from './translation-history.js'
 import type { TranslationCallMetadata } from '../shared/translation-call.js'
 
 export type QuickStatus = 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown'
@@ -72,7 +72,7 @@ export class QuickTranslationClient {
     this.drafts.set(session.id, next); return next.stamp
   }
   getRecords(id: string): readonly QuickRecord[] { return this.records.get(id) ?? [] }
-  getUnits(id: string): readonly TextUnit[] { return this.store.getTranslationHistory(id)?.units ?? [] }
+  getUnits(id: string): readonly TranslationUnit[] { return this.store.getTranslationHistory(id)?.units ?? [] }
   getReadiness(): { readonly status: 'idle' | 'loading' | 'ready' | 'unavailable'; readonly reason: string } { return { status: this.readiness, reason: this.reason } }
   isBusy(id: string): boolean { return this.getRecords(id).some(record => active(record.status) || record.status === 'unknown') }
   blockedReason(session: LocalSession): string | undefined {
@@ -89,6 +89,7 @@ export class QuickTranslationClient {
   retranslateBlockedReason(session: LocalSession, unitId: string): string | undefined {
     const unit = this.getUnits(session.id).find(unit => unit.id === unitId)
     if (!unit) return '该处理单元已不存在。'
+    if (!isTextUnit(unit)) return '整篇文档重译尚未接通。'
     return this.blockedReason({ ...session, input: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction })
   }
   selectFinal(id: string, unitId: string, revisionId: string): boolean {
@@ -108,6 +109,8 @@ export class QuickTranslationClient {
   }
   manualEditBlockedReason(id: string, unitId: string, revisionId: string): string | undefined {
     const session = this.store.getSession(id)
+    const unit = this.getUnits(id).find(unit => unit.id === unitId)
+    if (unit && !isTextUnit(unit)) return '文档译文编辑尚未接通。'
     return session && this.options.canManualEdit?.(session, unitId, revisionId) === false ? '此版本含原件关联，位置只读；暂不支持人工改写。' : undefined
   }
   finalizeForExport(id: string): boolean {
@@ -159,7 +162,7 @@ export class QuickTranslationClient {
     const draft = this.store.getSession(id)
     if (!draft || this.disposed || !this.port || this.retranslateBlockedReason(draft, unitId) || !draft.model) return
     const unit = this.getUnits(id).find(unit => unit.id === unitId)
-    if (unit) await this.start(draft, unit)
+    if (unit && isTextUnit(unit)) await this.start(draft, unit)
   }
   private async start(draft: LocalSession, unit?: TextUnit): Promise<void> {
     if (!this.port || !draft.model) return
@@ -204,7 +207,9 @@ export class QuickTranslationClient {
   private publish(pending: Pending): boolean {
     const record = pending.record
     if (!pending.historyAttached && !record.accepted) return false
-    const old = this.getUnits(record.localSessionId).find(unit => unit.id === record.unitId)?.revisions.find(revision => revision.id === record.id)
+    const unit = this.getUnits(record.localSessionId).find(unit => unit.id === record.unitId)
+    if (unit && !isTextUnit(unit)) return false
+    const old = unit?.revisions.find(revision => revision.id === record.id)
     if (pending.historyAttached && !old) return false
     if (old && old.accepted === record.accepted && old.status === record.status && old.text === record.text && old.message === (record.message ?? null) && JSON.stringify(old.callRecord) === JSON.stringify(record.callRecord)) return true
     const revision = this.revision(record)

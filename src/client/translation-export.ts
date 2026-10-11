@@ -1,11 +1,12 @@
 import type { LocalSession } from './sessions.js'
-import { persistedTranslationHistory, currentFinalRevision, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
+import { persistedTranslationHistory, currentFinalRevision, isTextUnit, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
 import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION, NORMAL_SYSTEM_PROMPT, NORMAL_TRANSLATION_PROMPT_VERSION } from '../shared/translation-call.js'
 
 export interface MissingTextUnit {
   readonly unitId: string
   readonly order: number
   readonly latestStatus: TextRevisionStatus | null
+  readonly reason?: 'document_not_supported'
 }
 export interface TranslationExport {
   readonly content: string | null
@@ -42,10 +43,20 @@ interface BilingualTextUnit {
   readonly status: 'final' | 'missing'
   readonly translation: string | null
 }
+interface UnsupportedDocumentUnit {
+  readonly kind: 'document'; readonly unitId: string; readonly order: number; readonly sourceVersion: number
+  readonly targetLanguage: string; readonly status: 'unsupported'; readonly reason: 'document_not_supported'
+}
 
-function finalSummary(history: TranslationHistory): { texts: string[]; units: BilingualTextUnit[]; missingUnits: MissingTextUnit[]; exportedUnitIds: string[] } {
-  const texts: string[] = [], units: BilingualTextUnit[] = [], missingUnits: MissingTextUnit[] = [], exportedUnitIds: string[] = []
+function finalSummary(history: TranslationHistory): { texts: string[]; units: (BilingualTextUnit | UnsupportedDocumentUnit)[]; missingUnits: MissingTextUnit[]; exportedUnitIds: string[] } {
+  const texts: string[] = [], units: (BilingualTextUnit | UnsupportedDocumentUnit)[] = [], missingUnits: MissingTextUnit[] = [], exportedUnitIds: string[] = []
   for (const unit of [...history.units].sort((a, b) => a.order - b.order)) {
+    if (!isTextUnit(unit)) {
+      units.push({ kind: 'document', unitId: unit.id, order: unit.order, sourceVersion: unit.sourceVersion,
+        targetLanguage: unit.targetLanguage, status: 'unsupported', reason: 'document_not_supported' })
+      missingUnits.push({ unitId: unit.id, order: unit.order, latestStatus: null, reason: 'document_not_supported' })
+      continue
+    }
     const revision = currentFinalRevision(unit)
     const translation = revision?.text ?? null
     units.push({ unitId: unit.id, order: unit.order, source: unit.source, targetLanguage: unit.targetLanguage,
@@ -124,8 +135,8 @@ export function buildTopicBilingualExport(topic: TranslationExportTopic, entries
 /** Browser facts and safe call fields, not Host capabilities or full provider configuration. */
 export function buildFullRecordExport(session: LocalSession, history: TranslationHistory, exportedAt: string): TranslationExport {
   const { missingUnits, exportedUnitIds } = finalSummary(history), complete = missingUnits.length === 0
-  const hasKnownPrompt = history.units.some(unit => unit.revisions.some(revision => revision.callRecord?.promptVersion === TRANSLATION_PROMPT_VERSION))
-  const hasNormalPrompt = history.units.some(unit => unit.revisions.some(revision => revision.callRecord?.promptVersion === NORMAL_TRANSLATION_PROMPT_VERSION))
+  const hasKnownPrompt = history.units.some(unit => isTextUnit(unit) && unit.revisions.some(revision => revision.callRecord?.promptVersion === TRANSLATION_PROMPT_VERSION))
+  const hasNormalPrompt = history.units.some(unit => isTextUnit(unit) && unit.revisions.some(revision => revision.callRecord?.promptVersion === NORMAL_TRANSLATION_PROMPT_VERSION))
   const promptDefinitions = [...(hasKnownPrompt ? [{ promptVersion: TRANSLATION_PROMPT_VERSION, systemPrompt: QUICK_SYSTEM_PROMPT,
     userMessageFields: { target_language: 'unit.targetLanguage', translation_requirements: 'unit.instruction', source_text: 'unit.sourceVersions[revision.sourceVersion-1].text' } }] : []),
     ...(hasNormalPrompt ? [{ promptVersion: NORMAL_TRANSLATION_PROMPT_VERSION, systemPrompt: NORMAL_SYSTEM_PROMPT, userMessageFields: {

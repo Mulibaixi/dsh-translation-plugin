@@ -1,10 +1,12 @@
 import {
-  emptyTopicTerms, decodeTopicTermSnapshot, decodeTopicTermUserInput, putTopicTerm, putUserTopicTerm, adoptTopicTerm, disableTopicTerm, reconcileTopicTerms, queryTopicTerms,
-  type TopicTermSnapshot, type TopicTermPut, type TopicTermUserInput, type TopicTermUserPut, type TermMutationResult, type TermEvidenceFact, type TopicTermQuery,
+  emptyTopicTerms, decodeTopicTermSnapshot, decodeTopicTermUserInput, putTopicTerm, putUserTopicTerm, adoptTopicTerm, disableTopicTerm, reconcileTopicTerms, queryTopicTerms, resolveTermEvidence,
+  type TopicTermSnapshot, type TopicTermPut, type TopicTermUserInput, type TopicTermUserPut, type TermMutationResult, type TermEvidenceFact, type TopicTermQuery, type TermEvidenceRef,
 } from '../memory/topic-terms.js'
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryVersion, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
+import { isTextUnit } from './translation-history.js'
+import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 
 export const TOPIC_TERMS_PREFIX = 'dsh-translation-plugin:topic-terms:v1:'
 export function topicTermsKey(topicId: string): string { return `${TOPIC_TERMS_PREFIX}${encodeURIComponent(topicId)}` }
@@ -63,7 +65,7 @@ export class TopicMemoryStore {
           const raw = this.storage.getItem(key), snapshot = raw === null ? undefined : decodeTopicTermSnapshot(JSON.parse(raw))
           if (!snapshot || topicTermsKey(snapshot.topicId) !== key) throw new Error('invalid snapshot')
           if (this.sessions.getTopics().some(topic => topic.id === snapshot.topicId) && !this.sessions.getTopics(snapshot.ownerId).some(topic => topic.id === snapshot.topicId)) throw new Error('topic owner mismatch')
-          const current = reconcileTopicTerms(snapshot, (sessionId, unitId) => this.readEvidence(sessionId, unitId), now())
+          const current = this.reconcile(snapshot)
           this.seats.set(snapshot.topicId, { snapshot: current, stored: raw, dirty: current !== snapshot, status: current === snapshot ? 'saved' : 'memory' })
         } catch { this.notice = '部分主题术语无法读取，原副本已保留。' }
       }
@@ -79,11 +81,19 @@ export class TopicMemoryStore {
     this.seats.set(topicId, seat); return seat
   }
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot { return this.seat(ownerId, topicId).snapshot }
+  readEvidenceAvailability(ownerId: string, topicId: string, ref: TermEvidenceRef): 'ready' | 'unloaded' | 'unavailable' {
+    if (isDocumentEvidenceUnloaded(this.sessions, { ownerId, topicId }, ref)) return 'unloaded'
+    return resolveTermEvidence({ ownerId, topicId }, ref, (sessionId, unitId) => this.readEvidence(sessionId, unitId)) !== undefined ? 'ready' : 'unavailable'
+  }
+  private reconcile(snapshot: TopicTermSnapshot): TopicTermSnapshot {
+    return reconcileTopicTerms(snapshot, (sessionId, unitId) => this.readEvidence(sessionId, unitId), now(),
+      ref => isDocumentEvidenceUnloaded(this.sessions, snapshot, ref))
+  }
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     if (!session || !history || this.sessions.isSessionDeleted(sessionId) || this.sessions.getStatus(sessionId) === 'conflict') return undefined
     const unit = history.units.find(unit => unit.id === unitId)
-    if (!unit) return undefined
+    if (!unit || !isTextUnit(unit)) return undefined
     const revision = unit.final && unit.revisions.find(revision => revision.id === unit.final?.revisionId)
     const event = [...history.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
     return { ownerId: session.ownerId, topicId: session.topicId, sourceVersion: unit.sourceVersion, source: unit.source,
@@ -140,7 +150,7 @@ export class TopicMemoryStore {
     this.enabled = enabled
     let changed = false
     for (const seat of this.seats.values()) {
-      const next = reconcileTopicTerms(seat.snapshot, (sessionId, unitId) => this.readEvidence(sessionId, unitId), now())
+      const next = this.reconcile(seat.snapshot)
       const invalidated = next !== seat.snapshot
       if (invalidated) { seat.snapshot = next; seat.dirty = true; if (seat.status !== 'conflict') seat.status = 'memory'; changed = true }
       if (enabled && (justEnabled || invalidated) && seat.dirty && seat.status !== 'conflict') this.queuePersist(seat)
@@ -184,7 +194,7 @@ export class TopicMemoryStore {
       const raw = this.storage?.getItem(topicTermsKey(topicId)) ?? null
       const parsed = raw === null ? emptyTopicTerms(ownerId, topicId, now()) : decodeTopicTermSnapshot(JSON.parse(raw))
       if (!parsed || parsed.ownerId !== ownerId || parsed.topicId !== topicId) throw new Error('invalid topic terms')
-      seat.snapshot = reconcileTopicTerms(parsed, (sessionId, unitId) => this.readEvidence(sessionId, unitId), now())
+      seat.snapshot = this.reconcile(parsed)
       seat.stored = raw; seat.dirty = parsed !== seat.snapshot; seat.status = seat.dirty ? 'memory' : 'saved'; this.notice = undefined; this.emit(); return true
     } catch { seat.status = 'conflict'; this.notice = '最新主题术语无法读取，当前内容保留。'; this.emit(); return false }
   }

@@ -7,6 +7,7 @@ import type { TermEvidenceResolver } from '../memory/topic-terms.js'
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
+import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 
 export const TOPIC_ARCHIVE_PREFIX = 'dsh-translation-plugin:topic-archive:v1:'
 export function topicArchiveKey(topicId: string): string { return `${TOPIC_ARCHIVE_PREFIX}${encodeURIComponent(topicId)}` }
@@ -59,7 +60,7 @@ export class TopicArchiveStore {
           const raw = this.storage.getItem(key), snapshot = raw === null ? undefined : decodeTopicArchiveSnapshot(JSON.parse(raw))
           if (!snapshot || topicArchiveKey(snapshot.topicId) !== key) throw new Error('invalid snapshot')
           if (this.sessions.getTopics().some(topic => topic.id === snapshot.topicId) && !this.sessions.getTopics(snapshot.ownerId).some(topic => topic.id === snapshot.topicId)) throw new Error('topic owner mismatch')
-          const current = reconcileTopicArchive(snapshot, this.resolver, now())
+          const current = this.reconcile(snapshot)
           this.seats.set(snapshot.topicId, { snapshot: current, stored: raw, dirty: current !== snapshot, status: current === snapshot ? 'saved' : 'memory' })
         } catch { this.notice = '部分主题档案无法读取，原副本已保留。' }
       }
@@ -78,6 +79,9 @@ export class TopicArchiveStore {
     this.seats.set(topicId, seat); return seat
   }
   getSnapshot(ownerId: string, topicId: string): TopicArchiveSnapshot { return this.seat(ownerId, topicId).snapshot }
+  private reconcile(snapshot: TopicArchiveSnapshot): TopicArchiveSnapshot {
+    return reconcileTopicArchive(snapshot, this.resolver, now(), ref => isDocumentEvidenceUnloaded(this.sessions, snapshot, ref))
+  }
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot {
     const seat = this.seat(ownerId, topicId)
     return { ...seat.snapshot, entries: seat.status === 'conflict' ? [] : queryTopicArchive(seat.snapshot, { ...query, ownerId, topicId }, this.resolver) }
@@ -127,7 +131,7 @@ export class TopicArchiveStore {
     this.enabled = enabled
     let changed = false
     for (const seat of this.seats.values()) {
-      const next = reconcileTopicArchive(seat.snapshot, this.resolver, now()), invalidated = next !== seat.snapshot
+      const next = this.reconcile(seat.snapshot), invalidated = next !== seat.snapshot
       if (invalidated) { seat.snapshot = next; seat.dirty = true; if (seat.status !== 'conflict') seat.status = 'memory'; changed = true }
       if (enabled && (justEnabled || invalidated) && seat.dirty && seat.status !== 'conflict') this.queuePersist(seat)
     }
@@ -172,7 +176,7 @@ export class TopicArchiveStore {
     try {
       const raw = this.storage?.getItem(topicArchiveKey(topicId)) ?? null, parsed = raw === null ? emptyTopicArchive(ownerId, topicId, now()) : decodeTopicArchiveSnapshot(JSON.parse(raw))
       if (!parsed || parsed.ownerId !== ownerId || parsed.topicId !== topicId) throw new Error('invalid topic archive')
-      seat.snapshot = reconcileTopicArchive(parsed, this.resolver, now()); seat.stored = raw; seat.dirty = parsed !== seat.snapshot
+      seat.snapshot = this.reconcile(parsed); seat.stored = raw; seat.dirty = parsed !== seat.snapshot
       seat.status = seat.dirty ? 'memory' : raw === null ? 'memory' : 'saved'; this.notice = undefined
       this.emit(); return true
     } catch { seat.status = 'conflict'; this.notice = '最新主题档案无法读取，当前内容保留。'; this.emit(); return false }

@@ -8,6 +8,7 @@ import type { QuickTranslationClient } from './quick-translation.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
 import type { TopicTerm, TopicTermSnapshot } from '../memory/topic-terms.js'
 import { resolveTermEvidence, type TermEvidenceRef } from '../memory/topic-terms.js'
+import { isTextUnit } from './translation-history.js'
 import { buildTopicArchiveJsonExport, buildTopicArchiveMarkdownExport, type TopicArchiveExportSnapshot } from './topic-archive-export.js'
 import type { TopicArchiveStore } from './topic-archive-store.js'
 import { TopicArchiveView } from './topic-archive-view.js'
@@ -86,7 +87,7 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
           const candidate = store.getSession(ref.sessionId)
           const session = candidate?.ownerId === ownerId && candidate.topicId === topicId && !store.isSessionDeleted(candidate.id) ? candidate : undefined
           const unit = session ? store.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined
-          const revision = unit?.revisions.find(revision => revision.id === ref.revisionId)
+          const revision = unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === ref.revisionId) : undefined
           return { entryId: entry.id, evidenceIndex, sessionName: session?.name ?? null, unitOrder: unit?.order ?? null, revisionOrder: revision?.order ?? null,
             readable: resolveTermEvidence(snapshot, ref, (sessionId, unitId) => terms.readEvidence(sessionId, unitId)) !== undefined }
         }))

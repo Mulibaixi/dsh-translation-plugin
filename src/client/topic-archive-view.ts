@@ -4,6 +4,8 @@ import type { TopicArchiveEntry, TopicArchiveKind, TopicArchiveSnapshot, TopicAr
 import type { TopicArchiveStore } from './topic-archive-store.js'
 import type { SessionStore } from './session-store.js'
 import type { TopicTermsViewPort } from './topic-terms-view.js'
+import { isTextUnit } from './translation-history.js'
+import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 
 const kinds = { entity: '实体', fact: '事实', relation: '关系' } as const
 const statuses = { proposal: '待确认', active: '生效', review_required: '待复核', disabled: '已停用' } as const
@@ -51,11 +53,12 @@ function ArchiveEvidence({ sessions, terms, snapshot, reference }: { readonly se
   const [open, setOpen] = react.useState(false), candidate = sessions.getSession(reference.sessionId)
   const session = candidate?.ownerId === snapshot.ownerId && candidate.topicId === snapshot.topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
   const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === reference.unitId) : undefined
-  const revision = unit?.revisions.find(revision => revision.id === reference.revisionId)
+  const revision = unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === reference.revisionId) : undefined
   const body = resolveTermEvidence(snapshot, reference, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
+  const unloaded = isDocumentEvidenceUnloaded(sessions, snapshot, reference)
   return h('div', { className: 'dsh-tp-term-evidence' },
-    h('span', { className: 'dsh-tp-muted' }, `${session?.name ?? '已删除会话'} · ${unit ? `文本 ${unit.order}` : '来源不可用'}${revision ? ` · 版本 ${revision.order}` : ''} · ${reference.kind === 'source' ? '原文' : '最终译文'}${reference.role === 'example' ? '（示例）' : ''}`),
-    h('button', { type: 'button', disabled: body === undefined, 'aria-expanded': open, onClick: () => setOpen(value => !value) }, body === undefined ? '依据已变化或不可用' : open ? '收起来源' : '查看来源'),
+    h('span', { className: 'dsh-tp-muted' }, `${session?.name ?? '已删除会话'} · ${unit ? `${isTextUnit(unit) ? '文本' : '文档'} ${unit.order}` : '来源不可用'}${revision ? ` · 版本 ${revision.order}` : ''} · ${reference.kind === 'source' ? '原文' : '最终译文'}${reference.role === 'example' ? '（示例）' : ''}`),
+    h('button', { type: 'button', disabled: body === undefined, 'aria-expanded': open, onClick: () => setOpen(value => !value) }, unloaded ? '文档依据尚未加载' : body === undefined ? '依据已变化或不可用' : open ? '收起来源' : '查看来源'),
     open && body !== undefined ? h('div', { className: 'dsh-tp-translation-text' }, body) : null)
 }
 

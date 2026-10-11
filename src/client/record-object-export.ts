@@ -1,5 +1,5 @@
 import type { RecordObjectReference } from '../shared/record-objects.js'
-import { currentFinalRevision } from './translation-history.js'
+import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import { projectRecordObjects } from './record-object-projection.js'
 import { buildBilingualExport, buildFinalTextExport, buildTopicBilingualExport, buildTopicFinalTextExport, type TranslationExportTopic, type TranslationExportSession, type TopicTranslationExport } from './translation-export.js'
 
@@ -28,6 +28,6 @@ export function buildRecordObjectExport(request: RecordObjectExportRequest, allo
     }))
     return { ...result, content: texts.join('\n\n') }
   }
-  const included = refs.filter(ref => entries.some(({ session, history }) => session.ownerId === ref.ownerId && session.topicId === ref.topicId && session.id === ref.sessionId && history.units.some(unit => unit.id === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : currentFinalRevision(unit)?.id === ref.revisionId))))
+  const included = refs.filter(ref => entries.some(({ session, history }) => session.ownerId === ref.ownerId && session.topicId === ref.topicId && session.id === ref.sessionId && history.units.some(unit => isTextUnit(unit) && unit.id === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : currentFinalRevision(unit)?.id === ref.revisionId))))
   return included.length ? { ...result, content: JSON.stringify({ ...JSON.parse(result.content), schemaVersion: 2, objectReferences: included }, null, 2) } : result
 }

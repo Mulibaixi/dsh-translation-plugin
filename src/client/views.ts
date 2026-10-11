@@ -3,7 +3,8 @@ import { h, react } from './react.js'
 import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
-import { currentFinalRevision, type TextUnit, type TextRevision } from './translation-history.js'
+import { currentFinalRevision, isTextUnit, type TextUnit, type TextRevision } from './translation-history.js'
+import { DocumentUnitSummary } from './document-unit-view.js'
 import { type TranslationExport, type TranslationExportTopic, type TranslationExportSession } from './translation-export.js'
 import { buildRecordObjectExport, recordObjectPlainText } from './record-object-export.js'
 import type { RecordObjectReference } from '../shared/record-objects.js'
@@ -456,7 +457,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const status = current ? store.getStatus(current.id) : 'memory'
   const records = current ? quick.getRecords(current.id) : []
   const units = current ? quick.getUnits(current.id) : []
-  const represented = new Set(units.flatMap(unit => unit.revisions.map(revision => revision.operationId)))
+  const represented = new Set(units.flatMap(unit => isTextUnit(unit) ? unit.revisions.map(revision => revision.operationId) : unit.tasks.map(task => task.operationId)))
   const transient = records.filter(record => !represented.has(record.id))
   const historyNote = store.getSettings().rememberHistory ? undefined
     : store.getHistory().length ? '已保存的历史保留；后续内容仅保留在本次运行。' : '本次内容仅保留在本次运行。'
@@ -562,7 +563,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         historyNote && (units.length || records.length) ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
-        ...units.map(unit => h(TranslationUnit, { key: unit.id, store, unit, quick, normal, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined })),
+        ...units.map(unit => isTextUnit(unit) ? h(TranslationUnit, { key: unit.id, store, unit, quick, normal, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined }) : h(DocumentUnitSummary, { key: unit.id, unit })),
         ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
         units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),
@@ -571,7 +572,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       exportNotice ? h('div', { role: exportNotice.failure ? 'alert' : 'status', className: exportNotice.failure ? 'dsh-tp-message' : 'dsh-tp-muted dsh-tp-message' }, exportNotice.message) : null,
       exportRequest ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '导出译文确认' },
         h('h3', null, `导出${exportRequest.scope === 'topic' ? '主题' : '会话'}「${exportRequest.scope === 'topic' ? exportRequest.topic.topicName : exportRequest.entries[0]!.session.name}」`),
-        h('p', null, `尚无最终译文：${exportRequest.result.missingUnits.map(unit => `${exportRequest.scope === 'topic' && 'sessionName' in unit ? `${unit.sessionName} · ` : ''}文本 ${unit.order}`).join('、')}。`),
+        h('p', null, `尚不能导出：${exportRequest.result.missingUnits.map(unit => `${exportRequest.scope === 'topic' && 'sessionName' in unit ? `${unit.sessionName} · ` : ''}${unit.reason === 'document_not_supported' ? `文档 ${unit.order}（整篇导出尚未接通）` : `文本 ${unit.order}（尚无最终译文）`}`).join('、')}。`),
         h('div', { className: 'dsh-tp-actions' },
           button('仅导出已定稿', () => deliver(projectTranslationExport(exportRequest, true)), exportRequest.result.exportedUnitIds.length === 0),
           button('取消', () => { closeSessionMenus(); setExportRequest(undefined) }),

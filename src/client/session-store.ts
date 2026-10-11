@@ -5,7 +5,10 @@ import {
 } from './sessions.js'
 import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKey, encodeModelPreference, decodeModelPreference } from './model-preferences.js'
 import { SESSION_ORDER_PREFIX, sessionOrderKey, encodeSessionOrder, decodeSessionOrder, reconcileSessionOrder, moveSessionOrder } from './session-order.js'
-import { decodeTranslationHistory, emptyTranslationHistory, persistedTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
+import { decodeTranslationHistory, emptyTranslationHistory, isDocumentUnit, persistedTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
+import { parseTranslationSourceReference, parseTranslationSourceStorageRequest, type TranslationSourceQueryReference, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
+import type { TranslationSourceScope } from '../shared/translation-sources.js'
+import type { TranslationSourceHistoryCallbacks, TranslationSourceHistoryCommit } from './source-storage-client.js'
 import {
   DELETED_SESSION_PREFIX, TOPIC_IDENTITY_PREFIX, TOPIC_NAME_PREFIX, TOPIC_LOCK_NAME,
   decodeDeletion, decodeTopicIdentity, decodeTopicName, deletedSessionKey, topicIdentityKey, topicNameKey,
@@ -26,6 +29,7 @@ interface Seat { session: LocalSession; savedSession: LocalSession | undefined; 
 interface TopicSeat { identity: TopicIdentity; name: string; persistedName: string | undefined; stored: string | null; durable: boolean; nameDirty: boolean }
 interface Workspace { active: string | undefined }
 export interface HistoryVersion { readonly id: string; readonly stored: string | null; readonly legacyRaw: string | null; readonly current: string }
+export interface SourceHistoryTarget { readonly sessionId: string; readonly unitId: string; readonly sourceVersion: number }
 export interface StructureLockPort { request<T>(name: string, action: () => T | Promise<T>): Promise<T> }
 export type SessionManagementResult =
   | { readonly ok: true; readonly sessions: readonly LocalSession[]; readonly persistence: TopicPersistence }
@@ -46,8 +50,8 @@ interface SessionSnapshot { readonly session: LocalSession; readonly translation
 function readSnapshot(raw: string): SessionSnapshot | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
-    const hasTranslations = [4, 5, 6, 7, 8, 9].includes(value.schemaVersion as number)
+    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    const hasTranslations = [4, 5, 6, 7, 8, 9, 10].includes(value.schemaVersion as number)
     const fields = hasTranslations ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
     if (Object.keys(value).length !== fields.length || fields.some(key => !Object.hasOwn(value, key))) return undefined
     if (hasTranslations && (value.translationHistory as { schemaVersion?: unknown } | null)?.schemaVersion !== (value.schemaVersion as number) - 3) return undefined
@@ -86,6 +90,93 @@ export class SessionStore {
   getSession(id: string): LocalSession | undefined { return this.seats.get(id)?.session }
   isSessionDeleted(id: string): boolean { return this.isDeleted(id) }
   getTranslationHistory(id: string): TranslationHistory | undefined { return this.seats.get(id)?.translationHistory }
+  /** Bind storage acknowledgments to an existing document source; this never admits a task. */
+  createSourceHistoryCallbacks(target: SourceHistoryTarget): TranslationSourceHistoryCallbacks {
+    const fixed = { ...target }, session = this.getSession(fixed.sessionId)
+    if (!session || !Number.isSafeInteger(fixed.sourceVersion) || fixed.sourceVersion < 1) throw new Error('Document source history target is unavailable')
+    const scope: TranslationSourceScope = { ownerId: session.ownerId, mainSessionId: session.ownerId, topicId: session.topicId, translationSessionId: session.id }
+    this.sourceHistoryVersion(fixed, scope)
+    return {
+      isHistoryEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
+      persistPreparedReference: async (value, confirmOperationId) => {
+        const reference = parseTranslationSourceReference(value)
+        if (reference.state !== 'prepared') throw new Error('History requires a prepared source reference')
+        parseTranslationSourceStorageRequest('confirmReference', { scope: reference.scope, referenceKey: reference.referenceKey,
+          prepareToken: reference.prepareToken, historyToken: 'validation', operationId: confirmOperationId })
+        const result = await this.withStructureLock<TranslationSourceHistoryCommit | undefined>(undefined, () => {
+          if (this.disposed || !this.storage || !this.readSettings() || !this.settings.rememberHistory) return undefined
+          const source = this.sourceHistoryVersion(fixed, scope)
+          if (JSON.stringify(reference.scope) !== JSON.stringify(scope) || JSON.stringify(reference.source) !== JSON.stringify(source.body.reference)) throw new Error('Prepared reference does not match the document source')
+          const query = { scope, referenceKey: reference.referenceKey }, retained = this.readSourceHistoryCommit(fixed, scope, query)
+          if (retained) {
+            if (JSON.stringify(retained.reference) !== JSON.stringify(reference) || retained.confirmOperationId !== confirmOperationId) throw new Error('Document source commit already has different credentials')
+            return retained
+          }
+          const seat = this.seats.get(fixed.sessionId)!, topic = this.topics.get(scope.topicId)
+          if (!topic) throw new Error('Document source topic is unavailable')
+          for (const unit of seat.translationHistory.units) if (isDocumentUnit(unit)) for (const version of unit.sourceVersions) {
+            if (version.historyCommit?.reference.referenceKey === reference.referenceKey && (unit.id !== fixed.unitId || version.version !== fixed.sourceVersion)) throw new Error('Source reference key already belongs to another document source')
+          }
+          const commit: TranslationSourceHistoryCommit = source.historyCommit ?? { reference,
+            historyToken: `source-history:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`, confirmOperationId }
+          if (JSON.stringify(commit.reference) !== JSON.stringify(reference) || commit.confirmOperationId !== confirmOperationId) throw new Error('Document source commit already has different credentials')
+          const history = decodeTranslationHistory({ ...seat.translationHistory, units: seat.translationHistory.units.map(unit =>
+            unit.id === fixed.unitId && isDocumentUnit(unit) ? { ...unit, sourceVersions: unit.sourceVersions.map(version =>
+              version.version === fixed.sourceVersion ? { ...version, historyCommit: commit } : version) } : unit) })
+          if (!history) throw new Error('Invalid document source history commit')
+          seat.translationHistory = history; seat.session = { ...seat.session, updatedAt: new Date().toISOString() }
+          if (seat.status !== 'conflict') seat.status = 'memory'
+          this.writeIdentity(topic); this.writeTopicName(topic); this.adoptTopic(seat)
+          if (!this.persistLocked(fixed.sessionId)) return undefined
+          const saved = this.readSourceHistoryCommit(fixed, scope, query)
+          if (!saved || saved.historyToken !== commit.historyToken || saved.confirmOperationId !== commit.confirmOperationId ||
+            JSON.stringify(saved.reference) !== JSON.stringify(commit.reference)) throw new Error('Document source commit read-back failed')
+          this.notice = undefined; this.emit(); return saved
+        })
+        if (!result) { this.emit(); throw new Error('Document source history was not saved') }
+        return result
+      },
+      readPersistedReference: async request => this.readSourceHistoryCommit(fixed, scope, request),
+    }
+  }
+  /** Verified persisted credentials for an explicit restore/open request; no automatic restoration. */
+  async readStoredSourceRequest(target: SourceHistoryTarget): Promise<TranslationSourceStoredRead | null> {
+    const session = this.getSession(target.sessionId)
+    if (!session) return null
+    const scope: TranslationSourceScope = { ownerId: session.ownerId, mainSessionId: session.ownerId, topicId: session.topicId, translationSessionId: session.id }
+    const source = this.sourceHistoryVersion(target, scope), key = source.historyCommit?.reference.referenceKey
+    if (!key) return null
+    const commit = this.readSourceHistoryCommit(target, scope, { scope, referenceKey: key })
+    return commit ? { scope: commit.reference.scope, referenceKey: commit.reference.referenceKey, source: commit.reference.source, historyToken: commit.historyToken } : null
+  }
+  private sourceHistoryVersion(target: SourceHistoryTarget, scope: TranslationSourceScope) {
+    const seat = this.seats.get(target.sessionId), session = seat?.session, unit = seat?.translationHistory.units.find(unit => unit.id === target.unitId)
+    if (this.disposed || !session || this.isDeleted(session.id) || session.ownerId !== scope.ownerId || scope.mainSessionId !== session.ownerId ||
+      session.topicId !== scope.topicId || session.id !== scope.translationSessionId || !unit || !isDocumentUnit(unit)) throw new Error('Document source history scope is unavailable')
+    const source = unit.sourceVersions.find(version => version.version === target.sourceVersion)
+    if (!source || source.body.kind !== 'asset') throw new Error('Document asset source version is unavailable')
+    return { ...source, body: source.body }
+  }
+  private readSourceHistoryCommit(target: SourceHistoryTarget, scope: TranslationSourceScope, value: TranslationSourceQueryReference): TranslationSourceHistoryCommit | null {
+    const query = parseTranslationSourceStorageRequest('queryReference', value) as TranslationSourceQueryReference
+    if (JSON.stringify(query.scope) !== JSON.stringify(scope)) throw new Error('Document source query is outside the bound scope')
+    const current = this.sourceHistoryVersion(target, scope)
+    if (!this.storage) throw new Error('History storage is unavailable')
+    const raw = this.storage.getItem(historyKey(target.sessionId))
+    if (raw === null) return null
+    const snapshot = readSnapshot(raw), session = snapshot?.session, unit = snapshot?.translationHistory.units.find(unit => unit.id === target.unitId)
+    if (!session || session.id !== target.sessionId || session.ownerId !== scope.ownerId || session.topicId !== scope.topicId ||
+      !this.matchesHistoryIdentity(session, this.seats.get(target.sessionId)!.session)) throw new Error('Persisted document source scope is unavailable')
+    if (!unit) return null
+    if (!isDocumentUnit(unit)) throw new Error('Persisted source target is not a document')
+    const source = unit.sourceVersions.find(version => version.version === target.sourceVersion)
+    if (!source) return null
+    if (source.body.kind !== 'asset' || JSON.stringify(source.body.reference) !== JSON.stringify(current.body.reference)) throw new Error('Persisted document source version does not match')
+    const commit = source.historyCommit
+    if (!commit) return null
+    if (JSON.stringify(commit.reference.scope) !== JSON.stringify(scope) || commit.reference.referenceKey !== query.referenceKey) throw new Error('Persisted document source credentials do not match')
+    return structuredClone(commit)
+  }
   getStatus(id: string): HistoryStatus { return this.seats.get(id)?.status ?? 'memory' }
   getStructureCapability(): 'web-locks' | 'runtime-only' { return this.storage && this.locks ? 'web-locks' : 'runtime-only' }
   getTopics(ownerId?: string): readonly { readonly id: string; readonly name: string; readonly nextSequence: number }[] {
@@ -815,9 +906,10 @@ export class SessionStore {
         seat.status = 'conflict'; this.notice = '会话历史已在其他窗口修改或删除，当前输入保留。请选择读取本地副本或明确覆盖。'; return false
       }
       const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
-      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 9 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
+      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 10 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
         ...(hasTranslations ? { translationHistory: persistedTranslationHistory(seat.translationHistory) } : {}) })
       this.storage.setItem(historyKey(id), serialized)
+      if (this.storage.getItem(historyKey(id)) !== serialized) throw new Error('history read-back failed')
       seat.stored = serialized; seat.savedSession = seat.session; seat.savedTranslationHistory = seat.translationHistory; seat.status = 'saved'
       return true
     } catch { seat.status = 'error'; this.notice = '会话历史保存失败，当前输入仍保留在窗口内存中。'; return false }

@@ -112,16 +112,16 @@ export function emptyTopicArchive(ownerId: string, topicId: string, at: string):
 export function referencedEntityIds(value: TopicArchiveSemantic): readonly string[] {
   return value.kind === 'entity' ? [] : value.kind === 'fact' ? value.entityIds : [...new Set([value.sourceEntityId, value.targetEntityId])]
 }
-function validBasis(snapshot: TopicArchiveSnapshot, entry: TopicArchiveContent, resolver: TermEvidenceResolver): boolean {
-  return sourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined)
+function validBasis(snapshot: TopicArchiveSnapshot, entry: TopicArchiveContent, resolver: TermEvidenceResolver, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
+  return sourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined || isUnloaded(ref))
 }
-function effectiveOwn(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver): boolean {
-  return entry.status === 'active' && (entry.origin === 'user_explicit' || (entry.origin === 'source_checked' && validBasis(snapshot, entry, resolver)))
+function effectiveOwn(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
+  return entry.status === 'active' && (entry.origin === 'user_explicit' || (entry.origin === 'source_checked' && validBasis(snapshot, entry, resolver, isUnloaded)))
 }
-function validReferences(snapshot: TopicArchiveSnapshot, value: TopicArchiveSemantic, resolver: TermEvidenceResolver, active: boolean): boolean {
+function validReferences(snapshot: TopicArchiveSnapshot, value: TopicArchiveSemantic, resolver: TermEvidenceResolver, active: boolean, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
   return referencedEntityIds(value).every(id => {
     const entity = snapshot.entries.find(entry => entry.id === id)
-    return entity?.kind === 'entity' && (!active || effectiveOwn(snapshot, entity, resolver))
+    return entity?.kind === 'entity' && (!active || effectiveOwn(snapshot, entity, resolver, isUnloaded))
   })
 }
 function effective(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver): boolean { return effectiveOwn(snapshot, entry, resolver) && validReferences(snapshot, entry, resolver, true) }
@@ -198,18 +198,19 @@ export function deleteTopicArchiveEntry(snapshot: TopicArchiveSnapshot, id: stri
   return result(old.kind === 'entity' ? reviewDependents(next, id, at) : next, 'updated', null)
 }
 /** A changed final basis never silently revives. User examples do not govern independent adoption. */
-export function reconcileTopicArchive(snapshot: TopicArchiveSnapshot, resolver: TermEvidenceResolver, at: string): TopicArchiveSnapshot {
+export function reconcileTopicArchive(snapshot: TopicArchiveSnapshot, resolver: TermEvidenceResolver, at: string,
+  isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): TopicArchiveSnapshot {
   if (!time(at)) throw new Error('Invalid topic archive reconciliation time')
   let next = snapshot
   for (const original of snapshot.entries) {
     const entry = next.entries.find(entry => entry.id === original.id)!
     if (entry.status === 'disabled' || entry.status === 'review_required' || entry.origin === 'user_explicit') continue
-    if (entry.evidence.some(ref => ref.role === 'basis' && resolveTermEvidence(snapshot, ref, resolver) === undefined) || (entry.status === 'active' && !sourceBasis(entry))) {
+    if (entry.evidence.some(ref => ref.role === 'basis' && resolveTermEvidence(snapshot, ref, resolver) === undefined && !isUnloaded(ref)) || (entry.status === 'active' && !sourceBasis(entry))) {
       next = replaceAndReview(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
     }
   }
   for (const entry of next.entries) if (entry.status !== 'disabled' && entry.status !== 'review_required' &&
-    !validReferences(next, entry, resolver, entry.status === 'active')) next = replace(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
+    !validReferences(next, entry, resolver, entry.status === 'active', isUnloaded)) next = replace(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
   return next
 }
 /** Normal retrieval matches caller-supplied exact labels; Quick never reads archives. */

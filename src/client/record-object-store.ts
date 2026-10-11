@@ -5,7 +5,7 @@ import {
 import { SessionStore, type HistoryStatus, type LocalStoragePort, type StructureLockPort } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
-import { canEditTextRevision } from './translation-history.js'
+import { canEditTextRevision, isTextUnit } from './translation-history.js'
 
 export const RECORD_OBJECTS_PREFIX = 'dsh-translation-plugin:record-objects:v1:'
 export function recordObjectsKey(sessionId: string): string { return `${RECORD_OBJECTS_PREFIX}${encodeURIComponent(sessionId)}` }
@@ -94,7 +94,7 @@ export class RecordObjectStore {
     const session = this.sessions.getSession(scope.sessionId)
     if (!session || session.ownerId !== scope.ownerId || session.topicId !== scope.topicId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict') return undefined
     const unit = this.sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === scope.unitId)
-    if (!unit) return undefined
+    if (!unit || !isTextUnit(unit)) return undefined
     if (scope.side === 'source') return scope.revisionId === null ? unit.source : undefined
     const revision = scope.revisionId === null ? undefined : unit.revisions.find(revision => revision.id === scope.revisionId)
     return revision && (!requireEnded || canEditTextRevision(revision)) ? revision.text : undefined

@@ -8,7 +8,7 @@ import { parseRequestContextInput } from '../shared/request-context.js'
 import { parseNormalTranslationV2Event, parseNormalTranslationV2Job, type NormalTranslationResolution, type NormalTranslationV2Event, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
 import { appendAdmittedTextUnit, appendTextRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation,
   registerTranslationExchange, registerTranslationResolution, registerTranslationResume, recordTranslationExchangeStatus, bindTranslationExchangeId,
-  recordTranslationResumeStarted, finishTranslationExchange } from './translation-history.js'
+  recordTranslationResumeStarted, finishTranslationExchange, isTextUnit } from './translation-history.js'
 import type { TranslationExchangeResolution } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import type { TranslationHistory, TextRevisionStatus } from './translation-history.js'
@@ -76,6 +76,7 @@ export class NormalTranslationClient {
     const session = this.store.getSession(target.translationSessionId), unit = this.store.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
     if (this.disposed || target.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || this.store.isSessionDeleted(session.id) || !unit ||
       !this.options.canAccessUnit?.(ownerId, session.id, unit.id)) return failure('reference_not_published', '此单元尚未明确提供给当前主模型。')
+    if (!isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
     if (session.mode !== 'normal' || session.archivedAt !== null) return failure('invalid_state', '请先恢复普通会话再处理历史单元。')
     if (unit.sourceVersion !== target.sourceVersion || this.store.getStatus(session.id) === 'conflict') return failure('stale_version', '原文版本已变化，请读取当前单元。')
     const key = this.key(ownerId, input.operationId), cached = this.unitSnapshots.get(key)
@@ -98,6 +99,7 @@ export class NormalTranslationClient {
     const session = this.store.getSession(target.translationSessionId), history = this.store.getTranslationHistory(target.translationSessionId), unit = history?.units.find(unit => unit.id === target.unitId)
     if (this.disposed || target.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || !unit || this.store.isSessionDeleted(session.id) ||
       !this.options.canAccessUnit?.(ownerId, session.id, unit.id)) return failure('reference_not_published', '此单元尚未明确提供给当前主模型。')
+    if (!isTextUnit(unit)) return failure('requires_batch', '文档原稿纠错尚未接通。')
     const previous = this.store.getAvailableSessions(ownerId).flatMap(candidate => this.store.getTranslationHistory(candidate.id)?.events ?? []).find(event => event.operationId === request.operationId)
     if (previous) {
       const source = unit.sourceVersions.find(source => source.operationId === request.operationId)
@@ -134,15 +136,17 @@ export class NormalTranslationClient {
     if (material.unitReference) {
       const cached = this.unitSnapshots.get(this.key(ownerId, request.operationId)), unit = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === material.unitReference?.unitId)
       if (!cached || JSON.stringify(cached) !== JSON.stringify(envelope) || !this.options.canAccessUnit?.(ownerId, session.id, material.unitReference.unitId)) return failure('reference_not_published', '历史处理材料未由当前Client冻结或授权。')
+      if (unit && !isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
       if (!unit || unit.sourceVersion !== material.sourceVersion || material.unitReference.sourceVersion !== unit.sourceVersion) return failure('stale_version', '准备后原文已变化，请使用新操作重新准备。')
     } else {
       if (!this.materials.resolveSubmittedMaterial(envelope)) return failure('material_not_submitted', '未找到完全一致的已提交材料，草稿未受理。')
       if (material.sourceVersion !== 1 || material.revises) return failure('stale_version', '此材料的源版本尚不可受理。')
     }
     if (!material.model) return failure('invalid_input', '此材料未选择翻译模型，请重新提交已选模型的材料。')
-    if (this.options.isSessionBusy?.(session.id) || this.store.getTranslationHistory(session.id)?.units.some(unit => unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
+    if (this.options.isSessionBusy?.(session.id) || this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit)
+      ? unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status)) : unit.tasks.some(task => ['running', 'unknown'].includes(task.status))) ||
       this.isBusy(session.id)) return failure('busy', '此翻译会话仍有执行中或结果未知的操作。')
-    if (!material.unitReference && this.store.getTranslationHistory(session.id)?.units.some(unit => unit.material?.materialId === material.materialId)) return failure('already_admitted', '此材料已建立处理单元，请引用原单元重译。')
+    if (!material.unitReference && this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit) && unit.material?.materialId === material.materialId)) return failure('already_admitted', '此材料已建立处理单元，请引用原单元重译。')
     const snapshot = this.terms.getSnapshot(ownerId, material.topicId), selected = request.termReferences.map(ref => snapshot.entries.find(entry => entry.id === ref.id && entry.version === ref.entryVersion))
     if (selected.some(entry => !entry || entry.status !== 'active' || entry.targetLanguage !== material.targetLanguage)) return failure('stale_terms', '所引用术语已变化、未生效或目标语言不符。')
     for (const entry of selected) {
@@ -203,7 +207,7 @@ export class NormalTranslationClient {
     if (event.sequence <= item.v2Sequence) return previous === undefined || previous === signature ? reply() : failure('idempotency_conflict', '同一 v2 事件不能更换内容。')
     if (event.sequence !== item.v2Sequence + 1) { item.v2Status = 'unknown'; item.operation = { ...op, status: 'unknown' }; return failure('sequence_gap', 'v2执行事件缺失，请查询原操作；未重发模型。') }
     const history = this.store.getTranslationHistory(session.id)!, unit = history.units.find(unit => unit.id === op.unitId)
-    if (!unit || !unit.sourceVersions.some(source => source.version === input.sourceVersion)) return failure('stale_version', '处理单元的源记录已不可用。')
+    if (!unit || !isTextUnit(unit) || !unit.sourceVersions.some(source => source.version === input.sourceVersion)) return failure('stale_version', '处理单元的源记录已不可用。')
     const at = new Date().toISOString(), callId = event.callId
     let attempt = callId ? item.v2Attempts.get(callId) : undefined
     const appendFact = (current: typeof history, revisionId: string | null, status: TextRevisionStatus | null): typeof history => appendTranslationEvent(current, {
@@ -357,7 +361,7 @@ export class NormalTranslationClient {
     if (update.sequence !== item.sequence + 1) { this.unknown(item, '流式回执尚未齐全，请查询原操作；未自动重发。'); return failure('sequence_gap', '执行事件缺失，请查询原操作。') }
     if (item.callId !== null && item.callId !== update.callId) return failure('identity_mismatch', '模型调用身份不一致，未采用。')
     const history = this.store.getTranslationHistory(session.id)!, unit = history.units.find(unit => unit.id === op.unitId)
-    if (!unit || !unit.sourceVersions.some(source => source.version === update.sourceVersion)) return failure('stale_version', '处理单元的源记录已不可用。')
+    if (!unit || !isTextUnit(unit) || !unit.sourceVersions.some(source => source.version === update.sourceVersion)) return failure('stale_version', '处理单元的源记录已不可用。')
     const existing = unit.revisions.find(revision => revision.id === update.callId)
     const text = item.text + update.textDelta, at = new Date().toISOString()
     if (['completed', 'failed', 'cancelled'].includes(op.status) && update.status !== op.status) return failure('invalid_state', '操作已经结束，迟到状态未采用。')
@@ -406,7 +410,9 @@ export class NormalTranslationClient {
     for (const session of this.store.getAvailableSessions(ownerId)) {
       const history = this.store.getTranslationHistory(session.id)
       const event = [...history?.events ?? []].reverse().find(event => event.operationId === operationId)
-      const unit = history?.units.find(unit => unit.id === event?.unitId), material = unit?.material
+      const unit = history?.units.find(unit => unit.id === event?.unitId)
+      if (!unit || !isTextUnit(unit)) continue
+      const material = unit.material
       const accepted = history?.events.find(event => event.operationId === operationId && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null)
       if (!unit || event?.type === 'source.corrected' || (material && material.mainSessionId !== ownerId) || this.store.isSessionDeleted(session.id)) continue
       const revision = [...unit.revisions].reverse().find(revision => revision.operationId === operationId)
@@ -464,6 +470,7 @@ export class NormalTranslationClient {
   retranslateBlockedReason(sessionId: string, unitId: string): string | undefined {
     const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
     if (!session || session.mode !== 'normal' || !unit || this.store.isSessionDeleted(sessionId)) return '普通单元已不可用。'
+    if (!isTextUnit(unit)) return '整篇文档重译尚未接通。'
     if (session.archivedAt !== null) return '请先恢复归档会话。'
     if (!session.model) return '请先选择本次翻译模型。'
     if (this.store.getStatus(sessionId) === 'conflict') return '本地记录已变化，请核对当前副本。'
@@ -503,7 +510,8 @@ export class NormalTranslationClient {
     let usedV2 = false
     try {
       const v2 = typeof this.options.remoteV2 === 'function' ? await this.options.remoteV2() : this.options.remoteV2
-      const exchangeMode = item.v2Sequence > 0 || this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)?.revisions.some(
+      const unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
+      const exchangeMode = item.v2Sequence > 0 || unit && isTextUnit(unit) && unit.revisions.some(
         revision => revision.operationId === status.operationId && revision.callRecord?.promptVersion === 'normal-text-exchange-v1')
       if (v2 && exchangeMode) {
         usedV2 = true
@@ -574,8 +582,9 @@ export class NormalTranslationClient {
     item.v2Status = 'unknown'; item.operation = { ...item.operation, status: 'unknown' }; item.message = message
     const at = new Date().toISOString(), history = this.store.getTranslationHistory(item.operation.translationSessionId)
     const exchange = history?.exchanges.find(value => value.operationId === item.operation.operationId && !['resolved', 'cancelled'].includes(value.status))
+    const unit = history?.units.find(unit => unit.id === item.operation.unitId)
     if (exchange) this.store.updateTranslationHistory(item.operation.translationSessionId, current => recordTranslationExchangeStatus(current, exchange.exchangeId, 'unknown', at))
-    else if (item.callId && history?.units.find(unit => unit.id === item.operation.unitId)?.revisions.find(revision => revision.id === item.callId)?.status === 'running') {
+    else if (item.callId && unit && isTextUnit(unit) && unit.revisions.find(revision => revision.id === item.callId)?.status === 'running') {
       this.store.updateTranslationHistory(item.operation.translationSessionId, current => updateTextRevision(current, item.operation.unitId, item.callId!, { status: 'unknown', message, updatedAt: at }))
     }
   }

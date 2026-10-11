@@ -261,13 +261,14 @@ export function disableTopicTerm(snapshot: TopicTermSnapshot, id: string, expect
 }
 
 /** Invalidated basis cannot silently revive, even if an old final revision is selected again. */
-export function reconcileTopicTerms(snapshot: TopicTermSnapshot, resolver: TermEvidenceResolver, at: string): TopicTermSnapshot {
+export function reconcileTopicTerms(snapshot: TopicTermSnapshot, resolver: TermEvidenceResolver, at: string,
+  isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): TopicTermSnapshot {
   if (!time(at)) throw new Error('Invalid topic term reconciliation time')
   let next = snapshot
   for (const entry of snapshot.entries) {
     if (entry.origin === 'user_explicit' || entry.status === 'disabled' || entry.status === 'review_required') continue
     const basis = entry.evidence.filter(ref => ref.role === 'basis')
-    if (basis.some(ref => resolveTermEvidence(snapshot, ref, resolver) === undefined) || (entry.status === 'active' && !hasSourceBasis(entry))) {
+    if (basis.some(ref => resolveTermEvidence(snapshot, ref, resolver) === undefined && !isUnloaded(ref)) || (entry.status === 'active' && !hasSourceBasis(entry))) {
       next = replace(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
     }
   }

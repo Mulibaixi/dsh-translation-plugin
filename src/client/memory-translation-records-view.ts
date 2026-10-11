@@ -2,7 +2,8 @@ import { h, react } from './react.js'
 import { downloadExport } from './browser-download.js'
 import type { SessionStore } from './session-store.js'
 import type { QuickTranslationClient } from './quick-translation.js'
-import { currentFinalRevision, type TextRevision } from './translation-history.js'
+import { currentFinalRevision, isTextUnit, type TextRevision } from './translation-history.js'
+import { DocumentUnitSummary } from './document-unit-view.js'
 import { type TopicTranslationExport, type TranslationExportSession, type TranslationExportTopic } from './translation-export.js'
 import { buildRecordObjectExport, recordObjectPlainText } from './record-object-export.js'
 import type { RecordObjectReference } from '../shared/record-objects.js'
@@ -107,7 +108,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
       message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null),
     exportRequest ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '导出译文确认' },
       h('h3', null, exportRequest.scope === 'topic' ? `导出主题「${exportRequest.topic.topicName}」` : `导出会话「${exportRequest.entries[0]!.session.remark || exportRequest.entries[0]!.session.name}」`),
-      h('p', null, `尚无最终译文：${exportRequest.result.missingUnits.map(unit => `${unit.sessionName} · 文本 ${unit.order}`).join('、')}。`),
+      h('p', null, `尚不能导出：${exportRequest.result.missingUnits.map(unit => `${unit.sessionName} · ${unit.reason === 'document_not_supported' ? `文档 ${unit.order}（整篇导出尚未接通）` : `文本 ${unit.order}（尚无最终译文）`}`).join('、')}。`),
       h('div', { className: 'dsh-tp-actions' },
         h('button', { type: 'button', disabled: exportRequest.result.exportedUnitIds.length === 0, onClick: () => deliverExport(projectExport(exportRequest, true)) }, '仅导出已定稿'),
         h('button', { type: 'button', onClick: () => setExportRequest(undefined) }, '取消')),
@@ -119,6 +120,8 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
         h('h3', null, session.remark || session.name),
         session.archivedAt !== null ? h('p', { className: 'dsh-tp-muted' }, '会话已归档，请先在翻译工作区恢复后编辑。') : null,
         ...units.map(unit => {
+          if (!isTextUnit(unit)) return h(DocumentUnitSummary, { key: unit.id, unit })
+          const revisions = unit.revisions
           const key = JSON.stringify([session.id, unit.id]), draft = drafts.get(key), open = expanded.has(key)
           const pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
           const final = currentFinalRevision(unit)
@@ -160,7 +163,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
                   onClick: () => setMessage(quick.selectFinal(session.id, unit.id, revision.id) ? '已设为最终。' : '版本已变化，未设为最终。') }, '设为最终') : null),
               blockedEdit ? h('small', { className: 'dsh-tp-muted' }, blockedEdit) : null,
               revisionDraft ? h('div', { className: 'dsh-tp-version-editor dsh-tp-record-inline-editor' },
-                h('small', { className: 'dsh-tp-muted' }, `基于版本 ${unit.revisions.find(item => item.id === revisionDraft.baseRevisionId)?.order ?? '已失效'}保存为新版本；未调用模型。`),
+                h('small', { className: 'dsh-tp-muted' }, `基于版本 ${revisions.find(item => item.id === revisionDraft.baseRevisionId)?.order ?? '已失效'}保存为新版本；未调用模型。`),
                 h('textarea', { 'aria-label': `编辑版本 ${revision.order} 的译文`, value: revisionDraft.text, rows: 8, disabled: archived || !!blockedEdit, onChange: (event: { currentTarget: { value: string } }) => {
                   const text = event.currentTarget.value
                   setDrafts(current => new Map(current).set(key, { ...revisionDraft, text }))
