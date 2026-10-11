@@ -15,7 +15,7 @@ export interface TranslationSourceImport {
   readonly receiptId: string
   readonly idempotencyKey: string
 }
-export interface TranslationSourceAsset {
+export interface SourceIdentity {
   /** Opaque identity of this immutable source asset, not a native attachment or host path. */
   readonly sourceId: string
   /** Asset version, independent of a future material sourceVersion. Corrections use a new asset. */
@@ -26,8 +26,8 @@ export interface TranslationSourceAsset {
   readonly encoding: 'utf-8'
   readonly bom: boolean
   readonly sha256: string
-  readonly persistence: 'runtime_only'
 }
+export interface TranslationSourceAsset extends SourceIdentity { readonly persistence: 'runtime_only' }
 export interface TranslationSourceAssetRead {
   readonly scope: TranslationSourceScope
   readonly sourceId: string
@@ -82,15 +82,25 @@ export function parseTranslationSourceScope(value: unknown): TranslationSourceSc
 function sourceId(value: unknown): asserts value is string {
   if (typeof value !== 'string' || !/^source-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(value)) throw new TypeError('Invalid source asset identity')
 }
-export function parseTranslationSourceAsset(value: unknown): TranslationSourceAsset {
-  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256', 'persistence'])
+export function parseSourceIdentity(value: unknown): SourceIdentity {
+  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256'])
   sourceId(value.sourceId); text(value.name, 255)
   if (/[\\/<>:"|?*]/u.test(value.name) || !/\.txt$/iu.test(value.name)) throw new TypeError('Invalid TXT file name')
   integer(value.bytes, 1, MAX_TRANSLATION_SOURCE_BYTES); integer(value.totalCodePoints, 1, value.bytes)
-  if (value.version !== 1 || value.encoding !== 'utf-8' || typeof value.bom !== 'boolean' || value.persistence !== 'runtime_only' ||
+  if (value.version !== 1 || value.encoding !== 'utf-8' || typeof value.bom !== 'boolean' ||
     typeof value.sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sha256)) throw new TypeError('Invalid immutable source descriptor')
   return { sourceId: value.sourceId, version: value.version, name: value.name, bytes: value.bytes, totalCodePoints: value.totalCodePoints,
-    encoding: value.encoding, bom: value.bom, sha256: value.sha256, persistence: value.persistence }
+    encoding: value.encoding, bom: value.bom, sha256: value.sha256 }
+}
+export function toSourceIdentity(value: TranslationSourceAsset): SourceIdentity {
+  const { persistence, ...identity } = value
+  if (persistence !== 'runtime_only') throw new TypeError('Invalid runtime source persistence')
+  return parseSourceIdentity(identity)
+}
+export function parseTranslationSourceAsset(value: unknown): TranslationSourceAsset {
+  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256', 'persistence'])
+  if (value.persistence !== 'runtime_only') throw new TypeError('Invalid runtime source persistence')
+  return { ...toSourceIdentity(value as unknown as TranslationSourceAsset), persistence: 'runtime_only' }
 }
 export function parseTranslationSourceRequest(method: 'importReceipt' | 'readRange', value: unknown): TranslationSourceImport | TranslationSourceAssetRead {
   if (method === 'importReceipt') {

@@ -14,6 +14,10 @@ import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type NativeMaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
 import { NormalTranslationClient, type NormalTranslationRemotePort, type NormalTranslationV2RemotePort } from './normal-translation.js'
 import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
+import type { TranslationSourceStorageRemotePort } from './source-storage-client.js'
+export { adaptTranslationSourceStorageRemote, TranslationSourceStorageClient } from './source-storage-client.js'
+export type { TranslationSourceHistoryCommit, TranslationSourceHistoryCallbacks, TranslationSourceSaveTransaction,
+  TranslationSourceSaveOutcome, TranslationSourceStorageRemotePort } from './source-storage-client.js'
 import type { Capability, ComposerExtensionService } from 'dsh-composer-extension/contracts'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
@@ -46,7 +50,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   get(name: 'remote.translationMaterials'): TranslationMaterialsRemotePort | undefined
   get(name: 'remote.translationNormal'): NormalTranslationRemotePort | undefined
   get(name: 'remote.translationNormalV2'): NormalTranslationV2RemotePort | undefined
-  get(name: 'remote.translationSources'): TranslationSourcesRemotePort | undefined
+  get(name: 'remote.translationSources'): (TranslationSourcesRemotePort & TranslationSourceStorageRemotePort) | undefined
   readonly conversation?: { readonly submissions?: NativeMaterialSubmissionRegistry }
   readonly composerExtension?: ComposerExtensionService
   readonly fileUpload: NativeFileUploadPort
@@ -58,7 +62,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
     readonly translationMaterials?: TranslationMaterialsRemotePort
     readonly translationNormal?: NormalTranslationRemotePort
     readonly translationNormalV2?: NormalTranslationV2RemotePort
-    readonly translationSources?: TranslationSourcesRemotePort
+    readonly translationSources?: TranslationSourcesRemotePort & TranslationSourceStorageRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }

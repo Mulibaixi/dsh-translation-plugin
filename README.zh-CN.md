@@ -182,7 +182,7 @@ pnpm install --frozen-lockfile
 pnpm build
 ```
 
-在 DSH 插件管理器中将本目录作为 `dsh-translation-plugin` 本地 bundle 安装，启用后重启。构建产物位于 `dist/`，不进入 Git；目录链接安装修改后重建同一目录。升级至 v0.15.1 须加载同版本 Host/Client，刷新 Client 注册（没有刷新功能时重新安装）后重启。普通材料入口还需要匹配的 Composer protocol 1 宿主，补充交互需要 `dsh-composer-extension` v0.1.0；官方 DSH `0.2.0-rc.2` 不自带提交接口。文本历史保存为 schema9/history6，旧格式仍可读取；术语和档案 schema 仍为1，对象位置命名空间不变。降级前备份应用数据，v0.14.3 及更早版本不能读取新 schema9 历史。
+在 DSH 插件管理器中将本目录作为 `dsh-translation-plugin` 本地 bundle 安装，启用后重启。构建产物位于 `dist/`，不进入 Git；目录链接安装修改后重建同一目录。升级至 v0.15.2 须加载同版本 Host/Client，刷新 Client 注册（没有刷新功能时重新安装）后重启。普通材料入口还需要匹配的 Composer protocol 1 宿主，补充交互需要 `dsh-composer-extension` v0.1.0；官方 DSH `0.2.0-rc.2` 不自带提交接口。文本历史保存为 schema9/history6，旧格式仍可读取；术语和档案 schema 仍为1，对象位置命名空间不变。降级前备份应用数据，v0.14.3 及更早版本不能读取新 schema9 历史。
 
 从早期框架版升级时，需要在插件管理器刷新包含模型目录 RPC 的 bundle 元信息；没有刷新功能时卸载后重新安装，再重启 DSH。不要手动修改 profile。
 
@@ -202,9 +202,11 @@ pnpm build
 
 纯文本提交核心分别表达材料、草稿、源版本和业务操作身份。Host 在受理前准备有效术语及实际模型调用，短回执通过正式桥回写业务受理和有序流式事件，Client 历史保持权威。每个修订只保存一份实际调用上下文，源版本记录是唯一持久原文；状态查询和取消不重复调用模型。
 
-普通模式 TXT 使用 DSH 原生 FileUpload 收据，并由 Host `translationSources` 固定原文引用。Host 按冻结的提交范围及实际所属 Agent/Peer 校验引用，主模型通过现有 `translation_read_source` 工具分页读取文件正文。解码后的 TXT 原稿仅留在 Host 运行期存储，不写入插件历史；原始 DSH 附件遵循宿主自己的保留策略。这不改变历史 schema，也不代表已支持整篇文件翻译。
+普通模式 TXT 使用 DSH 原生 FileUpload 收据，并由 Host `translationSources` 固定原文引用。Host 按冻结的提交范围及实际所属 Agent/Peer 校验引用，主模型通过现有 `translation_read_source` 工具分页读取文件正文。原稿服务另提供 UTF-8 原字节受管保存、历史引用确认、授权恢复及打开原件能力。历史保存方确认准确的原稿和引用后，该引用才成为已确认状态；确认回执不明时查询同一个引用。关闭历史停止新保存事务并保留旧副本；明确撤销只作用于所选引用，不改用户原文件。
 
-变化见 [CHANGELOG.md](CHANGELOG.md)。当前本地候选为 `v0.15.1`，普通模式长正文可自动打包为固定 TXT 原文引用，供主模型准备和讨论；整篇或分批翻译尚未接通。完整主发送联动仍需要宿主 Composer 扩展。快译、普通短文本执行、查询/取消、人工修订、最终选择、档案、原件关联、导出与可选历史继续可用。自动文档解析仍未开放。本地版本未远程发布，`private: true` 防止意外 npm 发布。
+当前 TXT 与长正文提交入口尚未将这些保存操作接入文档历史或自动恢复，其固定原文引用仍只在当前运行期可用，重启后不恢复。原始 DSH 附件遵循宿主自己的保留策略。文本历史保持 schema9/history6，整篇文件翻译尚未开放。
+
+变化见 [CHANGELOG.md](CHANGELOG.md)。当前本地候选为 `v0.15.2`，新增原稿持久保存基础。普通模式手动 TXT 或自动打包的长正文可作为固定原文引用，供主模型准备和讨论；整篇或分批翻译尚未接通。完整主发送联动仍需要宿主 Composer 扩展。快译、普通短文本执行、查询/取消、人工修订、最终选择、档案、原件关联、导出与可选历史继续可用。自动文档解析仍未开放。本地版本未远程发布，`private: true` 防止意外 npm 发布。
 
 
 许可证：[MIT](LICENSE)。
