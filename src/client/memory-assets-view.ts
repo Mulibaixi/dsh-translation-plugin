@@ -63,7 +63,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, objects
     store.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null,
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
-      return visitedTopic ? h('div', { key: id, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
+      return visitedTopic ? h('div', { key: `${ownerId}:${id}`, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
         h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
           active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
           navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
@@ -79,6 +79,7 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
   const [category, setCategory] = react.useState<'terms' | 'translations'>('terms')
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
+  const evidenceContextKey = JSON.stringify([ownerId, topicId, associatedSessionId, navigationRevision])
   function exportArchive(format: 'json' | 'markdown'): void {
     try {
       const frozen = structuredClone({ terms: terms.getSnapshot(ownerId, topicId), archive: archive.getSnapshot(ownerId, topicId) })
@@ -121,11 +122,13 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
               exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null),
             h('div', { className: 'dsh-tp-assets-module', hidden: kind !== 'terms' },
               h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName, hideExport: true,
+                active: active && category === 'terms' && kind === 'terms', evidenceContextKey,
                 targetLanguage: associatedSessionId && store.getSession(associatedSessionId)?.topicId === topicId ? store.getSession(associatedSessionId)?.targetLanguage : undefined,
                 onDelete: onDeleteTerm, onExport: () => {}, bridgeReason: topics?.getStatus(ownerId).reason,
                 onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined })),
             ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
-              h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type }))))),
+              h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type,
+                active: active && category === 'terms' && kind === type, evidenceContextKey }))))),
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
           h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations' }))))
 }

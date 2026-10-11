@@ -23,12 +23,16 @@ export interface TopicBridgeRemotePort {
 }
 export interface TopicBridgeTermsPort {
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot
+  reconcileAsync?(ownerId: string, topicId: string): Promise<TopicTermSnapshot>
   query(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): TopicTermSnapshot
+  queryAsync?(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): Promise<TopicTermSnapshot>
   apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicTermPut }): Promise<TermMutationResult>
 }
 export interface TopicBridgeArchivePort {
   getSnapshot(ownerId: string, topicId: string): TopicArchiveSnapshot
+  reconcileAsync?(ownerId: string, topicId: string): Promise<TopicArchiveSnapshot>
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot
+  queryAsync?(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot>
   apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicArchivePut }): Promise<ArchiveMutationResult>
 }
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
@@ -209,11 +213,11 @@ export class TopicBridgeClient {
       sessionIds: this.sessions.getAvailableSessions(ownerId).filter(session => session.topicId === topic.id && !this.sessions.isSessionDeleted(session.id)).map(session => session.id) })) })
     if (command.kind === 'list_topic_terms') {
       if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不属于当前主会话或不存在。')
-      return success({ kind: 'terms', snapshot: this.terms.getSnapshot(ownerId, command.topicId) })
+      return success({ kind: 'terms', snapshot: await (this.terms.reconcileAsync?.(ownerId, command.topicId) ?? this.terms.getSnapshot(ownerId, command.topicId)) })
     }
     if (command.kind === 'list_topic_archive' || command.kind === 'upsert_archive') {
       if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不属于当前主会话或不存在。')
-      if (command.kind === 'list_topic_archive') return success({ kind: 'archive', snapshot: this.archive.getSnapshot(ownerId, command.topicId) })
+      if (command.kind === 'list_topic_archive') return success({ kind: 'archive', snapshot: await (this.archive.reconcileAsync?.(ownerId, command.topicId) ?? this.archive.getSnapshot(ownerId, command.topicId)) })
       if (!command.entry.evidence.every(ref => this.publishedEvidence(ownerId, command.topicId, ref))) return error(request.requestId, 'reference_not_published', '档案依据不在用户明确提供的历史范围中。')
       const result = await this.archive.apply(ownerId, command.topicId, command.expectedVersion, { kind: 'put', input: command.entry })
       if (result.status === 'save_failed') return error(request.requestId, result.status, '当前档案内容可能已更新但未保存，请先查询当前版本后明确重试。')
@@ -249,14 +253,15 @@ export class TopicBridgeClient {
         return publication && publication.topicId === session.topicId ? success({ kind: 'unit', unit: structuredClone(publication.fact) })
           : error(request.requestId, 'reference_not_published', '用户尚未选择此单元供主模型参考。')
       }
-      case 'list_terms': return success({ kind: 'terms', snapshot: this.terms.getSnapshot(ownerId, session.topicId) })
+      case 'list_terms': return success({ kind: 'terms', snapshot: await (this.terms.reconcileAsync?.(ownerId, session.topicId) ?? this.terms.getSnapshot(ownerId, session.topicId)) })
       case 'query_terms': {
-        const snapshot = this.terms.query(ownerId, session.topicId, { mode: session.mode, sourceLanguage: command.sourceLanguage,
-          targetLanguage: command.targetLanguage, forms: command.forms })
+        const query = { mode: session.mode, sourceLanguage: command.sourceLanguage, targetLanguage: command.targetLanguage, forms: command.forms }
+        const snapshot = await (this.terms.queryAsync?.(ownerId, session.topicId, query) ?? this.terms.query(ownerId, session.topicId, query))
         return success({ kind: 'terms_query', snapshot })
       }
       case 'query_archive': {
-        const snapshot = this.archive.query(ownerId, session.topicId, { mode: session.mode, kinds: command.kinds, forms: command.forms })
+        const query = { mode: session.mode, kinds: command.kinds, forms: command.forms }
+        const snapshot = await (this.archive.queryAsync?.(ownerId, session.topicId, query) ?? this.archive.query(ownerId, session.topicId, query))
         return success({ kind: 'archive_query', snapshot })
       }
       case 'upsert_term': {

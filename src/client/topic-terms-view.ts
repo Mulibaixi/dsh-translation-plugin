@@ -4,12 +4,14 @@ import type { SessionStore, HistoryStatus } from './session-store.js'
 import { isTextUnit } from './translation-history.js'
 import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 import { buildTopicTermsJsonExport, buildTopicTermsMarkdownExport, type TopicTermsExport, type TopicTermsExportSnapshot } from './topic-terms-export.js'
+import type { EvidenceReadResult } from '../shared/translation-evidence.js'
 
 /** User editing and adoption record real browser actions, separate from model commands. */
 export interface TopicTermsViewPort {
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot
   subscribe(listener: () => void): () => void
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined
+  readEvidenceAsync?(ownerId: string, topicId: string, reference: TermEvidenceRef): Promise<EvidenceReadResult>
   getNotice(): string | undefined
   getStatus(ownerId: string, topicId: string): HistoryStatus
   reload(ownerId: string, topicId: string): boolean
@@ -23,19 +25,64 @@ const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict:
 function evidenceBody(terms: TopicTermsViewPort, snapshot: TopicTermSnapshot, ref: TermEvidenceRef): string | undefined {
   return resolveTermEvidence(snapshot, ref, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
 }
-function TermEvidence({ sessions, terms, snapshot, reference }: { readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly snapshot: TopicTermSnapshot; readonly reference: TermEvidenceRef }): unknown {
+/** The same precise reference viewer is shared by terminology and structured archives. */
+export function TopicEvidenceView({ sessions, terms, snapshot, reference, active = true, contextKey = '' }: {
+  readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly snapshot: { readonly ownerId: string; readonly topicId: string }
+  readonly reference: TermEvidenceRef; readonly active?: boolean; readonly contextKey?: string
+}): unknown {
   const [open, setOpen] = react.useState(false)
+  const [loaded, setLoaded] = react.useState<{ readonly key: string; readonly result: EvidenceReadResult } | undefined>(undefined)
+  const [pendingKey, setPendingKey] = react.useState<string | undefined>(undefined)
+  const generation = react.useRef(0)
   const candidate = sessions.getSession(reference.sessionId)
   const session = candidate?.ownerId === snapshot.ownerId && candidate.topicId === snapshot.topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
   const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === reference.unitId) : undefined
   const revision = reference.revisionId && unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === reference.revisionId) : undefined
-  const body = evidenceBody(terms, snapshot, reference)
+  const body = resolveTermEvidence(snapshot, reference, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
   const unloaded = isDocumentEvidenceUnloaded(sessions, snapshot, reference)
+  const selection = sessions.getTranslationHistory(reference.sessionId)?.events.filter(event => event.type === 'final.selected' && event.unitId === reference.unitId).at(-1)
+  const identity = JSON.stringify([snapshot.ownerId, snapshot.topicId, reference, candidate?.ownerId, candidate?.topicId,
+    sessions.isSessionDeleted(reference.sessionId), sessions.getStatus(reference.sessionId), unit?.sourceVersion, unit?.final, selection?.id, active, contextKey])
+  const currentIdentity = react.useRef(identity)
+  currentIdentity.current = identity
+  react.useEffect(() => {
+    generation.current++; setOpen(false); setLoaded(undefined); setPendingKey(undefined)
+    return () => { generation.current++ }
+  }, [identity, terms])
+  const result = loaded?.key === identity ? loaded.result : undefined
+  const pending = pendingKey === identity
+  const state = result?.status ?? (body !== undefined ? 'ready' : unloaded ? 'unloaded' : candidate && candidate.ownerId !== snapshot.ownerId ? 'forbidden' : 'missing')
+  const visibleBody = result?.status === 'ready' ? result.text : body
+  const statusLabels = { ready: '来源已加载', unloaded: '来源尚未加载', missing: '来源已缺失或变化', corrupt: '来源完整性校验失败', forbidden: '无权读取此来源' } as const
   const title = `${session?.name ?? '已删除会话'} · ${unit ? `${isTextUnit(unit) ? '文本' : '文档'} ${unit.order}` : '来源不可用'}${revision ? ` · 版本 ${revision.order}` : ''} · ${reference.kind === 'source' ? '原文' : '最终译文'}${reference.role === 'example' ? '（示例）' : ''}`
-  return h('div', { className: 'dsh-tp-term-evidence' },
+  async function toggle(reload = false): Promise<void> {
+    if (!active || pending) return
+    if (open && !reload) { generation.current++; setOpen(false); return }
+    setOpen(true)
+    if ((!reload && result) || !terms.readEvidenceAsync) return
+    const captured = identity, ticket = ++generation.current
+    setPendingKey(captured)
+    try {
+      const read = await terms.readEvidenceAsync(snapshot.ownerId, snapshot.topicId, structuredClone(reference))
+      if (ticket === generation.current && currentIdentity.current === captured) setLoaded({ key: captured, result: read })
+    } catch {
+      if (ticket === generation.current && currentIdentity.current === captured) setLoaded({ key: captured,
+        result: { status: 'unloaded', request: null, reason: 'connection_unavailable' } })
+    } finally {
+      if (ticket === generation.current && currentIdentity.current === captured) setPendingKey(undefined)
+    }
+  }
+  return h('div', { className: 'dsh-tp-term-evidence', 'data-evidence-state': state },
     h('span', { className: 'dsh-tp-muted' }, title),
-    h('button', { type: 'button', disabled: body === undefined, 'aria-expanded': open, onClick: () => setOpen(value => !value) }, unloaded ? '文档依据尚未加载' : body === undefined ? '依据已变化或不可用' : open ? '收起来源' : '查看来源'),
-    open && body !== undefined ? h('div', { className: 'dsh-tp-translation-text' }, body) : null,
+    h('button', { type: 'button', disabled: !active || pending || (!terms.readEvidenceAsync && body === undefined), 'aria-expanded': open,
+      onClick: () => { void toggle() } }, pending ? '正在加载来源…' : open ? '收起来源' : state === 'ready' ? '查看来源' : terms.readEvidenceAsync ? '加载来源片段' : unloaded ? '文档依据尚未加载' : '依据已变化或不可用'),
+    open ? h('small', { className: 'dsh-tp-muted', role: 'status' }, pending ? '正在读取准确来源范围。' : statusLabels[state]) : null,
+    open && !pending && state === 'ready' && visibleBody !== undefined ? h('div', { className: 'dsh-tp-translation-text' }, visibleBody) : null,
+    open && result?.status === 'unloaded' ? h('p', { className: 'dsh-tp-muted' }, result.reason === 'range_required'
+      ? '整份依据超过单次读取上限；此处只读取已明确引用的有界片段，未截断为全文。'
+      : '来源暂未取得，可重试；此状态不表示依据已失效。') : null,
+    open && result && result.status !== 'ready' ? h('button', { type: 'button', disabled: pending || !active,
+      onClick: () => { void toggle(true) } }, '重新查阅来源') : null,
   )
 }
 function TermRow({ entry, selected, pending, onAction, onDelete, onDetails }: {
@@ -70,12 +117,13 @@ function mutationMessage(result: TermMutationResult): true | string {
   if (result.status === 'invalid') return '术语内容或来源无效，未修改此条目。'
   return result.status === 'updated' || result.status === 'unchanged' ? true : '操作未完成，请核对后重试。'
 }
-export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect, hideExport = false, targetLanguage }: {
+export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect, hideExport = false, targetLanguage, active = true, evidenceContextKey }: {
   readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly ownerId: string; readonly topicId: string; readonly topicName: string
   readonly onDelete: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>; readonly onExport: (result: TopicTermsExport) => void
   readonly bridgeReason?: string | undefined; readonly onReconnect?: (() => void) | undefined
   readonly hideExport?: boolean | undefined
   readonly targetLanguage?: string | undefined
+  readonly active?: boolean | undefined; readonly evidenceContextKey?: string | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => terms.subscribe(() => refresh(value => value + 1)), [terms])
@@ -204,7 +252,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
           h('button', { type: 'button', disabled: pending, onClick: () => startEdit(entry) }, '编辑'),
           entry.sense ? h('div', null, `说明：${entry.sense}`) : null, entry.aliases.length ? h('div', null, `别名：${entry.aliases.join('、')}`) : null,
           entry.forbidden.length ? h('div', null, `避免：${entry.forbidden.join('、')}`) : null,
-          ...entry.evidence.map((reference, index) => h(TermEvidence, { key: `${entry.version}:${index}`, sessions, terms, snapshot, reference })),
+          ...entry.evidence.map((reference, index) => h(TopicEvidenceView, { key: `${ownerId}:${topicId}:${entry.id}:${entry.version}:${index}`, sessions, terms, snapshot, reference, active, contextKey: evidenceContextKey })),
         ) : h('p', { className: 'dsh-tp-muted' }, '选择术语查看详情。'),
       ),
     ),

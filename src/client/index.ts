@@ -14,7 +14,9 @@ import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type NativeMaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
 import { NormalTranslationClient, type NormalTranslationRemotePort, type NormalTranslationV2RemotePort } from './normal-translation.js'
 import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
-import type { TranslationSourceStorageRemotePort } from './source-storage-client.js'
+import { adaptTranslationSourceStorageRemote, type TranslationSourceStorageRemotePort } from './source-storage-client.js'
+import { adaptTranslationSourceIntegrityRemote, type TranslationSourceIntegrityRemotePort } from './source-integrity-client.js'
+import { TranslationSourceReader } from './source-reader.js'
 export { adaptTranslationSourceStorageRemote, TranslationSourceStorageClient } from './source-storage-client.js'
 export type { TranslationSourceHistoryCommit, TranslationSourceHistoryCallbacks, TranslationSourceSaveTransaction,
   TranslationSourceSaveOutcome, TranslationSourceStorageRemotePort } from './source-storage-client.js'
@@ -50,7 +52,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   get(name: 'remote.translationMaterials'): TranslationMaterialsRemotePort | undefined
   get(name: 'remote.translationNormal'): NormalTranslationRemotePort | undefined
   get(name: 'remote.translationNormalV2'): NormalTranslationV2RemotePort | undefined
-  get(name: 'remote.translationSources'): (TranslationSourcesRemotePort & TranslationSourceStorageRemotePort) | undefined
+  get(name: 'remote.translationSources'): (TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort) | undefined
   readonly conversation?: { readonly submissions?: NativeMaterialSubmissionRegistry }
   readonly composerExtension?: ComposerExtensionService
   readonly fileUpload: NativeFileUploadPort
@@ -62,7 +64,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
     readonly translationMaterials?: TranslationMaterialsRemotePort
     readonly translationNormal?: NormalTranslationRemotePort
     readonly translationNormalV2?: NormalTranslationV2RemotePort
-    readonly translationSources?: TranslationSourcesRemotePort & TranslationSourceStorageRemotePort
+    readonly translationSources?: TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
@@ -122,6 +124,14 @@ export function apply(ctx: ClientPluginContext): void {
       console.error(`[${CLIENT_ID}] Client translation remote mount failed: ${detail}`)
       return undefined
     })
+    const sourcesRemote = ctx.remote.$mount ? async () => {
+      const unmountRemote = await mountedRemote
+      return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationSources')
+    } : ctx.remote.translationSources
+    const sources = adaptTranslationSourcesRemote(sourcesRemote)
+    const storage = adaptTranslationSourceStorageRemote(sourcesRemote)
+    const integrity = adaptTranslationSourceIntegrityRemote(sourcesRemote)
+    const evidence = new TranslationSourceReader({ sessions: store, sources, storage, integrity })
     const objects = new RecordObjectStore(store)
     const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
@@ -129,6 +139,8 @@ export function apply(ctx: ClientPluginContext): void {
     } : ctx.remote.translationQuick), store, models, { canManualEdit: (session, unitId, revisionId) => !objects.hasRevisionObjects(session.ownerId, session.topicId, session.id, unitId, revisionId) })
     const terms = new TopicMemoryStore(store)
     const archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
+    terms.setEvidenceReader(evidence)
+    archive.setEvidenceReader(evidence)
     const topics = new TopicBridgeClient(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
@@ -136,10 +148,7 @@ export function apply(ctx: ClientPluginContext): void {
     const submissionBridge = materialSubmissionBridge(ctx)
     const materials = new MaterialSubmissionsClient({ store, topics, owner: ctx, ...submissionBridge,
       upload: ctx.fileUpload,
-      sources: adaptTranslationSourcesRemote(ctx.remote.$mount ? async () => {
-        const unmountRemote = await mountedRemote
-        return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationSources')
-      } : ctx.remote.translationSources),
+      sources,
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationMaterials')
@@ -168,6 +177,7 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
     ctx.effect(() => () => terms.dispose(), 'translation topic terms')
     ctx.effect(() => () => archive.dispose(), 'translation topic archive')
+    ctx.effect(() => () => evidence.dispose(), 'translation evidence reader')
     ctx.effect(() => () => { objectAssets.dispose(); objects.dispose() }, 'translation record objects')
     ctx.effect(() => async () => {
       remoteDisposed = true
@@ -180,7 +190,7 @@ export function apply(ctx: ClientPluginContext): void {
     }, 'translation remote clients')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
-    ctx.effect(() => ctx.on('connection/reset', () => { models.invalidate(true); quick.reset(); normal.reset(); materials.reset(); void topics.reset() }), 'translation catalog connection')
+    ctx.effect(() => ctx.on('connection/reset', () => { evidence.clearCache(); models.invalidate(true); quick.reset(); normal.reset(); materials.reset(); void topics.reset() }), 'translation catalog connection')
 
     const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
     const TranslationPanel: ClientComponent = (props = {}) => {

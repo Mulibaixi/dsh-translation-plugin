@@ -10,6 +10,8 @@ import { TRANSLATION_SOURCE_STORAGE_REMOTE, parseTranslationSourceStorageRequest
   type TranslationSourceStorageResult, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
 import { loadTranslationSourceStorage, sourceSha256, type StoredSourceReference, type TranslationSourceHostOptions,
   type TranslationSourceStorage } from './source-storage.js'
+import { TRANSLATION_SOURCE_INTEGRITY_REMOTE, parseTranslationSourceRangeHash,
+  type TranslationSourceRangeHash } from '../shared/translation-source-integrity.js'
 
 interface Agent { readonly id: string; readonly session: { readonly id: string }; readonly ctx: unknown }
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
@@ -195,6 +197,23 @@ export class TranslationSourcesService {
     const result = ok({ scope: request.scope, source: record.source, range: request.range, text: page.value.text })
     return translationSourceResultBytes(result) > MAX_TRANSLATION_SOURCE_PAGE_BYTES ? bad('page_too_large', '完整分页回复超过 32768 UTF-8 字节，未截断。', 'read_source') : result
   }
+  /** Exact copy validation stays at the authorized Host; no entire range is returned to Client. */
+  async verifyRangeHash(input: TranslationSourceRangeHash): Promise<TranslationSourceResult<{ readonly verified: true }>> {
+    let request: TranslationSourceRangeHash
+    try { request = parseTranslationSourceRangeHash(input) }
+    catch { return bad('invalid_input', '原稿范围校验参数无效。', 'verify_source_range') }
+    const peerId = this.ctx.invocation?.peer.id
+    if (!this.owns(request.scope, peerId)) return bad('scope_mismatch', '原稿范围校验不属于此主会话连接。', 'verify_source_range')
+    const record = this.sources.get(request.sourceId)
+    if (!record || !sameScope(record.scope, request.scope)) return bad('not_found', '此范围的固定源资产不存在。', 'verify_source_range')
+    if (record.peerId !== peerId || !this.owns(request.scope, peerId, record.agent)) return bad('scope_mismatch', '原稿所属连接或主 Agent 已失效。', 'verify_source_range')
+    if (request.version !== record.source.version) return bad('stale_version', '引用的固定源资产版本不一致。', 'verify_source_range')
+    if (request.range.end > record.source.totalCodePoints) return bad('range_out_of_bounds', '原稿校验范围超出固定源。', 'verify_source_range')
+    const text = record.text.slice(record.codePointOffsets[request.range.start]!, record.codePointOffsets[request.range.end]!)
+    const digest = await sourceSha256(new TextEncoder().encode(text))
+    if (this.sources.get(request.sourceId) !== record || !this.owns(request.scope, peerId, record.agent) || record.peerId !== peerId) return bad('scope_mismatch', '原稿范围校验时所属连接或 Agent 已失效。', 'verify_source_range')
+    return digest === request.sha256 ? ok({ verified: true }) : bad('integrity_failed', '原稿完整复制范围校验失败。', 'verify_source_range')
+  }
   private storagePort(): Promise<TranslationSourceStorage> {
     if (!this.storage) {
       const loaded = this.options.storage ? Promise.resolve(this.options.storage) : (this.options.loadStorage?.() ?? loadTranslationSourceStorage(this.ctx))
@@ -379,7 +398,7 @@ export function installTranslationSources(ctx: QuickHostContext, registerRemote 
   const service = new TranslationSourcesService(ctx, options); ctx.provide('translationSources', service)
   const register = (scope: QuickHostContext): void => {
     const registry = (scope.get?.('typert') ?? scope.typert) as QuickHostContext['typert']
-    registry?.register({ package: TRANSLATION_SOURCES_REMOTE.package, face: 'host', schemas: [], invocations: [...TRANSLATION_SOURCES_REMOTE.descriptors, ...TRANSLATION_SOURCE_STORAGE_REMOTE.descriptors],
+    registry?.register({ package: TRANSLATION_SOURCES_REMOTE.package, face: 'host', schemas: [], invocations: [...TRANSLATION_SOURCES_REMOTE.descriptors, ...TRANSLATION_SOURCE_STORAGE_REMOTE.descriptors, ...TRANSLATION_SOURCE_INTEGRITY_REMOTE.descriptors],
       model: { package: TRANSLATION_SOURCES_REMOTE.package, face: 'host', classes: [], events: [], objects: [] } })
   }
   if (registerRemote) { if (ctx.inject) ctx.inject(['typert'], register); else register(ctx) }

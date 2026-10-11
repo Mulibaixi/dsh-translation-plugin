@@ -1,13 +1,14 @@
 import {
-  emptyTopicArchive, decodeTopicArchiveSnapshot, decodeTopicArchiveUserInput, putTopicArchive, putUserTopicArchive, adoptTopicArchive,
-  disableTopicArchive, deleteTopicArchiveEntry, reconcileTopicArchive, queryTopicArchive,
+  emptyTopicArchive, decodeTopicArchiveSnapshot, decodeTopicArchivePut, decodeTopicArchiveUserInput, putTopicArchive, putUserTopicArchive, adoptTopicArchive,
+  disableTopicArchive, deleteTopicArchiveEntry, reconcileTopicArchive, queryTopicArchive, referencedEntityIds,
   type TopicArchiveSnapshot, type TopicArchivePut, type TopicArchiveUserInput, type TopicArchiveUserPut, type ArchiveMutationResult, type TopicArchiveQuery,
 } from '../memory/topic-archive.js'
 import type { TermEvidenceResolver } from '../memory/topic-terms.js'
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
-import { isDocumentEvidenceUnloaded } from './document-evidence.js'
+import { isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
+import type { TranslationEvidenceReader } from './source-reader.js'
 
 export const TOPIC_ARCHIVE_PREFIX = 'dsh-translation-plugin:topic-archive:v1:'
 export function topicArchiveKey(topicId: string): string { return `${TOPIC_ARCHIVE_PREFIX}${encodeURIComponent(topicId)}` }
@@ -33,6 +34,7 @@ export class TopicArchiveStore {
   private enabled: boolean
   private notice: string | undefined
   private disposed = false
+  private evidenceReader: TranslationEvidenceReader | undefined
 
   constructor(private readonly sessions: SessionStore, private readonly resolver: TermEvidenceResolver, private readonly storage: LocalStoragePort | undefined = browserStorage(),
     listen?: (onChange: (key: string | null) => void) => () => void, private readonly locks: StructureLockPort | undefined = browserLocks()) {
@@ -49,6 +51,7 @@ export class TopicArchiveStore {
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   getNotice(): string | undefined { return this.notice }
   getStatus(ownerId: string, topicId: string): HistoryStatus { return this.seat(ownerId, topicId).status }
+  setEvidenceReader(reader: TranslationEvidenceReader | undefined): void { this.evidenceReader = reader }
   dispose(): void { this.disposed = true; this.stopSession(); this.stopStorage?.(); this.listeners.clear(); this.seats.clear() }
   private load(): void {
     if (!this.storage) return
@@ -80,11 +83,42 @@ export class TopicArchiveStore {
   }
   getSnapshot(ownerId: string, topicId: string): TopicArchiveSnapshot { return this.seat(ownerId, topicId).snapshot }
   private reconcile(snapshot: TopicArchiveSnapshot): TopicArchiveSnapshot {
-    return reconcileTopicArchive(snapshot, this.resolver, now(), ref => isDocumentEvidenceUnloaded(this.sessions, snapshot, ref))
+    return reconcileTopicArchive(snapshot, this.resolver, now(), ref => isTopicEvidenceUnloaded(this.sessions, snapshot, ref))
   }
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot {
     const seat = this.seat(ownerId, topicId)
     return { ...seat.snapshot, entries: seat.status === 'conflict' ? [] : queryTopicArchive(seat.snapshot, { ...query, ownerId, topicId }, this.resolver) }
+  }
+  async queryAsync(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot> {
+    const fixed = structuredClone(query), seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
+    if (fixed.mode !== 'normal' || seat.status === 'conflict') return { ...snapshot, entries: [] }
+    const candidates = snapshot.entries.filter(entry => {
+      if (entry.status !== 'active' || !fixed.kinds.includes(entry.kind)) return false
+      const labels = entry.kind === 'entity' ? [entry.name, ...entry.aliases] : entry.kind === 'fact' ? [entry.title] : [entry.relation]
+      for (const id of referencedEntityIds(entry)) {
+        const entity = snapshot.entries.find(item => item.id === id)
+        if (entity?.kind === 'entity') labels.push(entity.name, ...entity.aliases)
+      }
+      return labels.some(label => fixed.forms.includes(label))
+    })
+    const dependencyIds = new Set(candidates.flatMap(referencedEntityIds))
+    const needed = [...candidates, ...snapshot.entries.filter(entry => dependencyIds.has(entry.id))]
+    const prepared = await prepareTopicEvidence(this.sessions, snapshot, needed.filter(entry => entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader)
+    if (this.disposed || reader !== this.evidenceReader || !prepared.isCurrent() || seat.snapshot !== snapshot || this.getStatus(ownerId, topicId) === 'conflict' || !this.currentRaw(seat) ||
+      !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return { ...seat.snapshot, entries: [] }
+    return { ...snapshot, entries: queryTopicArchive(snapshot, { ...fixed, ownerId, topicId }, prepared.resolver) }
+  }
+  async reconcileAsync(ownerId: string, topicId: string): Promise<TopicArchiveSnapshot> {
+    const seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
+    const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry => entry.origin !== 'user_explicit' &&
+      entry.status !== 'disabled' && entry.status !== 'review_required').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader)
+    return this.locked(seat.snapshot, () => {
+      if (reader !== this.evidenceReader || seat.snapshot !== snapshot || !prepared.isCurrent() || !this.currentRaw(seat) ||
+        !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return seat.snapshot
+      const next = reconcileTopicArchive(snapshot, prepared.resolver, now(), prepared.isUnloaded)
+      if (next !== snapshot) { seat.snapshot = next; seat.dirty = true; seat.status = 'memory'; this.persistLocked(seat); this.emit() }
+      return seat.snapshot
+    })
   }
   private savingEnabled(): boolean {
     if (!this.storage) return false
@@ -145,12 +179,21 @@ export class TopicArchiveStore {
   }
   async apply(ownerId: string, topicId: string, expectedVersion: number, command: TopicArchiveCommand): Promise<ArchiveMutationResult> {
     const seat = this.seat(ownerId, topicId), failure: ArchiveMutationResult = { status: 'invalid', snapshot: seat.snapshot, entry: null }
+    const fixed: TopicArchiveCommand = structuredClone(command), reader = this.evidenceReader
+    if (fixed.kind === 'put' && !decodeTopicArchivePut(fixed.input)) return failure
+    if (seat.snapshot.version !== expectedVersion) return { status: 'stale', snapshot: seat.snapshot, entry: null }
+    const content = fixed.kind === 'put' || fixed.kind === 'user_put' ? fixed.input : seat.snapshot.entries.find(entry => entry.id === fixed.id)
+    const dependencyIds = new Set(content ? referencedEntityIds(content) : [])
+    const refs = fixed.kind === 'disable' ? [] : [...(fixed.kind === 'put' ? fixed.input.evidence : []),
+      ...seat.snapshot.entries.filter(entry => dependencyIds.has(entry.id) && entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))]
+    const prepared = await prepareTopicEvidence(this.sessions, seat.snapshot, refs, this.resolver, reader)
     return this.locked(failure, () => {
-      if (!this.currentRaw(seat) || seat.snapshot.version !== expectedVersion) { this.emit(); return { status: 'stale', snapshot: seat.snapshot, entry: null } }
-      const result = command.kind === 'put' ? putTopicArchive(seat.snapshot, command.input, this.resolver, now()) :
-        command.kind === 'user_put' ? putUserTopicArchive(seat.snapshot, command.input, this.resolver, { eventId: eventId('archive-user-save'), at: now() }) :
-          command.kind === 'adopt' ? adoptTopicArchive(seat.snapshot, command.id, command.expectedEntryVersion, this.resolver, { eventId: eventId('archive-adoption'), at: now() }) :
-            disableTopicArchive(seat.snapshot, command.id, command.expectedEntryVersion, now())
+      if (reader !== this.evidenceReader || !prepared.isCurrent() || !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId) ||
+        !this.currentRaw(seat) || seat.snapshot.version !== expectedVersion) { this.emit(); return { status: 'stale', snapshot: seat.snapshot, entry: null } }
+      const result = fixed.kind === 'put' ? putTopicArchive(seat.snapshot, fixed.input, prepared.resolver, now()) :
+        fixed.kind === 'user_put' ? putUserTopicArchive(seat.snapshot, fixed.input, prepared.resolver, { eventId: eventId('archive-user-save'), at: now() }) :
+          fixed.kind === 'adopt' ? adoptTopicArchive(seat.snapshot, fixed.id, fixed.expectedEntryVersion, prepared.resolver, { eventId: eventId('archive-adoption'), at: now() }) :
+            disableTopicArchive(seat.snapshot, fixed.id, fixed.expectedEntryVersion, now())
       const changed = result.snapshot !== seat.snapshot
       if (changed) { seat.snapshot = result.snapshot; seat.dirty = true; seat.status = 'memory'; this.notice = undefined }
       // A repeated explicit save retries a dirty snapshot without manufacturing a new semantic version.

@@ -1,11 +1,8 @@
 import { h, react } from './react.js'
-import { resolveTermEvidence, type TermEvidenceRef } from '../memory/topic-terms.js'
 import type { TopicArchiveEntry, TopicArchiveKind, TopicArchiveSnapshot, TopicArchiveUserInput, ArchiveMutationResult } from '../memory/topic-archive.js'
 import type { TopicArchiveStore } from './topic-archive-store.js'
 import type { SessionStore } from './session-store.js'
-import type { TopicTermsViewPort } from './topic-terms-view.js'
-import { isTextUnit } from './translation-history.js'
-import { isDocumentEvidenceUnloaded } from './document-evidence.js'
+import { TopicEvidenceView, type TopicTermsViewPort } from './topic-terms-view.js'
 
 const kinds = { entity: '实体', fact: '事实', relation: '关系' } as const
 const statuses = { proposal: '待确认', active: '生效', review_required: '待复核', disabled: '已停用' } as const
@@ -49,23 +46,11 @@ function mutationMessage(result: ArchiveMutationResult): true | string {
   if (result.status === 'invalid') return '档案内容或关联实体无效；请检查必填内容与实体状态。'
   return result.status === 'updated' || result.status === 'unchanged' ? true : '操作未完成，请核对后重试。'
 }
-function ArchiveEvidence({ sessions, terms, snapshot, reference }: { readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly snapshot: TopicArchiveSnapshot; readonly reference: TermEvidenceRef }): unknown {
-  const [open, setOpen] = react.useState(false), candidate = sessions.getSession(reference.sessionId)
-  const session = candidate?.ownerId === snapshot.ownerId && candidate.topicId === snapshot.topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
-  const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === reference.unitId) : undefined
-  const revision = unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === reference.revisionId) : undefined
-  const body = resolveTermEvidence(snapshot, reference, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
-  const unloaded = isDocumentEvidenceUnloaded(sessions, snapshot, reference)
-  return h('div', { className: 'dsh-tp-term-evidence' },
-    h('span', { className: 'dsh-tp-muted' }, `${session?.name ?? '已删除会话'} · ${unit ? `${isTextUnit(unit) ? '文本' : '文档'} ${unit.order}` : '来源不可用'}${revision ? ` · 版本 ${revision.order}` : ''} · ${reference.kind === 'source' ? '原文' : '最终译文'}${reference.role === 'example' ? '（示例）' : ''}`),
-    h('button', { type: 'button', disabled: body === undefined, 'aria-expanded': open, onClick: () => setOpen(value => !value) }, unloaded ? '文档依据尚未加载' : body === undefined ? '依据已变化或不可用' : open ? '收起来源' : '查看来源'),
-    open && body !== undefined ? h('div', { className: 'dsh-tp-translation-text' }, body) : null)
-}
-
 /** One mounted view per topic and type keeps drafts when the user changes entries or categories. */
-export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, kind }: {
+export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, kind, active = true, evidenceContextKey }: {
   readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly archive: TopicArchiveStore
   readonly ownerId: string; readonly topicId: string; readonly kind: TopicArchiveKind
+  readonly active?: boolean | undefined; readonly evidenceContextKey?: string | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => archive.subscribe(() => refresh(value => value + 1)), [archive])
@@ -222,7 +207,7 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
           entry.kind === 'entity' ? [h('div', null, `别名：${entry.aliases.join('、') || '无'}`), h('div', { className: 'dsh-tp-translation-text' }, entry.description)] :
             entry.kind === 'fact' ? [h('div', { className: 'dsh-tp-translation-text' }, entry.body), h('div', null, `关联实体：${entry.entityIds.map(id => entityLabel(snapshot, id)).join('、') || '无'}`)] :
               [h('div', null, `源实体：${entityLabel(snapshot, entry.sourceEntityId)}`), h('div', null, `关系：${entry.relation}`), h('div', null, `目标实体：${entityLabel(snapshot, entry.targetEntityId)}`), h('div', { className: 'dsh-tp-translation-text' }, entry.description)],
-          ...entry.evidence.map((reference, index) => h(ArchiveEvidence, { key: `${entry.version}:${index}`, sessions, terms, snapshot, reference })),
+          ...entry.evidence.map((reference, index) => h(TopicEvidenceView, { key: `${ownerId}:${topicId}:${entry.id}:${entry.version}:${index}`, sessions, terms, snapshot, reference, active, contextKey: evidenceContextKey })),
         ) : h('p', { className: 'dsh-tp-muted' }, `选择${kinds[kind]}查看详情。`))),
     deletion ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除主题档案确认' },
       h('p', null, `删除“${title(snapshot, deletion.entry)}”？同主题全部会话共用此条目。${deletion.entry.kind === 'entity' ? '引用此实体的事实和关系将标为待复核。' : ''}`),

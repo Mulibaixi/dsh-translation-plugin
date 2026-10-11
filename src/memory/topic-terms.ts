@@ -55,7 +55,18 @@ export interface TermEvidenceFact {
   readonly source: string
   readonly final: { readonly revisionId: string; readonly selectionEventId: string; readonly sourceVersion: number; readonly text: string } | null
 }
-export type TermEvidenceResolver = (sessionId: string, unitId: string) => TermEvidenceFact | undefined
+/** Pure access to previously resolved facts. resolveRef returns exactly the requested range, never a partial whole body. */
+export type TermEvidenceResolver = ((sessionId: string, unitId: string) => TermEvidenceFact | undefined) & {
+  readonly resolveRef?: (scope: Pick<TopicTermSnapshot, 'ownerId' | 'topicId'>, ref: TermEvidenceRef) => string | undefined
+  /** Deferred facts may preserve a potential conflict; they never make a query or new basis ready. */
+  readonly isUnloaded?: (scope: Pick<TopicTermSnapshot, 'ownerId' | 'topicId'>, ref: TermEvidenceRef) => boolean
+}
+/** Includes scope and every evidence identity field; legacy source refs explicitly identify version 1. */
+export function termEvidenceKey(scope: Pick<TopicTermSnapshot, 'ownerId' | 'topicId'>, ref: TermEvidenceRef): string {
+  return JSON.stringify([scope.ownerId, scope.topicId, ref.sessionId, ref.unitId, ref.kind,
+    ref.kind === 'source' ? ref.sourceVersion ?? 1 : null, ref.revisionId, ref.selectionEventId,
+    ref.range?.start ?? null, ref.range?.end ?? null])
+}
 export interface TopicTermPut extends TopicTermContent {
   readonly id: string
   readonly expectedEntryVersion: number | null
@@ -151,6 +162,10 @@ export function emptyTopicTerms(ownerId: string, topicId: string, at: string): T
 }
 
 export function resolveTermEvidence(snapshot: Pick<TopicTermSnapshot, 'ownerId' | 'topicId'>, ref: TermEvidenceRef, resolver: TermEvidenceResolver): string | undefined {
+  if (resolver.resolveRef) {
+    const body = resolver.resolveRef(snapshot, ref)
+    return typeof body === 'string' && body.trim() ? body : undefined
+  }
   const fact = resolver(ref.sessionId, ref.unitId)
   if (!fact || fact.ownerId !== snapshot.ownerId || fact.topicId !== snapshot.topicId || !integer(fact.sourceVersion, 1)) return undefined
   let body: string
@@ -176,13 +191,16 @@ function validBasis(snapshot: TopicTermSnapshot, entry: TopicTermContent, resolv
 function effective(snapshot: TopicTermSnapshot, entry: TopicTerm, resolver: TermEvidenceResolver): boolean {
   return entry.status === 'active' && (entry.origin === 'user_explicit' || (entry.origin === 'source_checked' && validBasis(snapshot, entry, resolver)))
 }
-function conflicting(left: TopicTermContent, right: TopicTermContent): boolean {
+/** Shared candidate selection for bounded evidence preparation and the pure conflict check. */
+export function topicTermContentsConflict(left: TopicTermContent, right: TopicTermContent): boolean {
   return left.sourceLanguage === right.sourceLanguage && left.targetLanguage === right.targetLanguage && left.sense === right.sense &&
     [...left.sourceForms, ...left.aliases].some(form => [...right.sourceForms, ...right.aliases].includes(form)) &&
     (left.preferred !== right.preferred || left.forbidden.includes(right.preferred) || right.forbidden.includes(left.preferred))
 }
 function hasConflict(snapshot: TopicTermSnapshot, entry: TopicTermContent & { readonly id: string }, resolver?: TermEvidenceResolver): boolean {
-  return snapshot.entries.some(old => old.id !== entry.id && old.status === 'active' && (!resolver || effective(snapshot, old, resolver)) && conflicting(old, entry))
+  return snapshot.entries.some(old => old.id !== entry.id && old.status === 'active' && topicTermContentsConflict(old, entry) &&
+    (!resolver || effective(snapshot, old, resolver) || (old.origin === 'source_checked' && hasSourceBasis(old) &&
+      old.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined || resolver.isUnloaded?.(snapshot, ref)))))
 }
 function activeProjection(entry: TopicTerm): unknown {
   if (entry.status !== 'active') return null
