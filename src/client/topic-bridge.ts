@@ -1,5 +1,5 @@
 import {
-  MAX_TOPIC_BRIDGE_REPLY_BYTES, parseTopicBridgeCapability, parseTopicBridgeDown, parseTopicBridgeReply,
+  MAX_TOPIC_BRIDGE_REPLY_BYTES, parseTopicBridgeCapability, parseTopicBridgeV2Capability, parseTopicBridgeDown, parseTopicBridgeReply,
   type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact, type TopicSessionSummary,
 } from '../shared/topic-bridge.js'
 import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceRef, TopicTermQuery } from '../memory/topic-terms.js'
@@ -8,11 +8,14 @@ import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { NormalTranslationAcceptance, NormalTranslationUpdate } from '../shared/normal-translation.js'
 import type { NormalTranslationUnitRequest, NormalTranslationSourceCorrection } from '../shared/normal-translation.js'
+import type { NormalTranslationResolution, NormalTranslationV2Event } from '../shared/normal-translation-v2.js'
 import { currentFinalRevision } from './translation-history.js'
 import type { NormalTranslationReply } from './normal-translation.js'
 
 export interface TopicBridgeRemotePort {
   capabilities(): Promise<unknown>
+  capabilitiesV2?(): Promise<unknown>
+  connectV2?: TopicBridgeRemotePort['connect']
   connect(request: TopicBridgeOpen, signal?: AbortSignal): AsyncIterable<unknown> & {
     send(item: TopicBridgeReply): void
     dispose(): void | Promise<void>
@@ -33,6 +36,8 @@ interface NormalPort {
   prepare(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
   accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
   update(ownerId: string, request: NormalTranslationUpdate): NormalTranslationReply
+  updateV2(ownerId: string, request: { readonly mainSessionId: string; readonly translationSessionId: string; readonly unitId: string; readonly operationId: string; readonly sourceVersion: number; readonly event: NormalTranslationV2Event }): NormalTranslationReply
+  resolveExchange(ownerId: string, request: { readonly translationSessionId: string; readonly exchangeId: string; readonly resolution: NormalTranslationResolution }): NormalTranslationReply
   observe(ownerId: string, request: { readonly translationSessionId: string; readonly operationId: string }): NormalTranslationReply
   resolve(ownerId: string, request: NormalTranslationUnitRequest): NormalTranslationReply
   correctSource(ownerId: string, request: NormalTranslationSourceCorrection): NormalTranslationReply
@@ -102,12 +107,21 @@ export class TopicBridgeClient {
       if (response?.ok !== true) throw new Error('无法取得主题管理服务回执。')
       const capability = parseTopicBridgeCapability(response.value)
       if (!capability.ready) throw new Error(capability.reason ?? '主题管理服务尚未就绪。')
-      const handle = remote.connect({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
+      let protocol: 1 | 2 = 1
+      if (remote.capabilitiesV2 && remote.connectV2) {
+        try {
+          const response = await remote.capabilitiesV2() as { readonly ok?: boolean; readonly value?: unknown }
+          if (response?.ok === true && parseTopicBridgeV2Capability(response.value).ready) protocol = 2
+        } catch { /* Older Host: keep the single v1 connection and text-only execution. */ }
+      }
+      if (!current()) return
+      const handle = protocol === 2 ? remote.connectV2!({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
+        : remote.connect({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
       connection.handle = handle
       let opened = false
       for await (const raw of handle) {
         if (!current()) return
-        const frame = parseTopicBridgeDown(raw)
+        const frame = parseTopicBridgeDown(raw, protocol)
         if (frame.kind === 'ready') {
           if (opened || frame.ownerId !== ownerId || frame.mainSessionId !== ownerId) throw new Error('主题管理连接归属无效。')
           opened = true; connection.ready = true; connection.reason = undefined; this.emit()
@@ -123,7 +137,11 @@ export class TopicBridgeClient {
         }
         if (!current()) return
         if (new TextEncoder().encode(JSON.stringify(reply)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) reply = error(frame.requestId, 'reply_too_large', '此资料超过桥接读取上限，未截断或发送。')
-        handle.send(parseTopicBridgeReply(reply))
+        if (protocol === 1 && reply.ok && reply.value.kind === 'unit') {
+          reply = { ...reply, value: { ...reply.value, unit: { ...reply.value.unit, revisions: reply.value.unit.revisions.map(revision =>
+            revision.status === 'context_requested' ? { ...revision, status: 'failed' as const } : revision) } } }
+        }
+        handle.send(parseTopicBridgeReply(reply, protocol))
       }
       if (current()) throw new Error('主题管理连接已结束。')
     } catch (failure) {
@@ -175,6 +193,16 @@ export class TopicBridgeClient {
         : this.normal?.accept(ownerId, payload as NormalTranslationAcceptance)
       if (result?.ok && result.value.kind === 'normal_operation') this.publishAdmittedUnit(ownerId, result.value.operation.translationSessionId, result.value.operation.unitId)
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
+    }
+    if (command.kind === 'normal_v2_update') {
+      if (command.mainSessionId !== ownerId || !this.isPublished(ownerId, command.translationSessionId, command.unitId)) return error(request.requestId, 'reference_not_published', '普通翻译单元未由当前主会话明确提供。')
+      const { kind: _kind, ...payload } = command
+      const result = this.normal?.updateV2(ownerId, payload)
+      return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译 v2 通道尚未就绪。')
+    }
+    if (command.kind === 'normal_exchange_resolve') {
+      const result = this.normal?.resolveExchange(ownerId, command)
+      return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译 exchange 通道尚未就绪。')
     }
     if (command.kind === 'list_sessions') return success({ kind: 'sessions', sessions: this.sessions.getAvailableSessions(ownerId).filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => this.sessionSummary(session)) })
     if (command.kind === 'list_topics') return success({ kind: 'topics', topics: this.sessions.getTopics(ownerId).map(topic => ({ ...topic,
@@ -242,7 +270,7 @@ export class TopicBridgeClient {
   publishUnit(ownerId: string, sessionId: string, unitId: string): boolean {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     const unit = history?.units.find(unit => unit.id === unitId), latest = unit?.revisions.at(-1)
-    if (this.disposed || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || session.mode !== 'normal' || !unit || !latest || !['completed', 'failed', 'cancelled', 'interrupted'].includes(latest.status)) return false
+    if (this.disposed || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || session.mode !== 'normal' || !unit || !latest || !['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(latest.status)) return false
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
     const final = currentFinalRevision(unit)
     const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,

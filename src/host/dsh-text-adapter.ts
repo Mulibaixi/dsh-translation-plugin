@@ -1,7 +1,10 @@
 import type { ModelSelection } from '../shared/contracts.js'
 import type { TextCapabilityEvidence, TextExecutionAdapter, TextExecutionEvent, TextExecutionPacket } from '../shared/domain-contracts.js'
-import { NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION, reconstructTranslationContext, reconstructNormalTranslationContext,
+import { NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION,
+  reconstructTranslationContext, reconstructNormalExchangeTranslationContext, reconstructNormalTranslationContext,
   type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
+import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
+import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
 export { QUICK_SYSTEM_PROMPT } from '../shared/translation-call.js'
 
 /** Narrow views of the 0.2.0-rc.2 public runtime, checked against the installed packages. */
@@ -9,6 +12,8 @@ export interface DshPreparedCall {
   readonly config: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string; readonly maxTokens?: number }
   readonly adapterDefaults: Record<string, true>
   readonly context?: { readonly contextWindow: number }
+  /** Public rc.2 exact-route evidence that the adapter handles tool declarations. */
+  readonly toolUpdate?: 'in-history' | 'addition-only'
   stream(options: Record<string, unknown>): AsyncIterable<Record<string, unknown>>
 }
 export interface DshDetachedSession {
@@ -44,7 +49,29 @@ export interface NormalExecutionPacket {
   readonly targetLanguage: string
   readonly instruction: string
   readonly context: NormalTranslationContext
+  readonly exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>
+  readonly exchangeContextVersion?: number
 }
+export type NormalExecutionEvent = TextExecutionEvent | { readonly type: 'needs_context'; readonly input: RequestContextInput }
+type PreparedNormalCall = { route: ModelSelection; call: DshPreparedCall; normalContext?: NormalTranslationContext; requestContext: boolean;
+  exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }> }
+const requestContextTool = Object.freeze({
+  name: 'request_context',
+  description: 'Ask one to three focused questions only when the frozen translation context is insufficient or materially conflicting.',
+  parameters: {
+    type: 'object', additionalProperties: false, required: ['questions'],
+    properties: { questions: { type: 'array', minItems: 1, maxItems: 3, items: {
+      type: 'object', additionalProperties: false, required: ['type', 'range', 'question', 'reason'],
+      properties: {
+        type: { type: 'string', enum: ['missing_context', 'term_ambiguity', 'requirement_conflict'] },
+        range: { anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, required: ['start', 'end'],
+          properties: { start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 } } }] },
+        question: { type: 'string', minLength: 1, maxLength: 8192 },
+        reason: { type: 'string', minLength: 1, maxLength: 8192 },
+      },
+    } } },
+  },
+})
 export type LlmModuleLoader = () => Promise<DshLlmHelpers>
 const llmModule = '@deepseek-ai/dsh-llm'
 /** Resolve from the host composition, including its native package hooks, rather than the external bundle directory. */
@@ -87,7 +114,7 @@ function failure(error: unknown, stage: string): SafeExecutionFailure {
 /** Calls the registered DSH adapter once, with a detached native Session and no tools. */
 export class DshTextExecutionAdapter implements TextExecutionAdapter {
   private readonly generation = `dsh-quick:${crypto.randomUUID()}`
-  private readonly prepared = new Map<string, { route: ModelSelection; call: DshPreparedCall; normalContext?: NormalTranslationContext }>()
+  private readonly prepared = new Map<string, PreparedNormalCall>()
   private readonly routes = new Map<string, ModelSelection>()
   private readonly failures = new Map<string, SafeExecutionFailure>()
   private readonly logs = new Map<string, readonly unknown[]>()
@@ -132,7 +159,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         (route.reasoningEffort !== undefined && call.config.reasoningEffort !== route.reasoningEffort)) {
         throw Object.assign(new Error('Prepared route changed'), { code: 'INVALID_PREPARED_CALL' })
       }
-      this.prepared.set(operationId, { route: frozen(structuredClone(route)), call })
+      this.prepared.set(operationId, { route: frozen(structuredClone(route)), call, requestContext: false })
       this.routes.set(key(route), frozen(structuredClone(route)))
     } catch (error) { this.failures.set(operationId, failure(error, 'prepare')); throw error }
   }
@@ -141,21 +168,36 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   diagnostic(operationId: string): SafeExecutionFailure | undefined { return this.failures.get(operationId) }
   callMetadata(operationId: string): Omit<TranslationCallMetadata, 'usage'> | undefined { return this.calls.get(operationId) }
   /** Full native prepared-call config and a conservative estimate, before business acceptance. */
-  preflightNormal(packet: NormalExecutionPacket): TranslationCallMetadata {
+  preflightNormal(packet: NormalExecutionPacket, requestContextAvailable = false): TranslationCallMetadata {
     try {
       const bound = this.prepared.get(packet.operationId)
       if (!bound || key(bound.route) !== key(packet.model)) throw Object.assign(new Error('Normal preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
-      const context = reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context)
+      const requestContext = requestContextAvailable && bound.call.toolUpdate !== undefined
+      const context = requestContext
+        ? reconstructNormalExchangeTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, bound.exchangeResume)
+        : reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context)
       const bytes = new TextEncoder().encode(context.systemPrompt + context.userMessage).byteLength
       // This is a conservative UTF-8 based estimate, not a tokenizer measurement.
       if (bytes > 196_608) throw Object.assign(new Error('Normal execution package exceeds short-text budget'), { code: 'INPUT_LIMIT' })
       if (bound.call.context && bound.call.config.maxTokens !== undefined && bytes + 16 + bound.call.config.maxTokens > bound.call.context.contextWindow) throw Object.assign(new Error('Estimated input plus output reservation exceeds model context'), { code: 'CONTEXT_WINDOW_EXCEEDED' })
       const normalContext = frozen(structuredClone(packet.context))
-      this.prepared.set(packet.operationId, { ...bound, normalContext })
-      return { promptVersion: NORMAL_TRANSLATION_PROMPT_VERSION, model: { provider: bound.call.config.provider, model: bound.call.config.model,
+      this.prepared.set(packet.operationId, { ...bound, normalContext, requestContext })
+      return { promptVersion: requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION, model: { provider: bound.call.config.provider, model: bound.call.config.model,
         reasoningEffort: bound.call.config.reasoningEffort ?? null }, configVersion: null, maxOutputTokens: bound.call.config.maxTokens ?? null,
-        usage: { inputTokens: null, outputTokens: null }, context: normalContext }
+        usage: { inputTokens: null, outputTokens: null }, context: normalContext,
+        ...(requestContext ? { exchangeContext: bound.exchangeResume
+          ? { contextVersion: packet.exchangeContextVersion ?? 1, resolutionRefs: [{ resolutionId: bound.exchangeResume.resolutionId }] }
+          : { contextVersion: 1, resolutionRefs: [] } } : {}) }
     } catch (error) { this.failures.set(packet.operationId, failure(error, 'prepare')); throw error }
+  }
+  async prepareNormalResume(packet: NormalExecutionPacket, signal: AbortSignal): Promise<TranslationCallMetadata> {
+    if (!packet.exchangeResume) throw new Error('Resume resolution is missing')
+    await this.prepareOperation(packet.operationId, packet.model, signal)
+    const bound = this.prepared.get(packet.operationId)
+    if (!bound?.call.toolUpdate) throw Object.assign(new Error('Resume route no longer supports tools'), { code: 'INVALID_PREPARED_CALL' })
+    this.prepared.set(packet.operationId, { ...bound, normalContext: frozen(structuredClone(packet.context)), requestContext: true,
+      exchangeResume: frozen(structuredClone(packet.exchangeResume)) })
+    return this.preflightNormal(packet, true)
   }
   /** Host diagnostics only; this is never registered as a Remote method. */
   inspectLog(operationId: string): readonly unknown[] | undefined { return this.logs.get(operationId) }
@@ -174,18 +216,25 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     if (!bound || key(bound.route) !== key(packet.model) || packet.mode !== 'quick' || packet.tool_names.length || packet.memory_refs.length || packet.main_history.length) {
       throw new Error('Quick execution preparation does not match')
     }
-    yield* this.executePrepared(packet.operation_id, packet.attempt_id, bound.call, 'quick',
-      reconstructTranslationContext({ source: packet.source_text, targetLanguage: packet.target_language, instruction: packet.instruction }), signal)
+    for await (const event of this.executePrepared(packet.operation_id, packet.attempt_id, bound.call, 'quick',
+      reconstructTranslationContext({ source: packet.source_text, targetLanguage: packet.target_language, instruction: packet.instruction }), signal)) {
+      if (event.type === 'needs_context') throw Object.assign(new Error('Quick translation cannot request context'), { code: 'INVALID_STREAM' })
+      yield event
+    }
   }
-  async *executeNormal(packet: NormalExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncIterable<TextExecutionEvent> {
+  async *executeNormal(packet: NormalExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncGenerator<NormalExecutionEvent> {
     const bound = this.prepared.get(packet.operationId)
     this.prepared.delete(packet.operationId)
     if (!bound || key(bound.route) !== key(packet.model) || !bound.normalContext || JSON.stringify(bound.normalContext) !== JSON.stringify(packet.context)) throw new Error('Normal execution preparation does not match')
     yield* this.executePrepared(packet.operationId, packet.callId, bound.call, 'normal',
-      reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext), signal, bound.normalContext, onDispatch)
+      (bound.requestContext ? reconstructNormalExchangeTranslationContext : reconstructNormalTranslationContext)(
+        { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, bound.exchangeResume),
+      signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion)
   }
   private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal',
-    context: { readonly systemPrompt: string; readonly userMessage: string }, signal: AbortSignal, normalContext?: NormalTranslationContext, onDispatch?: () => void): AsyncIterable<TextExecutionEvent> {
+    context: { readonly systemPrompt: string; readonly userMessage: string }, signal: AbortSignal, normalContext?: NormalTranslationContext,
+    onDispatch?: () => void, requestContext = false, sourceCodePointLength = 0,
+    exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>, exchangeContextVersion = 1): AsyncGenerator<NormalExecutionEvent> {
     const helpers = this.helpers!
     const session = this.sessions!.prepare(`translation-${mode}:${attemptId}`)
     const events: unknown[] = []
@@ -203,10 +252,12 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         ...(Object.keys(call.adapterDefaults).length ? { adapterDefaults: call.adapterDefaults } : {}),
       }, reason: 'initial', startsSeries: true,
     })
-    const options = Object.freeze({ ...call.config, messages: frozen([...session.deriveMessages()]), signal, ...(mode === 'normal' ? { tools: Object.freeze([]) } : {}) })
+    const options = Object.freeze({ ...call.config, messages: frozen([...session.deriveMessages()]), signal,
+      ...(mode === 'normal' ? { tools: requestContext ? Object.freeze([requestContextTool]) : Object.freeze([]) } : {}) })
     const stream = new helpers.AssistantStreamAccumulator()
     const assembler = new helpers.BlockAssembler()
-    const blocks = new Map<number, { type: 'text' | 'reasoning'; declared: boolean; text: string }>()
+    const blocks = new Map<number, { type: 'text' | 'reasoning' | 'tool-call'; declared: boolean; text: string }>()
+    const toolCalls = new Map<number, { id?: string; name?: string; arguments: string }>()
     const closed = new Set<number>()
     let finish: Record<string, unknown> | undefined
     let totalText = 0
@@ -214,9 +265,13 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     let settlementDone = false
     try {
       signal.throwIfAborted()
-      this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal' ? NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION,
+      this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal'
+        ? requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION,
         model: Object.freeze({ provider: call.config.provider, model: call.config.model, reasoningEffort: call.config.reasoningEffort ?? null }),
-        configVersion: null, maxOutputTokens: call.config.maxTokens ?? null, ...(normalContext ? { context: normalContext } : {}) }))
+        configVersion: null, maxOutputTokens: call.config.maxTokens ?? null, ...(normalContext ? { context: normalContext } : {}),
+        ...(requestContext ? { exchangeContext: exchangeResume
+          ? { contextVersion: exchangeContextVersion, resolutionRefs: [{ resolutionId: exchangeResume.resolutionId }] }
+          : { contextVersion: 1, resolutionRefs: [] } } : {}) }))
       onDispatch?.()
       for await (const chunk of call.stream(options)) {
         if (finish) throw Object.assign(new Error('Chunk after terminal'), { code: 'INVALID_STREAM' })
@@ -224,8 +279,22 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         stream.push({ time: Date.now(), chunk })
         if (chunk.type === 'block-start') {
           if (!Number.isSafeInteger(chunk.index) || (chunk.index as number) < 0 || blocks.has(chunk.index as number) ||
-            (chunk.blockType !== 'text' && chunk.blockType !== 'reasoning')) throw Object.assign(new Error('Unsupported block'), { code: 'INVALID_STREAM' })
+            (chunk.blockType !== 'text' && chunk.blockType !== 'reasoning' && chunk.blockType !== 'tool-call')) throw Object.assign(new Error('Unsupported block'), { code: 'INVALID_STREAM' })
           blocks.set(chunk.index as number, { type: chunk.blockType, declared: true, text: '' })
+        } else if (chunk.type === 'tool-call-delta') {
+          const index = chunk.index as number, id = chunk.id as string, name = chunk.name as string | undefined, args = chunk.argumentsDelta as string
+          if (!Number.isSafeInteger(index) || index < 0 || typeof id !== 'string' || !id || (name !== undefined && typeof name !== 'string') ||
+            typeof args !== 'string' || closed.has(index)) throw Object.assign(new Error('Invalid tool-call delta'), { code: 'INVALID_STREAM' })
+          const block = blocks.get(index) ?? { type: 'tool-call' as const, declared: false, text: '' }
+          if (block.type !== 'tool-call') throw Object.assign(new Error('Tool-call block type changed'), { code: 'INVALID_STREAM' })
+          const callState = toolCalls.get(index) ?? { arguments: '' }
+          if (callState.id !== undefined && callState.id !== id || name !== undefined && callState.name !== undefined && callState.name !== name) {
+            throw Object.assign(new Error('Tool-call identity changed'), { code: 'INVALID_STREAM' })
+          }
+          callState.id = id; if (name !== undefined && name !== '') callState.name = name
+          callState.arguments += args
+          if (callState.arguments.length > 32_768) throw Object.assign(new Error('Tool-call arguments exceed limit'), { code: 'INVALID_STREAM' })
+          toolCalls.set(index, callState); blocks.set(index, block)
         } else if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') {
           const type = chunk.type === 'text-delta' ? 'text' : 'reasoning'
           if (!Number.isSafeInteger(chunk.index) || (chunk.index as number) < 0 || typeof chunk.text !== 'string' || closed.has(chunk.index as number)) throw Object.assign(new Error('Invalid delta'), { code: 'INVALID_STREAM' })
@@ -243,16 +312,26 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
           const block = chunk.block as { type?: string; text?: string } | undefined
           const partial = blocks.get(chunk.index as number)
           if (!Number.isSafeInteger(chunk.index) || (chunk.index as number) < 0 || !block ||
-            (block.type !== 'text' && block.type !== 'reasoning') || (partial && partial.type !== block.type) ||
-            closed.has(chunk.index as number) || typeof block.text !== 'string' || (partial?.text && partial.text !== block.text)) {
+            (block.type !== 'text' && block.type !== 'reasoning' && block.type !== 'tool-call') || (partial && partial.type !== block.type) ||
+            closed.has(chunk.index as number) || (block.type !== 'tool-call' && typeof block.text !== 'string') ||
+            (block.type !== 'tool-call' && partial?.text && partial.text !== block.text)) {
             throw Object.assign(new Error('Invalid block end'), { code: 'INVALID_STREAM' })
           }
-          blocks.set(chunk.index as number, { type: block.type, declared: partial?.declared ?? false, text: block.text })
+          if (block.type === 'tool-call') {
+            const call = block as { type: string; id?: string; name?: string; arguments?: string }
+            const callState = toolCalls.get(chunk.index as number)
+            if (!callState || !callState.id || !callState.name || typeof call.arguments !== 'string' ||
+              call.id !== callState.id || call.name !== callState.name || call.arguments !== callState.arguments) {
+              throw Object.assign(new Error('Incomplete tool-call block'), { code: 'INVALID_STREAM' })
+            }
+          }
+          blocks.set(chunk.index as number, { type: block.type, declared: partial?.declared ?? false, text: block.type === 'tool-call' ? '' : block.text! })
           if (block.type === 'text' && !partial?.text) {
-            totalText += block.text.length
+            const blockText = block.text!
+            totalText += blockText.length
             if (totalText > 2_000_000) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
-            emittedText += block.text
-            yield { type: 'text', text: block.text }
+            emittedText += blockText
+            yield { type: 'text', text: blockText }
           }
           closed.add(chunk.index as number)
         } else if (chunk.type === 'usage') {
@@ -261,17 +340,26 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
           yield { type: 'usage', input_tokens: usage.inputTokens!, output_tokens: usage.outputTokens! }
         } else if (chunk.type === 'finish') {
           const reason = chunk.reason as Record<string, unknown> | undefined
-          if (!reason || !['stop', 'max-tokens', 'error', 'aborted'].includes(String(reason.kind))) throw Object.assign(new Error('Unsupported terminal'), { code: 'INVALID_STREAM' })
+          if (!reason || !['stop', 'tool-calls', 'max-tokens', 'error', 'aborted'].includes(String(reason.kind))) throw Object.assign(new Error('Unsupported terminal'), { code: 'INVALID_STREAM' })
           finish = reason
         } else throw Object.assign(new Error('Unsupported stream chunk'), { code: 'INVALID_STREAM' })
         assembler.push(chunk)
       }
       if (!finish) throw Object.assign(new Error('Missing terminal'), { code: 'INVALID_STREAM' })
+      let needsContext: RequestContextInput | undefined
+      if (toolCalls.size || finish.kind === 'tool-calls') {
+        if (!requestContext || finish.kind !== 'tool-calls' || toolCalls.size !== 1 ||
+          [...blocks].some(([index, block]) => block.declared && !closed.has(index))) throw Object.assign(new Error('Unexpected or incomplete tool-call response'), { code: 'INVALID_STREAM' })
+        const call = [...toolCalls.values()][0]!
+        if (call.name !== 'request_context' || !call.id) throw Object.assign(new Error('Unknown control tool'), { code: 'INVALID_STREAM' })
+        try { needsContext = parseRequestContextInput(JSON.parse(call.arguments), sourceCodePointLength) }
+        catch { throw Object.assign(new Error('Invalid request_context payload'), { code: 'INVALID_STREAM' }) }
+      }
       const assembledText = assembler.blocks().filter(block => block.type === 'text').map(block => block.text ?? '').join('')
       if (assembledText !== emittedText) throw Object.assign(new Error('Assembled text differs from emitted text'), { code: 'INVALID_STREAM' })
-      const complete = finish.kind === 'stop' && !signal.aborted && [...blocks].every(([index, block]) => !block.declared || closed.has(index)) && !!assembledText.trim()
+      const complete = !needsContext && finish.kind === 'stop' && !signal.aborted && [...blocks].every(([index, block]) => !block.declared || closed.has(index)) && !!assembledText.trim()
       if (finish.kind === 'stop' && !complete) throw Object.assign(new Error('Incomplete blocks'), { code: 'INVALID_STREAM' })
-      if (finish.kind === 'stop' || finish.kind === 'max-tokens') {
+      if (finish.kind === 'stop' || finish.kind === 'max-tokens' || needsContext) {
         const content = assembler.blocks()
         append('assistant/message', { turn: 0, step: 0, message: helpers.createAssistantMessage({ content, source: { provider: call.config.provider, model: call.config.model } }), stream: stream.snapshot() }, true)
       } else {
@@ -279,6 +367,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         this.failures.set(operationId, failure(finish.failure, 'stream'))
       }
       settlementDone = true
+      if (needsContext) yield { type: 'needs_context', input: needsContext }
       yield {
         type: 'terminal', reason: signal.aborted || finish.kind === 'aborted' ? 'aborted' : finish.kind === 'max-tokens' ? 'max_tokens' : finish.kind === 'error' ? 'error' : 'stop',
         completeness: complete ? 'complete' : 'incomplete', checks_passed: complete,

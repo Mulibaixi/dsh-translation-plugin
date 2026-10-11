@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.14.3",
+  "version": "0.15.0",
   "private": true,
   "license": "MIT",
   "description": "A DeepSeek Harness translation plugin framework (early development).",
@@ -24,8 +24,17 @@
     "README.md",
     "README.zh-CN.md",
     "CHANGELOG.md",
+    "CONTRIBUTING.md",
     "LICENSE"
   ],
+  "peerDependencies": {
+    "dsh-composer-extension": "0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "dsh-composer-extension": {
+      "optional": true
+    }
+  },
   "engines": {
     "node": ">=22"
   },
@@ -38,6 +47,7 @@
     "check:policy": "node scripts/check-staged-files.mjs"
   },
   "devDependencies": {
+    "dsh-composer-extension": "link:../dsh-composer-extension",
     "typescript": "^5.9.3"
   },
   "dsh": {

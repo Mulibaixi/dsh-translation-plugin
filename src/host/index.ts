@@ -19,7 +19,7 @@ export { TranslationSourcesService, installTranslationSources } from './translat
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal', 'translationSources'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources'] as const
 
 export function apply(ctx: QuickHostContext): void {
   installTopicTools(ctx as TopicHostContext, undefined, false)

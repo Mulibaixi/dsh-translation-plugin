@@ -91,7 +91,7 @@ class ManagementConnection {
   private wake: (() => void) | undefined
   readonly stopped: Promise<void>
   private stop!: () => void
-  constructor(readonly identity: TopicBridgeOpen, readonly peerId: string, readonly timeoutMs: number) {
+  constructor(readonly identity: TopicBridgeOpen, readonly peerId: string, readonly timeoutMs: number, readonly protocol: 1 | 2) {
     this.stopped = new Promise(resolve => { this.stop = resolve })
   }
   async request(command: TopicBridgeCommand, exec: ToolExecution, peerRead = false): Promise<TopicBridgeValue> {
@@ -122,7 +122,7 @@ class ManagementConnection {
     if (reply.ok) {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
-        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected' }[pending.frame.command.kind]
+        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -149,6 +149,11 @@ export class TopicToolsService {
     const ready = !this.disposed && !!this.ctx.get?.('agents') && !!this.ctx.get?.('tools') && !!this.ctx.get?.('sessionController')
     return ready ? { ready: true } : { ready: false, reason: '宿主主题管理接口尚未就绪。' }
   }
+  capabilitiesV2(): TopicBridgeCapability & { readonly normalProtocol: 2 } { return { ...this.capabilities(), normalProtocol: 2 } }
+  protocolFor(ownerId: string): 1 | 2 | undefined {
+    const connection = this.connections.get(ownerId)
+    return connection?.ready && !connection.closed ? connection.protocol : undefined
+  }
   /** Only an authorized, fully established Client connection can address managed objects. */
   ownsConnection(ownerId: string, peerId: string): boolean {
     const connection = this.connections.get(ownerId)
@@ -162,7 +167,7 @@ export class TopicToolsService {
   /** Host services use this existing owner channel; the browser remains the sole record authority. */
   requestOwned(ownerId: string, command: TopicBridgeCommand, exec: ToolExecution): Promise<TopicBridgeValue> {
     if (!this.ownsAgent(ownerId, exec.agent)) throw bridgeError('scope_mismatch', '翻译操作不属于已连接的主 Agent。')
-    const parsed = parseTopicBridgeCommand(command)
+    const parsed = parseTopicBridgeCommand(command, this.connections.get(ownerId)!.protocol)
     if (new TextEncoder().encode(JSON.stringify(parsed)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '本次业务材料和要求超过通道上限，未截断或受理。')
     const connection = this.connections.get(ownerId)!, before = this.ownedRequests.get(connection) ?? Promise.resolve()
     const result = before.then(async () => {
@@ -177,7 +182,7 @@ export class TopicToolsService {
   /** Recovery reads use the admitted RPC peer and never activate or prompt a main Agent. */
   observeOperation(ownerId: string, peerId: string, command: Extract<TopicBridgeCommand, { kind: 'normal_observe' }>, signal: AbortSignal): Promise<TopicBridgeValue> {
     if (!this.ownsConnection(ownerId, peerId)) throw bridgeError('scope_mismatch', '业务观察不属于此主会话连接。')
-    const parsed = parseTopicBridgeCommand(command), connection = this.connections.get(ownerId)!
+    const connection = this.connections.get(ownerId)!, parsed = parseTopicBridgeCommand(command, connection.protocol)
     const result = (this.ownedRequests.get(connection) ?? Promise.resolve()).then(async () => {
       if (!this.ownsConnection(ownerId, peerId) || this.connections.get(ownerId) !== connection) throw bridgeError('scope_mismatch', '原业务观察连接已失效。')
       await connection.waitIdle(signal)
@@ -187,12 +192,18 @@ export class TopicToolsService {
     return result
   }
   async *connect(request: TopicBridgeOpen, signal: AbortSignal): AsyncGenerator<TopicBridgeDown> {
+    yield* this.connectProtocol(request, signal, 1)
+  }
+  async *connectV2(request: TopicBridgeOpen, signal: AbortSignal): AsyncGenerator<TopicBridgeDown> {
+    yield* this.connectProtocol(request, signal, 2)
+  }
+  private async *connectProtocol(request: TopicBridgeOpen, signal: AbortSignal, protocol: 1 | 2): AsyncGenerator<TopicBridgeDown> {
     request = parseTopicBridgeOpen(request)
     signal.throwIfAborted()
     const peerId = this.ctx.invocation?.peer.id
     if (!peerId || request.ownerId !== request.mainSessionId || !this.capabilities().ready) throw bridgeError('unavailable', '主题管理连接不可用。')
     if (this.connections.has(request.mainSessionId)) throw bridgeError('connection_occupied', '此主会话的主题管理连接已被占用。')
-    const connection = new ManagementConnection(request, peerId, this.timeoutMs)
+    const connection = new ManagementConnection(request, peerId, this.timeoutMs, protocol)
     this.connections.set(request.mainSessionId, connection)
     const abort = () => connection.close()
     signal.addEventListener('abort', abort, { once: true })

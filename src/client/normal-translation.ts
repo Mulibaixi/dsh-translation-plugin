@@ -4,17 +4,27 @@ import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } fr
 import type { TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
 import type { TranslationCallMetadata } from '../shared/translation-call.js'
-import { appendAdmittedTextUnit, appendTextRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation } from './translation-history.js'
+import { parseRequestContextInput } from '../shared/request-context.js'
+import { parseNormalTranslationV2Event, parseNormalTranslationV2Job, type NormalTranslationResolution, type NormalTranslationV2Event, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
+import { appendAdmittedTextUnit, appendTextRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation,
+  registerTranslationExchange, registerTranslationResolution, registerTranslationResume, recordTranslationExchangeStatus, bindTranslationExchangeId,
+  recordTranslationResumeStarted, finishTranslationExchange } from './translation-history.js'
+import type { TranslationExchangeResolution } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
+import type { TranslationHistory, TextRevisionStatus } from './translation-history.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import type { TopicBridgeTermsPort } from './topic-bridge.js'
 
-export type NormalTranslationReply = { readonly ok: true; readonly value: Extract<TopicBridgeValue, { kind: 'normal_operation' | 'normal_prepared' | 'normal_updated' | 'normal_observed' | 'normal_resolved' | 'normal_source_corrected' }> }
+export type NormalTranslationReply = { readonly ok: true; readonly value: Extract<TopicBridgeValue, { kind: 'normal_operation' | 'normal_prepared' | 'normal_updated' | 'normal_v2_updated' | 'normal_exchange_resolved' | 'normal_observed' | 'normal_resolved' | 'normal_source_corrected' }> }
   | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }
 export interface NormalTranslationRemotePort {
   status(request: NormalTranslationQuery): Promise<unknown>
   cancel(request: NormalTranslationQuery): Promise<unknown>
   requestUnit?(request: NormalTranslationUnitRequest): Promise<unknown>
+}
+export interface NormalTranslationV2RemotePort {
+  status(request: NormalTranslationQuery): Promise<unknown>
+  cancel(request: NormalTranslationQuery): Promise<unknown>
 }
 interface AcceptedOperation {
   readonly signature: string
@@ -27,6 +37,10 @@ interface AcceptedOperation {
   message: string | undefined
   querying: boolean
   readonly updates: Map<number, string>
+  v2Sequence: number
+  v2Status: NormalTranslationV2Status
+  readonly v2Updates: Map<number, string>
+  readonly v2Attempts: Map<string, { readonly contextVersion: number; metadata: TranslationCallMetadata; text: string; status: string; needsContext: boolean }>
 }
 const failure = (code: string, message: string): NormalTranslationReply => ({ ok: false, error: { code, message } })
 
@@ -42,6 +56,7 @@ export class NormalTranslationClient {
     private readonly terms: TopicBridgeTermsPort, private readonly retain: (ownerId: string) => () => void,
     private readonly options: { readonly isSessionBusy?: (sessionId: string) => boolean;
       readonly remote?: NormalTranslationRemotePort | (() => Promise<NormalTranslationRemotePort | undefined>) | undefined;
+    readonly remoteV2?: NormalTranslationV2RemotePort | (() => Promise<NormalTranslationV2RemotePort | undefined>) | undefined;
       readonly subscribeBridge?: (listener: () => void) => () => void;
       readonly bridgeReady?: (ownerId: string) => boolean;
       readonly canAccessUnit?: (ownerId: string, sessionId: string, unitId: string) => boolean;
@@ -159,7 +174,8 @@ export class NormalTranslationClient {
       translationSessionId: session.id, materialId: material.materialId, unitId: material.unitReference?.unitId ?? `unit:${material.materialId}`, sourceVersion: material.sourceVersion,
       draftVersion: material.draftVersion, status: 'accepted', persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' }
     const termSnapshot = prepared.value.termSnapshot
-    this.operations.set(key, { signature, operation, termSnapshot, release, callId: null, sequence: 0, text: '', message: undefined, querying: false, updates: new Map() })
+    this.operations.set(key, { signature, operation, termSnapshot, release, callId: null, sequence: 0, text: '', message: undefined, querying: false, updates: new Map(),
+      v2Sequence: 0, v2Status: 'accepted', v2Updates: new Map(), v2Attempts: new Map() })
     if (material.unitReference) {
       const intent = this.unitRequests.get(JSON.stringify([session.id, material.unitReference.unitId]))
       if (intent) { intent.release?.(); intent.release = undefined; intent.message = '此单元重译已受理。' }
@@ -174,6 +190,159 @@ export class NormalTranslationClient {
     if (this.disposed || !session || session.ownerId !== ownerId || this.store.isSessionDeleted(session.id)) return failure('out_of_scope', '业务操作不属于当前主会话或已删除。')
     const item = this.locate(ownerId, request.operationId)
     return { ok: true, value: { kind: 'normal_observed', operation: item?.operation.translationSessionId === session.id ? structuredClone(item.operation) : null } }
+  }
+
+  updateV2(ownerId: string, input: { readonly mainSessionId: string; readonly translationSessionId: string; readonly unitId: string; readonly operationId: string; readonly sourceVersion: number; readonly event: NormalTranslationV2Event }): NormalTranslationReply {
+    const event = parseNormalTranslationV2Event(input.event), item = this.locate(ownerId, input.operationId)
+    if (this.disposed || !item) return failure('operation_not_found', '此业务操作未在当前会话受理，结果未采用。')
+    const op = item.operation, session = this.store.getSession(op.translationSessionId)
+    if (input.mainSessionId !== ownerId || input.translationSessionId !== op.translationSessionId || input.unitId !== op.unitId || input.sourceVersion !== op.sourceVersion ||
+      !session || session.ownerId !== ownerId || session.topicId !== op.topicId || this.store.isSessionDeleted(session.id)) return failure('identity_mismatch', '普通翻译 v2 结果归属或源版本不一致。')
+    const signature = JSON.stringify(input), previous = item.v2Updates.get(event.sequence)
+    const reply = (): NormalTranslationReply => ({ ok: true, value: { kind: 'normal_v2_updated', operation: structuredClone(item.operation), callId: event.callId, sequence: event.sequence } })
+    if (event.sequence <= item.v2Sequence) return previous === undefined || previous === signature ? reply() : failure('idempotency_conflict', '同一 v2 事件不能更换内容。')
+    if (event.sequence !== item.v2Sequence + 1) { item.v2Status = 'unknown'; item.operation = { ...op, status: 'unknown' }; return failure('sequence_gap', 'v2执行事件缺失，请查询原操作；未重发模型。') }
+    const history = this.store.getTranslationHistory(session.id)!, unit = history.units.find(unit => unit.id === op.unitId)
+    if (!unit || !unit.sourceVersions.some(source => source.version === input.sourceVersion)) return failure('stale_version', '处理单元的源记录已不可用。')
+    const at = new Date().toISOString(), callId = event.callId
+    let attempt = callId ? item.v2Attempts.get(callId) : undefined
+    const appendFact = (current: typeof history, revisionId: string | null, status: TextRevisionStatus | null): typeof history => appendTranslationEvent(current, {
+      id: `text-event:${current.events.length + 1}`, type: 'operation.call_event', at, unitId: unit.id, revisionId, operationId: op.operationId, status, reason: null,
+      sourceVersion: op.sourceVersion, callId: callId!, contextVersion: event.contextVersion, normalV2Sequence: event.sequence,
+    })
+    let updated = false
+    if (event.kind === 'call-started') {
+      const metadata = event.metadata!, oldCalls = item.v2Attempts.size
+      if (!callId || attempt || event.contextVersion !== oldCalls + 1 || metadata.exchangeContext?.contextVersion !== event.contextVersion) return failure('identity_mismatch', 'v2模型调用身份或上下文版本不连续。')
+      if (event.contextVersion === 1 ? event.exchangeId !== null || !this.matchesCall(item, metadata, null) : !this.matchesResume(item, metadata, history, event.exchangeId)) return failure('invalid_metadata', '续作模型、来源或已登记答复不匹配。')
+      updated = this.store.updateTranslationHistory(session.id, current => {
+        let next = appendTextRevision(current, unit.id, { id: callId, operationId: op.operationId, model: { provider: metadata.model.provider, model: metadata.model.model,
+          ...(metadata.model.reasoningEffort === null ? {} : { reasoningEffort: metadata.model.reasoningEffort }) }, draftVersion: op.draftVersion, sourceVersion: op.sourceVersion,
+          createdAt: at, updatedAt: at, accepted: true, status: 'running', text: '', callRecord: metadata, message: null })
+        if (event.contextVersion > 1) {
+          const resolutionId = metadata.exchangeContext!.resolutionRefs[0]!.resolutionId
+          const exchange = current.exchanges.find(item => item.operationId === op.operationId && item.resolutions.some(resolution => resolution.resolutionId === resolutionId))!
+          next = recordTranslationResumeStarted(next, exchange.exchangeId, callId, event.contextVersion, at)
+        }
+        return appendFact(next, callId, 'running')
+      })
+      if (updated) { attempt = { contextVersion: event.contextVersion, metadata, text: '', status: 'running', needsContext: false }; item.v2Attempts.set(callId, attempt) }
+    } else if (event.kind === 'partial') {
+      if (!callId || !attempt || attempt.status !== 'running') return failure('invalid_state', '部分译文未关联活动 call。')
+      const body = attempt.text + event.textDelta
+      updated = this.store.updateTranslationHistory(session.id, current => appendFact(updateTextRevision(current, unit.id, callId,
+        { text: body, callRecord: attempt!.metadata, updatedAt: at }), callId, 'running'))
+      if (updated) { attempt.text = body }
+    } else if (event.kind === 'needs-context') {
+      if (!callId || !attempt || attempt.status !== 'running' || event.contextVersion !== attempt.contextVersion) return failure('invalid_state', '补充问题未关联活动 call。')
+      try { parseRequestContextInput(event.requestContext, Array.from(unit.sourceVersions.find(source => source.version === op.sourceVersion)!.text).length) }
+      catch { return failure('invalid_input', '补充问题的原文范围或内容无效。') }
+      const exchangeId = event.exchangeId ?? `pending:${op.operationId}:${callId}`
+      updated = this.store.updateTranslationHistory(session.id, current => {
+        const revised = updateTextRevision(current, unit.id, callId, { status: 'context_requested', text: attempt!.text, callRecord: attempt!.metadata, updatedAt: at,
+          message: '等待主模型补充背景。' })
+        const exchange = registerTranslationExchange(revised, { mainSessionId: ownerId, topicId: op.topicId, translationSessionId: op.translationSessionId,
+          unitId: op.unitId, sourceVersion: op.sourceVersion, operationId: op.operationId, callId, contextVersion: event.contextVersion,
+          exchangeId, version: 1, status: 'open', questions: event.requestContext!, resolutions: [], resumeIntent: null }, at, event.sequence)
+        const withControl = event.status === 'waiting_user' ? recordTranslationExchangeStatus(exchange, exchangeId, 'waiting_user', at, event.sequence) : exchange
+        return appendFact(withControl, callId, 'context_requested')
+      })
+      if (updated) { attempt.status = 'context_requested'; attempt.needsContext = true; item.v2Status = event.status === 'waiting_user' ? 'waiting_user' : 'waiting_context'; item.operation = { ...op, status: 'unknown' }; item.message = event.status === 'waiting_user' ? '此操作需要用户补充具体要求。' : '等待主模型补充背景。' }
+    } else if (event.kind === 'call-ended') {
+      if (!callId || !attempt || (attempt.status !== 'running' && !(attempt.needsContext && attempt.status === 'context_requested'))) return failure('invalid_state', 'call结束未关联活动 call。')
+      const terminalStatus: TextRevisionStatus = attempt.needsContext ? 'context_requested' : event.status as TextRevisionStatus
+      const metadata = event.metadata ?? attempt.metadata
+      if (terminalStatus === 'completed' && !attempt.text.trim()) return failure('incomplete_result', '空输出不能记为完成。')
+      updated = this.store.updateTranslationHistory(session.id, current => {
+        const revised = updateTextRevision(current, unit.id, callId,
+          { status: terminalStatus, text: attempt!.text, callRecord: metadata, message: event.error?.message ?? (attempt!.needsContext ? '等待主模型补充背景。' : null), updatedAt: at })
+        const resolutionId = metadata?.exchangeContext?.resolutionRefs[0]?.resolutionId
+        const exchange = !attempt!.needsContext && attempt!.contextVersion > 1 && event.exchangeId
+          ? current.exchanges.find(item => item.exchangeId === event.exchangeId && item.resolutions.some(resolution => resolution.resolutionId === resolutionId)) : undefined
+        const settled = exchange ? finishTranslationExchange(revised, exchange.exchangeId,
+          event.status === 'completed' ? 'resolved' : event.status === 'cancelled' ? 'cancelled' : 'unknown', at) : revised
+        return appendFact(settled, callId, terminalStatus)
+      })
+      if (updated) {
+        attempt.status = terminalStatus; attempt.metadata = metadata
+        if (!attempt.needsContext) {
+          item.v2Status = event.status as NormalTranslationV2Status
+          const finalStatus = event.status!
+          const legacyStatus: NormalTranslationOperation['status'] = finalStatus === 'waiting_context' || finalStatus === 'waiting_user' ? 'unknown' : finalStatus === 'resuming' ? 'running' : finalStatus
+          item.operation = { ...op, status: legacyStatus }
+          item.message = event.error?.message
+          if (['completed', 'failed', 'cancelled'].includes(legacyStatus)) { item.release?.(); item.release = undefined }
+        }
+      }
+    } else if (event.kind === 'resume-registered') {
+      if (!callId || !event.exchangeId || !event.resolutionId) return failure('invalid_state', '续作登记缺少 exchange、resolution 或候选 call 身份。')
+      const exchange = history.exchanges.find(exchange => exchange.operationId === op.operationId &&
+        (exchange.exchangeId === event.exchangeId || exchange.exchangeId === `pending:${op.operationId}:${exchange.callId}`) && exchange.resolutions.some(resolution => resolution.resolutionId === event.resolutionId))
+      if (!exchange) return failure('operation_not_found', '未找到匹配的已登记 answer。')
+      updated = this.store.updateTranslationHistory(session.id, current => {
+        const bound = exchange.exchangeId === event.exchangeId ? current : bindTranslationExchangeId(current, exchange.exchangeId, event.exchangeId!)
+        return registerTranslationResume(bound, event.exchangeId!, event.resolutionId!, callId!, event.contextVersion, at, event.sequence)
+      })
+      if (updated) { item.v2Status = 'resuming'; item.operation = { ...op, status: 'running' }; item.message = '补充调用已登记，等待实际派发。' }
+    } else {
+      if (!callId || !attempt || attempt.contextVersion !== event.contextVersion || !['waiting_context', 'waiting_user', 'resuming', 'cancelled', 'unknown'].includes(event.status ?? '')) return failure('invalid_state', '控制状态未关联原 call。')
+      const pending = history.exchanges.find(exchange => exchange.operationId === op.operationId && exchange.callId === callId)
+      if (event.exchangeId && !pending) return failure('operation_not_found', '控制状态未关联已登记的 exchange。')
+      const exchangeId = event.exchangeId ?? pending?.exchangeId
+      if (exchangeId) updated = this.store.updateTranslationHistory(session.id, current => {
+        const bound = pending && pending.exchangeId !== exchangeId ? bindTranslationExchangeId(current, pending.exchangeId, exchangeId) : current
+        const controlStatus = event.status === 'waiting_context' ? 'open' : event.status === 'waiting_user' ? 'waiting_user' : event.status === 'resuming' ? 'resuming' : event.status === 'cancelled' ? 'cancelled' : 'unknown'
+        return recordTranslationExchangeStatus(bound, exchangeId, controlStatus, at, event.sequence)
+      })
+      else updated = true
+      item.v2Status = event.status === 'waiting_context' ? 'waiting_context' : event.status!
+      const legacyStatus: NormalTranslationOperation['status'] = event.status === 'resuming' ? 'running'
+        : event.status === 'waiting_context' || event.status === 'waiting_user' || event.status === 'unknown' ? 'unknown' : event.status as NormalTranslationOperation['status']
+      item.operation = { ...op, status: legacyStatus }
+      item.message = event.status === 'waiting_context' ? '等待主模型补充背景。' : event.status === 'waiting_user' ? '此操作需要用户补充具体要求。' : undefined
+      if (event.status === 'cancelled') { item.release?.(); item.release = undefined }
+      if (!updated) return failure('history_update_failed', '控制状态未写入历史。')
+    }
+    if (!updated) return failure('history_update_failed', '普通翻译 v2 历史未更新。')
+    item.v2Sequence = event.sequence; item.v2Updates.set(event.sequence, signature)
+    this.emit(); return reply()
+  }
+
+  private matchesResume(item: AcceptedOperation, metadata: TranslationCallMetadata, history: TranslationHistory, exchangeId: string | null): boolean {
+    const refs = metadata.exchangeContext?.resolutionRefs
+    if (metadata.promptVersion !== 'normal-text-exchange-v1' || metadata.exchangeContext?.contextVersion !== item.v2Attempts.size + 1 || refs?.length !== 1) return false
+    const exchange = history.exchanges.find(exchange => exchange.operationId === item.operation.operationId && exchange.resolutions.some(resolution => resolution.resolutionId === refs[0]!.resolutionId))
+    if (!exchange || exchange.exchangeId !== exchangeId || exchange.status !== 'resuming' || exchange.sourceVersion !== item.operation.sourceVersion) return false
+    const resolution = exchange.resolutions.find(item => item.resolutionId === refs[0]!.resolutionId)
+    const previous = [...item.v2Attempts.values()].at(-1)?.metadata
+    return resolution?.kind === 'answer' && !!previous && JSON.stringify(metadata.model) === JSON.stringify(previous.model) &&
+      JSON.stringify(metadata.context) === JSON.stringify(previous.context) && metadata.configVersion === previous.configVersion && metadata.maxOutputTokens === previous.maxOutputTokens
+  }
+
+  resolveExchange(ownerId: string, request: { readonly translationSessionId: string; readonly exchangeId: string; readonly resolution: NormalTranslationResolution }): NormalTranslationReply {
+    const session = this.store.getSession(request.translationSessionId), history = this.store.getTranslationHistory(request.translationSessionId)
+    const exchange = history?.exchanges.find(item => item.exchangeId === request.exchangeId)
+    if (this.disposed || !session || session.ownerId !== ownerId || !exchange || exchange.mainSessionId !== ownerId || exchange.translationSessionId !== session.id ||
+      exchange.topicId !== session.topicId || this.store.isSessionDeleted(session.id) || this.store.getStatus(session.id) === 'conflict' ||
+      !this.options.canAccessUnit?.(ownerId, session.id, exchange.unitId)) return failure('out_of_scope', '此 exchange 不属于当前已授权的主会话或翻译会话。')
+    if (exchange.sourceVersion !== this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === exchange.unitId)?.sourceVersion) return failure('stale_version', '原文已变化，此 exchange 已失效。')
+    if (request.resolution.kind === 'answer') {
+      const current = this.terms.getSnapshot(ownerId, session.topicId)
+      if (request.resolution.references.some(ref => !current.entries.some(entry => entry.id === ref.id && entry.version === ref.version && entry.status === 'active'))) {
+        return failure('stale_reference', '答复引用的术语版本已变化，请读取当前依据。')
+      }
+    }
+    const updated = this.store.updateTranslationHistory(session.id, current => registerTranslationResolution(current, request.exchangeId, request.resolution, new Date().toISOString()))
+    if (!updated) return failure('history_update_failed', '补充答复未登记到当前历史。')
+    const next = this.store.getTranslationHistory(session.id)!.exchanges.find(item => item.exchangeId === request.exchangeId)!
+    const item = this.operations.get(this.key(ownerId, next.operationId))
+    if (item) {
+      item.v2Status = next.status === 'open' ? 'waiting_context' : next.status === 'resolved' ? 'completed' : next.status
+      item.operation = { ...item.operation, status: next.status === 'cancelled' ? 'cancelled' : next.status === 'resuming' ? 'running' : 'unknown' }
+      item.message = next.status === 'waiting_user' ? '此操作需要用户补充具体要求。' : undefined
+    }
+    return { ok: true, value: { kind: 'normal_exchange_resolved', exchangeId: next.exchangeId, version: next.version,
+      status: request.resolution.kind === 'answer' ? 'resuming' : request.resolution.kind === 'defer' ? 'waiting_user' : 'cancelled' } }
   }
 
   update(ownerId: string, input: NormalTranslationUpdate): NormalTranslationReply {
@@ -211,6 +380,7 @@ export class NormalTranslationClient {
     if (!updated) { this.unknown(item, '译文记录未更新，请查询原操作；未自动重发。'); return failure('history_update_failed', '译文记录未更新。') }
     item.callId = update.callId; item.sequence = update.sequence; item.text = text; item.message = message ?? undefined; item.updates.set(update.sequence, signature)
     item.operation = { ...op, status: update.status, persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' }
+    item.v2Status = update.status
     if (['completed', 'failed', 'cancelled', 'unknown'].includes(update.status)) {
       // TopicBridge must send this short receipt before closing its last stream lease.
       const release = item.release; item.release = undefined; if (release) setTimeout(release, 0)
@@ -219,7 +389,8 @@ export class NormalTranslationClient {
   }
 
   private matchesCall(item: AcceptedOperation, metadata: TranslationCallMetadata, previous: TranslationCallMetadata | null): boolean {
-    if (metadata.promptVersion !== 'normal-text-v1' || !metadata.context) return false
+    if (!['normal-text-v1', 'normal-text-exchange-v1'].includes(metadata.promptVersion) || !metadata.context) return false
+    if (metadata.promptVersion === 'normal-text-exchange-v1' && (metadata.exchangeContext?.contextVersion !== 1 || metadata.exchangeContext.resolutionRefs.length !== 0)) return false
     if (previous) return JSON.stringify({ ...metadata, usage: null }) === JSON.stringify({ ...previous, usage: null })
     if (!item.signature) return true // A restored history already owns its saved call context.
     const request = JSON.parse(item.signature) as NormalTranslationAcceptance, model = request.envelope.material.model!
@@ -239,24 +410,34 @@ export class NormalTranslationClient {
       const accepted = history?.events.find(event => event.operationId === operationId && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null)
       if (!unit || event?.type === 'source.corrected' || (material && material.mainSessionId !== ownerId) || this.store.isSessionDeleted(session.id)) continue
       const revision = [...unit.revisions].reverse().find(revision => revision.operationId === operationId)
-      if (!accepted && revision?.callRecord?.promptVersion !== 'normal-text-v1') continue
+      if (!accepted && !['normal-text-v1', 'normal-text-exchange-v1'].includes(revision?.callRecord?.promptVersion ?? '')) continue
       const receipt = [...history!.events].reverse().find(event => event.operationId === operationId && event.normalSequence !== undefined)
       const state = revision?.status ?? event?.status
+      const restoredV2Status: NormalTranslationV2Status = ['completed', 'failed', 'cancelled'].includes(state ?? '')
+        ? state as NormalTranslationV2Status : 'unknown'
       const item: AcceptedOperation = { signature: '', operation: { operationId, mainSessionId: ownerId, topicId: session.topicId,
         translationSessionId: session.id, materialId: material?.materialId ?? unit.id, unitId: unit.id, sourceVersion: revision?.sourceVersion ?? accepted?.sourceVersion ?? 1,
         draftVersion: material?.draftVersion ?? 1, status: ['completed', 'failed', 'cancelled'].includes(state ?? '') ? state as 'completed' | 'failed' | 'cancelled' : 'unknown',
         persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' }, termSnapshot: { ...this.terms.getSnapshot(ownerId, session.topicId), entries: [] },
         release: undefined, callId: revision?.id ?? null, sequence: receipt?.normalSequence ?? 0, text: revision?.text ?? '', message: revision?.message ??
-          (['completed', 'failed', 'cancelled'].includes(state ?? '') ? undefined : '上次普通执行已中断，可查询原操作；未自动重发。'), querying: false, updates: new Map() }
+          (['completed', 'failed', 'cancelled'].includes(state ?? '') ? undefined : '上次普通执行已中断，可查询原操作；未自动重发。'), querying: false, updates: new Map(),
+        v2Sequence: history?.events.filter(event => event.operationId === operationId && event.normalV2Sequence !== undefined).at(-1)?.normalV2Sequence ?? 0,
+        v2Status: restoredV2Status,
+        v2Updates: new Map(), v2Attempts: new Map(unit.revisions.filter(revision => revision.operationId === operationId &&
+          revision.callRecord?.promptVersion === 'normal-text-exchange-v1').map(revision => [revision.id, {
+          contextVersion: revision.callRecord!.exchangeContext!.contextVersion, metadata: revision.callRecord!, text: revision.text,
+          status: ['completed', 'failed', 'cancelled', 'context_requested'].includes(revision.status) ? revision.status : 'running',
+          needsContext: history!.exchanges.some(exchange => exchange.operationId === operationId && exchange.callId === revision.id),
+        }])) }
       this.operations.set(key, item); return item
     }
     return undefined
   }
-  getUnitStatus(sessionId: string, unitId: string): { readonly operationId: string; readonly status: NormalTranslationOperation['status']; readonly message: string | undefined; readonly querying: boolean } | undefined {
+  getUnitStatus(sessionId: string, unitId: string): { readonly operationId: string; readonly status: NormalTranslationV2Status; readonly message: string | undefined; readonly querying: boolean } | undefined {
     const session = this.store.getSession(sessionId), history = this.store.getTranslationHistory(sessionId)
     const event = [...history?.events ?? []].reverse().find(event => event.unitId === unitId && event.operationId !== null && event.type !== 'final.selected' && event.type !== 'revision.manual_saved' && event.type !== 'source.corrected')
     const item = session && event?.operationId ? this.locate(session.ownerId, event.operationId) : undefined
-    return item ? { operationId: item.operation.operationId, status: item.operation.status, message: item.message, querying: item.querying } : undefined
+    return item ? { operationId: item.operation.operationId, status: item.v2Status, message: item.message, querying: item.querying } : undefined
   }
   isBusy(sessionId: string): boolean {
     const session = this.store.getSession(sessionId)
@@ -268,6 +449,7 @@ export class NormalTranslationClient {
     if (!['accepted', 'running', 'unknown'].includes(item.operation.status)) return
     const at = new Date().toISOString(), op = item.operation
     item.operation = { ...op, status: 'unknown' }; item.message = message
+    item.v2Status = 'unknown'
     if (item.callId) this.store.updateTranslationHistory(op.translationSessionId, history => updateTextRevision(history, op.unitId, item.callId!, { status: 'unknown', message, updatedAt: at }))
     else this.store.updateTranslationHistory(op.translationSessionId, history => appendTranslationEvent(history, {
       id: `text-event:${history.events.length + 1}`, type: 'operation.updated', at, unitId: op.unitId, revisionId: null, operationId: op.operationId, status: 'unknown', reason: null, sourceVersion: op.sourceVersion,
@@ -318,7 +500,39 @@ export class NormalTranslationClient {
     const item = this.locate(session.ownerId, status.operationId)!
     if (item.querying) return
     item.querying = true; item.release ??= this.retain(session.ownerId); this.emit()
+    let usedV2 = false
     try {
+      const v2 = typeof this.options.remoteV2 === 'function' ? await this.options.remoteV2() : this.options.remoteV2
+      const exchangeMode = item.v2Sequence > 0 || this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)?.revisions.some(
+        revision => revision.operationId === status.operationId && revision.callRecord?.promptVersion === 'normal-text-exchange-v1')
+      if (v2 && exchangeMode) {
+        usedV2 = true
+        let more = true, action = method
+        while (more && !this.disposed) {
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const after = item.v2Sequence, raw = await Promise.race([v2[action]({ mainSessionId: session.ownerId, translationSessionId: sessionId, operationId: status.operationId, afterSequence: after }),
+            new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('普通 v2 状态查询超时；未自动重发。')), 15000) })]).finally(() => clearTimeout(timer)) as {
+              ok?: boolean; error?: { code?: string; message?: string; stage?: string }; value?: { ok?: boolean; error?: { code?: string; message?: string; stage?: string }; value?: unknown }
+            }
+          if (this.disposed) return
+          action = 'status'
+          const error = raw?.error ?? raw?.value?.error
+          if (raw?.ok !== true || raw.value?.ok !== true) throw new Error(error ? `${error.code ?? 'remote_error'}${error.stage ? ` (${error.stage})` : ''}: ${error.message ?? '未取得普通 v2 状态。'}` : '未取得普通 v2 状态；未自动重发。')
+          const job: NormalTranslationV2Job = parseNormalTranslationV2Job(raw.value.value)
+          const operation = job.operation
+          if (operation.mainSessionId !== session.ownerId || operation.operationId !== status.operationId || operation.translationSessionId !== sessionId || operation.unitId !== unitId ||
+            operation.sourceVersion !== item.operation.sourceVersion) throw new Error('普通 v2 状态身份不一致；未自动重发。')
+          for (const event of job.events) {
+            const result = this.updateV2(session.ownerId, { mainSessionId: session.ownerId, translationSessionId: sessionId, unitId, operationId: status.operationId,
+              sourceVersion: item.operation.sourceVersion, event })
+            if (!result.ok) throw new Error(result.error.message)
+          }
+          more = job.more
+          if (more && item.v2Sequence <= after) throw new Error('普通 v2 状态分页未推进；未自动重发。')
+          if (!job.events.length && job.status === 'unknown') this.markV2Unknown(item, job.error?.message ?? '普通执行状态未知，请保留原操作查询。')
+        }
+        return
+      }
       const port = typeof this.options.remote === 'function' ? await this.options.remote() : this.options.remote
       if (!port) throw new Error('普通翻译服务尚未就绪。')
       let more = true, action = method
@@ -345,8 +559,25 @@ export class NormalTranslationClient {
           }))
         }
       }
-    } catch (error) { this.unknown(item, error instanceof Error ? error.message : '普通执行查询未完成。') }
-    finally { item.querying = false; if (!['accepted', 'running'].includes(item.operation.status)) { item.release?.(); item.release = undefined }; this.emit() }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '普通执行查询未完成。'
+      if (usedV2) this.markV2Unknown(item, message); else this.unknown(item, message)
+    }
+    finally {
+      item.querying = false
+      const active = usedV2 ? ['accepted', 'running', 'waiting_context', 'waiting_user', 'resuming', 'unknown'].includes(item.v2Status) : ['accepted', 'running'].includes(item.operation.status)
+      if (!active) { item.release?.(); item.release = undefined }
+      this.emit()
+    }
+  }
+  private markV2Unknown(item: AcceptedOperation, message: string): void {
+    item.v2Status = 'unknown'; item.operation = { ...item.operation, status: 'unknown' }; item.message = message
+    const at = new Date().toISOString(), history = this.store.getTranslationHistory(item.operation.translationSessionId)
+    const exchange = history?.exchanges.find(value => value.operationId === item.operation.operationId && !['resolved', 'cancelled'].includes(value.status))
+    if (exchange) this.store.updateTranslationHistory(item.operation.translationSessionId, current => recordTranslationExchangeStatus(current, exchange.exchangeId, 'unknown', at))
+    else if (item.callId && history?.units.find(unit => unit.id === item.operation.unitId)?.revisions.find(revision => revision.id === item.callId)?.status === 'running') {
+      this.store.updateTranslationHistory(item.operation.translationSessionId, current => updateTextRevision(current, item.operation.unitId, item.callId!, { status: 'unknown', message, updatedAt: at }))
+    }
   }
   reset(): void { for (const item of this.operations.values()) if (['accepted', 'running'].includes(item.operation.status)) this.unknown(item, '连接已重置，请查询原操作；未自动重发。') }
   dispose(): void {

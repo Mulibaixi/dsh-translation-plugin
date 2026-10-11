@@ -3,13 +3,18 @@ import { NORMAL_TRANSLATION_REMOTE, parseNormalTranslationExecute, parseNormalTr
   type NormalTranslationUpdate, type NormalTranslationError, type NormalTranslationCapability,
   parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt,
   parseNormalTranslationUnitRequest, type NormalTranslationUnitRequest, type NormalTranslationUnitReceipt } from '../shared/normal-translation.js'
+import { NORMAL_TRANSLATION_V2_REMOTE, NormalTranslationAttemptJournal, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { TranslationMaterialEnvelope, TranslationMaterialSnapshot } from '../shared/translation-material.js'
 import type { NormalTranslationContext, TranslationCallMetadata } from '../shared/translation-call.js'
+import type { RequestContextInput } from '../shared/request-context.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
 import { DshTextExecutionAdapter, hostLlmLoader, type LlmModuleLoader, type NormalExecutionPacket } from './dsh-text-adapter.js'
 import type { TopicHostContext, TopicToolsService, ToolExecution, MainAgent } from './topic-tools.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
+import type { TranslationExchangeService, ExecutorOperationRef, NeedsContextReference, ExchangeScope, ExchangeResolution,
+  PreparedExecutorResume, ExecutorResumeRegistration } from 'dsh-composer-extension/contracts'
+import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
 
 type Accepted = Extract<TopicBridgeValue, { kind: 'normal_operation' }>
 type Envelope = Extract<TranslationMaterialEnvelope, { kind: 'material' }>
@@ -31,9 +36,28 @@ interface Job {
   metadata: TranslationCallMetadata | null
   status: NormalTranslationJob['status']
   error: NormalTranslationError | null
+  requestContext?: RequestContextInput
+  readonly attempts: NormalTranslationAttemptJournal
+  v2Status: NormalTranslationV2Status
+  exchangeId: string | null
   deliveryFailed: boolean
+  deliveredSequence: number
   acceptRequested: boolean
   writing: Promise<void>
+  exchange?: TranslationExchangeService
+  exchangeOwner?: TopicHostContext
+}
+interface ResumeToken {
+  readonly token: PreparedExecutorResume
+  readonly job: Job
+  readonly exchangeId: string
+  readonly resolutionId: string
+  readonly resolution: ExchangeResolution
+  readonly clientResolution: NormalTranslationResolution
+  readonly packet: NormalExecutionPacket | null
+  readonly metadata: TranslationCallMetadata | null
+  registered: boolean
+  dispatched: boolean
 }
 function rejected(code: string, message: string, stage: string): Error { return Object.assign(new Error(message), { code, stage }) }
 function ok<T>(value: T): NormalTranslationResult<T> { return { ok: true, value: structuredClone(value) } }
@@ -46,6 +70,8 @@ function requireInline(envelope: Envelope): asserts envelope is InlineEnvelope {
 /** Transient calls and short receipts only. The Client owns all source and revision history. */
 export class NormalTranslationService {
   readonly typertRemote: { readonly service: NormalTranslationService; readonly serviceKey: 'translationNormal'; readonly namespace: 'translationNormal' }
+  readonly typertRemoteV2: { readonly service: { status: NormalTranslationService['statusV2']; cancel: NormalTranslationService['cancelV2'] }; readonly serviceKey: 'translationNormalV2'; readonly namespace: 'translationNormalV2' }
+  readonly v2Remote: { status: NormalTranslationService['statusV2']; cancel: NormalTranslationService['cancelV2'] }
   readonly adapter: DshTextExecutionAdapter
   private readonly admissions = new Map<string, Admission>()
   private readonly jobs = new Map<string, Job>()
@@ -53,14 +79,162 @@ export class NormalTranslationService {
   private readonly corrections = new Map<string, { readonly signature: string; readonly result: Promise<NormalTranslationCorrectionReceipt> }>()
   private readonly unitRequests = new Map<string, { readonly signature: string; readonly result: Promise<NormalTranslationResult<NormalTranslationUnitReceipt>> }>()
   private readonly activeSessions = new Set<string>()
+  private readonly resumeTokens = new Map<string, ResumeToken>()
+  private readonly resumesByResolution = new Map<string, ResumeToken>()
+  private exchange: TranslationExchangeService | undefined
+  private unregisterExchange: (() => void) | undefined
   private disposed = false
   constructor(readonly ctx: TopicHostContext, loadModule?: LlmModuleLoader) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationNormal', property: 'ctx' } })
     this.typertRemote = Object.freeze({ service: this, serviceKey: 'translationNormal', namespace: 'translationNormal' })
+    // Gateway must bind the v2 service and its invocation-scoped Context, just like v1.
+    const v2Remote = {
+      ctx,
+      status(this: { ctx: TopicHostContext }, request: NormalTranslationQuery) {
+        return (this.ctx.get?.('translationNormal') as NormalTranslationService).statusV2(request)
+      },
+      cancel(this: { ctx: TopicHostContext }, request: NormalTranslationQuery) {
+        return (this.ctx.get?.('translationNormal') as NormalTranslationService).cancelV2(request)
+      },
+    }
+    Object.defineProperty(v2Remote, Symbol.for('cordis.tracker'), { value: { associate: 'translationNormalV2', property: 'ctx' } })
+    this.v2Remote = v2Remote
+    this.typertRemoteV2 = Object.freeze({ service: v2Remote, serviceKey: 'translationNormalV2', namespace: 'translationNormalV2' })
+    Object.defineProperty(v2Remote, 'typertRemote', { value: this.typertRemoteV2, configurable: true, writable: true })
     this.adapter = new DshTextExecutionAdapter(ctx, loadModule)
+    this.attachExchange(ctx)
+  }
+  private attachExchange(scope: TopicHostContext): TranslationExchangeService | undefined {
+    const exchange = scope.get?.('translationExchange') as TranslationExchangeService | undefined
+    if (!exchange || this.exchange === exchange) return exchange
+    this.unregisterExchange?.()
+    this.exchange = exchange
+    this.unregisterExchange = exchange.register(scope as unknown as Parameters<TranslationExchangeService['register']>[0], this)
+    return exchange
   }
   private get topics(): TopicToolsService { return this.ctx.get?.('translationTopics') as TopicToolsService }
   private get materials(): TranslationMaterialsService { return this.ctx.get?.('translationMaterials') as TranslationMaterialsService }
+  async inspectOperation(ref: ExecutorOperationRef): Promise<unknown> {
+    const job = this.jobs.get(identity(ref.mainSessionId, ref.operationId)), operation = job?.operation
+    const latest = job?.attempts.snapshot().attempts.at(-1)
+    if (!job || !operation || !job.requestContext || !['running', 'waiting_context'].includes(job.v2Status) || job.controller.signal.aborted || !latest ||
+      job.callId !== ref.callId || ref.hostGeneration !== job.exchange?.hostGeneration || ref.contextVersion !== latest.contextVersion ||
+      ref.lastSequence !== job.attempts.snapshot().events.length || (latest.endSequence !== null && latest.status !== 'failed')) return null
+    const scope: ExchangeScope = { mainSessionId: operation.mainSessionId, topicId: operation.topicId, translationSessionId: operation.translationSessionId,
+      unitId: operation.unitId, sourceVersion: operation.sourceVersion, operationId: operation.operationId }
+    if (JSON.stringify(scope) !== JSON.stringify({ mainSessionId: ref.mainSessionId, topicId: ref.topicId, translationSessionId: ref.translationSessionId,
+      unitId: ref.unitId, sourceVersion: ref.sourceVersion, operationId: ref.operationId })) return null
+    return { scope, callId: job.callId, contextVersion: ref.contextVersion, hostGeneration: ref.hostGeneration, status: 'waiting_context',
+      lastSequence: job.attempts.snapshot().events.length, sourceCodePointLength: Array.from(job.envelope.material.sourceText).length, requestContext: job.requestContext }
+  }
+  async prepareResume(ref: ExecutorOperationRef, resolutionId: string, observedVersion: number, resolution: ExchangeResolution): Promise<PreparedExecutorResume> {
+    const job = this.jobs.get(identity(ref.mainSessionId, ref.operationId)), latest = job?.attempts.snapshot().attempts.at(-1)
+    if (!job || !job.operation || !job.packet || !job.requestContext || !['waiting_context', 'waiting_user'].includes(job.v2Status) ||
+      job.controller.signal.aborted || !latest || latest.endSequence === null || latest.status !== 'failed' || job.callId !== ref.callId ||
+      ref.hostGeneration !== job.exchange?.hostGeneration || ref.contextVersion !== latest.contextVersion ||
+      ref.lastSequence !== job.attempts.snapshot().events.length || job.exchangeId !== ref.exchangeId) throw rejected('resume_scope_mismatch', '续作目标不是当前仍等待补充的翻译操作。', 'authorize')
+    const tokenKey = JSON.stringify([job.internalId, resolutionId]), previous = this.resumesByResolution.get(tokenKey)
+    if (previous) {
+      if (JSON.stringify(previous.resolution) !== JSON.stringify(resolution) || previous.token.contextVersion !== ref.contextVersion + 1) throw rejected('resume_idempotency_conflict', '同一 resolutionId 不能更换答复或续作上下文。', 'protocol')
+      return previous.token
+    }
+    let clientResolution: NormalTranslationResolution
+    if (resolution.kind === 'answer') {
+      const termIds = new Set(job.packet.context.terms.map(term => JSON.stringify([term.id, term.entryVersion])))
+      if (resolution.references.some(reference => !termIds.has(JSON.stringify([reference.id, reference.version])))) throw rejected('stale_reference', '答复引用不属于该翻译操作冻结的术语或依据版本。', 'resolve')
+      clientResolution = { ...resolution, resolutionId, observedVersion }
+      const candidateCallId = `normal-call:${crypto.randomUUID()}`
+      const packet: NormalExecutionPacket = { ...job.packet, operationId: `${job.internalId}:resume:${candidateCallId}`, callId: candidateCallId, exchangeResume: clientResolution,
+        exchangeContextVersion: ref.contextVersion + 1 }
+      const metadata = await this.adapter.prepareNormalResume(packet, job.controller.signal)
+      const token: PreparedExecutorResume = Object.freeze({ candidateCallId, contextVersion: ref.contextVersion + 1, token: crypto.randomUUID() })
+      const entry: ResumeToken = { token, job, exchangeId: job.exchangeId!, resolutionId, resolution, clientResolution, packet, metadata, registered: false, dispatched: false }
+      this.resumeTokens.set(token.token as string, entry); this.resumesByResolution.set(tokenKey, entry)
+      return token
+    }
+    clientResolution = { ...resolution, resolutionId, observedVersion }
+    const token: PreparedExecutorResume = Object.freeze({ candidateCallId: null, contextVersion: ref.contextVersion, token: crypto.randomUUID() })
+    const entry: ResumeToken = { token, job, exchangeId: job.exchangeId!, resolutionId, resolution, clientResolution, packet: null, metadata: null, registered: false, dispatched: false }
+    this.resumeTokens.set(token.token as string, entry); this.resumesByResolution.set(tokenKey, entry)
+    return token
+  }
+  async registerResume(prepared: PreparedExecutorResume): Promise<ExecutorResumeRegistration> {
+    const entry = this.resumeTokens.get(prepared.token as string)
+    if (!entry || entry.token !== prepared || entry.token.candidateCallId !== prepared.candidateCallId || entry.token.contextVersion !== prepared.contextVersion) throw rejected('resume_token_invalid', '续作准备令牌无效。', 'authorize')
+    if (entry.registered) return { candidateCallId: prepared.candidateCallId, contextVersion: prepared.contextVersion, lastSequence: entry.job.attempts.snapshot().events.length }
+    const { job, clientResolution, exchangeId } = entry, operation = job.operation!
+    const value = await this.topics.requestOwned(operation.mainSessionId, { kind: 'normal_exchange_resolve', translationSessionId: operation.translationSessionId,
+      exchangeId, resolution: clientResolution }, { agent: job.agent, callId: operation.operationId, signal: job.delivery.signal })
+    if (value.kind !== 'normal_exchange_resolved' || value.exchangeId !== exchangeId || value.status !== (clientResolution.kind === 'answer' ? 'resuming' : clientResolution.kind === 'defer' ? 'waiting_user' : 'cancelled')) throw rejected('resume_resolution_unconfirmed', 'Client 未确认求助答复登记。', 'register_resume')
+    if (clientResolution.kind === 'answer') {
+      job.attempts.resumeRegistered(prepared.candidateCallId!, prepared.contextVersion, entry.resolutionId, exchangeId)
+      this.deliverV2(job)
+      await job.writing
+      if (job.deliveryFailed || job.deliveredSequence < job.attempts.snapshot().events.length) {
+        job.v2Status = 'unknown'; job.status = 'unknown'; job.operation = { ...operation, status: 'unknown' }
+        throw rejected('resume_intent_unconfirmed', 'Client 未确认续作意图登记。', 'register_resume')
+      }
+      job.v2Status = 'resuming'
+    } else if (clientResolution.kind === 'defer') {
+      job.attempts.control(job.callId!, 'waiting_user', entry.resolutionId, exchangeId)
+      this.deliverV2(job)
+      await job.writing
+      if (job.deliveryFailed) throw rejected('defer_unconfirmed', 'Client 未确认等待用户状态。', 'register_resume')
+      job.v2Status = 'waiting_user'
+    }
+    entry.registered = true
+    return { candidateCallId: prepared.candidateCallId, contextVersion: prepared.contextVersion, lastSequence: job.attempts.snapshot().events.length }
+  }
+  async dispatchResume(prepared: PreparedExecutorResume): Promise<{ readonly status: 'resuming' }> {
+    const entry = this.resumeTokens.get(prepared.token as string)
+    if (!entry || entry.token !== prepared || !entry.registered || !entry.packet || !entry.metadata || entry.job.controller.signal.aborted) throw rejected('resume_dispatch_unavailable', '续作尚未确认登记或操作已取消。', 'dispatch')
+    if (entry.dispatched) return { status: 'resuming' }
+    const { job } = entry
+    if (job.v2Status !== 'resuming' || !this.activeSessions.has(job.sessionId)) throw rejected('resume_operation_changed', '翻译会话不再处于该续作状态。', 'dispatch')
+    entry.dispatched = true
+    job.packet = entry.packet; job.metadata = entry.metadata; job.exchangeId = entry.exchangeId; delete job.requestContext
+    job.v2Status = 'resuming'; job.status = 'running'; job.error = null
+    queueMicrotask(() => { void this.run(job) })
+    return { status: 'resuming' }
+  }
+  async queryOperation(ref: ExecutorOperationRef): Promise<unknown> {
+    const job = this.jobs.get(identity(ref.mainSessionId, ref.operationId)), operation = job?.operation
+    if (!job || !operation || ref.hostGeneration !== job.exchange?.hostGeneration || job.callId !== ref.callId ||
+      ref.contextVersion !== job.attempts.snapshot().attempts.at(-1)?.contextVersion || operation.topicId !== ref.topicId ||
+      operation.translationSessionId !== ref.translationSessionId || operation.unitId !== ref.unitId || operation.sourceVersion !== ref.sourceVersion) return null
+    return this.viewV2(job, 0)
+  }
+  async cancelOperation(ref: ExecutorOperationRef): Promise<unknown> {
+    const job = this.jobs.get(identity(ref.mainSessionId, ref.operationId)), operation = job?.operation
+    const attempt = job?.attempts.snapshot().attempts.at(-1)
+    const preparedResume = job && [...this.resumesByResolution.values()].some(entry => entry.job === job && entry.registered &&
+      entry.token.candidateCallId === ref.callId && entry.token.contextVersion === ref.contextVersion && entry.exchangeId === ref.exchangeId)
+    if (!job || !operation || ref.hostGeneration !== job.exchange?.hostGeneration || (job.callId !== ref.callId && !preparedResume) ||
+      (job.callId === ref.callId && ref.contextVersion !== attempt?.contextVersion) || operation.topicId !== ref.topicId ||
+      operation.translationSessionId !== ref.translationSessionId || operation.unitId !== ref.unitId || operation.sourceVersion !== ref.sourceVersion ||
+      !['preparing', 'accepted', 'running', 'waiting_context', 'waiting_user', 'resuming', 'unknown'].includes(job.v2Status)) return false
+    job.controller.abort()
+    if (job.exchange && job.exchangeId && attempt && attempt.endSequence !== null && ['waiting_context', 'waiting_user', 'resuming', 'unknown'].includes(job.v2Status)) {
+      job.attempts.control(attempt.callId, 'cancelled', null, job.exchangeId)
+      job.v2Status = 'cancelled'; job.status = 'cancelled'; job.operation = { ...operation, status: 'cancelled' }
+      job.error = { code: 'CANCELLED', message: '等待补充的普通翻译已取消。', stage: 'cancel' }
+      this.deliverV2(job); await job.writing
+      const current = { mainSessionId: operation.mainSessionId, topicId: operation.topicId, translationSessionId: operation.translationSessionId,
+        unitId: operation.unitId, sourceVersion: operation.sourceVersion, operationId: operation.operationId, callId: attempt.callId,
+        contextVersion: attempt.contextVersion, hostGeneration: job.exchange.hostGeneration,
+        lastSequence: job.attempts.snapshot().events.length, exchangeId: job.exchangeId }
+      if (job.deliveryFailed || job.deliveredSequence < job.attempts.snapshot().events.length) {
+        job.v2Status = 'unknown'; job.status = 'unknown'; job.operation = { ...operation, status: 'unknown' }
+        await job.exchange.finishOperation(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['finishOperation']>[0], current, 'unknown')
+        return false
+      }
+      const finished = await job.exchange.finishOperation(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['finishOperation']>[0], current, 'cancelled')
+      if (!finished.ok) { job.v2Status = 'unknown'; job.status = 'unknown'; job.operation = { ...operation, status: 'unknown' }; return false }
+      this.activeSessions.delete(job.sessionId)
+    }
+    return true
+  }
+  authorizePeer(mainSessionId: string, peerId: string): boolean { return this.topics.ownsConnection(mainSessionId, peerId) }
   private owned(request: NormalTranslationExecute, exec: ToolExecution): void {
     if (this.disposed || !this.topics?.ownsAgent(request.target.mainSessionId, exec.agent)) throw rejected('scope_mismatch', '普通翻译操作不属于已连接的主 Agent。', 'authorize')
     exec.signal.throwIfAborted()
@@ -115,7 +289,8 @@ export class NormalTranslationService {
     this.activeSessions.add(sessionId)
     const job: Job = { request, envelope, agent: exec.agent!, sessionId, controller: new AbortController(), delivery: new AbortController(),
       internalId: `normal-operation:${crypto.randomUUID()}`, updates: [], acceptance: undefined!, operation: null, packet: undefined,
-      callId: null, metadata: null, status: 'preparing', error: null, deliveryFailed: false, acceptRequested: false, writing: Promise.resolve() }
+      callId: null, metadata: null, status: 'preparing', error: null, deliveryFailed: false, acceptRequested: false, writing: Promise.resolve(),
+      deliveredSequence: 0, attempts: new NormalTranslationAttemptJournal(), v2Status: 'accepted', exchangeId: null }
     const abort = () => job.controller.abort()
     exec.signal.addEventListener('abort', abort, { once: true })
     this.jobs.set(key, job)
@@ -144,7 +319,14 @@ export class NormalTranslationService {
       })) }
       job.packet = { operationId: job.internalId, callId: `normal-call:${crypto.randomUUID()}`, model, sourceText: envelope.material.sourceText,
         targetLanguage: envelope.material.targetLanguage, instruction: envelope.material.instruction, context }
-      job.metadata = this.adapter.preflightNormal(job.packet)
+      const exchangeOwner = this.ctx
+      const exchange = this.attachExchange(exchangeOwner)
+      if (exchange) { job.exchange = exchange; job.exchangeOwner = exchangeOwner }
+      else { delete job.exchange; delete job.exchangeOwner }
+      const exchangeCapabilities = await exchange?.capabilities()
+      const requestContextAvailable = this.topics.protocolFor(request.target.mainSessionId) === 2 && exchangeCapabilities?.ok === true &&
+        exchangeCapabilities.value.capabilities.exchange.state === 'available' && exchangeCapabilities.value.capabilities.modelControl.state === 'available'
+      job.metadata = this.adapter.preflightNormal(job.packet, requestContextAvailable)
       job.controller.signal.throwIfAborted()
       job.acceptRequested = true
       const accepted = await this.admit(request, exec, true, envelope)
@@ -157,7 +339,7 @@ export class NormalTranslationService {
       job.status = unknown ? 'unknown' : job.controller.signal.aborted ? 'cancelled' : 'failed'
       job.error = this.adapter.diagnostic(job.internalId) ?? { code: unknown ? 'OUTCOME_UNKNOWN' : (error as { code?: string }).code ?? 'PREPARE_FAILED',
         message: unknown ? '业务受理回执尚未确认；保留此操作并查询，未派发翻译模型。' : job.status === 'cancelled' ? '普通翻译已在模型调用前取消。' : request.target.kind === 'unit' ? '重译准备未完成，原文及已完成的纠错保留。' : '普通翻译准备未完成，材料保留。', stage: (error as { stage?: string }).stage ?? 'prepare' }
-      this.adapter.discard(job.internalId)
+      this.adapter.discard(job.packet?.operationId ?? job.internalId)
       if (job.operation && unknown) this.emit(job, 'unknown', '', null, job.error)
       if (!unknown) this.activeSessions.delete(job.sessionId)
       throw rejected(job.error.code, job.error.message, job.error.stage)
@@ -247,6 +429,8 @@ export class NormalTranslationService {
       unitId: operation.unitId, operationId: operation.operationId, sourceVersion: operation.sourceVersion, callId: job.callId,
       sequence: job.updates.length + 1, status, textDelta, metadata, error }
     job.updates.push(structuredClone(update)); job.status = status; job.operation = { ...operation, status }
+    const v2Attempt = job.attempts.snapshot().attempts.length > 0 && job.metadata?.promptVersion === 'normal-text-exchange-v1'
+    if (v2Attempt) return
     job.writing = job.writing.then(async () => {
       if (job.deliveryFailed || this.disposed) return
       try {
@@ -261,38 +445,173 @@ export class NormalTranslationService {
       }
     })
   }
+  private deliverV2(job: Job): void {
+    const event = job.attempts.snapshot().events.at(-1)!, operation = job.operation!
+    job.writing = job.writing.then(async () => {
+      if (job.deliveryFailed || this.disposed) return
+      try {
+        const value = await this.topics.requestOwned(operation.mainSessionId, { kind: 'normal_v2_update', mainSessionId: operation.mainSessionId,
+          translationSessionId: operation.translationSessionId, unitId: operation.unitId, operationId: operation.operationId, sourceVersion: operation.sourceVersion, event },
+          { agent: job.agent, callId: event.callId ?? operation.operationId, signal: job.delivery.signal })
+        if (value.kind !== 'normal_v2_updated' || value.callId !== event.callId || value.sequence !== event.sequence || value.operation.operationId !== operation.operationId ||
+          value.operation.mainSessionId !== operation.mainSessionId || value.operation.unitId !== operation.unitId || value.operation.sourceVersion !== operation.sourceVersion) throw rejected('invalid_reply', '普通翻译 v2 回写回执身份不一致。', 'writeback')
+        job.deliveredSequence = event.sequence
+      } catch {
+        job.deliveryFailed = true
+        job.error = { code: 'WRITEBACK_UNCONFIRMED', message: 'v2 译文回写尚未确认，请查询原操作；模型不会重新调用。', stage: 'writeback' }
+        job.controller.abort()
+      }
+    })
+  }
   private async run(job: Job): Promise<void> {
     if (!job.operation || !job.packet) return
     let terminal = false, bodyLength = 0
     try {
+      if (job.error?.code === 'HOST_GENERATION_LOST') return
       if (job.controller.signal.aborted || this.disposed) { this.emit(job, 'cancelled', '', null, { code: 'CANCELLED_BEFORE_DISPATCH', message: '已在模型调用前取消。', stage: 'cancel' }); return }
       for await (const event of this.adapter.executeNormal(job.packet, job.controller.signal, () => {
+        if (job.error?.code === 'HOST_GENERATION_LOST') throw job.error
         job.callId = job.packet!.callId
+        const contextVersion = job.metadata!.exchangeContext?.contextVersion ?? 1
+        job.attempts.start(job.callId, contextVersion, job.metadata!, job.exchangeId)
+        job.v2Status = 'running'
+        if (job.metadata!.promptVersion === 'normal-text-exchange-v1') {
+          const resolutionId = job.metadata!.exchangeContext?.resolutionRefs[0]?.resolutionId
+          this.deliverV2(job)
+          if (resolutionId && job.exchange) {
+            job.writing = job.writing.then(() => {
+              const operation = job.operation!, latest = job.attempts.snapshot().attempts.at(-1)!
+              job.exchange!.resumeStarted(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['resumeStarted']>[0], {
+                mainSessionId: operation.mainSessionId, topicId: operation.topicId, translationSessionId: operation.translationSessionId,
+                unitId: operation.unitId, sourceVersion: operation.sourceVersion, operationId: operation.operationId, callId: job.callId!,
+                contextVersion: latest.contextVersion, hostGeneration: job.exchange!.hostGeneration, lastSequence: job.attempts.snapshot().events.length,
+                ...(job.exchangeId ? { exchangeId: job.exchangeId } : {}),
+              }, resolutionId)
+            })
+          }
+        }
         this.emit(job, 'running', '', job.metadata)
       })) {
+        if (job.error?.code === 'HOST_GENERATION_LOST') throw job.error
         if (event.type === 'text') {
           bodyLength += event.text.length
           const points = Array.from(event.text)
-          for (let offset = 0; offset < points.length; offset += 8192) this.emit(job, 'running', points.slice(offset, offset + 8192).join(''))
+          for (let offset = 0; offset < points.length; offset += 8192) {
+            const delta = points.slice(offset, offset + 8192).join('')
+            if (delta) {
+              job.attempts.partial(job.callId!, delta)
+              if (job.metadata?.promptVersion === 'normal-text-exchange-v1') this.deliverV2(job)
+            }
+            this.emit(job, 'running', delta)
+          }
         } else if (event.type === 'usage') {
           job.metadata = { ...job.metadata!, usage: { inputTokens: event.input_tokens ?? job.metadata!.usage.inputTokens,
             outputTokens: event.output_tokens ?? job.metadata!.usage.outputTokens } }
+        } else if (event.type === 'needs_context') {
+          job.requestContext = event.input
+          const operation = job.operation!
+          const scope: ExchangeScope = { mainSessionId: operation.mainSessionId, topicId: operation.topicId,
+            translationSessionId: operation.translationSessionId, unitId: operation.unitId, sourceVersion: operation.sourceVersion, operationId: operation.operationId }
+          job.exchangeId = null
+          job.v2Status = 'waiting_context'
+          job.attempts.needsContext(job.callId!, event.input, null, 'waiting_context')
+          this.deliverV2(job)
+          await job.writing
+          if (job.deliveryFailed) {
+            job.v2Status = 'unknown'
+            job.error = { code: 'QUESTION_WRITEBACK_UNKNOWN', message: '补充问题未获 Client 确认；未通知主模型，也不会自动续作。', stage: 'writeback' }
+            continue
+          }
+          let controlStatus: 'waiting_context' | 'waiting_user' = 'waiting_context'
+          let registered = false
+          let ref: NeedsContextReference | undefined
+          if (job.exchange && job.operation && job.metadata?.promptVersion === 'normal-text-exchange-v1') {
+            ref = { scope, callId: job.callId!, contextVersion: job.attempts.snapshot().attempts.at(-1)!.contextVersion,
+              hostGeneration: job.exchange.hostGeneration, lastSequence: job.attempts.snapshot().events.length }
+            const accepted = await job.exchange.acceptNeedsContext(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['acceptNeedsContext']>[0], ref, event.input)
+            if (accepted.ok) {
+              job.exchangeId = accepted.value.exchangeId
+              controlStatus = accepted.value.status === 'waiting_user' ? 'waiting_user' : 'waiting_context'
+              registered = true
+            }
+          }
+          job.v2Status = controlStatus
+          if (job.metadata?.promptVersion === 'normal-text-exchange-v1' && !registered) {
+            job.attempts.control(job.callId!, 'unknown', null, null)
+            job.v2Status = 'unknown'
+            job.error = { code: 'EXCHANGE_UNAVAILABLE', message: '求助控制事实未能登记，操作状态未知；不会自动续作。', stage: 'register_resume' }
+          } else if (registered) {
+            job.attempts.control(job.callId!, controlStatus, null, job.exchangeId)
+          }
+          if (job.metadata?.promptVersion === 'normal-text-exchange-v1') {
+            this.deliverV2(job)
+            await job.writing
+            if (job.deliveryFailed) {
+              job.v2Status = 'unknown'
+              job.error = { code: 'EXCHANGE_BIND_UNKNOWN', message: '求助编号未获 Client 确认；不会通知主模型或自动续作。', stage: 'writeback' }
+              if (ref && job.exchangeId) await job.exchange?.finishOperation(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['finishOperation']>[0], {
+                ...scope, callId: job.callId!, contextVersion: ref.contextVersion, hostGeneration: ref.hostGeneration,
+                lastSequence: job.attempts.snapshot().events.length, exchangeId: job.exchangeId,
+              }, 'unknown')
+            }
+          }
         } else {
           terminal = true
           const complete = event.reason === 'stop' && event.provider_state === 'finished' && event.completeness === 'complete' && event.checks_passed && bodyLength > 0
-          const status = event.provider_state === 'unknown' ? 'unknown' : event.reason === 'aborted' ? 'cancelled' : complete ? 'completed' : 'failed'
-          const error = status === 'completed' ? null : this.adapter.diagnostic(job.internalId) ?? { code: status === 'cancelled' ? 'CANCELLED' : 'INCOMPLETE_RESULT',
-            message: status === 'cancelled' ? '普通翻译已取消，已有输出保留。' : '普通译文未完整完成，已有输出保留。', stage: status === 'cancelled' ? 'cancel' : 'stream' }
+          const status = event.provider_state === 'unknown' ? 'unknown' : event.reason === 'aborted' ? 'cancelled' : complete && !job.requestContext ? 'completed' : 'failed'
+          if (job.callId) job.attempts.end(job.callId, status, status === 'completed' ? null : {
+            code: status === 'cancelled' ? 'CANCELLED' : job.requestContext ? 'EXCHANGE_UNAVAILABLE' : 'INCOMPLETE_RESULT',
+            message: status === 'cancelled' ? '普通翻译已取消，已有输出保留。' : job.requestContext ? '当前执行尚未连接补充协调器，部分译文已保留。' : '普通译文未完整完成，已有输出保留。',
+            stage: status === 'cancelled' ? 'cancel' : job.requestContext ? 'resolve' : 'stream',
+          }, job.metadata ?? undefined, job.exchangeId)
+          if (job.metadata?.promptVersion === 'normal-text-exchange-v1') this.deliverV2(job)
+          if (!job.requestContext) job.v2Status = status
+          const error = status === 'completed' ? null : status === 'cancelled'
+            ? { code: 'CANCELLED', message: '普通翻译已取消，已有输出保留。', stage: 'cancel' }
+            : job.requestContext ? { code: 'EXCHANGE_UNAVAILABLE', message: '当前执行尚未连接补充协调器，部分译文已保留。', stage: 'resolve' }
+            : this.adapter.diagnostic(job.packet.operationId) ?? { code: 'INCOMPLETE_RESULT', message: '普通译文未完整完成，已有输出保留。', stage: 'stream' }
           job.error = error; this.emit(job, status, '', job.metadata, error)
         }
       }
       if (!terminal) throw rejected('INVALID_STREAM', '模型未提供结束状态。', 'protocol')
     } catch {
-      const error = this.adapter.diagnostic(job.internalId) ?? { code: 'OUTCOME_UNKNOWN', message: '模型调用结束状态尚未确认，请查询原操作。', stage: 'stream' }
-      job.error = error; this.emit(job, 'unknown', '', job.callId ? job.metadata : null, error)
+      const error = job.error?.code === 'HOST_GENERATION_LOST' ? job.error : this.adapter.diagnostic(job.packet.operationId) ?? { code: 'OUTCOME_UNKNOWN', message: '模型调用结束状态尚未确认，请查询原操作。', stage: 'stream' }
+      job.error = error
+      const status = error.stage === 'protocol' ? 'failed' : 'unknown'
+      if (job.callId && job.attempts.snapshot().attempts.at(-1)?.endSequence === null) {
+        job.attempts.end(job.callId, status, error, job.metadata ?? undefined, job.exchangeId)
+        if (job.metadata?.promptVersion === 'normal-text-exchange-v1') this.deliverV2(job)
+      }
+      if (job.v2Status !== 'waiting_context') job.v2Status = status
+      this.emit(job, status, '', job.callId ? job.metadata : null, error)
     } finally {
-      this.adapter.discard(job.internalId)
-      if (job.status !== 'unknown') this.activeSessions.delete(job.sessionId)
+      this.adapter.discard(job.packet.operationId)
+      await job.writing
+      if (job.deliveryFailed) {
+        job.v2Status = 'unknown'; job.status = 'unknown'
+        if (job.operation) job.operation = { ...job.operation, status: 'unknown' }
+      }
+      const attempt = job.attempts.snapshot().attempts.at(-1)
+      if (job.exchange && job.operation && job.exchangeId && job.callId && job.metadata?.promptVersion === 'normal-text-exchange-v1' && attempt) {
+        const result = job.v2Status === 'waiting_context' || job.v2Status === 'waiting_user' ? 'needs_context'
+          : job.v2Status === 'completed' ? 'completed' : job.v2Status === 'cancelled' ? 'cancelled' : 'unknown'
+        await job.exchange.finishOperation(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['finishOperation']>[0], {
+          mainSessionId: job.operation.mainSessionId, topicId: job.operation.topicId, translationSessionId: job.operation.translationSessionId,
+          unitId: job.operation.unitId, sourceVersion: job.operation.sourceVersion, operationId: job.operation.operationId,
+          callId: attempt.callId, contextVersion: attempt.contextVersion, hostGeneration: job.exchange.hostGeneration,
+          lastSequence: job.attempts.snapshot().events.length, exchangeId: job.exchangeId,
+        }, result)
+        // The translator attempt must be durably ended before the main Agent can resolve it.
+        if (result === 'needs_context' && job.v2Status === 'waiting_context' && !job.deliveryFailed) {
+          await job.exchange.notifyMainAgent(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['notifyMainAgent']>[0], {
+            scope: { mainSessionId: job.operation.mainSessionId, topicId: job.operation.topicId, translationSessionId: job.operation.translationSessionId,
+              unitId: job.operation.unitId, sourceVersion: job.operation.sourceVersion, operationId: job.operation.operationId },
+            callId: attempt.callId, contextVersion: attempt.contextVersion, hostGeneration: job.exchange.hostGeneration,
+            lastSequence: job.attempts.snapshot().events.length,
+          })
+        }
+      }
+      if (!['unknown', 'waiting_context', 'waiting_user', 'resuming'].includes(job.v2Status)) this.activeSessions.delete(job.sessionId)
     }
   }
   private scoped(input: NormalTranslationQuery): NormalTranslationResult<Job> {
@@ -333,6 +652,58 @@ export class NormalTranslationService {
     }
     return this.view(job, request.afterSequence)
   }
+  private viewV2(job: Job, after: number): NormalTranslationResult<NormalTranslationV2Job> {
+    const { attempts, events } = job.attempts.snapshot()
+    const page: typeof events[number][] = []
+    const operation = job.operation && { ...job.operation, status: job.v2Status }
+    const view = (): NormalTranslationV2Job => ({ operation: operation!, status: job.v2Status, attempts, events: page,
+      lastSequence: events.length, more: after + page.length < events.length, error: job.error })
+    if (!operation) return bad('not_found', '普通翻译尚未取得受理回执。', 'observe')
+    if (after > events.length) return bad('stale_cursor', '查询位置超过原操作的实际记录。', 'observe')
+    for (const event of events.slice(after)) {
+      page.push(event)
+      if (new TextEncoder().encode(JSON.stringify(view())).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) { page.pop(); break }
+    }
+    return ok(view())
+  }
+  async statusV2(input: NormalTranslationQuery): Promise<NormalTranslationResult<NormalTranslationV2Job>> {
+    const request = parseNormalTranslationQuery(input), found = this.scoped(request)
+    if (!found.ok) return found
+    const job = found.value
+    const live = this.ctx.get?.('translationExchange') as TranslationExchangeService | undefined
+    if (job.exchange && job.exchange.hostGeneration !== live?.hostGeneration && ['accepted', 'running', 'waiting_context', 'waiting_user', 'resuming'].includes(job.v2Status)) {
+      job.controller.abort()
+      job.v2Status = 'unknown'; job.status = 'unknown'
+      job.operation = job.operation && { ...job.operation, status: 'unknown' }
+      job.error = { code: 'HOST_GENERATION_LOST', message: '补充协调宿主已重新加载，原操作状态未知；不会自动重新调用模型。', stage: 'observe' }
+      const attempt = job.attempts.snapshot().attempts.at(-1)
+      if (attempt?.endSequence !== null && attempt && job.exchangeId) {
+        job.attempts.control(attempt.callId, 'unknown', null, job.exchangeId)
+        this.deliverV2(job); await job.writing
+      }
+    }
+    return this.viewV2(job, request.afterSequence)
+  }
+  async cancelV2(input: NormalTranslationQuery): Promise<NormalTranslationResult<NormalTranslationV2Job>> {
+    const request = parseNormalTranslationQuery(input), found = this.scoped(request)
+    if (!found.ok) return found
+    const job = found.value
+    if (['preparing', 'accepted', 'running', 'unknown', 'waiting_context', 'waiting_user', 'resuming'].includes(job.v2Status)) {
+      const attempt = job.attempts.snapshot().attempts.at(-1)
+      if (job.exchange && job.exchangeId && attempt) {
+        const operation = job.operation!
+        const prepared = [...this.resumesByResolution.values()].find(entry => entry.job === job && entry.registered &&
+          entry.token.candidateCallId === job.packet?.callId && entry.exchangeId === job.exchangeId)
+        const cancelled = await this.cancelOperation({ mainSessionId: operation.mainSessionId, topicId: operation.topicId,
+          translationSessionId: operation.translationSessionId, unitId: operation.unitId, sourceVersion: operation.sourceVersion,
+          operationId: operation.operationId, callId: prepared?.token.candidateCallId ?? job.callId ?? attempt.callId,
+          contextVersion: prepared?.token.contextVersion ?? attempt.contextVersion,
+          hostGeneration: job.exchange.hostGeneration, lastSequence: job.attempts.snapshot().events.length, exchangeId: job.exchangeId })
+        if (cancelled === false) return bad('cancel_unconfirmed', '普通翻译取消未获执行端确认；请查询原操作。', 'writeback')
+      } else job.controller.abort()
+    }
+    return this.viewV2(job, request.afterSequence)
+  }
   cancel(input: NormalTranslationQuery): NormalTranslationResult<NormalTranslationJob> {
     const request = parseNormalTranslationQuery(input), found = this.scoped(request)
     if (!found.ok) return found
@@ -342,7 +713,10 @@ export class NormalTranslationService {
   }
   dispose(): void {
     this.disposed = true
-    for (const job of this.jobs.values()) { job.controller.abort(); job.delivery.abort(); this.adapter.discard(job.internalId) }
+    this.unregisterExchange?.(); this.unregisterExchange = undefined; this.exchange = undefined
+    for (const job of this.jobs.values()) { job.controller.abort(); job.delivery.abort(); this.adapter.discard(job.packet?.operationId ?? job.internalId) }
+    for (const entry of this.resumeTokens.values()) if (entry.packet) this.adapter.discard(entry.packet.operationId)
+    this.resumeTokens.clear(); this.resumesByResolution.clear()
     this.admissions.clear(); this.resolved.clear(); this.corrections.clear(); this.unitRequests.clear(); this.activeSessions.clear()
   }
 }
@@ -350,10 +724,11 @@ export function installNormalTranslation(ctx: TopicHostContext, loadModule?: Llm
   if (ctx.root && !Object.hasOwn(ctx.root.reflect.props, 'invocation')) ctx.root.accessor('invocation', { get: () => undefined })
   const service = new NormalTranslationService(ctx, loadModule)
   ctx.provide('translationNormal', service)
+  ctx.provide('translationNormalV2', service.v2Remote)
   if (registerRemote) {
     const register = (scope: TopicHostContext): void => {
       const registry = (scope.get?.('typert') ?? scope.typert) as TopicHostContext['typert']
-      registry?.register({ package: NORMAL_TRANSLATION_REMOTE.package, face: 'host', schemas: [], invocations: NORMAL_TRANSLATION_REMOTE.descriptors,
+      registry?.register({ package: NORMAL_TRANSLATION_REMOTE.package, face: 'host', schemas: [], invocations: [...NORMAL_TRANSLATION_REMOTE.descriptors, ...NORMAL_TRANSLATION_V2_REMOTE.descriptors],
         model: { package: NORMAL_TRANSLATION_REMOTE.package, face: 'host', classes: [], events: [], objects: [] } })
     }
     if (ctx.inject) ctx.inject(['typert'], register)

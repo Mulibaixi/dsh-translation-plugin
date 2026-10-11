@@ -274,7 +274,7 @@ function TranslationRecord({ record, quick, canRestore }: { readonly record: Qui
 function TranslationRevision({ unit, revision, quick, session, editor, objects, objectAssets }: RecordObjectsProps & { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor }): unknown {
   const [details, setDetails] = react.useState(false)
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
-  const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断' }[revision.status]
+  const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断', context_requested: '等待补充背景' }[revision.status]
   const record = quick.getRecords(session.id).find(record => record.id === revision.operationId)
   const currentSource = revision.sourceVersion === unit.sourceVersion
   const eligible = revision.sourceVersion === unit.sourceVersion && revision.accepted && revision.status === 'completed' && !!revision.text.trim()
@@ -330,10 +330,11 @@ function TranslationRevision({ unit, revision, quick, session, editor, objects, 
   )
 }
 
-function TranslationUnit({ unit, quick, normal, session, editor, topics, objects, objectAssets }: RecordObjectsProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly normal?: NormalTranslationClient | undefined; readonly session: LocalSession; readonly editor: RevisionEditor; readonly topics?: TopicBridgeClient | undefined }): unknown {
+function TranslationUnit({ store, unit, quick, normal, session, editor, topics, objects, objectAssets }: StoreProps & RecordObjectsProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly normal?: NormalTranslationClient | undefined; readonly session: LocalSession; readonly editor: RevisionEditor; readonly topics?: TopicBridgeClient | undefined }): unknown {
   const [expanded, setExpanded] = react.useState(false)
   const [referenceFailure, setReferenceFailure] = react.useState(false)
   const [sourcesExpanded, setSourcesExpanded] = react.useState(false)
+  const [exchangeExpanded, setExchangeExpanded] = react.useState(false)
   const latest = unit.revisions.at(-1)
   const retranslation = normal?.getRetranslationStatus(session.id, unit.id)
   const sourceHistory = unit.sourceVersions.length > 1 ? h('div', null,
@@ -342,13 +343,27 @@ function TranslationUnit({ unit, quick, normal, session, editor, topics, objects
     sourcesExpanded ? h('div', { className: 'dsh-tp-old-versions' }, ...unit.sourceVersions.map(source => h('section', { key: source.version },
       h('small', { className: 'dsh-tp-muted' }, `原文版本 ${source.version}${source.version === unit.sourceVersion ? '（当前）' : '（历史）'}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null) : null
   const operation = normal?.getUnitStatus(session.id, unit.id)
+  const exchange = operation ? store.getTranslationHistory(session.id)?.exchanges.filter(item => item.unitId === unit.id && item.operationId === operation.operationId).at(-1) : undefined
+  const operationStatus: Record<string, string> = {
+    accepted: '材料已受理，等待翻译执行。', running: '正在翻译…', waiting_context: '等待主模型补充背景。',
+    waiting_user: '等待用户补充具体要求。', resuming: '补充已登记，等待翻译续作。', completed: '翻译完成。',
+    failed: '翻译失败。', cancelled: '已取消。', unknown: '执行状态未知，可查询本轮状态。',
+  }
   const execution = operation && operation.status !== 'completed' ? h('div', { className: 'dsh-tp-muted' },
-    h('p', { role: operation.status === 'failed' || operation.status === 'unknown' ? 'alert' : 'status' }, operation.message ?? {
-      accepted: '材料已受理，等待翻译执行。', running: '正在翻译…', failed: '翻译失败。', cancelled: '已取消。', unknown: '执行结果未知，可查询本轮状态。',
-    }[operation.status]),
+    h('p', { role: operation.status === 'failed' || operation.status === 'unknown' ? 'alert' : 'status' }, operation.message ?? operationStatus[operation.status]),
+    exchange ? h('section', { className: 'dsh-tp-message', 'aria-label': `文本 ${unit.order}补充问题状态` },
+      h('p', { role: 'status' }, `补充协调：${exchange.status === 'open' ? '等待主模型答复' : exchange.status === 'waiting_user' ? '等待用户答复' : exchange.status === 'resuming' ? '正在续作' : exchange.status === 'resolved' ? '已完成' : exchange.status === 'cancelled' ? '已取消' : '状态未知'}`),
+      ['open', 'waiting_user', 'unknown'].includes(exchange.status) ? h('button', { type: 'button', 'aria-label': exchangeExpanded ? `收起文本 ${unit.order}补充问题` : `查看文本 ${unit.order}补充问题`, onClick: () => setExchangeExpanded(value => !value) }, exchangeExpanded ? '收起补充问题' : `查看补充问题（${exchange.questions.questions.length}）`) : null,
+      exchangeExpanded ? h('div', { className: 'dsh-tp-exchange-questions' }, ...exchange.questions.questions.map((question, index) => {
+        const excerpt = question.range ? Array.from(unit.source).slice(question.range.start, question.range.end).join('') : null
+        return h('article', { key: `${exchange.exchangeId}:${index}` },
+          h('p', null, question.question), h('small', { className: 'dsh-tp-muted' }, question.reason),
+          excerpt === null ? null : h('blockquote', { className: 'dsh-tp-muted' }, `原文位置 ${question.range!.start}–${question.range!.end}：“${excerpt}”`))
+      })) : null,
+    ) : null,
     h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
-      ['accepted', 'running', 'unknown'].includes(operation.status) ? button(operation.querying ? '正在查询…' : '查询普通执行状态', () => { void normal?.query(session.id, unit.id) }, operation.querying) : null,
-      ['accepted', 'running', 'unknown'].includes(operation.status) ? button('取消普通翻译', () => { void normal?.cancel(session.id, unit.id) }, operation.querying) : null,
+      ['accepted', 'running', 'waiting_context', 'waiting_user', 'resuming', 'unknown'].includes(operation.status) ? button(operation.querying ? '正在查询…' : '查询普通执行状态', () => { void normal?.query(session.id, unit.id) }, operation.querying) : null,
+      ['accepted', 'running', 'waiting_context', 'waiting_user', 'resuming', 'unknown'].includes(operation.status) ? button('取消普通翻译', () => { void normal?.cancel(session.id, unit.id) }, operation.querying) : null,
     )) : null
   const edit = [...editor.drafts.values()].find(edit => edit.sessionId === session.id && edit.unitId === unit.id)
   react.useEffect(() => { if (edit && edit.baseRevisionId !== latest?.id) setExpanded(true) }, [edit?.baseRevisionId, latest?.id])
@@ -545,7 +560,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         historyNote && (units.length || records.length) ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
-        ...units.map(unit => h(TranslationUnit, { key: unit.id, unit, quick, normal, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined })),
+        ...units.map(unit => h(TranslationUnit, { key: unit.id, store, unit, quick, normal, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined })),
         ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
         units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),

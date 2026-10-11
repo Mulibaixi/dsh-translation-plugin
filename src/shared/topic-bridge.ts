@@ -2,11 +2,13 @@ import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type To
 import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
 import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, parseNormalTranslationUpdate, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseNormalTranslationCorrectionReceipt, type NormalTranslationAcceptance, type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationUnitTarget, type NormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt } from './normal-translation.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
+import { parseNormalTranslationV2Event, type NormalTranslationResolution, type NormalTranslationV2Event } from './normal-translation-v2.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
 export interface TopicBridgeOpen { readonly ownerId: string; readonly mainSessionId: string }
 export interface TopicBridgeCapability { readonly ready: boolean; readonly reason?: string }
+export interface TopicBridgeV2Capability extends TopicBridgeCapability { readonly normalProtocol: 2 }
 export type TopicPersistence = 'saved' | 'runtime_only'
 export interface TopicSummary {
   readonly id: string
@@ -38,7 +40,7 @@ export interface TopicUnitFact {
   readonly instruction: string
   readonly revisions: readonly {
     readonly id: string; readonly order: number; readonly kind: 'machine' | 'manual'
-    readonly status: 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted'
+    readonly status: 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted' | 'context_requested'
     readonly text: string; readonly baseRevisionId: string | null; readonly sourceVersion: number
   }[]
   readonly final: { readonly revisionId: string; readonly selection: 'automatic' | 'user_fixed'; readonly selectionEventId: string } | null
@@ -49,6 +51,8 @@ export type TopicBridgeCommand =
   | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
   | ({ readonly kind: 'normal_prepare' } & NormalTranslationAcceptance)
   | ({ readonly kind: 'normal_update' } & NormalTranslationUpdate)
+  | { readonly kind: 'normal_v2_update'; readonly mainSessionId: string; readonly translationSessionId: string; readonly unitId: string; readonly operationId: string; readonly sourceVersion: number; readonly event: NormalTranslationV2Event }
+  | { readonly kind: 'normal_exchange_resolve'; readonly translationSessionId: string; readonly exchangeId: string; readonly resolution: NormalTranslationResolution }
   | { readonly kind: 'normal_observe'; readonly translationSessionId: string; readonly operationId: string }
   | { readonly kind: 'list_sessions' }
   | { readonly kind: 'list_topics' }
@@ -70,6 +74,8 @@ export type TopicBridgeValue =
   | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
   | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot }
   | { readonly kind: 'normal_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
+  | { readonly kind: 'normal_v2_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
+  | { readonly kind: 'normal_exchange_resolved'; readonly exchangeId: string; readonly version: number; readonly status: 'waiting_user' | 'resuming' | 'cancelled' }
   | { readonly kind: 'normal_observed'; readonly operation: NormalTranslationOperation | null }
   | { readonly kind: 'sessions'; readonly sessions: readonly TopicSessionSummary[]; readonly persistence?: TopicPersistence }
   | { readonly kind: 'topics'; readonly topics: readonly TopicSummary[] }
@@ -120,8 +126,9 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
   if (value.ownerId !== value.mainSessionId) throw new TypeError('Topic bridge requires its own main Session')
   return { ownerId: value.ownerId, mainSessionId: value.mainSessionId }
 }
-export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
+export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 = 1): TopicBridgeCommand {
   object(value)
+  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
   switch (value.kind) {
       case 'normal_resolve': {
         exact(value, ['kind', 'target', 'operationId']); text(value.operationId)
@@ -141,6 +148,29 @@ export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
       case 'normal_update': {
         const { kind, ...update } = value
         return { kind: 'normal_update', ...parseNormalTranslationUpdate(update) }
+      }
+      case 'normal_v2_update': {
+        exact(value, ['kind', 'mainSessionId', 'translationSessionId', 'unitId', 'operationId', 'sourceVersion', 'event'])
+        for (const field of ['mainSessionId', 'translationSessionId', 'unitId', 'operationId']) text(value[field])
+        integer(value.sourceVersion, 1)
+        return { kind: 'normal_v2_update', mainSessionId: value.mainSessionId as string, translationSessionId: value.translationSessionId as string, unitId: value.unitId as string,
+          operationId: value.operationId as string, sourceVersion: value.sourceVersion as number, event: parseNormalTranslationV2Event(value.event) }
+      }
+      case 'normal_exchange_resolve': {
+        exact(value, ['kind', 'translationSessionId', 'exchangeId', 'resolution']); text(value.translationSessionId); text(value.exchangeId); object(value.resolution)
+        if (value.resolution.kind === 'answer') {
+          exact(value.resolution, ['resolutionId', 'observedVersion', 'kind', 'answerText', 'organizedRequirements', 'references'])
+          text(value.resolution.resolutionId); integer(value.resolution.observedVersion, 1); content(value.resolution.answerText, 32768, true); content(value.resolution.organizedRequirements, 32768, true)
+          if (new TextEncoder().encode(value.resolution.answerText + value.resolution.organizedRequirements).byteLength > 32768 ||
+            !value.resolution.answerText.trim() && !value.resolution.organizedRequirements.trim()) throw new TypeError('Invalid exchange answer budget')
+          if (!Array.isArray(value.resolution.references) || value.resolution.references.length > 32) throw new TypeError('Invalid exchange references')
+          for (const reference of value.resolution.references) { object(reference); exact(reference, ['id', 'version']); text(reference.id); integer(reference.version, 1) }
+        } else if (value.resolution.kind === 'defer' || value.resolution.kind === 'abort') {
+          exact(value.resolution, ['resolutionId', 'observedVersion', 'kind', 'reason']); text(value.resolution.resolutionId); integer(value.resolution.observedVersion, 1); content(value.resolution.reason, 4096, true)
+          if (new TextEncoder().encode(value.resolution.reason).byteLength > 4096) throw new TypeError('Invalid exchange reason budget')
+        } else throw new TypeError('Invalid exchange resolution')
+        return { kind: 'normal_exchange_resolve', translationSessionId: value.translationSessionId, exchangeId: value.exchangeId,
+          resolution: structuredClone(value.resolution) as unknown as NormalTranslationResolution }
       }
       case 'normal_observe': exact(value, ['kind', 'translationSessionId', 'operationId']); text(value.translationSessionId); text(value.operationId); break
       case 'list_sessions': case 'list_topics': exact(value, ['kind']); break
@@ -190,7 +220,7 @@ export function parseTopicBridgeCommand(value: unknown): TopicBridgeCommand {
   if (['read_unit', 'list_terms', 'query_terms'].includes(value.kind as string)) text(value.translationSessionId)
   return structuredClone(value) as unknown as TopicBridgeCommand
 }
-export function parseTopicBridgeDown(value: unknown): TopicBridgeDown {
+export function parseTopicBridgeDown(value: unknown, protocol: 1 | 2 = 1): TopicBridgeDown {
   object(value)
   if (value.kind === 'ready') {
     exact(value, ['kind', 'ownerId', 'mainSessionId'])
@@ -199,9 +229,9 @@ export function parseTopicBridgeDown(value: unknown): TopicBridgeDown {
   exact(value, ['kind', 'requestId', 'mainSessionId', 'callId', 'command'])
   if (value.kind !== 'request') throw new TypeError('Invalid topic bridge frame')
   text(value.requestId); text(value.mainSessionId); text(value.callId)
-  return { kind: 'request', requestId: value.requestId, mainSessionId: value.mainSessionId, callId: value.callId, command: parseTopicBridgeCommand(value.command) }
+  return { kind: 'request', requestId: value.requestId, mainSessionId: value.mainSessionId, callId: value.callId, command: parseTopicBridgeCommand(value.command, protocol) }
 }
-function parseUnit(value: unknown): TopicUnitFact {
+function parseUnit(value: unknown, protocol: 1 | 2): TopicUnitFact {
   object(value); exact(value, ['id', 'order', 'source', 'targetLanguage', 'instruction', 'revisions', 'final', ...(value.sourceVersion === undefined ? [] : ['sourceVersion'])])
   const sourceVersion = value.sourceVersion ?? 1; integer(sourceVersion, 1)
   text(value.id); integer(value.order, 1); text(value.source, 2_000_000); text(value.targetLanguage, 200); text(value.instruction, 20_000, true)
@@ -211,7 +241,7 @@ function parseUnit(value: unknown): TopicUnitFact {
     integer(revision.sourceVersion ?? 1, 1)
     text(revision.id); integer(revision.order, 1); text(revision.text, 2_000_000, true)
     if (revision.baseRevisionId !== null) text(revision.baseRevisionId)
-    if (!['machine', 'manual'].includes(revision.kind as string) || !['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted'].includes(revision.status as string)) throw new TypeError('Invalid topic unit state')
+    if (!['machine', 'manual'].includes(revision.kind as string) || !['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted', ...(protocol === 2 ? ['context_requested'] : [])].includes(revision.status as string)) throw new TypeError('Invalid topic unit state')
   }
   if (value.final !== null) {
     object(value.final); exact(value.final, ['revisionId', 'selection', 'selectionEventId']); text(value.final.revisionId); text(value.final.selectionEventId)
@@ -225,8 +255,9 @@ function sessionSummary(value: unknown): void {
   if (value.mode !== 'quick' && value.mode !== 'normal') throw new TypeError('Invalid translation Session mode')
   strings(value.publishedUnitIds)
 }
-function parseValue(value: unknown): TopicBridgeValue {
+function parseValue(value: unknown, protocol: 1 | 2): TopicBridgeValue {
   object(value)
+  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
     case 'normal_resolved': {
       exact(value, ['kind', 'envelope']); const envelope = parseTranslationMaterialEnvelope(value.envelope)
@@ -244,6 +275,15 @@ function parseValue(value: unknown): TopicBridgeValue {
     case 'normal_updated': {
       exact(value, ['kind', 'operation', 'callId', 'sequence']); if (value.callId !== null) text(value.callId); integer(value.sequence, 1)
       return { kind: 'normal_updated', operation: parseNormalTranslationOperation(value.operation), callId: value.callId, sequence: value.sequence }
+    }
+    case 'normal_v2_updated': {
+      exact(value, ['kind', 'operation', 'callId', 'sequence']); if (value.callId !== null) text(value.callId); integer(value.sequence, 1)
+      return { kind: 'normal_v2_updated', operation: parseNormalTranslationOperation(value.operation), callId: value.callId, sequence: value.sequence }
+    }
+    case 'normal_exchange_resolved': {
+      exact(value, ['kind', 'exchangeId', 'version', 'status']); text(value.exchangeId); integer(value.version, 1)
+      if (!['waiting_user', 'resuming', 'cancelled'].includes(value.status as string)) throw new TypeError('Invalid exchange resolution state')
+      return structuredClone(value) as unknown as TopicBridgeValue
     }
     case 'normal_operation': {
       exact(value, ['kind', 'operation', 'termSnapshot'])
@@ -268,7 +308,7 @@ function parseValue(value: unknown): TopicBridgeValue {
     case 'session_created':
       exact(value, ['kind', 'session', 'reason', 'persistence']); sessionSummary(value.session); content(value.reason, 1000); persistence(value.persistence)
       break
-    case 'unit': exact(value, ['kind', 'unit']); return { kind: 'unit', unit: parseUnit(value.unit) }
+    case 'unit': exact(value, ['kind', 'unit']); return { kind: 'unit', unit: parseUnit(value.unit, protocol) }
     case 'terms': case 'terms_query': {
       exact(value, ['kind', 'snapshot'])
       const snapshot = decodeTopicTermSnapshot(value.snapshot)
@@ -286,12 +326,12 @@ function parseValue(value: unknown): TopicBridgeValue {
   return structuredClone(value) as unknown as TopicBridgeValue
 }
 /** Untrusted uplink parsing happens once at the Gateway boundary. */
-export function parseTopicBridgeReply(value: unknown): TopicBridgeReply {
+export function parseTopicBridgeReply(value: unknown, protocol: 1 | 2 = 1): TopicBridgeReply {
   object(value); text(value.requestId)
   if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw new TypeError('Topic reply exceeds Gateway budget')
   if (value.ok === true) {
     exact(value, ['requestId', 'ok', 'value'])
-    return { requestId: value.requestId, ok: true, value: parseValue(value.value) }
+    return { requestId: value.requestId, ok: true, value: parseValue(value.value, protocol) }
   }
   if (value.ok !== false) throw new TypeError('Invalid topic bridge receipt')
   exact(value, ['requestId', 'ok', 'error']); object(value.error); exact(value.error, ['code', 'message']); text(value.error.code, 80); text(value.error.message, 1000)
@@ -305,6 +345,12 @@ export function parseTopicBridgeCapability(value: unknown): TopicBridgeCapabilit
 }
 const packageName = 'dsh-translation-plugin'
 const codec = (name: string, parse: (value: unknown) => unknown) => ({ mode: 'strict' as const, typeSymbol: `${packageName}#topicBridge/${name}`, create: () => ({ parse }) })
+export function parseTopicBridgeV2Capability(value: unknown): TopicBridgeV2Capability {
+  object(value)
+  if (value.normalProtocol !== 2) throw new TypeError('Topic bridge v2 version mismatch')
+  const { normalProtocol: _protocol, ...capability } = value
+  return { ...parseTopicBridgeCapability(capability), normalProtocol: 2 }
+}
 /** Public InvocationDescriptor fields from the installed Gateway's stream/uplink contract. */
 export const TOPIC_BRIDGE_REMOTE = { package: packageName, descriptors: [
   { id: `${packageName}#translationTopics/capabilities`, service: 'translationTopics', namespace: 'translationTopics', method: 'capabilities',
@@ -312,4 +358,9 @@ export const TOPIC_BRIDGE_REMOTE = { package: packageName, descriptors: [
   { id: `${packageName}#translationTopics/connect`, service: 'translationTopics', namespace: 'translationTopics', method: 'connect', mode: 'stream' as const,
     invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: codec('open', parseTopicBridgeOpen) }],
     cancellation: { parameter: 'signal' }, result: codec('down', parseTopicBridgeDown), uplink: { codec: codec('reply', parseTopicBridgeReply) } },
+  { id: `${packageName}#translationTopics/capabilitiesV2`, service: 'translationTopics', namespace: 'translationTopics', method: 'capabilitiesV2',
+    invocation: { kind: 'direct' as const }, parameters: [], result: codec('capabilityV2', parseTopicBridgeV2Capability) },
+  { id: `${packageName}#translationTopics/connectV2`, service: 'translationTopics', namespace: 'translationTopics', method: 'connectV2', mode: 'stream' as const,
+    invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: codec('openV2', parseTopicBridgeOpen) }],
+    cancellation: { parameter: 'signal' }, result: codec('downV2', value => parseTopicBridgeDown(value, 2)), uplink: { codec: codec('replyV2', value => parseTopicBridgeReply(value, 2)) } },
 ] }

@@ -11,9 +11,10 @@ import { TopicArchiveStore } from './topic-archive-store.js'
 import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
-import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
-import { NormalTranslationClient, type NormalTranslationRemotePort } from './normal-translation.js'
+import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type NativeMaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
+import { NormalTranslationClient, type NormalTranslationRemotePort, type NormalTranslationV2RemotePort } from './normal-translation.js'
 import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
+import type { Capability, ComposerExtensionService } from 'dsh-composer-extension/contracts'
 import {
   MEMORY_ASSETS_TAB_ID, MEMORY_ASSETS_TAB_KIND, MEMORY_ASSETS_PATTERN,
   openMemoryAssets, parseMemoryAssetsAddress, readMemoryAssetsNavigation, type MemoryAssetsSidebar, type MemoryAssetsTabInfo,
@@ -38,14 +39,16 @@ interface SidebarRightTabDefinition {
   }[]
 }
 
-interface ClientPluginContext {
+type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] & {
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
   get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
   get(name: 'remote.translationObjects'): ObjectAssetsRemotePort | undefined
   get(name: 'remote.translationMaterials'): TranslationMaterialsRemotePort | undefined
   get(name: 'remote.translationNormal'): NormalTranslationRemotePort | undefined
+  get(name: 'remote.translationNormalV2'): NormalTranslationV2RemotePort | undefined
   get(name: 'remote.translationSources'): TranslationSourcesRemotePort | undefined
-  readonly conversation?: { readonly submissions?: MaterialSubmissionRegistry }
+  readonly conversation?: { readonly submissions?: NativeMaterialSubmissionRegistry }
+  readonly composerExtension?: ComposerExtensionService
   readonly fileUpload: NativeFileUploadPort
   readonly remote: {
     readonly session: ModelCatalogPort
@@ -54,6 +57,7 @@ interface ClientPluginContext {
     readonly translationObjects?: ObjectAssetsRemotePort
     readonly translationMaterials?: TranslationMaterialsRemotePort
     readonly translationNormal?: NormalTranslationRemotePort
+    readonly translationNormalV2?: NormalTranslationV2RemotePort
     readonly translationSources?: TranslationSourcesRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
@@ -74,6 +78,26 @@ interface ClientPluginContext {
 const CLIENT_ID = 'dsh-translation-plugin'
 export const name = 'dsh-translation-client'
 export const inject = ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload', 'conversation'] as const
+
+function materialSubmissionBridge(ctx: ClientPluginContext): { registry?: MaterialSubmissionRegistry; composerReason?: string } {
+  const extension = ctx.get ? ctx.get('composerExtension') : ctx.composerExtension
+  const capability: Capability | undefined = extension?.capabilities()
+  if (extension) return capability?.state === 'available'
+    ? { registry: extension }
+    : { composerReason: capability?.reason ?? 'composer_extension_unavailable' }
+
+  const native = ctx.conversation?.submissions
+  if (native?.protocolVersion === 1) return {
+    registry: {
+      capabilities: () => ({ state: 'available', version: 1, reason: null }),
+      register: (owner, adapter) => native.register(owner, { freeze: adapter.freeze }),
+    },
+  }
+
+  const composerReason = capability?.reason ?? (native === undefined ? undefined : native.protocolVersion === undefined
+    ? 'composer_protocol_undeclared' : `composer_protocol_unsupported:${native.protocolVersion}`)
+  return composerReason === undefined ? {} : { composerReason }
+}
 
 function withClientDiagnostics<T>(stage: string, action: () => T): T {
   try { return action() } catch (error) {
@@ -105,13 +129,13 @@ export function apply(ctx: ClientPluginContext): void {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
     } : ctx.remote.translationTopics, store, terms, archive)
-    const materials = new MaterialSubmissionsClient({ store, topics, owner: ctx,
+    const submissionBridge = materialSubmissionBridge(ctx)
+    const materials = new MaterialSubmissionsClient({ store, topics, owner: ctx, ...submissionBridge,
       upload: ctx.fileUpload,
       sources: adaptTranslationSourcesRemote(ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationSources')
       } : ctx.remote.translationSources),
-      registry: typeof ctx.conversation?.submissions?.register === 'function' ? ctx.conversation.submissions : undefined,
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationMaterials')
@@ -130,6 +154,10 @@ export function apply(ctx: ClientPluginContext): void {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationNormal')
       } : ctx.remote.translationNormal,
+      remoteV2: ctx.remote.$mount ? async () => {
+        const unmountRemote = await mountedRemote
+        return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationNormalV2')
+      } : ctx.remote.translationNormalV2,
     })
     topics.setNormalTranslation(normal)
     ctx.effect(() => () => store.dispose(), 'translation client store')

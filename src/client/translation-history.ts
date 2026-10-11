@@ -1,8 +1,10 @@
 import { decodeRoute, type ModelRoute } from './sessions.js'
 import { parseTranslationCallMetadata, type TranslationCallMetadata } from '../shared/translation-call.js'
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
+import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
+import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
 
-export type TextRevisionStatus = 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted'
+export type TextRevisionStatus = 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted' | 'context_requested'
 export interface TextRevision {
   readonly id: string
   readonly operationId: string
@@ -56,7 +58,7 @@ export interface TextMaterialIdentity {
 export interface TranslationEvent {
   readonly id: string
   readonly order: number
-  readonly type: 'operation.submitted' | 'operation.accepted' | 'operation.retranslation_accepted' | 'operation.updated' | 'final.selected' | 'operation.restored' | 'revision.manual_saved' | 'source.corrected'
+  readonly type: 'operation.submitted' | 'operation.accepted' | 'operation.retranslation_accepted' | 'operation.updated' | 'operation.call_event' | 'final.selected' | 'operation.restored' | 'revision.manual_saved' | 'source.corrected' | 'exchange.needs_context' | 'exchange.resolution_registered' | 'exchange.resume_registered' | 'exchange.control' | 'exchange.call_started' | 'exchange.resolved' | 'exchange.invalidated'
   readonly at: string
   readonly unitId: string | null
   readonly revisionId: string | null
@@ -67,21 +69,50 @@ export interface TranslationEvent {
   readonly normalSequence?: number
   readonly sourceVersion?: number
   readonly sourceReason?: string
+  readonly exchangeId?: string
+  readonly resolutionId?: string | null
+  readonly callId?: string
+  readonly contextVersion?: number
+  readonly normalV2Sequence?: number
+}
+export type TranslationExchangeResolution = NormalTranslationResolution
+export interface TranslationResumeIntent {
+  readonly resolutionId: string
+  readonly candidateCallId: string
+  readonly contextVersion: number
+  readonly status: 'registered' | 'started' | 'unknown'
+}
+export interface TranslationExchangeRecord {
+  readonly mainSessionId: string
+  readonly topicId: string
+  readonly translationSessionId: string
+  readonly unitId: string
+  readonly sourceVersion: number
+  readonly operationId: string
+  readonly callId: string
+  readonly contextVersion: number
+  readonly exchangeId: string
+  readonly version: number
+  readonly status: 'open' | 'waiting_user' | 'resuming' | 'resolved' | 'cancelled' | 'unknown'
+  readonly questions: RequestContextInput
+  readonly resolutions: readonly TranslationExchangeResolution[]
+  readonly resumeIntent: TranslationResumeIntent | null
 }
 /** One browser snapshot; events and final pointers reference the sole revision body. */
 export interface TranslationHistory {
-  readonly schemaVersion: 5
+  readonly schemaVersion: 6
   readonly units: readonly TextUnit[]
   readonly events: readonly TranslationEvent[]
+  readonly exchanges: readonly TranslationExchangeRecord[]
 }
 export type NewTextUnit = Pick<TextUnit, 'id' | 'source' | 'targetLanguage' | 'instruction' | 'createdAt'>
 export type NewTextRevision = Omit<TextRevision, 'order' | 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'> & Partial<Pick<TextRevision, 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'>>
 export type TextRevisionPatch = Partial<Pick<TextRevision, 'status' | 'text' | 'message' | 'updatedAt' | 'callRecord'>>
 
-export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 5, units: [], events: [] } }
+export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 6, units: [], events: [], exchanges: [] } }
 
 type Data = Record<string, unknown>
-const statuses: readonly TextRevisionStatus[] = ['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted']
+const statuses: readonly TextRevisionStatus[] = ['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted', 'context_requested']
 function record(value: unknown): value is Data { return typeof value === 'object' && value !== null && !Array.isArray(value) }
 function exact(value: Data, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)) }
 function text(value: unknown, max: number, required = false): value is string {
@@ -99,7 +130,7 @@ export function currentFinalRevision(unit: TextUnit): TextRevision | undefined {
   return unit.revisions.find(revision => revision.id === unit.final?.revisionId && revision.sourceVersion === unit.sourceVersion && eligible(revision))
 }
 export function canEditTextRevision(revision: TextRevision): boolean {
-  return ['completed', 'failed', 'cancelled', 'interrupted'].includes(revision.status) && !!revision.text.trim()
+  return ['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(revision.status) && !!revision.text.trim()
 }
 
 function decodeRevision(value: unknown, schemaVersion = 3, parseCall = true): TextRevision | undefined {
@@ -132,9 +163,58 @@ function decodeMaterial(value: unknown): TextMaterialIdentity | null | undefined
   return model === undefined ? undefined : { ...value, model } as unknown as TextMaterialIdentity
 }
 
+function decodeExchangeResolution(value: unknown): TranslationExchangeResolution | undefined {
+  if (!record(value)) return undefined
+  if (value.kind === 'answer') {
+    if (!exact(value, ['resolutionId', 'observedVersion', 'kind', 'answerText', 'organizedRequirements', 'references']) || !identity(value.resolutionId) || !order(value.observedVersion) ||
+      !text(value.answerText, 32768) || !text(value.organizedRequirements, 32768) || (!value.answerText.trim() && !value.organizedRequirements.trim()) ||
+      new TextEncoder().encode(value.answerText + value.organizedRequirements).byteLength > 32768 || !Array.isArray(value.references) || value.references.length > 32) return undefined
+    const ids = new Set<string>(), references: { id: string; version: number }[] = []
+    for (const raw of value.references) {
+      if (!record(raw) || !exact(raw, ['id', 'version']) || !identity(raw.id) || !order(raw.version) || ids.has(raw.id)) return undefined
+      ids.add(raw.id); references.push({ id: raw.id, version: raw.version as number })
+    }
+    return { resolutionId: value.resolutionId, observedVersion: value.observedVersion as number, kind: 'answer', answerText: value.answerText,
+      organizedRequirements: value.organizedRequirements, references }
+  }
+  if ((value.kind !== 'defer' && value.kind !== 'abort') || !exact(value, ['resolutionId', 'observedVersion', 'kind', 'reason']) ||
+    !identity(value.resolutionId) || !order(value.observedVersion) || !text(value.reason, 4096) || new TextEncoder().encode(value.reason).byteLength > 4096) return undefined
+  return { resolutionId: value.resolutionId, observedVersion: value.observedVersion as number, kind: value.kind, reason: value.reason }
+}
+
+function decodeExchange(value: unknown, units: readonly TextUnit[]): TranslationExchangeRecord | undefined {
+  if (!record(value) || !exact(value, ['mainSessionId', 'topicId', 'translationSessionId', 'unitId', 'sourceVersion', 'operationId', 'callId', 'contextVersion', 'exchangeId', 'version', 'status', 'questions', 'resolutions', 'resumeIntent']) ||
+    !identity(value.mainSessionId) || !identity(value.topicId) || !identity(value.translationSessionId) || !identity(value.unitId) || !order(value.sourceVersion) ||
+    !identity(value.operationId) || !identity(value.callId) || !order(value.contextVersion) || !identity(value.exchangeId) || !order(value.version) ||
+    !['open', 'waiting_user', 'resuming', 'resolved', 'cancelled', 'unknown'].includes(value.status as string) || !Array.isArray(value.resolutions) || value.resolutions.length > 20) return undefined
+  const unit = units.find(item => item.id === value.unitId), source = unit?.sourceVersions.find(item => item.version === value.sourceVersion)
+  const revision = unit?.revisions.find(item => item.id === value.callId)
+  if (!unit || !source || !revision || revision.operationId !== value.operationId || revision.sourceVersion !== value.sourceVersion ||
+    revision.callRecord?.promptVersion !== 'normal-text-exchange-v1') return undefined
+  let questions: RequestContextInput
+  try { questions = parseRequestContextInput(value.questions, Array.from(source.text).length) } catch { return undefined }
+  const resolutions = value.resolutions.map(decodeExchangeResolution)
+  if (resolutions.some(item => !item) || new Set(resolutions.map(item => item!.resolutionId)).size !== resolutions.length ||
+    resolutions.some((item, index) => resolutions.slice(0, index).some(previous => previous!.observedVersion === item!.observedVersion))) return undefined
+  let resumeIntent: TranslationResumeIntent | null = null
+  if (value.resumeIntent !== null) {
+    const intent = value.resumeIntent, resolutionId = record(intent) ? intent.resolutionId : undefined
+    if (!record(intent) || !exact(intent, ['resolutionId', 'candidateCallId', 'contextVersion', 'status']) || !identity(resolutionId) || !identity(intent.candidateCallId) ||
+      !order(intent.contextVersion) || intent.contextVersion !== (value.contextVersion as number) + 1 || !['registered', 'started', 'unknown'].includes(intent.status as string) ||
+      !resolutions.some(item => item?.resolutionId === resolutionId && item.kind === 'answer')) return undefined
+    if (intent.status === 'started' && !unit.revisions.some(item => item.id === intent.candidateCallId && item.operationId === value.operationId && item.sourceVersion === value.sourceVersion)) return undefined
+    resumeIntent = { resolutionId, candidateCallId: intent.candidateCallId, contextVersion: intent.contextVersion as number, status: intent.status as TranslationResumeIntent['status'] }
+  }
+  return { mainSessionId: value.mainSessionId, topicId: value.topicId, translationSessionId: value.translationSessionId, unitId: value.unitId,
+    sourceVersion: value.sourceVersion as number, operationId: value.operationId, callId: value.callId, contextVersion: value.contextVersion as number,
+    exchangeId: value.exchangeId, version: value.version as number, status: value.status as TranslationExchangeRecord['status'], questions,
+    resolutions: resolutions as TranslationExchangeResolution[], resumeIntent }
+}
+
 /** Validation does not turn live requests into restored requests. Unknown fields are rejected. */
 export function decodeTranslationHistory(value: unknown): TranslationHistory | undefined {
-  if (!record(value) || !exact(value, ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events)) return undefined
+  if (!record(value) || !exact(value, value.schemaVersion === 6 ? ['schemaVersion', 'units', 'events', 'exchanges'] : ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5, 6].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events) ||
+    (value.schemaVersion === 6 && !Array.isArray(value.exchanges))) return undefined
   const units: TextUnit[] = [], revisionIds = new Set<string>(), operationUnits = new Map<string, string>(), unitIds = new Set<string>()
   for (const item of value.units) {
     if (!record(item) || !exact(item, ['id', 'order', ...(((value.schemaVersion as number) < 3 || Object.hasOwn(item, 'source')) ? ['source'] : []), 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final', ...((value.schemaVersion as number) >= 3 ? ['sourceVersion', 'sourceVersions', 'material'] : [])]) ||
@@ -179,14 +259,20 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
   const events: TranslationEvent[] = [], eventIds = new Set<string>()
   for (const item of value.events) {
     if (!record(item) || !exact(item, ['id', 'order', 'type', 'at', 'unitId', 'revisionId', 'operationId', 'status', 'reason', ...((value.schemaVersion as number) >= 4 && Object.hasOwn(item, 'normalSequence') ? ['normalSequence'] : []),
-      ...((value.schemaVersion as number) >= 5 ? ['sourceVersion', 'sourceReason'].filter(field => Object.hasOwn(item, field)) : [])]) ||
+      ...((value.schemaVersion as number) >= 5 ? ['sourceVersion', 'sourceReason'].filter(field => Object.hasOwn(item, field)) : []),
+      ...((value.schemaVersion as number) >= 6 ? ['exchangeId', 'resolutionId', 'callId', 'contextVersion', 'normalV2Sequence'].filter(field => Object.hasOwn(item, field)) : [])]) ||
       (Object.hasOwn(item, 'normalSequence') && (!order(item.normalSequence) || item.type !== 'operation.updated' || !identity(item.operationId))) ||
+      (Object.hasOwn(item, 'normalV2Sequence') && (!order(item.normalV2Sequence) || !['operation.call_event', 'exchange.needs_context', 'exchange.resolution_registered', 'exchange.resume_registered', 'exchange.control', 'exchange.call_started', 'exchange.resolved', 'exchange.invalidated'].includes(item.type as string) || !identity(item.operationId) || !identity(item.callId) || !order(item.contextVersion))) ||
       (Object.hasOwn(item, 'sourceVersion') && (!order(item.sourceVersion) || !units.find(unit => unit.id === item.unitId)?.sourceVersions.some(source => source.version === item.sourceVersion))) ||
       (Object.hasOwn(item, 'sourceReason') && (item.type !== 'source.corrected' || !text(item.sourceReason, 1000))) ||
       (item.type === 'source.corrected' && (!order(item.sourceVersion) || item.revisionId !== null || !identity(item.operationId) || !text(item.sourceReason, 1000))) || !identity(item.id) || eventIds.has(item.id) ||
-      item.order !== events.length + 1 || !['operation.submitted', 'operation.accepted', 'operation.retranslation_accepted', 'operation.updated', 'final.selected', 'operation.restored', 'revision.manual_saved', 'source.corrected'].includes(item.type as string) || !time(item.at) ||
+      item.order !== events.length + 1 || !['operation.submitted', 'operation.accepted', 'operation.retranslation_accepted', 'operation.updated', 'operation.call_event', 'final.selected', 'operation.restored', 'revision.manual_saved', 'source.corrected', 'exchange.needs_context', 'exchange.resolution_registered', 'exchange.resume_registered', 'exchange.control', 'exchange.call_started', 'exchange.resolved', 'exchange.invalidated'].includes(item.type as string) || !time(item.at) ||
       !(item.unitId === null || (identity(item.unitId) && unitIds.has(item.unitId))) || !(item.revisionId === null || (identity(item.revisionId) && revisionIds.has(item.revisionId))) ||
       !(item.operationId === null || identity(item.operationId)) || !(item.status === null || status(item.status)) || !(item.reason === null || ['advance', 'user_selection', 'restored', 'export'].includes(item.reason as string))) return undefined
+    const exchangeEvent = String(item.type).startsWith('exchange.')
+    if (exchangeEvent ? (value.schemaVersion !== 6 || !identity(item.exchangeId) || !identity(item.callId) || !order(item.contextVersion) ||
+      !(item.resolutionId === null || identity(item.resolutionId)) || !identity(item.operationId) || !identity(item.unitId)) :
+      ['exchangeId', 'resolutionId'].some(field => Object.hasOwn(item, field)) || (item.type !== 'operation.call_event' && ['callId', 'contextVersion'].some(field => Object.hasOwn(item, field)))) return undefined
     if (item.revisionId !== null) {
       const unit = units.find(unit => unit.id === item.unitId), revision = unit?.revisions.find(revision => revision.id === item.revisionId)
       if (!revision || item.operationId !== revision.operationId || (item.sourceVersion !== undefined && item.sourceVersion !== revision.sourceVersion)) return undefined
@@ -197,7 +283,19 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
     }
     events.push({ ...item } as unknown as TranslationEvent); eventIds.add(item.id)
   }
-  return { schemaVersion: 5, units, events }
+  const exchanges = (value.schemaVersion as number) === 6 ? (value.exchanges as unknown[]).map(item => decodeExchange(item, units)) : []
+  if (exchanges.some(item => !item) || new Set(exchanges.map(item => item!.exchangeId)).size !== exchanges.length ||
+    new Set(exchanges.map(item => JSON.stringify([item!.operationId, item!.callId]))).size !== exchanges.length) return undefined
+  for (const event of events.filter(event => event.type.startsWith('exchange.'))) {
+    const exchange = exchanges.find(item => item!.exchangeId === event.exchangeId)
+    const linkedCall = exchange && units.find(unit => unit.id === exchange.unitId)?.revisions.find(revision => revision.id === event.callId)
+    const registeredCandidate = event.type === 'exchange.resume_registered' && exchange?.resumeIntent?.candidateCallId === event.callId
+    if (!exchange || exchange.operationId !== event.operationId || exchange.unitId !== event.unitId || (!linkedCall && !registeredCandidate) || (linkedCall && linkedCall.operationId !== exchange.operationId) ||
+      (!['exchange.call_started', 'exchange.resume_registered'].includes(event.type) && (exchange.callId !== event.callId || exchange.contextVersion !== event.contextVersion)) ||
+      (['exchange.call_started', 'exchange.resume_registered'].includes(event.type) && event.contextVersion !== exchange.contextVersion + 1) ||
+      (event.resolutionId !== null && !exchange.resolutions.some(resolution => resolution.resolutionId === event.resolutionId))) return undefined
+  }
+  return { schemaVersion: 6, units, events, exchanges: exchanges as TranslationExchangeRecord[] }
 }
 
 /** Version records own source bodies; storage and full-record exports omit the compatibility projection. */
@@ -209,6 +307,98 @@ export function appendTranslationEvent(history: TranslationHistory, event: Omit<
   if (history.events.some(old => old.id === event.id)) throw new Error('Duplicate translation event')
   return { ...history, events: [...history.events, { ...event, order: history.events.length + 1 }] }
 }
+function appendExchangeEvent(history: TranslationHistory, exchange: TranslationExchangeRecord, type: Extract<TranslationEvent['type'], `exchange.${string}`>, at: string,
+  callId = exchange.callId, contextVersion = exchange.contextVersion, resolutionId: string | null = exchange.resolutions.at(-1)?.resolutionId ?? null): TranslationHistory {
+  return appendTranslationEvent(history, { id: `text-event:${history.events.length + 1}`, type, at, unitId: exchange.unitId, revisionId: null,
+    operationId: exchange.operationId, status: type === 'exchange.needs_context' ? 'context_requested' : null, reason: null, sourceVersion: exchange.sourceVersion,
+    exchangeId: exchange.exchangeId, resolutionId, callId, contextVersion })
+}
+
+export function registerTranslationExchange(history: TranslationHistory, input: TranslationExchangeRecord, at: string, normalV2Sequence?: number): TranslationHistory {
+  if (!time(at) || input.version !== 1 || input.status !== 'open' || input.resolutions.length || input.resumeIntent !== null) throw new Error('Invalid initial translation exchange')
+  const exchange = decodeExchange(input, history.units)
+  if (!exchange) throw new Error('Translation exchange scope or source range is invalid')
+  const previous = history.exchanges.find(item => item.exchangeId === exchange.exchangeId || (item.operationId === exchange.operationId && item.callId === exchange.callId))
+  if (previous) {
+    if (JSON.stringify(previous) === JSON.stringify(exchange)) return history
+    throw new Error('Translation exchange identity already has different content')
+  }
+  const next = { ...history, exchanges: [...history.exchanges, exchange] }
+  const result = appendExchangeEvent(next, exchange, 'exchange.needs_context', at, exchange.callId, exchange.contextVersion, null)
+  return normalV2Sequence === undefined ? result : { ...result, events: result.events.map((event, index) => index === result.events.length - 1 ? { ...event, normalV2Sequence } : event) }
+}
+
+export function registerTranslationResolution(history: TranslationHistory, exchangeId: string, input: TranslationExchangeResolution, at: string): TranslationHistory {
+  const exchange = history.exchanges.find(item => item.exchangeId === exchangeId), resolution = decodeExchangeResolution(input)
+  if (!exchange || !resolution || !time(at)) throw new Error('Translation exchange unavailable')
+  const previous = exchange.resolutions.find(item => item.resolutionId === resolution.resolutionId)
+  if (previous) {
+    if (JSON.stringify(previous) === JSON.stringify(resolution)) return history
+    throw new Error('Resolution identity already has different content')
+  }
+  if (resolution.observedVersion !== exchange.version || !['open', 'waiting_user'].includes(exchange.status)) throw new Error('Translation exchange version changed')
+  const status = resolution.kind === 'answer' ? 'resuming' : resolution.kind === 'defer' ? 'waiting_user' : 'cancelled'
+  const updated: TranslationExchangeRecord = { ...exchange, version: exchange.version + 1, status, resolutions: [...exchange.resolutions, resolution], resumeIntent: null }
+  const next = { ...history, exchanges: history.exchanges.map(item => item.exchangeId === exchangeId ? updated : item) }
+  return appendExchangeEvent(next, updated, 'exchange.resolution_registered', at, updated.callId, updated.contextVersion, resolution.resolutionId)
+}
+
+export function registerTranslationResume(history: TranslationHistory, exchangeId: string, resolutionId: string, candidateCallId: string, contextVersion: number, at: string, normalV2Sequence?: number): TranslationHistory {
+  const exchange = history.exchanges.find(item => item.exchangeId === exchangeId), resolution = exchange?.resolutions.find(item => item.resolutionId === resolutionId)
+  if (!exchange || !resolution || resolution.kind !== 'answer' || exchange.status !== 'resuming' || !identity(candidateCallId) || !time(at) || contextVersion !== exchange.contextVersion + 1) throw new Error('Resume intent is not prepared')
+  const intent = { resolutionId, candidateCallId, contextVersion, status: 'registered' as const }
+  if (exchange.resumeIntent) {
+    if (JSON.stringify(exchange.resumeIntent) === JSON.stringify(intent)) return history
+    throw new Error('A different resume is already registered')
+  }
+  const updated = { ...exchange, version: exchange.version + 1, resumeIntent: intent }
+  const next = { ...history, exchanges: history.exchanges.map(item => item.exchangeId === exchangeId ? updated : item) }
+  const result = appendExchangeEvent(next, updated, 'exchange.resume_registered', at, candidateCallId, contextVersion, resolutionId)
+  return normalV2Sequence === undefined ? result : { ...result, events: result.events.map((event, index) => index === result.events.length - 1 ? { ...event, normalV2Sequence } : event) }
+}
+
+export function recordTranslationExchangeStatus(history: TranslationHistory, exchangeId: string, status: Extract<TranslationExchangeRecord['status'], 'open' | 'waiting_user' | 'resuming' | 'cancelled' | 'unknown'>,
+  at: string, normalV2Sequence?: number): TranslationHistory {
+  const exchange = history.exchanges.find(item => item.exchangeId === exchangeId)
+  if (!exchange || !time(at)) throw new Error('Translation exchange unavailable')
+  const updated = { ...exchange, status }
+  const result = appendExchangeEvent({ ...history, exchanges: history.exchanges.map(item => item.exchangeId === exchangeId ? updated : item) }, updated, 'exchange.control', at)
+  return normalV2Sequence === undefined ? result : { ...result, events: result.events.map((event, index) => index === result.events.length - 1 ? { ...event, normalV2Sequence } : event) }
+}
+
+export function bindTranslationExchangeId(history: TranslationHistory, pendingId: string, exchangeId: string): TranslationHistory {
+  if (!identity(exchangeId)) throw new Error('Invalid exchange identity')
+  const exchange = history.exchanges.find(item => item.exchangeId === pendingId)
+  if (!exchange) {
+    if (history.exchanges.some(item => item.exchangeId === exchangeId)) return history
+    throw new Error('Pending exchange unavailable')
+  }
+  if (!pendingId.startsWith('pending:') || history.exchanges.some(item => item.exchangeId === exchangeId)) throw new Error('Exchange identity cannot be rebound')
+  return { ...history, exchanges: history.exchanges.map(item => item.exchangeId === pendingId ? { ...item, exchangeId } : item),
+    events: history.events.map(event => event.exchangeId === pendingId ? { ...event, exchangeId } : event) }
+}
+
+export function recordTranslationResumeStarted(history: TranslationHistory, exchangeId: string, callId: string, contextVersion: number, at: string): TranslationHistory {
+  const exchange = history.exchanges.find(item => item.exchangeId === exchangeId), unit = exchange && history.units.find(item => item.id === exchange.unitId)
+  const revision = unit?.revisions.find(item => item.id === callId), resolution = exchange?.resolutions.at(-1)
+  if (!exchange || !unit || !revision || !resolution || resolution.kind !== 'answer' || exchange.status !== 'resuming' || !time(at) ||
+    contextVersion !== exchange.contextVersion + 1 || revision.operationId !== exchange.operationId || revision.sourceVersion !== exchange.sourceVersion ||
+    exchange.resumeIntent?.candidateCallId !== callId || exchange.resumeIntent.resolutionId !== resolution.resolutionId || exchange.resumeIntent.contextVersion !== contextVersion ||
+    revision.callRecord?.exchangeContext?.contextVersion !== contextVersion || !revision.callRecord.exchangeContext.resolutionRefs.some(ref => ref.resolutionId === resolution.resolutionId)) throw new Error('Resume call is not registered for this exchange')
+  const updated = { ...exchange, version: exchange.version + 1, resumeIntent: { ...exchange.resumeIntent, status: 'started' as const } }
+  const next = { ...history, exchanges: history.exchanges.map(item => item.exchangeId === exchangeId ? updated : item) }
+  return appendExchangeEvent(next, updated, 'exchange.call_started', at, callId, contextVersion, resolution.resolutionId)
+}
+
+export function finishTranslationExchange(history: TranslationHistory, exchangeId: string, result: 'resolved' | 'cancelled' | 'unknown', at: string): TranslationHistory {
+  const exchange = history.exchanges.find(item => item.exchangeId === exchangeId)
+  if (!exchange || !time(at)) throw new Error('Translation exchange unavailable')
+  if (exchange.status === result) return history
+  const updated: TranslationExchangeRecord = { ...exchange, version: exchange.version + 1, status: result }
+  const next = { ...history, exchanges: history.exchanges.map(item => item.exchangeId === exchangeId ? updated : item) }
+  return appendExchangeEvent(next, updated, 'exchange.resolved', at, updated.callId, updated.contextVersion)
+}
+
 function event(history: TranslationHistory, unit: TextUnit, revision: TextRevision, type: TranslationEvent['type'], at: string, reason: TranslationEvent['reason'] = null): TranslationHistory {
   return appendTranslationEvent(history, { id: `text-event:${history.events.length + 1}`, type, at, unitId: unit.id, revisionId: revision.id, operationId: revision.operationId, status: revision.status, reason })
 }
@@ -285,8 +475,14 @@ export function appendSourceCorrection(history: TranslationHistory, unitId: stri
     !text(data.reason, 1000) || !time(data.at) || history.events.some(event => event.operationId === data.operationId)) throw new Error('Invalid or stale source correction')
   const sourceVersion = unit.sourceVersion + 1, updated: TextUnit = { ...unit, source: data.text, sourceVersion,
     sourceVersions: [...unit.sourceVersions, { version: sourceVersion, text: data.text, createdAt: data.at, operationId: data.operationId }] }
-  return appendTranslationEvent(replaceUnit(history, updated), { id: `text-event:${history.events.length + 1}`, type: 'source.corrected', at: data.at,
+  let next = appendTranslationEvent(replaceUnit(history, updated), { id: `text-event:${history.events.length + 1}`, type: 'source.corrected', at: data.at,
     unitId, revisionId: null, operationId: data.operationId, status: null, reason: null, sourceVersion, sourceReason: data.reason })
+  for (const exchange of history.exchanges.filter(item => item.unitId === unitId && item.sourceVersion === data.expectedVersion && ['open', 'waiting_user', 'resuming', 'unknown'].includes(item.status))) {
+    const cancelled = { ...exchange, version: exchange.version + 1, status: 'cancelled' as const }
+    next = { ...next, exchanges: next.exchanges.map(item => item.exchangeId === exchange.exchangeId ? cancelled : item) }
+    next = appendExchangeEvent(next, cancelled, 'exchange.invalidated', data.at, cancelled.callId, cancelled.contextVersion, null)
+  }
+  return next
 }
 
 export function acceptUnitRetranslation(history: TranslationHistory, unitId: string, operationId: string, sourceVersion: number, at: string): TranslationHistory {

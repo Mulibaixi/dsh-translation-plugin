@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      dsh-composer-extension:
+        specifier: link:../dsh-composer-extension
+        version: link:../dsh-composer-extension
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
