@@ -5,6 +5,7 @@ import { NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_V
   type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
 import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
 import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
+import type { TranslationMaterialRoute } from '../shared/translation-material.js'
 export { QUICK_SYSTEM_PROMPT } from '../shared/translation-call.js'
 
 /** Narrow views of the 0.2.0-rc.2 public runtime, checked against the installed packages. */
@@ -53,7 +54,21 @@ export interface NormalExecutionPacket {
   readonly exchangeContextVersion?: number
 }
 export type NormalExecutionEvent = TextExecutionEvent | { readonly type: 'needs_context'; readonly input: RequestContextInput }
+export interface AnalysisExecutionPacket {
+  readonly operationId: string
+  readonly callId: string
+  readonly model: ModelSelection
+  readonly systemPrompt: string
+  readonly userMessage: string
+}
+export interface AnalysisExecutionBudget {
+  readonly tokens: number
+  readonly kind: 'estimated'
+  readonly contextWindow: number | null
+  readonly maxOutputTokens: number | null
+}
 type PreparedNormalCall = { route: ModelSelection; call: DshPreparedCall; normalContext?: NormalTranslationContext; requestContext: boolean;
+  analysisContext?: { readonly systemPrompt: string; readonly userMessage: string };
   exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }> }
 const requestContextTool = Object.freeze({
   name: 'request_context',
@@ -167,6 +182,40 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   discard(operationId: string): void { this.prepared.delete(operationId) }
   diagnostic(operationId: string): SafeExecutionFailure | undefined { return this.failures.get(operationId) }
   callMetadata(operationId: string): Omit<TranslationCallMetadata, 'usage'> | undefined { return this.calls.get(operationId) }
+  /** rc.2 has no public structured-output declaration. Use strict, bounded JSON parsing in the caller. */
+  preflightAnalysis(packet: AnalysisExecutionPacket): AnalysisExecutionBudget & { readonly route: TranslationMaterialRoute } {
+    try {
+      const bound = this.prepared.get(packet.operationId)
+      if (!bound || key(bound.route) !== key(packet.model)) throw Object.assign(new Error('Analysis preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
+      const bytes = new TextEncoder().encode(packet.systemPrompt + packet.userMessage).byteLength
+      if (bytes > 196608) throw Object.assign(new Error('Analysis package exceeds input budget'), { code: 'INPUT_LIMIT' })
+      if (bound.call.context && bound.call.config.maxTokens !== undefined && bytes + 16 + bound.call.config.maxTokens > bound.call.context.contextWindow) {
+        throw Object.assign(new Error('Estimated analysis input plus output reservation exceeds context'), { code: 'CONTEXT_WINDOW_EXCEEDED' })
+      }
+      this.prepared.set(packet.operationId, { ...bound, analysisContext: frozen({ systemPrompt: packet.systemPrompt, userMessage: packet.userMessage }) })
+      return { tokens: bytes + 16, kind: 'estimated', contextWindow: bound.call.context?.contextWindow ?? null, maxOutputTokens: bound.call.config.maxTokens ?? null,
+        route: { provider: bound.call.config.provider, model: bound.call.config.model,
+          ...(bound.call.config.reasoningEffort === undefined ? {} : { reasoningEffort: bound.call.config.reasoningEffort }) } }
+    } catch (error) { this.failures.set(packet.operationId, failure(error, 'prepare')); throw error }
+  }
+  analysisInputBudget(operationId: string): number {
+    const bound = this.prepared.get(operationId)
+    if (!bound) throw Object.assign(new Error('Analysis preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
+    return Math.min(196608, bound.call.context && bound.call.config.maxTokens !== undefined
+      ? bound.call.context.contextWindow - bound.call.config.maxTokens - 16 : 196608)
+  }
+  /** Same native route preparation, stream validator, and detached Session as translation calls. */
+  async *executeAnalysis(packet: AnalysisExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncGenerator<TextExecutionEvent> {
+    const bound = this.prepared.get(packet.operationId)
+    this.prepared.delete(packet.operationId)
+    if (!bound || key(bound.route) !== key(packet.model) || !bound.analysisContext ||
+      bound.analysisContext.systemPrompt !== packet.systemPrompt || bound.analysisContext.userMessage !== packet.userMessage) throw new Error('Analysis execution preparation does not match')
+    for await (const event of this.executePrepared(packet.operationId, packet.callId, bound.call, 'analysis', bound.analysisContext, signal,
+      undefined, onDispatch)) {
+      if (event.type === 'needs_context') throw Object.assign(new Error('Analysis cannot request tools'), { code: 'INVALID_STREAM' })
+      yield event
+    }
+  }
   /** Full native prepared-call config and a conservative estimate, before business acceptance. */
   preflightNormal(packet: NormalExecutionPacket, requestContextAvailable = false): TranslationCallMetadata {
     try {
@@ -231,7 +280,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, bound.exchangeResume),
       signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion)
   }
-  private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal',
+  private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal' | 'analysis',
     context: { readonly systemPrompt: string; readonly userMessage: string }, signal: AbortSignal, normalContext?: NormalTranslationContext,
     onDispatch?: () => void, requestContext = false, sourceCodePointLength = 0,
     exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>, exchangeContextVersion = 1): AsyncGenerator<NormalExecutionEvent> {
@@ -253,7 +302,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       }, reason: 'initial', startsSeries: true,
     })
     const options = Object.freeze({ ...call.config, messages: frozen([...session.deriveMessages()]), signal,
-      ...(mode === 'normal' ? { tools: requestContext ? Object.freeze([requestContextTool]) : Object.freeze([]) } : {}) })
+      ...(mode === 'normal' || mode === 'analysis' ? { tools: requestContext ? Object.freeze([requestContextTool]) : Object.freeze([]) } : {}) })
     const stream = new helpers.AssistantStreamAccumulator()
     const assembler = new helpers.BlockAssembler()
     const blocks = new Map<number, { type: 'text' | 'reasoning' | 'tool-call'; declared: boolean; text: string }>()
@@ -265,7 +314,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     let settlementDone = false
     try {
       signal.throwIfAborted()
-      this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal'
+      if (mode !== 'analysis') this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal'
         ? requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION,
         model: Object.freeze({ provider: call.config.provider, model: call.config.model, reasoningEffort: call.config.reasoningEffort ?? null }),
         configVersion: null, maxOutputTokens: call.config.maxTokens ?? null, ...(normalContext ? { context: normalContext } : {}),
@@ -304,7 +353,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
           blocks.set(chunk.index as number, block)
           if (type === 'text') {
             totalText += chunk.text.length
-            if (totalText > 2_000_000) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
+            if (totalText > (mode === 'analysis' ? 131072 : 2_000_000)) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
             emittedText += chunk.text
             yield { type: 'text', text: chunk.text }
           }
@@ -329,7 +378,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
           if (block.type === 'text' && !partial?.text) {
             const blockText = block.text!
             totalText += blockText.length
-            if (totalText > 2_000_000) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
+            if (totalText > (mode === 'analysis' ? 131072 : 2_000_000)) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
             emittedText += blockText
             yield { type: 'text', text: blockText }
           }

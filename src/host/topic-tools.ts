@@ -2,6 +2,8 @@ import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen
 import type { DshExecutionContext } from './dsh-text-adapter.js'
 import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection } from '../shared/normal-translation.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
+import type { TerminologyAnalysisService } from './terminology-analysis.js'
+import { parseTranslationAnalysisStart, parseTranslationAnalysisQuery, parseTranslationAnalysisRead } from '../shared/translation-preparation.js'
 
 export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
 export interface MainAgent {
@@ -296,6 +298,40 @@ export class TopicToolsService {
           return result.value
         },
       })))
+      const analysis = this.ctx.get?.('translationAnalysis') as TerminologyAnalysisService | undefined
+      if (analysis) {
+        const queryParameters = { target: { ...materialTargetParameter, required: true }, analysisId: { type: 'string', required: true },
+          version: { type: 'integer', enum: [1], required: true } }
+        const rangeParameter = { type: 'object', additionalProperties: false, properties: {
+          start: { type: 'integer', required: true }, end: { type: 'integer', required: true },
+        } }
+        const checkAgent = (exec: ToolExecution): void => {
+          if (exec.agent !== agent || !this.ownsAgent(connection.identity.mainSessionId, exec.agent)) throw bridgeError('scope_mismatch', '术语分析工具不属于已连接的实际主 Agent。')
+          exec.signal.throwIfAborted()
+        }
+        disposers.push(agent.ctx.tools.register(helpers.defineTool({
+          name: 'translation_analyze_terminology',
+          description: 'Start independent background terminology analysis of exact frozen material already delivered to this main Agent. Use one operationId and analysisId; repeating the same request does not repeat model calls. Omitted ranges scan the entire source; explicit ordered ranges scan only those positions, and excludedRanges must explicitly identify any copy regions. Analysis uses the frozen Session model/effort, reads bounded source pages, and returns a short runtime status. It creates no translation unit, revision or final and does not consume or edit a draft. Composer phase capability enables one automatic completion/failure/unknown notice so the original task can continue without another user command; check notification availability. Candidates remain proposals. Unknown calls must be queried, never automatically restarted.',
+          parameters: { target: { ...materialTargetParameter, required: true }, operationId: { type: 'string', required: true }, analysisId: { type: 'string', required: true },
+            ranges: { type: 'array', items: rangeParameter }, excludedRanges: { type: 'array', items: rangeParameter } },
+          output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+          execute: (args: unknown, exec: ToolExecution) => { checkAgent(exec); return analysis.prepare(parseTranslationAnalysisStart(args), exec) },
+        })))
+        disposers.push(agent.ctx.tools.register(helpers.defineTool({
+          name: 'translation_analysis_status',
+          description: 'Read one authorized independent analysis run and its exact source, route, coverage and notification status. A completed partial scan does not establish complete document preparation. Uses the delivered material target, analysisId and immutable version. Does not invoke a model or continue a call.',
+          parameters: queryParameters,
+          output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+          execute: (args: unknown, exec: ToolExecution) => { checkAgent(exec); return analysis.status(parseTranslationAnalysisQuery(args), exec) },
+        })))
+        disposers.push(agent.ctx.tools.register(helpers.defineTool({
+          name: 'translation_analysis_read',
+          description: 'Read a bounded page of candidates, successful coverage, or actual calls for one exact authorized analysis version. At most 50 items and 32768 UTF-8 bytes for the complete page; follow nextCursor. Candidate descriptions are model inference and source occurrences are Host positions; they are not researched reference evidence or user-fixed topic terms. No source body or whole candidate table is injected into the main chat; reading never starts another model call.',
+          parameters: { ...queryParameters, section: { type: 'string', enum: ['candidates', 'coverage', 'calls'], required: true }, cursor: { type: 'string' }, limit: { type: 'integer' } },
+          output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+          execute: (args: unknown, exec: ToolExecution) => { checkAgent(exec); return analysis.read(parseTranslationAnalysisRead(args), exec) },
+        })))
+      }
       const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown>; correctSource(args: unknown, exec: ToolExecution): Promise<unknown> } | undefined
       if (normal) disposers.push(agent.ctx.tools.register(helpers.defineTool({
         name: 'translation_execute', description: 'Execute short normal translation when the user requests it. Refer to delivered material or an explicitly provided unit and exact sourceVersion from translation_read_unit. An existing unit uses its session current translation model, with original language and requirements; the draft is untouched. Never rewrite source or choose a provider. Reuse operationId for the same operation; explicit retranslation uses a new operationId. If the user requested source correction and retranslation, first call translation_correct_source, then execute its returned sourceVersion with an independent operationId. Preparation failure preserves the correction.',
