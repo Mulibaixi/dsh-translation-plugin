@@ -130,6 +130,12 @@ export const styles = `
 .dsh-tp-records-session > h3, .dsh-tp-records-session > p { margin: 8px 10px; }
 .dsh-tp-record-unit { border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-record-unit-heading { display: flex; align-items: baseline; gap: 8px; padding: 4px 6px; }
+.dsh-tp-record-unit-heading { flex-wrap: wrap; }
+.dsh-tp-record-unit-heading h3 { margin: 0; }
+.dsh-tp-record-block + .dsh-tp-record-block { border-top: 1px solid var(--dsw-alias-border-l2, #8883); }
+.dsh-tp-record-block-heading { display: block; padding: 4px 10px; }
+.dsh-tp-record-page-actions { font-size: 12px; }
+.dsh-tp-record-open { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: baseline; }
 .dsh-tp-record-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .dsh-tp-record-source, .dsh-tp-record-target { min-width: 0; padding: 8px 10px; }
 .dsh-tp-record-source { border-right: 1px solid var(--dsw-alias-border-l2, #8883); }

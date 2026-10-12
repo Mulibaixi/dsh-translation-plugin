@@ -1,5 +1,5 @@
 import type { TermEvidenceRef } from '../memory/topic-terms.js'
-import { documentSourceLength, type ChunkRevision, type DocumentRevision, type DocumentSourceVersion } from '../shared/translation-batch.js'
+import { documentSourceLength, sameVersionReference, type ChunkPlanItem, type ChunkRevision, type DocumentChunkPlan, type DocumentRevision, type DocumentSourceVersion } from '../shared/translation-batch.js'
 import type { EvidenceReadRequest, EvidenceReadResult, EvidenceReadyResult, EvidenceUnavailableResult } from '../shared/translation-evidence.js'
 import type { TranslationSourceIntegrityPort } from '../shared/translation-source-integrity.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength,
@@ -17,6 +17,32 @@ export interface TranslationEvidenceReader {
   read(request: EvidenceReadRequest): Promise<EvidenceReadResult>
   isCurrent(request: EvidenceReadRequest): boolean
 }
+export interface DocumentReadTarget {
+  readonly ownerId: string; readonly topicId: string; readonly sessionId: string; readonly unitId: string
+  readonly sourceVersion?: number; readonly manifestRevisionId?: string | null
+}
+export interface DocumentReadBlock extends ChunkPlanItem {
+  readonly revisionId: string | null
+  readonly revision: ChunkRevision | null
+}
+/** Content remains in the immutable history records; this handle fixes their identities, not UI selection. */
+export interface DocumentReadSnapshot {
+  readonly target: DocumentReadTarget & { readonly sourceVersion: number }
+  readonly source: DocumentSourceVersion
+  readonly manifest: DocumentRevision | null
+  readonly plan: DocumentChunkPlan | null
+  readonly blocks: readonly DocumentReadBlock[]
+  readonly finalRevisionId: string | null
+  readonly totalSourceCodePoints: number
+  check(): EvidenceUnavailableResult | null
+  readSource(range: TranslationSourceRange): Promise<EvidenceReadResult>
+  readChunk(revisionId: string, range: TranslationSourceRange): Promise<EvidenceReadResult>
+  openOriginal(signal: AbortSignal): Promise<{ readonly status: 'opened' } | EvidenceUnavailableResult>
+}
+export type DocumentReadHandle = DocumentReadSnapshot
+export interface TranslationDocumentReader {
+  captureDocument(target: DocumentReadTarget): DocumentReadSnapshot | EvidenceUnavailableResult
+}
 export interface TranslationSourceReaderOptions {
   readonly sessions: EvidenceSessionPort
   readonly sources?: TranslationSourcesPort
@@ -32,6 +58,7 @@ interface Snapshot {
   readonly final: DocumentRevision | TextRevision | null
   readonly chunks: readonly ChunkRevision[]
   readonly totalCodePoints: number
+  readonly checkFixed?: () => EvidenceUnavailableResult | null
 }
 interface CacheStamp {
   readonly source: WeakRef<Snapshot['source']>
@@ -74,7 +101,7 @@ function snapshotSame(left: Snapshot, right: Snapshot): boolean {
 }
 
 /** Exact evidence reads, with only bounded ready pages cached. Temporary failures are never cached. */
-export class TranslationSourceReader implements TranslationEvidenceReader {
+export class TranslationSourceReader implements TranslationEvidenceReader, TranslationDocumentReader {
   private readonly pages = new Map<string, { readonly stamp: CacheStamp; readonly result: EvidenceReadyResult }>()
   private readonly sourceLeases = new Set<string>()
   private readonly copyHashes = new Map<string, WeakRef<Snapshot['source']>>()
@@ -94,6 +121,116 @@ export class TranslationSourceReader implements TranslationEvidenceReader {
     return 'status' in snapshot ? snapshot : request
   }
   isCurrent(request: EvidenceReadRequest): boolean { return !('status' in this.inspect(request)) }
+  captureDocument(target: DocumentReadTarget): DocumentReadSnapshot | EvidenceUnavailableResult {
+    target = { ...target }
+    const sessions = this.options.sessions, session = sessions.getSession(target.sessionId)
+    const unit = sessions.getTranslationHistory(target.sessionId)?.units.find(unit => unit.id === target.unitId)
+    const sourceVersion = target.sourceVersion ?? unit?.sourceVersion ?? 1
+    const request: EvidenceReadRequest = { ownerId: target.ownerId, topicId: target.topicId, sessionId: target.sessionId,
+      unitId: target.unitId, sourceVersion, side: 'source', range: null, revisionId: null, selectionEventId: null }
+    if (this.disposed) return unavailable(request, 'unloaded', 'reader_disposed')
+    if (!session || sessions.isSessionDeleted(target.sessionId)) return unavailable(request, 'missing', 'session_missing')
+    if (session.ownerId !== target.ownerId || session.topicId !== target.topicId || this.options.authorize && !this.options.authorize(request)) return unavailable(request, 'forbidden', 'scope_mismatch')
+    if (sessions.getStatus(session.id) === 'conflict') return unavailable(request, 'unloaded', 'history_conflict')
+    if (!unit || !isDocumentUnit(unit)) return unavailable(request, 'missing', 'document_missing')
+    const source = unit.sourceVersions.find(source => source.version === sourceVersion)
+    if (!source) return unavailable(request, 'missing', 'source_version_missing')
+    const selected = currentDocumentFinalRevision(unit)
+    const manifest = target.manifestRevisionId === undefined ? (selected?.sourceVersion === sourceVersion ? selected : undefined) ?? [...unit.revisions].reverse().find(revision => revision.sourceVersion === sourceVersion) ?? null
+      : target.manifestRevisionId === null ? null : unit.revisions.find(revision => revision.id === target.manifestRevisionId) ?? null
+    if (target.manifestRevisionId && !manifest || manifest && manifest.sourceVersion !== sourceVersion) return unavailable(request, 'missing', 'manifest_missing')
+    const plan = manifest ? unit.plans.find(plan => sameVersionReference(plan, manifest.planRef)) ?? null
+      : [...unit.plans].reverse().find(plan => plan.sourceVersion === sourceVersion) ?? null
+    const blocks: DocumentReadBlock[] = (plan?.items ?? []).map(item => {
+      const entry = manifest?.entries.find(entry => entry.chunkId === item.chunkId)
+      return { ...item, revisionId: entry?.revisionId ?? null, revision: entry ? unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId) ?? null : null }
+    })
+    const scope: TranslationSourceScope = { ownerId: target.ownerId, mainSessionId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId }
+    const check = (): EvidenceUnavailableResult | null => {
+      if (this.disposed) return unavailable(request, 'unloaded', 'reader_disposed')
+      if (this.options.authorize && !this.options.authorize(request)) return unavailable(request, 'forbidden', 'authorization_changed')
+      const currentSession = sessions.getSession(target.sessionId)
+      if (!currentSession || sessions.isSessionDeleted(target.sessionId)) return unavailable(request, 'missing', 'session_missing')
+      if (currentSession.ownerId !== target.ownerId || currentSession.topicId !== target.topicId) return unavailable(request, 'forbidden', 'scope_mismatch')
+      if (sessions.getStatus(target.sessionId) === 'conflict') return unavailable(request, 'unloaded', 'history_conflict')
+      const current = sessions.getTranslationHistory(target.sessionId)?.units.find(unit => unit.id === target.unitId)
+      if (!current || !isDocumentUnit(current)) return unavailable(request, 'missing', 'document_missing')
+      const retainedSource = current.sourceVersions.find(version => version.version === sourceVersion)
+      if (!retainedSource) return unavailable(request, 'missing', 'source_version_missing')
+      if (source.version !== retainedSource.version || source.body.kind !== retainedSource.body.kind ||
+        (source.body.kind === 'inline' && retainedSource.body.kind === 'inline' ? source.body.text !== retainedSource.body.text
+          : source.body.kind === 'asset' && retainedSource.body.kind === 'asset' && !same(source.body.reference, retainedSource.body.reference))) return unavailable(request, 'corrupt', 'source_identity_changed')
+      const retainedPlan = plan && current.plans.find(value => sameVersionReference(value, plan))
+      if (plan && retainedPlan !== plan && !same(plan, retainedPlan)) return unavailable(request, 'corrupt', 'plan_identity_changed')
+      const retainedManifest = manifest && current.revisions.find(value => value.id === manifest.id)
+      if (manifest && retainedManifest !== manifest && !same(manifest, retainedManifest)) return unavailable(request, 'corrupt', 'manifest_identity_changed')
+      for (const block of blocks) if (block.revision) {
+        const retained = current.chunkRevisions.find(chunk => chunk.id === block.revision!.id)
+        if (!retained || retained !== block.revision && !same(block.revision, retained)) return unavailable(request, 'corrupt', 'chunk_identity_changed')
+      }
+      return null
+    }
+    const snapshot: Snapshot = { unit, source, scope, final: manifest, chunks: blocks.flatMap(block => block.revision ? [block.revision] : []),
+      totalCodePoints: documentSourceLength(source), checkFixed: check }
+    const read = async (range: TranslationSourceRange, chunk?: ChunkRevision): Promise<EvidenceReadResult> => {
+      range = { ...range }
+      const fixed = { ...request, range: { ...range }, ...(chunk ? { side: 'final' as const, revisionId: manifest?.id ?? null } : {}) }
+      const changed = check()
+      if (changed) return changed
+      if (this.options.authorize && !this.options.authorize(fixed)) return unavailable(fixed, 'forbidden', 'authorization_changed')
+      const reading = { ...snapshot, checkFixed: () => this.options.authorize && !this.options.authorize(fixed) ? unavailable(fixed, 'forbidden', 'authorization_changed') : check() }
+      const length = chunk ? chunk.content.kind === 'text' ? sourceCodePointLength(chunk.content.text) : chunk.content.range.end - chunk.content.range.start : documentSourceLength(source)
+      if (!validRange(range) || range.end > length) return unavailable(fixed, 'missing', 'range_out_of_bounds', length)
+      if (range.end - range.start > MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS) return unavailable(fixed, 'unloaded', 'range_required', length)
+      let loaded: LoadedText
+      try {
+        if (!chunk) loaded = await this.sourceText(fixed, reading, range)
+        else if (chunk.status !== 'completed' || chunk.sourceVersion !== sourceVersion) return unavailable(fixed, 'missing', 'chunk_not_completed', length)
+        else if (chunk.content.kind === 'text') loaded = { text: slicePoints(chunk.content.text, range) }
+        else {
+          const prepared = await this.prepareAsset(fixed, reading)
+          if ('status' in prepared) return prepared
+          const verified = await this.verifyCopy(fixed, reading, chunk, prepared)
+          if (verified) return verified
+          loaded = await this.sourceText(fixed, reading, { start: chunk.content.range.start + range.start, end: chunk.content.range.start + range.end }, prepared)
+        }
+      } catch { return unavailable(fixed, 'unloaded', 'transport_unavailable') }
+      const after = reading.checkFixed()
+      if (after) return after
+      if ('status' in loaded) return loaded
+      if (sourceCodePointLength(loaded.text) !== range.end - range.start) return unavailable(fixed, 'corrupt', 'range_length_mismatch')
+      const result: EvidenceReadyResult = { status: 'ready', request: fixed, range: { ...range }, totalCodePoints: length,
+        sourceVersion, manifestRevisionId: chunk ? manifest?.id ?? null : null, text: loaded.text }
+      return translationSourceResultBytes({ ok: true, value: result }) > MAX_TRANSLATION_SOURCE_PAGE_BYTES ? unavailable(fixed, 'unloaded', 'range_required', length) : result
+    }
+    return { target: { ...target, sourceVersion }, source, manifest, plan, blocks, finalRevisionId: selected?.id ?? null,
+      totalSourceCodePoints: documentSourceLength(source), check, readSource: range => read(range), openOriginal: async signal => {
+        const before = check()
+        if (before) return before
+        if (source.body.kind !== 'asset' || !source.historyCommit) return unavailable(request, 'unloaded', 'original_projection_required')
+        if (!this.options.storage) return unavailable(request, 'unloaded', 'storage_service_unavailable')
+        try {
+          const stored = await sessions.readStoredSourceRequest({ sessionId: target.sessionId, unitId: target.unitId, sourceVersion })
+          const changed = check()
+          if (changed) return changed
+          if (!stored) return unavailable(request, 'unloaded', 'reference_unconfirmed')
+          if (!same(stored.scope, scope) || !same(stored.source, source.body.reference)) return unavailable(request, 'forbidden', 'stored_scope_mismatch')
+          const response = await this.options.storage.openOriginal(stored, signal)
+          const after = check()
+          return after ?? (response.ok ? { status: 'opened' } : this.businessError(request, response.error.code, true))
+        } catch { return unavailable(request, 'unloaded', 'transport_unavailable') }
+      }, readChunk: (revisionId, range) => {
+        const block = blocks.find(block => block.revisionId === revisionId), chunk = block?.revision
+        const entry = manifest?.entries.find(entry => entry.revisionId === revisionId)
+        if (!chunk || !block || !entry || entry.reuseRef || chunk.chunkId !== block.chunkId || !same(entry.outputRange, block.outputRange) ||
+          chunk.taskId !== manifest!.taskId || !sameVersionReference(chunk.planRef, manifest!.planRef) || !sameVersionReference(chunk.preparationRef, manifest!.preparationRef) ||
+          (block.mode === 'copy' ? chunk.kind !== 'copy' || chunk.content.kind !== 'source_copy' : chunk.kind === 'copy') ||
+          chunk.content.kind === 'source_copy' && (chunk.content.sourceVersion !== sourceVersion || !same(chunk.content.range, block.outputRange))) {
+          return Promise.resolve(unavailable(request, 'corrupt', 'manifest_invalid'))
+        }
+        return read(range, chunk)
+      } }
+  }
   clearCache(): void { this.pages.clear(); this.sourceLeases.clear(); this.copyHashes.clear() }
   dispose(): void { this.disposed = true; this.clearCache() }
 
@@ -141,6 +278,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader {
     return { unit, source, scope, final, chunks, totalCodePoints }
   }
   private after(request: EvidenceReadRequest, snapshot: Snapshot): EvidenceUnavailableResult | null {
+    if (snapshot.checkFixed) return snapshot.checkFixed()
     const current = this.inspect(request)
     if ('status' in current) return current
     return snapshotSame(snapshot, current) ? null : unavailable(request, 'unloaded', 'evidence_changed')

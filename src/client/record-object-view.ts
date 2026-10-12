@@ -1,5 +1,6 @@
 import { h, react } from './react.js'
-import type { RecordObjectTarget, RecordObjectReferenceInput } from '../shared/record-objects.js'
+import type { RecordObjectTarget, RecordObjectReferenceInput, RecordObjectReference } from '../shared/record-objects.js'
+import type { TranslationSourceRange } from '../shared/translation-source-read.js'
 import { OBJECT_ASSET_KINDS, type ObjectAssetKind } from '../shared/object-assets.js'
 import type { RecordObjectStore } from './record-object-store.js'
 import type { ObjectAssetsClient } from './object-assets-client.js'
@@ -15,9 +16,14 @@ function RecordObjectFormula({ source }: { readonly source: string }): unknown {
     h('details', null, h('summary', null, '公式源'), h('pre', null, source)),
     h('small', { className: 'dsh-tp-muted' }, '公式源和原件可查看。'))
 }
-export function RecordObjectText({ text, target, objects, objectAssets }: RecordObjectsProps & { readonly text: string; readonly target: RecordObjectTarget }): unknown {
+export function RecordObjectText({ text, target, objects, objectAssets, references, range, totalCodePoints, hideUnavailable = false }: RecordObjectsProps & {
+  readonly text: string; readonly target: RecordObjectTarget; readonly references?: readonly RecordObjectReference[] | undefined
+  readonly range?: TranslationSourceRange | undefined; readonly totalCodePoints?: number | undefined; readonly hideUnavailable?: boolean
+}): unknown {
   const [failures, setFailures] = react.useState<ReadonlyMap<string, string>>(() => new Map())
-  const projected = projectRecordObjects(text, target, objects?.getReferences(target) ?? [])
+  const refs = references ?? objects?.getReferences(target) ?? []
+  const pageRefs = range ? refs.filter(ref => ref.offset >= range.start && (ref.offset < range.end || ref.offset === range.end && range.end === totalCodePoints)).map(ref => ({ ...ref, offset: ref.offset - range.start })) : refs
+  const projected = projectRecordObjects(text, target, pageRefs)
   function object(reference: typeof projected.unavailableRefs[number], unavailable = false): unknown {
     const refId = reference.refId, label = recordObjectLabel(reference)
     return h('span', { key: refId, 'data-object-ref-id': refId }, h('button', {
@@ -32,7 +38,7 @@ export function RecordObjectText({ text, target, objects, objectAssets }: Record
     reference.asset.kind === 'formula' && reference.formulaSource ? h(RecordObjectFormula, { source: reference.formulaSource }) : null)
   }
   return h('div', { className: 'dsh-tp-translation-text' }, ...projected.segments.map(segment => segment.kind === 'text' ? segment.text : object(segment.reference)),
-    projected.unavailableRefs.length ? h('div', { className: 'dsh-tp-object-unavailable', 'aria-label': '关联位置不可用' }, ...projected.unavailableRefs.map(reference => object(reference, true))) : null)
+    !hideUnavailable && projected.unavailableRefs.length ? h('div', { className: 'dsh-tp-object-unavailable', 'aria-label': '关联位置不可用' }, ...projected.unavailableRefs.map(reference => object(reference, true))) : null)
 }
 
 export function RecordObjectEditor({ session, unit, objects, objectAssets }: RecordObjectsProps & { readonly session: LocalSession; readonly unit: TextUnit }): unknown {

@@ -1,7 +1,8 @@
 import type { RecordObjectReference } from '../shared/record-objects.js'
 import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import { projectRecordObjects } from './record-object-projection.js'
-import { buildBilingualExport, buildFinalTextExport, buildTopicBilingualExport, buildTopicFinalTextExport, type TranslationExportTopic, type TranslationExportSession, type TopicTranslationExport } from './translation-export.js'
+import { buildBilingualExport, buildFinalTextExport, buildTopicBilingualExport, buildTopicFinalTextExport, buildTranslationExportAsync, type TranslationExportTopic, type TranslationExportSession, type TopicTranslationExport } from './translation-export.js'
+import type { TranslationDocumentReader } from './source-reader.js'
 
 export interface RecordObjectExportRequest {
   readonly topic: TranslationExportTopic; readonly entries: readonly TranslationExportSession[]; readonly scope: 'session' | 'topic'
@@ -9,6 +10,10 @@ export interface RecordObjectExportRequest {
 }
 export function recordObjectPlainText(text: string, target: Parameters<typeof projectRecordObjects>[1], references: readonly RecordObjectReference[]): string {
   return projectRecordObjects(text, target, references).segments.map(segment => segment.kind === 'text' ? segment.text : `[${segment.label}]`).join('')
+}
+/** The asynchronous projection preserves ordered document blocks and gaps with frozen object references. */
+export function buildRecordObjectExportAsync(request: RecordObjectExportRequest, reader: TranslationDocumentReader | undefined, allowPartial = false): Promise<TopicTranslationExport> {
+  return buildTranslationExportAsync(request, reader, { allowPartial })
 }
 /** Frozen references decorate exports; canonical source and revision bodies stay unchanged. */
 export function buildRecordObjectExport(request: RecordObjectExportRequest, allowPartial = false): TopicTranslationExport {

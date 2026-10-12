@@ -1,12 +1,20 @@
 import type { LocalSession } from './sessions.js'
-import { persistedTranslationHistory, currentFinalRevision, isTextUnit, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
+import { persistedTranslationHistory, currentDocumentFinalRevision, currentFinalRevision, isTextUnit, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
 import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION, NORMAL_SYSTEM_PROMPT, NORMAL_TRANSLATION_PROMPT_VERSION } from '../shared/translation-call.js'
+import type { RecordObjectReference } from '../shared/record-objects.js'
+import type { DocumentRevision, DocumentSourceVersion } from '../shared/translation-batch.js'
+import type { EvidenceUnavailableResult } from '../shared/translation-evidence.js'
+import { projectRecordObjects } from './record-object-projection.js'
+import { recordObjectLabel } from './record-object-projection.js'
+import { sourceCodePointLength } from '../shared/translation-source-read.js'
+import { projectDocument, type DocumentMissingRange } from './document-export.js'
+import type { DocumentReadSnapshot, TranslationDocumentReader } from './source-reader.js'
 
 export interface MissingTextUnit {
   readonly unitId: string
   readonly order: number
   readonly latestStatus: TextRevisionStatus | null
-  readonly reason?: 'document_not_supported'
+  readonly reason?: string
 }
 export interface TranslationExport {
   readonly content: string | null
@@ -15,6 +23,11 @@ export interface TranslationExport {
   readonly complete: boolean
   readonly missingUnits: readonly MissingTextUnit[]
   readonly exportedUnitIds: readonly string[]
+  readonly missingRanges?: readonly MissingTranslationRange[]
+}
+export interface MissingTranslationRange extends DocumentMissingRange {
+  readonly sessionId: string; readonly sessionName: string; readonly sessionSequence: number
+  readonly unitId: string; readonly order: number; readonly sourceVersion: number
 }
 export interface TranslationExportTopic {
   readonly ownerId: string
@@ -34,6 +47,27 @@ export interface TopicTranslationExport extends TranslationExport {
   readonly missingUnits: readonly MissingTopicTextUnit[]
 }
 export interface FinalExportOptions { readonly allowPartial?: boolean }
+export interface TranslationExportRequest {
+  readonly topic: TranslationExportTopic
+  readonly entries: readonly TranslationExportSession[]
+  readonly scope: 'session' | 'topic'
+  readonly format: 'txt' | 'json'
+  readonly exportedAt: string
+  readonly references?: readonly RecordObjectReference[]
+}
+export interface AsyncTranslationExport extends TopicTranslationExport {
+  readonly missingRanges: readonly MissingTranslationRange[]
+}
+const partialExports = new WeakMap<TranslationExport, { readonly content: string | null; readonly check: () => boolean }>()
+/** Partial confirmation uses the already fixed projection and rechecks its authorization without fetching it again. */
+export function allowPartialTranslationExport<T extends TranslationExport>(result: T): T {
+  const prepared = partialExports.get(result)
+  if (!prepared) throw new Error('部分导出没有固定的读取结果，请重新导出。')
+  if (!prepared.check()) throw new Error('原导出范围已不可读取，请重新导出。')
+  const partial = { ...result, content: prepared.content }
+  partialExports.set(partial, prepared)
+  return partial
+}
 
 interface BilingualTextUnit {
   readonly unitId: string
@@ -146,4 +180,95 @@ export function buildFullRecordExport(session: LocalSession, history: Translatio
   const content = JSON.stringify({ format: 'dsh-translation-session', schemaVersion: 1, exportedAt, session, history: persistedTranslationHistory(history),
     summary: { complete, missingUnits, exportedUnitIds }, promptDefinitions }, null, 2)
   return { content, fileName: `${fileBase(session, exportedAt)}-records.json`, mimeType: 'application/json;charset=utf-8', complete, missingUnits, exportedUnitIds }
+}
+
+interface FrozenTextExportUnit extends BilingualTextUnit {
+  readonly kind: 'text'
+  readonly finalRevisionId: string | null
+  readonly latestStatus: TextRevisionStatus | null
+}
+interface FrozenDocumentExportUnit {
+  readonly kind: 'document'; readonly unitId: string; readonly order: number; readonly targetLanguage: string
+  readonly sourceVersion: number; readonly source: DocumentSourceVersion | null; readonly finalRevisionId: string | null
+  readonly manifest: DocumentRevision | null; readonly snapshot: DocumentReadSnapshot | EvidenceUnavailableResult
+}
+function objectText(text: string, session: LocalSession, unitId: string, revisionId: string, references: readonly RecordObjectReference[]): string {
+  return projectRecordObjects(text, { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId,
+    side: 'revision', revisionId }, references).segments.map(segment => segment.kind === 'text' ? segment.text : `[${segment.label}]`).join('')
+}
+
+/** Capture every scope and immutable document identity before the first asynchronous page read. */
+export async function buildTranslationExportAsync(request: TranslationExportRequest, reader: TranslationDocumentReader | undefined, options: FinalExportOptions = {}): Promise<AsyncTranslationExport> {
+  const topic = { ...request.topic }, scope = request.scope, format = request.format, exportedAt = request.exportedAt
+  if (scope === 'session' && request.entries.length !== 1) throw new Error('Session translation export requires one session')
+  const references = structuredClone(request.references ?? [])
+  const sessions = scopedSessions(topic, request.entries).map(({ session, history }) => ({ session: { ...session }, units: [...history.units].sort((a, b) => a.order - b.order).map((unit): FrozenTextExportUnit | FrozenDocumentExportUnit => {
+    if (isTextUnit(unit)) {
+      const final = currentFinalRevision(unit)
+      return { kind: 'text', unitId: unit.id, order: unit.order, source: unit.source, targetLanguage: unit.targetLanguage,
+        status: final ? 'final' : 'missing', translation: final?.text ?? null, finalRevisionId: final?.id ?? null, latestStatus: unit.revisions.at(-1)?.status ?? null }
+    }
+    const final = currentDocumentFinalRevision(unit)
+    const manifest = final ?? [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion) ?? null
+    const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id,
+      sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }
+    const captured = reader?.captureDocument(target) ?? { status: 'unloaded' as const, request: null, reason: 'document_reader_unavailable' }
+    const snapshot = 'status' in captured ? captured : { ...captured, finalRevisionId: final?.id ?? null }
+    return { kind: 'document', unitId: unit.id, order: unit.order, targetLanguage: unit.targetLanguage,
+      sourceVersion: unit.sourceVersion, source: unit.sourceVersions.find(source => source.version === unit.sourceVersion) ?? null,
+      finalRevisionId: final?.id ?? null, manifest, snapshot }
+  }) }))
+  const missingUnits: MissingTopicTextUnit[] = [], missingRanges: MissingTranslationRange[] = [], exportedUnitIds: string[] = [], texts: string[] = []
+  const exportedSessions: { id: string; name: string; remark: string; sequence: number; units: unknown[] }[] = []
+  const hasDocument = sessions.some(entry => entry.units.some(unit => unit.kind === 'document'))
+  for (const { session, units } of sessions) {
+    const exportedUnits: unknown[] = []
+    for (const unit of units) {
+      const location = { sessionId: session.id, sessionName: session.name, sessionSequence: session.sequence, unitId: unit.unitId, order: unit.order }
+      if (unit.kind === 'text') {
+        const { kind: _kind, finalRevisionId: _finalRevisionId, latestStatus: _latestStatus, ...bilingual } = unit
+        exportedUnits.push(bilingual)
+        if (unit.translation !== null && unit.finalRevisionId) {
+          exportedUnitIds.push(unit.unitId); texts.push(objectText(unit.translation, session, unit.unitId, unit.finalRevisionId, references))
+        } else { missingUnits.push({ ...location, latestStatus: unit.latestStatus }); if (hasDocument) texts.push(`\n[缺失：${session.name} · 文本 ${unit.order}尚无最终译文]\n`) }
+        continue
+      }
+      let projection
+      if ('status' in unit.snapshot) {
+        const length = unit.source?.body.kind === 'asset' ? unit.source.body.reference.totalCodePoints : unit.source?.body.text ? sourceCodePointLength(unit.source.body.text) : 0
+        projection = { text: null, complete: false, hasTranslation: false, blocks: [], missingRanges: [{ range: { start: 0, end: length }, chunkId: null,
+          side: 'translation' as const, status: unit.snapshot.status, reason: unit.snapshot.reason }] }
+      } else projection = await projectDocument(unit.snapshot, format === 'json')
+      const ranges = projection.missingRanges.map(missing => ({ ...missing, ...location, sourceVersion: unit.sourceVersion }))
+      missingRanges.push(...ranges)
+      if (!projection.complete) missingUnits.push({ ...location, latestStatus: null, reason: 'document_incomplete' })
+      if (projection.hasTranslation && projection.text !== null) {
+        exportedUnitIds.push(unit.unitId)
+        const refs = references.filter(ref => ref.ownerId === session.ownerId && ref.topicId === session.topicId && ref.sessionId === session.id && ref.unitId === unit.unitId && ref.side === 'revision' && ref.revisionId === unit.manifest?.id)
+        texts.push(unit.manifest && projection.complete ? objectText(projection.text, session, unit.unitId, unit.manifest.id, refs)
+          : projection.text + refs.map(ref => `\n[${recordObjectLabel(ref)}：关联位置不可用]`).join(''))
+      }
+      else texts.push(`\n[缺失：${session.name} · 文档 ${unit.order}；原文码点 ${ranges[0]?.range.start ?? 0}–${ranges[0]?.range.end ?? 0}]\n`)
+      exportedUnits.push({ kind: 'document', unitId: unit.unitId, order: unit.order, sourceVersion: unit.sourceVersion,
+        targetLanguage: unit.targetLanguage, status: projection.complete ? 'final' : 'partial', complete: projection.complete,
+        source: unit.source?.body.kind === 'asset' ? { kind: 'asset', reference: unit.source.body.reference } : { kind: 'inline' },
+        finalRevisionId: unit.finalRevisionId, manifestRevisionId: unit.manifest?.id ?? null, manifest: unit.manifest,
+        blocks: projection.blocks, missingRanges: ranges })
+    }
+    exportedSessions.push({ id: session.id, name: session.name, remark: session.remark, sequence: session.sequence, units: exportedUnits })
+  }
+  const complete = missingUnits.length === 0
+  const check = (): boolean => sessions.every(entry => entry.units.every(unit => unit.kind !== 'document' || 'status' in unit.snapshot || unit.snapshot.check() === null))
+  if (!check()) throw new Error('导出范围在读取期间已不可访问，请重新导出。')
+  const includedObjects = references.filter(ref => sessions.some(({ session, units }) => session.ownerId === ref.ownerId && session.topicId === ref.topicId && session.id === ref.sessionId && units.some(unit => unit.unitId === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : (unit.kind === 'text' ? unit.finalRevisionId : unit.manifest?.id) === ref.revisionId))))
+  const partialContent = exportedUnitIds.length ? format === 'txt' ? texts.join('\n\n') : JSON.stringify({
+    format: 'dsh-translation-bilingual', schemaVersion: hasDocument ? 3 : includedObjects.length ? 2 : 1, exportedAt, scope,
+    topic, sessions: exportedSessions, summary: { complete, missingUnits, exportedUnitIds, ...(hasDocument ? { missingRanges } : {}) },
+    ...(includedObjects.length ? { objectReferences: includedObjects } : {}),
+  }, null, 2) : null
+  const name = scope === 'session' ? sessions[0]!.session.name : topic.topicName
+  const result: AsyncTranslationExport = { content: complete || options.allowPartial ? partialContent : null, fileName: `${namedFileBase(name, exportedAt)}${scope === 'topic' ? '-topic' : ''}${format === 'json' ? '-bilingual' : ''}${complete ? '' : '-partial'}.${format}`,
+    mimeType: format === 'json' ? 'application/json;charset=utf-8' : 'text/plain;charset=utf-8', complete, missingUnits, missingRanges, exportedUnitIds }
+  partialExports.set(result, { content: partialContent, check })
+  return result
 }

@@ -197,7 +197,7 @@ export function apply(ctx: ClientPluginContext): void {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, objects, objectAssets, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, terms, objects, objectAssets, documents: evidence, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId },
@@ -213,7 +213,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, objects, objectAssets, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, objects, objectAssets, documents: evidence, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })
