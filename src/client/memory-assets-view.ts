@@ -25,7 +25,7 @@ interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps {
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, quick, topics, objects, objectAssets, documents, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly onSelectTopic?: ((topicId: string) => void) | undefined
 }): unknown {
@@ -65,7 +65,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, objects
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: `${ownerId}:${id}`, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
-        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, documents, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
+        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
           active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
           navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
     }),
@@ -73,7 +73,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, objects
   )
 }
 
-function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, documents, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
+function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
   readonly topicName: string; readonly active: boolean
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined
 }): unknown {
@@ -131,5 +131,5 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
               h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type,
                 active: active && category === 'terms' && kind === type, evidenceContextKey }))))),
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
-          h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, documents, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations' }))))
+          h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, documents, documentTasks, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations' }))))
 }

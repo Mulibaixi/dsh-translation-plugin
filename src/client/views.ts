@@ -85,7 +85,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, terms, objects, objectAssets, documents, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, terms, objects, objectAssets, documents, documentTasks, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
     const reconcile = (): void => setDrafts(current => {
@@ -121,7 +121,7 @@ export function PanelRouter({ store, models, quick, normal, sessionId, topics, m
     },
   }
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, normal, editor, topics, materials, terms, objects, objectAssets, documents, onDeleteTerm, onOpenAssets, ownerId: sessionId, key: sessionId })
+    sessionId?.trim() ? h(WorkspaceView, { store, models, quick, normal, editor, topics, materials, terms, objects, objectAssets, documents, documentTasks, onDeleteTerm, onOpenAssets, ownerId: sessionId, key: sessionId })
       : h('p', { role: 'alert' }, '请在主窗口会话中打开翻译面板。'),
   )
 }
@@ -403,7 +403,7 @@ function TranslationUnit({ store, unit, quick, normal, session, editor, topics, 
   )
 }
 
-function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, materials, terms, objects, objectAssets, documents, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
+function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, materials, terms, objects, objectAssets, documents, documentTasks, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   react.useEffect(() => {
@@ -581,7 +581,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
         historyNote && (units.length || records.length) ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
-        ...units.map(unit => isTextUnit(unit) ? h(TranslationUnit, { key: unit.id, store, unit, quick, normal, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined }) : h(DocumentUnitView, { key: unit.id, unit, session: current!, store, documents, objects, objectAssets })),
+        ...units.map(unit => isTextUnit(unit) ? h(TranslationUnit, { key: unit.id, store, unit, quick, normal, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined }) : h(DocumentUnitView, { key: unit.id, unit, session: current!, store, documents, documentTasks, objects, objectAssets })),
         ...transient.map(record => h(TranslationRecord, { key: record.id, record, quick, canRestore: !current?.input })),
         units.length === 0 && records.length === 0 && current?.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, current ? '在下方输入待翻译内容，选择模型后发送。' : '用“+”新建主题及首会话，或从已归档列表恢复。') : null,
       ),

@@ -5,6 +5,7 @@ import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } fr
 import { parseNormalTranslationV2Event, type NormalTranslationResolution, type NormalTranslationV2Event } from './normal-translation-v2.js'
 import { parseDocumentAcceptRequest, parseDocumentBlockRegistration, parseDocumentTaskEvent, parseDocumentTaskFinish, parseDocumentTaskScope,
   parseDocumentTaskRelease,
+  parseDocumentTaskControl, parseDocumentRestoreRequest, parseDocumentRestoreCapture, type DocumentTaskControl, type DocumentRestoreRequest, type DocumentRestoreCapture,
   parseDocumentTaskReceipt, parseDocumentBlockReceipt, type DocumentAcceptRequest, type DocumentBlockRegistration, type DocumentTaskEvent,
   type DocumentTaskFinish, type DocumentTaskRelease, type DocumentTaskScope, type DocumentTaskReceipt, type DocumentBlockReceipt } from './document-execution.js'
 import {
@@ -62,6 +63,8 @@ export type TopicBridgeCommand =
   | { readonly kind: 'document_finish'; readonly request: DocumentTaskFinish }
   | { readonly kind: 'document_release'; readonly request: DocumentTaskRelease }
   | { readonly kind: 'document_observe'; readonly request: DocumentTaskScope }
+  | { readonly kind: 'document_control'; readonly request: DocumentTaskControl }
+  | { readonly kind: 'document_restore'; readonly request: DocumentRestoreRequest }
   | { readonly kind: 'preparation_prepare'; readonly request: TranslationPreparationPrepare; readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>; readonly analysis: PreparationAnalysisFacts }
   | { readonly kind: 'preparation_set'; readonly request: TranslationPreparationSet; readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }> }
   | { readonly kind: 'preparation_status'; readonly request: TranslationPreparationQuery }
@@ -93,6 +96,7 @@ export type TopicBridgeValue =
   | { readonly kind: 'document_accepted' | 'document_updated'; readonly receipt: DocumentTaskReceipt }
   | { readonly kind: 'document_registered'; readonly registration: DocumentBlockReceipt }
   | { readonly kind: 'document_observed'; readonly receipt: DocumentTaskReceipt | null }
+  | { readonly kind: 'document_restored'; readonly capture: DocumentRestoreCapture }
   | { readonly kind: 'preparation_receipt'; readonly receipt: PreparationReceipt }
   | { readonly kind: 'preparation_page'; readonly page: PreparationPage }
   | { readonly kind: 'preparation_captured'; readonly snapshot: PreparationSnapshot }
@@ -155,7 +159,7 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
 }
 export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 = 1): TopicBridgeCommand {
   object(value)
-  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
+  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe', 'document_control', 'document_restore'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
   switch (value.kind) {
       case 'document_accept': exact(value, ['kind', 'request']); return { kind: 'document_accept', request: parseDocumentAcceptRequest(value.request) }
       case 'document_register': exact(value, ['kind', 'request']); return { kind: 'document_register', request: parseDocumentBlockRegistration(value.request) }
@@ -163,6 +167,8 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 = 1): To
       case 'document_finish': exact(value, ['kind', 'request']); return { kind: 'document_finish', request: parseDocumentTaskFinish(value.request) }
       case 'document_release': exact(value, ['kind', 'request']); return { kind: 'document_release', request: parseDocumentTaskRelease(value.request) }
       case 'document_observe': exact(value, ['kind', 'request']); return { kind: 'document_observe', request: parseDocumentTaskScope(value.request) }
+      case 'document_control': exact(value, ['kind', 'request']); return { kind: 'document_control', request: parseDocumentTaskControl(value.request) }
+      case 'document_restore': exact(value, ['kind', 'request']); return { kind: 'document_restore', request: parseDocumentRestoreRequest(value.request) }
       case 'preparation_prepare': {
         exact(value, ['kind', 'request', 'envelope', 'analysis'])
         const envelope = parseTranslationMaterialEnvelope(value.envelope)
@@ -305,11 +311,12 @@ function sessionSummary(value: unknown): void {
 }
 function parseValue(value: unknown, protocol: 1 | 2): TopicBridgeValue {
   object(value)
-  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
+  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
     case 'document_accepted': case 'document_updated': exact(value, ['kind', 'receipt']); return { kind: value.kind, receipt: parseDocumentTaskReceipt(value.receipt) }
     case 'document_registered': exact(value, ['kind', 'registration']); return { kind: 'document_registered', registration: parseDocumentBlockReceipt(value.registration) }
     case 'document_observed': exact(value, ['kind', 'receipt']); return { kind: 'document_observed', receipt: value.receipt === null ? null : parseDocumentTaskReceipt(value.receipt) }
+    case 'document_restored': exact(value, ['kind', 'capture']); return { kind: 'document_restored', capture: parseDocumentRestoreCapture(value.capture) }
     case 'preparation_receipt': exact(value, ['kind', 'receipt']); return { kind: 'preparation_receipt', receipt: parsePreparationReceipt(value.receipt) }
     case 'preparation_page': exact(value, ['kind', 'page']); return { kind: 'preparation_page', page: parsePreparationPage(value.page) }
     case 'preparation_captured': exact(value, ['kind', 'snapshot']); return { kind: 'preparation_captured', snapshot: parsePreparationSnapshot(value.snapshot) }

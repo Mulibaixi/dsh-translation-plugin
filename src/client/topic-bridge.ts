@@ -190,7 +190,7 @@ export class TopicBridgeClient {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
-    if (command.kind === 'document_accept' || command.kind === 'document_register' || command.kind === 'document_event' || command.kind === 'document_finish' || command.kind === 'document_release' || command.kind === 'document_observe') {
+    if (command.kind === 'document_accept' || command.kind === 'document_register' || command.kind === 'document_event' || command.kind === 'document_finish' || command.kind === 'document_release' || command.kind === 'document_observe' || command.kind === 'document_control' || command.kind === 'document_restore') {
       if (!this.documents) return error(request.requestId, 'execution_unavailable', '整篇执行登记尚未就绪。')
       if (command.kind === 'document_accept') {
         const result = await this.documents.accept(ownerId, command.request)
@@ -203,6 +203,14 @@ export class TopicBridgeClient {
       if (command.kind === 'document_observe') {
         const result = this.documents.observe(ownerId, command.request)
         return result.ok ? success({ kind: 'document_observed', receipt: result.value }) : error(request.requestId, result.error.code, result.error.message)
+      }
+      if (command.kind === 'document_restore') {
+        const result = await this.documents.restore(ownerId, command.request)
+        return result.ok ? success({ kind: 'document_restored', capture: result.value }) : error(request.requestId, result.error.code, result.error.message)
+      }
+      if (command.kind === 'document_control') {
+        const result = await this.documents.control(ownerId, command.request)
+        return result.ok ? success({ kind: 'document_updated', receipt: result.value }) : error(request.requestId, result.error.code, result.error.message)
       }
       if (command.kind === 'document_release') {
         const result = this.documents.releaseAcknowledgedFinish(ownerId, command.request)

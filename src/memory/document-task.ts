@@ -16,8 +16,9 @@ export type DocumentMutation =
   | { readonly kind: 'plan'; readonly plan: DocumentChunkPlan }
   | { readonly kind: 'task'; readonly task: DocumentTaskRecord }
   | { readonly kind: 'task_update'; readonly taskId: string; readonly status: DocumentTaskRecord['status'] }
-  | { readonly kind: 'chunk'; readonly revision: ChunkRevision }
-  | { readonly kind: 'chunk_update'; readonly revisionId: string; readonly patch: Partial<Pick<ChunkRevision, 'status' | 'content' | 'callRecord' | 'updatedAt'>> }
+  | { readonly kind: 'task_facts'; readonly taskId: string; readonly facts: NonNullable<DocumentTaskRecord['executionFacts']>; readonly status?: DocumentTaskRecord['status']; readonly planRef?: VersionReference; readonly preparationRef?: VersionReference }
+  | { readonly kind: 'chunk'; readonly revision: ChunkRevision; readonly executionFacts?: NonNullable<DocumentTaskRecord['executionFacts']> }
+  | { readonly kind: 'chunk_update'; readonly revisionId: string; readonly patch: Partial<Pick<ChunkRevision, 'status' | 'content' | 'callRecord' | 'updatedAt'>>; readonly executionFacts?: NonNullable<DocumentTaskRecord['executionFacts']> }
   | { readonly kind: 'manifest'; readonly revision: Omit<DocumentRevision, 'eligibility'> }
   | { readonly kind: 'final'; readonly revisionId: string; readonly at: string }
 
@@ -53,8 +54,9 @@ function binding(unit: DocumentUnit, value: Pick<DocumentTaskRecord, 'sourceVers
 }
 function taskOf(unit: DocumentUnit, value: Pick<ChunkRevision, 'taskId' | 'sourceVersion' | 'planRef' | 'preparationRef'>): DocumentTaskRecord {
   const task = unit.tasks.find(item => item.taskId === value.taskId)
-  if (!task || task.sourceVersion !== value.sourceVersion || !sameVersionReference(task.planRef, value.planRef) ||
-    !sameVersionReference(task.preparationRef, value.preparationRef)) throw new TypeError('Document result does not belong to its fixed task')
+  const oldBinding = task?.executionFacts?.controls.some(control => control.planRef && control.preparationRef && sameVersionReference(control.planRef, value.planRef) && sameVersionReference(control.preparationRef, value.preparationRef))
+  const initial = task?.executionFacts && unit.plans.find(plan => sameVersionReference(plan.preparationRef, task.executionFacts!.baseline.contextBindings[0]?.contextRef.preparationRef ?? task.preparationRef) && sameVersionReference(plan, value.planRef))
+  if (!task || task.sourceVersion !== value.sourceVersion || !(sameVersionReference(task.planRef, value.planRef) && sameVersionReference(task.preparationRef, value.preparationRef) || oldBinding || initial)) throw new TypeError('Document result does not belong to its fixed task')
   return task
 }
 function validateChunk(unit: DocumentUnit, revision: ChunkRevision): void {
@@ -70,7 +72,7 @@ export function documentManifestEligibility(unit: DocumentUnit, revision: Omit<D
   taskOf(unit, revision)
   const plan = binding(unit, revision)
   if (revision.entries.length !== plan.items.length) throw new TypeError('Document manifest must cover the fixed plan once')
-  let complete = true
+  let complete = true, mixedDependencies = false
   const revisionIds = new Set<string>()
   for (let index = 0; index < plan.items.length; index++) {
     const item = plan.items[index]!, entry = revision.entries[index]!
@@ -81,11 +83,11 @@ export function documentManifestEligibility(unit: DocumentUnit, revision: Omit<D
     // Source equality alone cannot prove that terminology and background dependencies are unchanged.
     // A later reuse implementation must supply those facts before this branch can be admitted.
     if (entry.reuseRef) throw new TypeError('Document reuse requires verified source and preparation dependencies')
-    if (chunk.taskId !== revision.taskId || chunk.sourceVersion !== revision.sourceVersion || !sameVersionReference(chunk.planRef, revision.planRef) ||
-      !sameVersionReference(chunk.preparationRef, revision.preparationRef)) throw new TypeError('Document manifest mixes fixed task versions')
+    if (chunk.taskId !== revision.taskId || chunk.sourceVersion !== revision.sourceVersion) throw new TypeError('Document manifest mixes source or task identities')
+    if (!sameVersionReference(chunk.planRef, revision.planRef) || !sameVersionReference(chunk.preparationRef, revision.preparationRef)) mixedDependencies = true
     if (chunk.status !== 'completed') complete = false
   }
-  return { complete, finalEligible: complete && revision.review.status === 'passed' && revision.review.issues.length === 0 }
+  return { complete, finalEligible: complete && !mixedDependencies && revision.review.status === 'passed' && revision.review.issues.length === 0 }
 }
 
 /** Strict saved-history boundary; no I/O, execution capability, or replay is reconstructed. */
@@ -98,7 +100,7 @@ export function parseDocumentUnit(value: unknown): DocumentUnit {
   unique(unit.sourceVersions.filter(item => item.operationId !== null), item => item.operationId!)
   unique(unit.plans, item => item.operationId)
   unique([...unit.sourceVersions.filter(item => item.operationId !== null).map(item => item.operationId!),
-    ...unit.plans.map(item => item.operationId), ...unit.tasks.map(item => item.operationId)], item => item)
+    ...unit.plans.map(item => item.operationId), ...unit.tasks.map(item => item.operationId), ...unit.tasks.flatMap(task => task.executionFacts?.controls.map(control => control.operationId) ?? [])], item => item)
   versions(unit.preparations); versions(unit.plans)
   if (!unit.tasks.length) throw new TypeError('Document units require a real admitted task')
   const assets = new Map<string, unknown>()
@@ -112,6 +114,16 @@ export function parseDocumentUnit(value: unknown): DocumentUnit {
   for (const preparation of unit.preparations) sourceOf(unit, preparation.sourceVersion)
   for (const plan of unit.plans) binding(unit, { sourceVersion: plan.sourceVersion, planRef: plan, preparationRef: plan.preparationRef })
   for (const task of unit.tasks) binding(unit, task)
+  for (const task of unit.tasks) if (task.executionFacts) {
+    const facts = task.executionFacts
+    for (const block of facts.blocks) {
+      const request = block.request, chunk = unit.chunkRevisions.find(chunk => chunk.id === request.revisionId)
+      if (request.taskId !== task.taskId || request.unitId !== unit.id || request.scope.translationSessionId === '' || request.scope.ownerId !== request.scope.mainSessionId ||
+        chunk && (chunk.childOperationId !== request.childOperationId || chunk.chunkId !== request.chunkId || chunk.callId !== request.callId || chunk.attemptId !== request.attemptId)) throw new TypeError('Saved block registration disagrees with actual chunk facts')
+      if (block.phase === 'dispatched' && !chunk?.callRecord || block.phase === 'settled' && chunk && !['completed', 'failed', 'cancelled', 'unknown', 'interrupted'].includes(chunk.status)) throw new TypeError('Saved block phase lacks actual result facts')
+    }
+    if (facts.actualCalls !== facts.baseline.analysisActualCalls + unit.chunkRevisions.filter(chunk => chunk.taskId === task.taskId && chunk.callRecord).length) throw new TypeError('Actual call count disagrees with saved calls')
+  }
   for (const chunk of unit.chunkRevisions) validateChunk(unit, chunk)
   const children = new Map<string, ChunkRevision>()
   for (const chunk of unit.chunkRevisions) {
@@ -175,9 +187,22 @@ export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutatio
     const old = unit.tasks.find(task => task.taskId === mutation.taskId)
     if (!old) throw new TypeError('Document task unavailable')
     if (old.status === mutation.status) return unit
-    if (!['running', 'unknown'].includes(old.status)) throw new TypeError('Ended document tasks are immutable')
+    if (!['running', 'paused', 'waiting_context', 'waiting_user', 'unknown'].includes(old.status)) throw new TypeError('Ended document tasks are immutable')
     if (mutation.status === 'completed' && !unit.revisions.some(revision => revision.taskId === old.taskId && revision.eligibility.complete)) throw new TypeError('Completed document task lacks a complete manifest')
     next = { ...unit, tasks: unit.tasks.map(task => task.taskId === old.taskId ? { ...task, status: mutation.status } : task) }
+  } else if (mutation.kind === 'task_facts') {
+    const old = unit.tasks.find(task => task.taskId === mutation.taskId)
+    if (!old?.executionFacts) throw new TypeError('Document execution baseline unavailable')
+    const facts = mutation.facts
+    if (!same(old.executionFacts.baseline, facts.baseline) || facts.taskSequence < old.executionFacts.taskSequence || facts.taskVersion < old.executionFacts.taskVersion ||
+      facts.actualCalls < old.executionFacts.actualCalls || facts.outputBytes < old.executionFacts.outputBytes || facts.automaticSupplementCalls < old.executionFacts.automaticSupplementCalls ||
+      old.executionFacts.supplements?.some((supplement, index) => !same(supplement, facts.supplements?.[index])) ||
+      old.executionFacts.controls.some((control, index) => !same(control, facts.controls[index])) || old.executionFacts.blocks.some(block => {
+        const next = facts.blocks.find(item => item.request.revisionId === block.request.revisionId)
+        return !next || !same(block.request, next.request) || next.sequence < block.sequence || block.phase === 'settled' && next.phase !== 'settled'
+      })) throw new TypeError('Saved execution facts cannot be rewritten')
+    next = { ...unit, tasks: unit.tasks.map(task => task.taskId === old.taskId ? { ...task, executionFacts: facts, status: mutation.status ?? task.status,
+      planRef: mutation.planRef ?? task.planRef, preparationRef: mutation.preparationRef ?? task.preparationRef } : task) }
   } else if (mutation.kind === 'chunk') {
     const revision = parseChunkRevision(mutation.revision, documentSourceLength(sourceOf(unit, mutation.revision.sourceVersion)))
     const old = unit.chunkRevisions.find(item => item.id === revision.id)
@@ -204,6 +229,12 @@ export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutatio
     if (old) { if (same(old, revision)) return unit; throw new TypeError('Document manifest already has different content') }
     next = { ...unit, revisions: [...unit.revisions, revision] }
   } else return selectDocumentFinal(unit, mutation.revisionId, mutation.at)
+  if ((mutation.kind === 'chunk' || mutation.kind === 'chunk_update') && mutation.executionFacts) {
+    const taskId = mutation.kind === 'chunk' ? mutation.revision.taskId : unit.chunkRevisions.find(chunk => chunk.id === mutation.revisionId)!.taskId
+    const old = unit.tasks.find(task => task.taskId === taskId)!, facts = mutation.executionFacts
+    if (!old.executionFacts || !same(old.executionFacts.baseline, facts.baseline) || facts.taskVersion !== old.executionFacts.taskVersion || facts.taskSequence < old.executionFacts.taskSequence) throw new TypeError('Chunk execution facts changed baseline or control version')
+    next = { ...next, tasks: next.tasks.map(task => task.taskId === taskId ? { ...task, executionFacts: facts } : task) }
+  }
   return parseDocumentUnit(next)
 }
 export function currentDocumentFinal(unit: DocumentUnit): DocumentRevision | undefined {
@@ -213,18 +244,18 @@ export function advanceDocumentFinal(unit: DocumentUnit, selectedAt: string): Do
   at(selectedAt)
   if (unit.final?.selection === 'user_fixed' && currentDocumentFinal(unit)) return unit
   const latest = [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
-  if (!latest?.eligibility.finalEligible || latest.id === unit.final?.revisionId) return unit
+  if (!latest?.eligibility.finalEligible || latest.id === unit.final?.revisionId || unit.tasks.find(task => task.taskId === latest.taskId)?.executionFacts?.reviewIssues.length) return unit
   return { ...unit, final: { revisionId: latest.id, selection: 'automatic', selectedAt } }
 }
 export function selectDocumentFinal(unit: DocumentUnit, revisionId: string, selectedAt: string): DocumentUnit {
   at(selectedAt)
   const revision = unit.revisions.find(item => item.id === revisionId)
-  if (!revision || revision.sourceVersion !== unit.sourceVersion || !revision.eligibility.finalEligible) throw new TypeError('Only an eligible current-source manifest can be final')
+  if (!revision || revision.sourceVersion !== unit.sourceVersion || !revision.eligibility.finalEligible || unit.tasks.find(task => task.taskId === revision.taskId)?.executionFacts?.reviewIssues.length) throw new TypeError('Only an eligible current-source manifest can be final')
   if (unit.final?.selection === 'user_fixed' && unit.final.revisionId === revisionId) return unit
   return { ...unit, final: { revisionId, selection: 'user_fixed', selectedAt } }
 }
 export function restoreDocumentUnit(unit: DocumentUnit): DocumentUnit {
-  const interrupted = (status: DocumentTaskRecord['status']): boolean => ['running', 'unknown'].includes(status)
+  const interrupted = (status: DocumentTaskRecord['status']): boolean => ['running', 'paused', 'waiting_context', 'waiting_user', 'unknown'].includes(status)
   const tasks = unit.tasks.map(task => interrupted(task.status) ? { ...task, status: 'interrupted' as const } : task)
   const chunkRevisions = unit.chunkRevisions.map(chunk => interrupted(chunk.status) ? { ...chunk, status: 'interrupted' as const } : chunk)
   if (tasks.every((task, index) => task === unit.tasks[index]) && chunkRevisions.every((chunk, index) => chunk === unit.chunkRevisions[index])) return unit

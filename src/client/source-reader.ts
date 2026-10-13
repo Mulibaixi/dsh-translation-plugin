@@ -146,7 +146,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       const entry = manifest?.entries.find(entry => entry.chunkId === item.chunkId)
       const revision = entry ? unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId) ?? null : !manifest && task && plan
         ? [...unit.chunkRevisions].reverse().find(chunk => chunk.chunkId === item.chunkId && chunk.taskId === task.taskId && chunk.sourceVersion === sourceVersion &&
-          sameVersionReference(chunk.planRef, plan) && sameVersionReference(chunk.preparationRef, task.preparationRef)) ?? null : null
+          unit.plans.some(actual => sameVersionReference(actual, chunk.planRef) && actual.items.some(original => original.chunkId === item.chunkId && same(original.outputRange, item.outputRange) && original.mode === item.mode))) ?? null : null
       return { ...item, revisionId: revision?.id ?? null, revision }
     })
     const scope: TranslationSourceScope = { ownerId: target.ownerId, mainSessionId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId }
@@ -228,7 +228,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
         const entry = manifest?.entries.find(entry => entry.revisionId === revisionId)
         const binding = manifest ?? task
         if (!chunk || !block || !binding || !plan || manifest && (!entry || entry.reuseRef || !same(entry.outputRange, block.outputRange)) || chunk.chunkId !== block.chunkId ||
-          chunk.taskId !== binding.taskId || !sameVersionReference(chunk.planRef, binding.planRef) || !sameVersionReference(chunk.preparationRef, binding.preparationRef) ||
+          chunk.taskId !== binding.taskId || !unit.plans.some(actual => sameVersionReference(actual, chunk.planRef) && sameVersionReference(actual.preparationRef, chunk.preparationRef) && actual.items.some(original => original.chunkId === block.chunkId && same(original.outputRange, block.outputRange) && original.mode === block.mode)) ||
           (block.mode === 'copy' ? chunk.kind !== 'copy' || chunk.content.kind !== 'source_copy' : chunk.kind === 'copy') ||
           chunk.content.kind === 'source_copy' && (chunk.content.sourceVersion !== sourceVersion || !same(chunk.content.range, block.outputRange))) {
           return Promise.resolve(unavailable(request, 'corrupt', 'manifest_invalid'))

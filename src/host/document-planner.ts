@@ -1,5 +1,5 @@
 import type { ModelSelection } from '../shared/contracts.js'
-import { parseDocumentChunkPlan, type ChunkPlanItem, type DocumentChunkPlan, type VersionReference } from '../shared/translation-batch.js'
+import { parseDocumentChunkPlan, type ChunkPlanItem, type DocumentChunkPlan, type VersionReference, type DocumentSourceVersion, type DocumentExecutionBaseline } from '../shared/translation-batch.js'
 import {
   documentPlanningBytes, reconstructDocumentTranslationPrompt, MAX_DOCUMENT_PLAN_CHUNKS, MAX_DOCUMENT_PLAN_CALLS,
   MAX_DOCUMENT_PLAN_PAGE_BYTES, MAX_DOCUMENT_PLAN_PAGE_ITEMS, MAX_DOCUMENT_PLAN_PACKET_BYTES,
@@ -14,7 +14,9 @@ import type { DshTextExecutionAdapter } from './dsh-text-adapter.js'
 
 /** Supplied only by the authorized Host service, never by a model or RPC caller. */
 export interface DocumentPlanningInput {
-  readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>
+  readonly envelope?: Extract<TranslationMaterialEnvelope, { kind: 'material' }>
+  readonly restoredSource?: DocumentSourceVersion
+  readonly maxInputChars?: number
   readonly preparation: PreparationSnapshot
   readonly analysis: { readonly analysisId: string; readonly version: number; readonly actualCalls: number }
   readonly readSource: (range: TranslationSourceRange) => string | Promise<string>
@@ -52,6 +54,11 @@ function reject(code: string, message: string, stage = 'plan_document'): Error {
 function same(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right) }
 function frozen<T>(value: T): T { if (value && typeof value === 'object') { Object.values(value).forEach(frozen); Object.freeze(value) } return value }
 function key(target: TranslationPlanQuery['target'], id: string): string { return JSON.stringify([target.mainSessionId, id]) }
+function inputLimit(input: DocumentPlanningInput): number {
+  const maximum = input.envelope?.material.maxInputChars ?? input.maxInputChars
+  if (!Number.isSafeInteger(maximum) || maximum! < 1) throw reject('execution_baseline_missing', '缺少实际受理时的单次正文上限，无法恢复执行。', 'restore_document')
+  return maximum!
+}
 function overlap(left: TranslationSourceRange, right: TranslationSourceRange): boolean { return left.start < right.end && right.start < left.end }
 function covers(actual: readonly TranslationSourceRange[], required: TranslationSourceRange): boolean {
   let end = required.start
@@ -111,7 +118,9 @@ export class DocumentPlanner {
 
   private check(input: DocumentPlanningInput, target: TranslationPlanQuery['target'], preparationRef: VersionReference): PreparationSnapshot {
     if (!input.isCurrent()) throw reject('scope_mismatch', '规划所属实际主 Agent 或固定材料已失效。', 'authorize_plan')
-    const preparation = parsePreparationSnapshot(input.preparation), envelope = input.envelope, material = envelope.material
+    const preparation = parsePreparationSnapshot(input.preparation), envelope = input.envelope
+    if (!envelope) throw reject('material_missing', '新规划需要确切已交付材料。')
+    const material = envelope.material
     if (!same(preparation.target, target) || envelope.ownerId !== target.mainSessionId || envelope.mainSessionId !== target.mainSessionId ||
       envelope.requestId !== target.requestId || material.materialId !== target.materialId || material.sourceVersion !== target.sourceVersion ||
       preparation.id !== preparationRef.id || preparation.version !== preparationRef.version ||
@@ -129,9 +138,9 @@ export class DocumentPlanner {
     return preparation
   }
   private async source(input: DocumentPlanningInput, preparation: PreparationSnapshot, signal: AbortSignal): Promise<{ readonly points: readonly string[]; readonly bytes: number }> {
-    const asset = input.envelope.material.sourceRef
+    const asset = input.envelope?.material.sourceRef ?? (input.restoredSource?.body.kind === 'asset' ? input.restoredSource.body.reference : undefined)
     if (asset && (asset.bytes > 2 * 1024 * 1024 || asset.totalCodePoints !== preparation.totalCodePoints || asset.sha256 !== preparation.sourceSha256)) throw reject('source_limit', '原稿身份不一致或超过 2 MiB 整体上限。')
-    const inline = input.envelope.material.sourceText
+    const inline = input.envelope?.material.sourceText ?? (input.restoredSource?.body.kind === 'inline' ? input.restoredSource.body.text : undefined)
     if (inline !== undefined && (new TextEncoder().encode(inline).byteLength > 2 * 1024 * 1024 || sourceCodePointLength(inline) !== preparation.totalCodePoints)) throw reject('source_limit', '内联原稿超过 2 MiB 或固定码点长度不一致。')
     const pieces: string[] = []
     for (let start = 0; start < preparation.totalCodePoints; start += 4000) {
@@ -215,7 +224,7 @@ export class DocumentPlanner {
     const preparedId = `document-suggestion:${crypto.randomUUID()}`
     try {
       const preparation = this.check(input, request.target, request.preparationRef)
-      const suggestionKey = this.suggestionKey(request), signature = JSON.stringify([preparation.sourceSha256, preparation.route, preparation.version, input.analysis.actualCalls, input.envelope.material.maxInputChars])
+      const suggestionKey = this.suggestionKey(request), signature = JSON.stringify([preparation.sourceSha256, preparation.route, preparation.version, input.analysis.actualCalls, inputLimit(input)])
       let record = this.suggestions.get(suggestionKey)
       if (request.cursor !== undefined) {
         if (!record || record.signature !== signature) return bad('invalid_cursor', '建议游标的固定材料或分析事实已失效。', 'read_plan_suggestion')
@@ -228,19 +237,19 @@ export class DocumentPlanner {
         for (const part of partitions) {
           if (part.mode === 'copy') {
             const item: ChunkPlanItem = { chunkId: `suggested-${items.length + 1}`, outputRange: part.range, mode: 'copy', contextRanges: [] }
-            items.push({ item, boundary: 'excluded_copy', budget: this.budget(preparation, item, source.points, capacity, input.envelope.material.maxInputChars).budget })
+            items.push({ item, boundary: 'excluded_copy', budget: this.budget(preparation, item, source.points, capacity, inputLimit(input)).budget })
             continue
           }
           let start = part.range.start
           while (start < part.range.end) {
-            let end = Math.min(part.range.end, start + Math.min(4000, input.envelope.material.maxInputChars))
+            let end = Math.min(part.range.end, start + Math.min(4000, inputLimit(input)))
             let boundary: DocumentPlanSuggestion['boundary'] = end === part.range.end ? 'end' : 'capacity'
             const selected = this.boundary(source.points, start, end, part.range.end)
             end = selected.end; boundary = selected.boundary
             let item: ChunkPlanItem, budget: DocumentChunkBudget
             for (;;) {
               item = { chunkId: `suggested-${items.length + 1}`, outputRange: { start, end }, mode: 'translate', contextRanges: [] }
-              try { budget = this.budget(preparation, item, source.points, capacity, input.envelope.material.maxInputChars).budget; break }
+              try { budget = this.budget(preparation, item, source.points, capacity, inputLimit(input)).budget; break }
               catch (error) {
                 if (end - start <= 1 || !['context_capacity', 'output_capacity', 'input_package_limit', 'term_range_budget'].includes((error as { code?: string }).code ?? '')) throw error
                 const reduced = start + Math.max(1, Math.floor((end - start) * 0.75))
@@ -300,7 +309,7 @@ export class DocumentPlanner {
       this.validatePlan(preparation, plan, protectedRanges)
       const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
       const budgets = plan.items.map(item => {
-        try { return this.budget(preparation, item, source.points, capacity, input.envelope.material.maxInputChars, protectedRanges).budget }
+        try { return this.budget(preparation, item, source.points, capacity, inputLimit(input), protectedRanges).budget }
         catch (error) {
           const protection = item.mode === 'translate' ? protectedRanges.find(range => overlap(range, item.outputRange)) : undefined
           if (protection && ['single_input_limit', 'context_capacity', 'output_capacity', 'input_package_limit'].includes((error as { code?: string }).code ?? '')) {
@@ -346,7 +355,7 @@ export class DocumentPlanner {
       const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
       if (!same(capacity.route, record.receipt.capacity.route)) throw reject('model_mismatch', '实际默认推理等级或路由已变化，请重新准备并规划。', 'freeze_document')
       const budgets = record.plan.items.map(item => this.budget(preparation, item, source.points, capacity,
-        input.envelope.material.maxInputChars, record.protectedRanges).budget)
+        inputLimit(input), record.protectedRanges).budget)
       return ok(frozen({ target: record.target, sourceSha256: record.sourceSha256,
         plan: { ...record.plan, protectedRanges: record.protectedRanges },
         preparation: frozen(structuredClone(preparation)), protectedRanges: record.protectedRanges, budgets, capacity,
@@ -358,6 +367,42 @@ export class DocumentPlanner {
   async readExecutionSource(input: DocumentPlanningInput, snapshot: DocumentExecutionFreeze, signal: AbortSignal): Promise<readonly string[]> {
     return (await this.source(input, snapshot.preparation, signal)).points
   }
+  /** Reconstruct a saved task from persisted actual facts. No runtime plan Map or inferred analysis counts. */
+  async restoreExecution(input: DocumentPlanningInput, rawPlan: DocumentChunkPlan, baseline: DocumentExecutionBaseline,
+    signal: AbortSignal): Promise<AnalysisResult<DocumentExecutionFreeze>> {
+    const preparedId = `document-restore:${crypto.randomUUID()}`
+    try {
+      const preparation = parsePreparationSnapshot(input.preparation)
+      if (!input.isCurrent() || !preparation.preparationReady || !preparation.mechanicalCoverage.complete || !preparation.modelReview.complete ||
+        preparation.conflicts.length || preparation.questions.some(question => question.decision === null)) throw reject('preparation_not_ready', '已保存准备缺少完整扫描、审阅或关键问题决策。', 'restore_document')
+      if (input.restoredSource?.version !== preparation.sourceVersion || input.analysis.actualCalls !== baseline.analysisActualCalls ||
+        !Number.isSafeInteger(baseline.analysisActualCalls)) throw reject('execution_baseline_missing', '已保存原稿、准备与实际分析事实不一致。', 'restore_document')
+      const plan = parseDocumentChunkPlan(rawPlan, preparation.totalCodePoints), protectedRanges = plan.protectedRanges ?? []
+      if (plan.sourceVersion !== preparation.sourceVersion || !same(plan.preparationRef, { id: preparation.id, version: preparation.version })) throw reject('source_mismatch', '已保存计划未引用确切原稿和准备版本。', 'restore_document')
+      this.validatePlan(preparation, plan, protectedRanges)
+      const source = await this.source(input, preparation, signal)
+      const capacity = await this.adapter.prepareDocumentCapacity(preparedId, model(baseline.route), signal)
+      if (!same(capacity.route, baseline.route)) throw reject('model_mismatch', '实际模型路由与已保存默认推理等级不一致，请明确更新准备与规划。', 'restore_document')
+      const budgets = plan.items.map(item => this.budget(preparation, item, source.points, capacity, inputLimit(input), protectedRanges).budget)
+      if (!same(budgets.map(item => ({ chunkId: item.chunkId, contextRef: item.contextRef })), baseline.contextBindings)) throw reject('context_mismatch', '已保存调用上下文无法按确切准备和计划重建。', 'restore_document')
+      return ok(frozen({ target: preparation.target, sourceSha256: preparation.sourceSha256, plan, preparation, protectedRanges, budgets, capacity,
+        callBudget: callBudget(baseline.analysisActualCalls, plan.items) }))
+    } catch (error) { return errorResult(error) }
+    finally { this.adapter.discard(preparedId) }
+  }
+  /** An explicit task route change freezes a new actual capacity, while old analysis/call facts stay immutable. */
+  async rerouteExecution(input: DocumentPlanningInput, snapshot: DocumentExecutionFreeze, route: TranslationMaterialRoute,
+    signal: AbortSignal): Promise<AnalysisResult<DocumentExecutionFreeze>> {
+    const preparedId = `document-route:${crypto.randomUUID()}`
+    try {
+      const source = await this.source(input, snapshot.preparation, signal)
+      const capacity = await this.adapter.prepareDocumentCapacity(preparedId, model(route), signal)
+      if (capacity.route.provider !== route.provider || capacity.route.model !== route.model || route.reasoningEffort !== undefined && route.reasoningEffort !== capacity.route.reasoningEffort) throw reject('model_mismatch', '明确新模型与实际准备路由不一致。', 'update_document')
+      const budgets = snapshot.plan.items.map(item => this.budget(snapshot.preparation, item, source.points, capacity, inputLimit(input), snapshot.protectedRanges).budget)
+      return ok(frozen({ ...snapshot, capacity, budgets }))
+    } catch (error) { return errorResult(error) }
+    finally { this.adapter.discard(preparedId) }
+  }
   async reconstructExecution(input: DocumentPlanningInput, snapshot: DocumentExecutionFreeze, chunkId: string,
     capacity: DocumentPreparedCapacity, signal: AbortSignal, frozenSource?: readonly string[]): Promise<AnalysisResult<DocumentTranslationPrompt>> {
     try {
@@ -367,7 +412,7 @@ export class DocumentPlanner {
       signal.throwIfAborted()
       if (!input.isCurrent()) throw reject('scope_mismatch', '整篇原会话或源授权已失效。', 'prepare_document')
       const points = frozenSource ?? (await this.source(input, snapshot.preparation, signal)).points
-      const assembled = this.budget(snapshot.preparation, item, points, capacity, input.envelope.material.maxInputChars, snapshot.protectedRanges)
+      const assembled = this.budget(snapshot.preparation, item, points, capacity, inputLimit(input), snapshot.protectedRanges)
       const expected = snapshot.budgets.find(item => item.chunkId === chunkId)
       if (!expected || !same(assembled.budget.contextRef, expected.contextRef)) throw reject('context_mismatch', '实际上下文引用与受理时冻结集合不一致。', 'prepare_document')
       return ok(assembled.prompt!)
@@ -392,7 +437,7 @@ export class DocumentPlanner {
       if (!item) return bad('not_found', '未找到计划块。')
       if (item.mode === 'copy') return bad('copy_has_no_call', 'copy 块只引用原稿范围，不存在模型提示或调用记录。')
       const source = await this.source(input, preparation, signal)
-      const assembled = this.budget(preparation, item, source.points, record.receipt.capacity, input.envelope.material.maxInputChars, record.protectedRanges)
+      const assembled = this.budget(preparation, item, source.points, record.receipt.capacity, inputLimit(input), record.protectedRanges)
       return ok(assembled.prompt!)
     } catch (error) { return errorResult(error) }
   }

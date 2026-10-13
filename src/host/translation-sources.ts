@@ -339,7 +339,16 @@ export class TranslationSourcesService {
     try { request = parseTranslationSourceStorageRequest('restore', input) as TranslationSourceStoredRead } catch { return storageBad('invalid_input', '原稿恢复参数无效。', 'restore_source') }
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId)
     if (!authorized.ok) return authorized
-    const agent = authorized.value
+    return this.restoreAuthorized(request, peerId!, authorized.value)
+  }
+  /** Private document recovery. The actual owner bridge supplies the current Peer, never the request body. */
+  async restoreForAgent(input: TranslationSourceStoredRead, peerId: string, agent: Agent): Promise<TranslationSourceStorageResult<TranslationSourceRestored>> {
+    let request: TranslationSourceStoredRead
+    try { request = parseTranslationSourceStorageRequest('restore', input) as TranslationSourceStoredRead } catch { return storageBad('invalid_input', '原稿恢复参数无效。', 'restore_source') }
+    if (!this.owns(request.scope, peerId, agent)) return storageBad('scope_mismatch', '原稿恢复不属于实际主 Agent 和负责人连接。', 'restore_source')
+    return this.restoreAuthorized(request, peerId, agent)
+  }
+  private restoreAuthorized(request: TranslationSourceStoredRead, peerId: string, agent: Agent): Promise<TranslationSourceStorageResult<TranslationSourceRestored>> {
     return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, async (storage, prior) => {
       const reference = this.confirmed(prior, request)
       if (!reference.ok) return reference

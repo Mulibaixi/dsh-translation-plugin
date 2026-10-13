@@ -337,6 +337,19 @@ export class PreparationStore {
       return ok(this.receipt(seat, snapshot, !!seat.catalog && !!envelope && matchesTarget(envelope, query.target)))
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '准备查询参数或保存记录无效。', 'read_preparation') }
   }
+  /** Saved immutable preparation for explicit task recovery; never restores analysis authority. */
+  documentAnalysisActualCalls(scope: TranslationSourceScope, reference: { readonly id: string; readonly version: number }): number | null {
+    const seat = this.fresh(key(scope.ownerId, reference.id)), snapshot = seat?.audit.versions.find(item => item.version === reference.version)
+    return snapshot && same(snapshot.scope, scope) && seat?.catalog ? seat.catalog.analysis.run.actualCalls : null
+  }
+  savedDocumentPreparation(scope: TranslationSourceScope, reference: { readonly id: string; readonly version: number }, sourceSha256: string): AnalysisResult<PreparationSnapshot> {
+    try {
+      const seat = this.fresh(key(scope.ownerId, reference.id)), snapshot = seat?.audit.versions.find(item => item.version === reference.version)
+      if (!snapshot || snapshot.storage !== 'saved' || !same(snapshot.scope, scope) || snapshot.sourceSha256 !== sourceSha256) return bad('preparation_unavailable', '确切准备正文未保存或与此原稿范围不符。', 'restore_document')
+      if (!snapshot.preparationReady || !snapshot.mechanicalCoverage.complete || !snapshot.modelReview.complete || snapshot.conflicts.length || snapshot.questions.some(question => question.decision === null)) return bad('preparation_not_ready', '已保存准备尚未完整解决关键问题。', 'restore_document')
+      return ok(structuredClone(snapshot))
+    } catch { return bad('preparation_unavailable', '已保存准备记录不可读取。', 'restore_document') }
+  }
   /** Private planning capture: saved audits alone never recreate runtime preparation authority. */
   async documentPreparation(args: unknown, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): Promise<AnalysisResult<PreparationSnapshot>> {
     try {

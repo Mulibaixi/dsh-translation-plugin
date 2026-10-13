@@ -183,6 +183,15 @@ export class SessionStore {
     }
   }
   /** Verified persisted credentials for an explicit restore/open request; no automatic restoration. */
+  readStoredDocumentTask(sessionId: string, unitId: string, taskId: string): import('../shared/translation-batch.js').DocumentUnit | null {
+    const seat = this.seats.get(sessionId), raw = this.storage?.getItem(historyKey(sessionId)), snapshot = raw ? readSnapshot(raw) : undefined
+    if (!seat || !snapshot || this.disposed || this.isDeleted(sessionId) || !this.matchesHistoryIdentity(seat.session, snapshot.session)) return null
+    const stored = snapshot.translationHistory.units.find(unit => unit.id === unitId), current = seat.translationHistory.units.find(unit => unit.id === unitId)
+    if (!stored || !current || !isDocumentUnit(stored) || !isDocumentUnit(current)) return null
+    const savedTask = stored.tasks.find(task => task.taskId === taskId), task = current.tasks.find(task => task.taskId === taskId)
+    if (!savedTask || !task || JSON.stringify(savedTask.executionFacts) !== JSON.stringify(task.executionFacts)) return null
+    return structuredClone(stored)
+  }
   async readStoredSourceRequest(target: SourceHistoryTarget): Promise<TranslationSourceStoredRead | null> {
     const session = this.getSession(target.sessionId)
     if (!session) return null

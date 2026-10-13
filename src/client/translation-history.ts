@@ -5,7 +5,7 @@ import { parseRequestContextInput, type RequestContextInput } from '../shared/re
 import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
 import { advanceDocumentFinal, createDocumentUnit, currentDocumentFinal, parseDocumentUnit, reduceDocumentUnit,
   restoreDocumentUnit, type DocumentMutation, type NewDocumentUnit } from '../memory/document-task.js'
-import type { DocumentRevision, DocumentUnit } from '../shared/translation-batch.js'
+import type { DocumentRevision, DocumentUnit, DocumentTaskStatus } from '../shared/translation-batch.js'
 export type { DocumentRevision, DocumentSourceVersion, DocumentSourceHistoryCommit, DocumentUnit } from '../shared/translation-batch.js'
 export type { DocumentMutation, NewDocumentUnit } from '../memory/document-task.js'
 
@@ -71,7 +71,7 @@ export interface TranslationEvent {
   readonly unitId: string | null
   readonly revisionId: string | null
   readonly operationId: string | null
-  readonly status: TextRevisionStatus | null
+  readonly status: TextRevisionStatus | DocumentTaskStatus | null
   readonly reason: 'advance' | 'user_selection' | 'restored' | 'export' | null
   /** Last ordinary stream receipt applied to this history; absent on quick and legacy facts. */
   readonly normalSequence?: number
@@ -301,7 +301,7 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       (item.type === 'source.corrected' && (!order(item.sourceVersion) || item.revisionId !== null || !identity(item.operationId) || !text(item.sourceReason, 1000))) || !identity(item.id) || eventIds.has(item.id) ||
       item.order !== events.length + 1 || !['operation.submitted', 'operation.accepted', 'operation.retranslation_accepted', 'operation.updated', 'operation.call_event', 'final.selected', 'operation.restored', 'revision.manual_saved', 'source.corrected', 'exchange.needs_context', 'exchange.resolution_registered', 'exchange.resume_registered', 'exchange.control', 'exchange.call_started', 'exchange.resolved', 'exchange.invalidated', ...((value.schemaVersion as number) >= 7 ? ['document.admitted', 'document.updated', 'document.restored'] : [])].includes(item.type as string) || !time(item.at) ||
       !(item.unitId === null || (identity(item.unitId) && unitIds.has(item.unitId))) || !(item.revisionId === null || (identity(item.revisionId) && revisionIds.has(item.revisionId))) ||
-      !(item.operationId === null || identity(item.operationId)) || !(item.status === null || status(item.status)) || !(item.reason === null || ['advance', 'user_selection', 'restored', 'export'].includes(item.reason as string))) return undefined
+      !(item.operationId === null || identity(item.operationId)) || !(item.status === null || status(item.status) || String(item.type).startsWith('document.') && ['paused', 'waiting_context', 'waiting_user'].includes(item.status as string)) || !(item.reason === null || ['advance', 'user_selection', 'restored', 'export'].includes(item.reason as string))) return undefined
     const exchangeEvent = String(item.type).startsWith('exchange.')
     if (String(item.type).startsWith('document.')) {
       const unit = units.find(unit => unit.id === item.unitId)
@@ -612,6 +612,7 @@ export function restoreTranslationHistory(history: TranslationHistory, at = new 
 
 function documentOperationIds(unit: DocumentUnit): readonly string[] {
   return [...unit.tasks.map(task => task.operationId), ...unit.plans.map(plan => plan.operationId),
+    ...unit.tasks.flatMap(task => task.executionFacts?.controls.map(control => control.operationId) ?? []),
     ...unit.sourceVersions.flatMap(source => source.operationId === null ? [] : [source.operationId]), ...unit.chunkRevisions.map(chunk => chunk.childOperationId)]
 }
 function revisionOperationId(unit: TranslationUnit, revision: TextRevision | DocumentRevision): string | undefined {
@@ -652,12 +653,12 @@ export function applyDocumentMutation(history: TranslationHistory, unitId: strin
   const revision = mutation.kind === 'manifest' ? updated.revisions.find(item => item.id === mutation.revision.id)
     : mutation.kind === 'final' ? updated.revisions.find(item => item.id === mutation.revisionId) : undefined
   const operationId = revision ? revisionOperationId(updated, revision) : mutation.kind === 'task' ? mutation.task.operationId
-    : mutation.kind === 'task_update' ? updated.tasks.find(item => item.taskId === mutation.taskId)?.operationId
+    : mutation.kind === 'task_update' || mutation.kind === 'task_facts' ? updated.tasks.find(item => item.taskId === mutation.taskId)?.operationId
     : mutation.kind === 'source' ? mutation.source.operationId : mutation.kind === 'plan' ? mutation.plan.operationId
     : mutation.kind === 'chunk' ? mutation.revision.childOperationId : mutation.kind === 'chunk_update' ? updated.chunkRevisions.find(item => item.id === mutation.revisionId)?.childOperationId : null
   const sourceVersion = revision?.sourceVersion ?? (mutation.kind === 'chunk' ? mutation.revision.sourceVersion
     : mutation.kind === 'chunk_update' ? updated.chunkRevisions.find(item => item.id === mutation.revisionId)!.sourceVersion
-    : mutation.kind === 'task' ? mutation.task.sourceVersion : mutation.kind === 'task_update' ? updated.tasks.find(item => item.taskId === mutation.taskId)!.sourceVersion
+    : mutation.kind === 'task' ? mutation.task.sourceVersion : mutation.kind === 'task_update' || mutation.kind === 'task_facts' ? updated.tasks.find(item => item.taskId === mutation.taskId)!.sourceVersion
     : mutation.kind === 'plan' ? mutation.plan.sourceVersion : mutation.kind === 'preparation' ? mutation.preparation.sourceVersion : updated.sourceVersion)
   const next = documentEvent(replaceUnit(history, updated), updated, mutation.kind === 'final' ? 'final.selected' : 'document.updated', at,
     revision?.id ?? null, operationId, mutation.kind === 'final' ? 'user_selection' : null, sourceVersion)

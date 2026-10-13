@@ -1,7 +1,9 @@
 import { parseDocumentAcceptRequest, parseDocumentBlockRegistration, parseDocumentTaskEvent, parseDocumentTaskFinish, parseDocumentTaskScope,
   MAX_DOCUMENT_OUTPUT_BYTES, type DocumentAcceptRequest, type DocumentBlockRegistration, type DocumentBlockReceipt,
   parseDocumentTaskRelease, type DocumentTaskEvent, type DocumentTaskFinish, type DocumentTaskReceipt, type DocumentTaskRelease, type DocumentTaskScope } from '../shared/document-execution.js'
-import { documentSourceLength, parseDocumentCallRecord, sameVersionReference, type ChunkRevision, type DocumentUnit } from '../shared/translation-batch.js'
+import { parseDocumentTaskControl, parseDocumentRestoreRequest, parseDocumentRestoreCapture, parseTranslationBatchControl, parseDocumentTaskReceipt, parseDocumentBatchStatusView,
+  type DocumentTaskControl, type DocumentRestoreRequest, type DocumentRestoreCapture, type TranslationBatchControl } from '../shared/document-execution.js'
+import { documentSourceLength, parseDocumentChunkPlan, parseDocumentCallRecord, sameVersionReference, type ChunkRevision, type DocumentUnit, type DocumentExecutionFacts } from '../shared/translation-batch.js'
 import { toSourceIdentity } from '../shared/translation-sources.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength, type TranslationSourceRange } from '../shared/translation-source-read.js'
 import type { AnalysisResult, PreparationSnapshot } from '../shared/translation-preparation.js'
@@ -12,14 +14,15 @@ import type { PreparationStore } from './preparation-store.js'
 import type { TranslationSourceReader } from './source-reader.js'
 import type { TranslationSourceStorageClient } from './source-storage-client.js'
 
-type Block = { readonly request: DocumentBlockRegistration; sequence: number; phase: 'registered' | 'dispatched' | 'settled' }
+type Block = { readonly request: DocumentBlockRegistration; sequence: number; phase: 'registered' | 'claimed' | 'dispatched' | 'settled' }
+type TaskRequest = Pick<DocumentAcceptRequest, 'operationId' | 'plan' | 'preparationRef' | 'contextBindings' | 'createdAt' | 'executionBaseline'> & { readonly envelope?: DocumentAcceptRequest['envelope'] }
 interface Task {
   readonly signature: string
-  readonly request: DocumentAcceptRequest
+  request: TaskRequest
   readonly scope: DocumentTaskScope
-  readonly releaseLease: () => void
-  readonly releaseBridge: () => void
-  readonly release: () => void
+  releaseLease: () => void
+  releaseBridge: () => void
+  release: () => void
   readonly blocks: Map<string, Block>
   readonly events: Map<number, string>
   sequence: number
@@ -32,12 +35,19 @@ interface Task {
   storageError: string | null
   storage: 'saved' | 'runtime_only'
 }
+export interface TranslationBatchRemotePort {
+  status(request: import('../shared/document-execution.js').TranslationBatchStatus): Promise<unknown>
+  pause(request: TranslationBatchControl): Promise<unknown>
+  cancel(request: TranslationBatchControl): Promise<unknown>
+  resume(request: TranslationBatchControl): Promise<unknown>
+}
 export interface DocumentTasksOptions {
   readonly isSessionBusy?: (sessionId: string) => boolean
   readonly reader?: TranslationSourceReader
   readonly sourceStorage?: TranslationSourceStorageClient
   readonly subscribeBridge?: (listener: () => void) => () => void
   readonly bridgeReady?: (ownerId: string) => boolean
+  readonly remote?: TranslationBatchRemotePort | (() => Promise<TranslationBatchRemotePort | undefined>) | undefined
 }
 function bad(code: string, message: string, stage = 'document_writeback'): AnalysisResult<never> { return { ok: false, error: { code, message, stage } } }
 const ok = <T>(value: T): AnalysisResult<T> => ({ ok: true, value })
@@ -70,6 +80,10 @@ export class DocumentTasksClient {
   private readonly admissions = new Map<string, { readonly signature: string; readonly promise: Promise<AnalysisResult<DocumentTaskReceipt>> }>()
   private readonly stopBridge: (() => void) | undefined
   private disposed = false
+  private readonly controlsPending = new Map<string, Set<'pause' | 'cancel' | 'resume' | 'status'>>()
+  private readonly noticeOwners = new Map<string, string>()
+  private readonly notices = new Map<string, string>()
+  private readonly listeners = new Set<() => void>()
   constructor(private readonly store: SessionStore, private readonly materials: MaterialSubmissionsClient, private readonly preparations: PreparationStore,
     private readonly retain: (ownerId: string) => () => void, private readonly options: DocumentTasksOptions = {}) {
     this.stopBridge = options.subscribeBridge?.(() => {
@@ -91,11 +105,17 @@ export class DocumentTasksClient {
       session.ownerId === ownerId && session.topicId === scope.scope.topicId && !this.store.isSessionDeleted(session.id) ? task : undefined
   }
   private receipt(task: Task): DocumentTaskReceipt {
-    const request = task.request, status = this.unit(task)!.tasks.find(item => item.taskId === task.scope.taskId)!.status
-    return { ...task.scope, operationId: request.operationId, sourceVersion: request.envelope.material.sourceVersion,
+    const request = task.request, record = this.unit(task)!.tasks.find(item => item.taskId === task.scope.taskId)!, status = record.status, facts = record.executionFacts
+    return { ...task.scope, operationId: request.operationId, sourceVersion: record.sourceVersion,
       planRef: { id: request.plan.id, version: request.plan.version }, preparationRef: request.preparationRef,
       taskSequence: task.sequence, status, storage: task.storage === 'saved' && this.store.getSettings().rememberHistory && this.store.getStatus(task.scope.scope.translationSessionId) === 'saved' ? 'saved' : 'runtime_only',
-      storageError: task.storage === 'saved' && !this.store.getSettings().rememberHistory ? '历史保存已关闭；后续事实仅保留在当前运行期。' : task.storageError, restartExecutable: false }
+      storageError: task.storage === 'saved' && !this.store.getSettings().rememberHistory ? '历史保存已关闭；后续事实仅保留在当前运行期。' : task.storageError,
+      restartExecutable: Boolean(facts && task.storage === 'saved'), ...(facts ? { taskVersion: facts.taskVersion, hostGeneration: [...facts.controls].reverse().find(control => control.baseline)?.baseline?.hostGeneration ?? facts.baseline.hostGeneration } : {}) }
+  }
+  private facts(task: Task): DocumentExecutionFacts | undefined { return this.unit(task)?.tasks.find(item => item.taskId === task.scope.taskId)?.executionFacts }
+  private progressedFacts(task: Task, sequence: number, outputBytes = task.outputBytes, actualCall = false): DocumentExecutionFacts | undefined {
+    const facts = this.facts(task)
+    return facts && { ...facts, taskSequence: sequence, outputBytes, actualCalls: facts.actualCalls + Number(actualCall), blocks: [...task.blocks.values()].map(block => ({ request: block.request, sequence: block.sequence, phase: block.phase })) }
   }
   accept(ownerId: string, raw: DocumentAcceptRequest): Promise<AnalysisResult<DocumentTaskReceipt>> {
     let request: DocumentAcceptRequest
@@ -127,6 +147,11 @@ export class DocumentTasksClient {
     const prepared = await this.preparations.documentPreparation({ target, preparationId: request.preparationRef.id, version: request.preparationRef.version }, envelope)
     if (!prepared.ok) { release(); return prepared }
     const snapshot = prepared.value
+    if (request.executionBaseline && (!same(request.executionBaseline.contextBindings, request.contextBindings) || request.executionBaseline.maxInputChars !== material!.maxInputChars ||
+      request.executionBaseline.analysisActualCalls !== this.preparations.documentAnalysisActualCalls(snapshot.scope, request.preparationRef) ||
+      request.executionBaseline.route.provider !== material!.model.provider || request.executionBaseline.route.model !== material!.model.model || material!.model.reasoningEffort !== undefined && request.executionBaseline.route.reasoningEffort !== material!.model.reasoningEffort)) {
+      release(); return bad('execution_baseline_mismatch', '执行基线未绑定此固定材料和真实分析调用事实。', 'accept_document')
+    }
     if (this.disposed || !this.materials.resolveSubmittedMaterial(envelope) || this.store.isSessionDeleted(session.id)) { release(); return bad('scope_mismatch', '文档受理时固定材料已不可用。', 'accept_document') }
     for (const [index, binding] of request.contextBindings.entries()) {
       const item = request.plan.items[index]!, expected = item.mode === 'copy' ? [] : contexts(snapshot, item.outputRange, item.contextRanges)
@@ -140,11 +165,13 @@ export class DocumentTasksClient {
     if (!this.store.updateTranslationHistory(session.id, current => appendDocumentUnit(current, { id: request.unitId, targetLanguage: material!.targetLanguage,
       instruction: material!.instruction, createdAt: request.createdAt, source, preparation: { ...request.preparationRef, sourceVersion: 1 }, plan: request.plan,
       task: { taskId: request.taskId, operationId: request.operationId, sourceVersion: 1, planRef: { id: request.plan.id, version: request.plan.version },
-        preparationRef: request.preparationRef, createdAt: request.createdAt, status: 'running' } }))) { release(); return bad('history_update_failed', '文档单元记录未完成，材料保留。', 'accept_document') }
+        preparationRef: request.preparationRef, createdAt: request.createdAt, status: 'running', ...(request.executionBaseline ? { executionFacts: {
+          baseline: request.executionBaseline, taskVersion: 1, taskSequence: 0, actualCalls: request.executionBaseline.analysisActualCalls, outputBytes: 0, automaticSupplementCalls: 0, blocks: [], controls: [], reviewIssues: [] } } : {}) } }))) { release(); return bad('history_update_failed', '文档单元记录未完成，材料保留。', 'accept_document') }
     const scope: DocumentTaskScope = { scope: { ownerId, mainSessionId: ownerId, topicId: session.topicId, translationSessionId: session.id }, taskId: request.taskId, unitId: request.unitId }
     const task: Task = { signature, request: structuredClone(request), scope, releaseLease: releaseTaskLease, releaseBridge: releaseTaskBridge, release,
       blocks: new Map(), events: new Map(), sequence: 0, finishSequence: null, outputBytes: 0, historySaved: false, sourceSaved: !material!.sourceRef,
       preparationSaved: snapshot.storage === 'saved', preparationStorageError: snapshot.storageError, storage: 'runtime_only', storageError: null }
+    task.release = () => { task.releaseLease(); task.releaseBridge() }
     this.tasks.set(this.key(ownerId, request.taskId), task)
     if (this.store.getSettings().rememberHistory) {
       const historySaved = await this.store.saveTranslationHistoryAsync(session.id)
@@ -180,18 +207,24 @@ export class DocumentTasksClient {
     try { request = parseDocumentBlockRegistration(raw) } catch { return bad('invalid_input', '块登记参数无效。') }
     const task = this.locate(ownerId, { scope: request.scope, taskId: request.taskId, unitId: request.unitId })
     if (!task) return bad('task_not_found', '准确受理的整篇任务不存在。')
-    const old = task.blocks.get(request.childOperationId)
+    const old = task.blocks.get(request.revisionId)
     const receipt = (block: Block): DocumentBlockReceipt => ({ ...task.scope, childOperationId: block.request.childOperationId, revisionId: block.request.revisionId,
       callId: block.request.callId, attemptId: block.request.attemptId, sequence: block.sequence, registered: true })
     if (old) return same(old.request, request) ? ok(receipt(old)) : bad('idempotency_conflict', '块操作已绑定其他调用或版本。')
     const unit = this.unit(task)!, item = task.request.plan.items.find(item => item.chunkId === request.chunkId)
-    if (!item || (item.mode === 'copy') !== (request.callId === null) || unit.tasks.find(item => item.taskId === request.taskId)?.status !== 'running' ||
-      [...task.blocks.values()].some(block => block.phase !== 'settled' || block.request.chunkId === request.chunkId || block.request.revisionId === request.revisionId ||
+    const completed = (chunkId: string) => unit.chunkRevisions.some(chunk => chunk.taskId === request.taskId && chunk.chunkId === chunkId && chunk.status === 'completed')
+    if (!item || (item.mode === 'copy') !== (request.callId === null) || unit.tasks.find(item => item.taskId === request.taskId)?.status !== 'running' || completed(request.chunkId) ||
+      request.planRef && !sameVersionReference(request.planRef, task.request.plan) || request.preparationRef && !sameVersionReference(request.preparationRef, task.request.preparationRef) ||
+      request.contextRef && !same({ ...request.contextRef, supplementRefs: [] }, task.request.contextBindings.find(binding => binding.chunkId === request.chunkId)?.contextRef) || request.outputRange && !same(request.outputRange, item.outputRange) ||
+      [...task.blocks.values()].some(block => block.phase !== 'settled' || block.request.revisionId === request.revisionId ||
         request.callId !== null && block.request.callId === request.callId || request.attemptId !== null && block.request.attemptId === request.attemptId)) return bad('invalid_state', '块未属于固定串行计划或前一块尚未结算。')
-    const nextItem = task.request.plan.items[task.blocks.size]
+    const nextItem = task.request.plan.items.find(item => !completed(item.chunkId))
     if (nextItem?.chunkId !== request.chunkId) return bad('invalid_state', '块登记必须沿固定源顺序。')
     const block: Block = { request, sequence: 0, phase: 'registered' }
-    task.blocks.set(request.childOperationId, block)
+    task.blocks.set(request.revisionId, block)
+    const facts = this.progressedFacts(task, task.sequence)
+    if (facts && !this.store.updateTranslationHistory(task.scope.scope.translationSessionId, history => applyDocumentMutation(history, task.scope.unitId,
+      { kind: 'task_facts', taskId: task.scope.taskId, facts }, request.createdAt))) { task.blocks.delete(request.revisionId); return bad('history_update_failed', '块登记事实未保存。') }
     return ok(receipt(block))
   }
   async event(ownerId: string, raw: DocumentTaskEvent): Promise<AnalysisResult<DocumentTaskReceipt>> {
@@ -201,17 +234,20 @@ export class DocumentTasksClient {
     if (!task) return bad('task_not_found', '文档任务不存在或所属范围不一致。')
     const digestResult = await eventSignature(event), signature = digestResult.signature, old = task.events.get(event.taskSequence)
     if (old) return old === signature ? ok(this.receipt(task)) : bad('idempotency_conflict', '父事件序号已有不同事实。')
-    const block = task.blocks.get(event.childOperationId), unit = this.unit(task)!
-    if (!block || block.request.revisionId !== event.revisionId || event.taskSequence !== task.sequence + 1 || event.sequence !== block.sequence + 1) return bad('sequence_gap', '父或子事件有缺口；请查询原事件，未重发调用。')
-    const item = task.request.plan.items.find(item => item.chunkId === block.request.chunkId)!, context = task.request.contextBindings.find(binding => binding.chunkId === item.chunkId)!.contextRef
+    const block = task.blocks.get(event.revisionId), unit = this.unit(task)!
+    if (!block || block.request.childOperationId !== event.childOperationId || event.taskSequence !== task.sequence + 1 || event.sequence !== block.sequence + 1) return bad('sequence_gap', '父或子事件有缺口；请查询原事件，未重发调用。')
+    const item = task.request.plan.items.find(item => item.chunkId === block.request.chunkId)!, context = block.request.contextRef ?? task.request.contextBindings.find(binding => binding.chunkId === item.chunkId)!.contextRef
     const sourceLength = documentSourceLength(unit.sourceVersions.find(source => source.version === task.request.plan.sourceVersion)!)
     const previous = unit.chunkRevisions.find(chunk => chunk.id === event.revisionId)
     let newBytes = 0, next: ChunkRevision | undefined
-    if (event.kind === 'dispatched') {
-      if (block.phase !== 'registered' || !block.request.callId || !block.request.attemptId || item.mode !== 'translate') return bad('invalid_state', '实际派发事件没有准确块登记。')
+    if (event.kind === 'dispatch_intent') {
+      if (block.phase !== 'registered' || !block.request.callId || item.mode !== 'translate') return bad('invalid_state', '派发槽认领没有准确块登记。')
+    } else if (event.kind === 'dispatched') {
+      if (!(block.phase === 'claimed' || !this.facts(task) && block.phase === 'registered') || !block.request.callId || !block.request.attemptId || item.mode !== 'translate') return bad('invalid_state', '实际派发事件没有准确块登记和派发认领。')
       let call
       try { call = parseDocumentCallRecord(event.callRecord, sourceLength) } catch { return bad('invalid_call', '实际模型调用记录无效。') }
-      const route = task.request.envelope.material.model!
+      const facts = this.facts(task), baseline = [...(facts?.controls ?? [])].reverse().find(control => control.baseline)?.baseline ?? facts?.baseline
+      const route = baseline?.route ?? task.request.envelope!.material.model!
       if (call.callId !== block.request.callId || call.attemptId !== block.request.attemptId || !same(call.contextRef, context) ||
         call.model.provider !== route.provider || call.model.model !== route.model || route.reasoningEffort !== undefined && call.model.reasoningEffort !== route.reasoningEffort) return bad('call_mismatch', '实际调用身份、模型或上下文未使用受理时固定版本。')
       next = { id: event.revisionId, taskId: event.taskId, childOperationId: event.childOperationId, attemptId: call.attemptId, callId: call.callId,
@@ -239,6 +275,8 @@ export class DocumentTasksClient {
       next = { id: event.revisionId, taskId: event.taskId, childOperationId: event.childOperationId, attemptId: null, callId: null,
         sourceVersion: task.request.plan.sourceVersion, chunkId: item.chunkId, planRef: { id: task.request.plan.id, version: task.request.plan.version }, preparationRef: task.request.preparationRef,
         kind: 'copy', status: 'completed', content: { kind: 'source_copy', sourceVersion: unit.sourceVersion, range: item.outputRange, sha256: digest }, callRecord: null, createdAt: event.at, updatedAt: event.at }
+    } else if (event.kind === 'settled' && !previous && ['registered', 'claimed'].includes(block.phase)) {
+      if (event.status === 'completed' || event.usage.inputTokens !== null || event.usage.outputTokens !== null) return bad('invalid_state', '尚未派发的块不能伪造成功或模型用量。')
     } else {
       if (block.phase !== 'dispatched' || !previous || previous.content.kind !== 'text' || !previous.callRecord) return bad('invalid_state', '实际输出没有派发调用事实，或此块已结算。')
       if (event.kind === 'delta') {
@@ -252,11 +290,21 @@ export class DocumentTasksClient {
     if (task.outputBytes + newBytes > MAX_DOCUMENT_OUTPUT_BYTES) return bad('output_budget_exceeded', '整篇累计结果超过 16 MiB；已有残稿保留，未截断为成功。')
     const current = this.locate(ownerId, task.scope)
     if (!current || task.sequence + 1 !== event.taskSequence || block.sequence + 1 !== event.sequence) return bad('sequence_changed', '读取期间实际事件已有变化，请查询当前父子序号。')
+    const nextPhase = event.kind === 'dispatch_intent' ? 'claimed' : event.kind === 'copy' || event.kind === 'settled' ? 'settled' : 'dispatched'
+    const facts = this.progressedFacts(task, event.taskSequence, task.outputBytes + newBytes, event.kind === 'dispatched')
+    if (event.kind === 'dispatched' && event.callRecord.contextRef.supplementRefs.some(ref => !facts?.supplements?.some(supplement => supplement.chunkId === item.chunkId && sameVersionReference(ref, supplement)))) return bad('supplement_unavailable', '实际调用所用补充正文没有确切登记。')
+    const nextFacts = facts && { ...facts, blocks: facts.blocks.map(item => item.request.revisionId === event.revisionId ? { ...item, sequence: event.sequence, phase: nextPhase as Block['phase'] } : item) }
     if (!this.store.updateTranslationHistory(event.scope.translationSessionId, history => applyDocumentMutation(history, event.unitId,
-      previous ? { kind: 'chunk_update', revisionId: previous.id, patch: { status: next.status, content: next.content, callRecord: next.callRecord, updatedAt: next.updatedAt } }
-        : { kind: 'chunk', revision: next }, event.at))) return bad('history_update_failed', '块实际事实写入失败，未重复调用。')
+      next ? previous ? { kind: 'chunk_update', revisionId: previous.id, patch: { status: next.status, content: next.content, callRecord: next.callRecord, updatedAt: next.updatedAt }, ...(nextFacts ? { executionFacts: nextFacts } : {}) }
+        : { kind: 'chunk', revision: next, ...(nextFacts ? { executionFacts: nextFacts } : {}) }
+        : { kind: 'task_facts', taskId: event.taskId, facts: nextFacts! }, event.at))) return bad('history_update_failed', '块实际事实写入失败，未重复调用。')
     task.sequence = event.taskSequence; block.sequence = event.sequence; task.events.set(event.taskSequence, signature); task.outputBytes += newBytes
-    block.phase = event.kind === 'copy' || event.kind === 'settled' ? 'settled' : 'dispatched'
+    block.phase = nextPhase
+    if (event.kind === 'dispatch_intent' || event.kind === 'dispatched' || event.kind === 'settled' || event.kind === 'copy') {
+      task.historySaved = this.store.getSettings().rememberHistory && await this.store.saveTranslationHistoryAsync(event.scope.translationSessionId)
+      this.refreshStorage(task)
+      if (event.kind === 'dispatch_intent' && task.sourceSaved && task.preparationSaved && this.store.getSettings().rememberHistory && !task.historySaved) return bad('history_save_failed', '派发认领未确认保存，未授权此块模型派发。')
+    }
     return ok(this.receipt(task))
   }
   async finish(ownerId: string, raw: DocumentTaskFinish): Promise<AnalysisResult<DocumentTaskReceipt>> {
@@ -266,17 +314,19 @@ export class DocumentTasksClient {
     if (!task) return bad('task_not_found', '准确受理的整篇任务不存在。')
     const signature = JSON.stringify(request), prior = task.events.get(request.taskSequence)
     if (prior) return prior === signature ? ok(this.receipt(task)) : bad('idempotency_conflict', '整体结算序号已有其他事实。')
-    if (request.taskSequence !== task.sequence + 1 || [...task.blocks.values()].some(block => block.phase === 'dispatched')) return bad('sequence_gap', '整篇结算须等待准确块结算及父事件序号。')
+    if (request.taskSequence !== task.sequence + 1 || [...task.blocks.values()].some(block => block.phase === 'dispatched' || block.phase === 'claimed')) return bad('sequence_gap', '整篇结算须等待准确块结算及父事件序号。')
     const unit = this.unit(task)!, plan = task.request.plan
-    const chunks = plan.items.map(item => unit.chunkRevisions.find(chunk => chunk.taskId === request.taskId && chunk.chunkId === item.chunkId))
+    const chunks = plan.items.map(item => [...unit.chunkRevisions].reverse().find(chunk => chunk.taskId === request.taskId && chunk.chunkId === item.chunkId))
     const complete = chunks.every(chunk => chunk?.status === 'completed')
     if (request.status === 'completed' && !complete) return bad('incomplete_result', '范围缺失、截断或未知块不能记为整篇完成。')
     if (!this.store.updateTranslationHistory(request.scope.translationSessionId, history => {
       const manifest = chunks.every(Boolean) ? applyDocumentMutation(history, request.unitId, { kind: 'manifest', revision: {
         id: request.manifestId, taskId: request.taskId, sourceVersion: unit.sourceVersion, planRef: { id: plan.id, version: plan.version }, preparationRef: task.request.preparationRef, createdAt: request.at,
         entries: plan.items.map((item, index) => ({ chunkId: item.chunkId, outputRange: item.outputRange, revisionId: chunks[index]!.id })),
-        review: { status: 'pending', checkedAt: null, issues: [] } } }, request.at) : history
-      return applyDocumentMutation(manifest, request.unitId, { kind: 'task_update', taskId: request.taskId, status: request.status }, request.at)
+        review: { status: 'pending', checkedAt: null, issues: this.facts(task)?.reviewIssues ?? [] } } }, request.at) : history
+      const facts = this.progressedFacts(task, request.taskSequence)
+      return applyDocumentMutation(manifest, request.unitId, facts ? { kind: 'task_facts', taskId: request.taskId, facts, status: request.status }
+        : { kind: 'task_update', taskId: request.taskId, status: request.status }, request.at)
     })) return bad('history_update_failed', '整篇清单与状态未完成写回。')
     task.sequence = request.taskSequence; task.events.set(request.taskSequence, signature)
     if (request.status !== 'unknown') task.finishSequence = request.taskSequence
@@ -299,11 +349,153 @@ export class DocumentTasksClient {
     task.releaseBridge()
     return ok(this.receipt(task))
   }
+  async restore(ownerId: string, raw: DocumentRestoreRequest): Promise<AnalysisResult<DocumentRestoreCapture>> {
+    let request: DocumentRestoreRequest
+    try { request = parseDocumentRestoreRequest(raw) } catch { return bad('invalid_input', '文档恢复查询参数无效。', 'restore_document') }
+    const scope = request.scope, session = this.store.getSession(scope.translationSessionId)
+    if (this.disposed || !session || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || session.ownerId !== ownerId || session.topicId !== scope.topicId || session.mode !== 'normal' || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档恢复不属于此主会话。', 'restore_document')
+    const current = this.store.getTranslationHistory(session.id)?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === request.taskId))
+    if (!current || !isDocumentUnit(current) || request.unitId !== undefined && request.unitId !== current.id) return bad('task_not_found', '此范围内没有确切任务。', 'restore_document')
+    const record = current.tasks.find(task => task.taskId === request.taskId)!
+    if (!record.executionFacts) return bad('execution_baseline_missing', '此旧任务未保存真实分析调用数、模型容量和执行序号，无法恢复；已有结果仍可查阅。', 'restore_document')
+    const saved = this.store.readStoredDocumentTask(session.id, current.id, record.taskId)
+    if (!saved) return bad('history_not_saved', '当前任务执行事实没有准确的已保存副本。', 'restore_document')
+    const savedRecord = saved.tasks.find(task => task.taskId === record.taskId)!, facts = savedRecord.executionFacts!, source = saved.sourceVersions.find(source => source.version === record.sourceVersion)!, plan = saved.plans.find(plan => sameVersionReference(plan, record.planRef))!
+    if (['waiting_context', 'waiting_user'].includes(savedRecord.status)) return bad('context_restore_unavailable', '旧任务的动态求助问题未保存，无法恢复此等待；已有结果仍可查阅。', 'restore_document')
+    if (saved.chunkRevisions.filter(chunk => chunk.taskId === record.taskId).some(chunk => chunk.callRecord?.contextRef.supplementRefs.some(ref => !facts.supplements?.some(supplement => supplement.chunkId === chunk.chunkId && sameVersionReference(ref, supplement))))) return bad('context_restore_unavailable', '实际调用的补充正文缺失，无法重建该调用准备。', 'restore_document')
+    const sourceSha256 = source.body.kind === 'asset' ? source.body.reference.sha256 : await digest(new TextEncoder().encode(source.body.text))
+    const prepared = this.preparations.savedDocumentPreparation(scope, record.preparationRef, sourceSha256)
+    if (!prepared.ok) return prepared
+    const sourceRestore = source.body.kind === 'asset' ? await this.store.readStoredSourceRequest({ sessionId: session.id, unitId: current.id, sourceVersion: source.version }) : null
+    if (source.body.kind === 'asset' && !sourceRestore) return bad('source_reference_unconfirmed', '原稿身份或准确历史保存引用未确认。', 'restore_document')
+    const baseline = [...facts.controls].reverse().find(control => control.baseline)?.baseline ?? facts.baseline
+    const capture: DocumentRestoreCapture = { receipt: { scope, taskId: record.taskId, unitId: current.id, operationId: record.operationId, sourceVersion: record.sourceVersion,
+      planRef: record.planRef, preparationRef: record.preparationRef, taskSequence: facts.taskSequence, taskVersion: facts.taskVersion,
+      hostGeneration: baseline.hostGeneration, status: record.status, storage: 'saved', storageError: null, restartExecutable: true }, source, plan,
+      preparation: prepared.value, executionFacts: facts, chunks: saved.chunkRevisions.filter(chunk => chunk.taskId === record.taskId).map(({ id, chunkId, status, callId, attemptId, childOperationId, planRef, preparationRef, sourceVersion }) => ({ id, chunkId, status, callId, attemptId, childOperationId, planRef, preparationRef, sourceVersion })),
+      ...(sourceRestore ? { sourceRestore } : {}) }
+    try { return ok(parseDocumentRestoreCapture(capture)) } catch { return bad('restore_packet_too_large', '完整恢复事实超过主题桥预算或引用无效，未截字段或开始调用。', 'restore_document') }
+  }
+  async control(ownerId: string, raw: DocumentTaskControl): Promise<AnalysisResult<DocumentTaskReceipt>> {
+    let request: DocumentTaskControl
+    try { request = parseDocumentTaskControl(raw) } catch { return bad('invalid_input', '文档控制写回参数无效。') }
+    let task = this.locate(ownerId, { scope: request.scope, taskId: request.taskId, unitId: request.unitId })
+    if (!task) {
+      if (request.kind !== 'resume') return bad('task_not_found', '当前运行期没有此文档任务。')
+      const captured = await this.restore(ownerId, { scope: request.scope, taskId: request.taskId, unitId: request.unitId, hostGeneration: request.hostGeneration })
+      if (!captured.ok) return captured
+      const value = captured.value, facts = value.executionFacts
+      if (request.expectedTaskVersion !== facts.taskVersion || request.taskSequence !== facts.taskSequence + 1) return bad('stale_task_version', '已保存任务版本或父序号已变化。', 'restore_document')
+      if (facts.blocks.some(block => block.phase !== 'settled') || value.chunks.some(chunk => ['running', 'unknown', 'interrupted'].includes(chunk.status))) return bad('prior_call_unconfirmed', '旧块调用未确认结束；只能查询，不能新身份重发。', 'restore_document')
+      const releaseLease = this.store.claimDocumentLease(request.scope.translationSessionId, request.taskId)
+      if (!releaseLease) return bad('busy', '此翻译会话已由另一操作占用。')
+      const baseline = [...facts.controls].reverse().find(control => control.baseline)?.baseline ?? facts.baseline
+      const recovered: Task = { signature: `restored:${request.taskId}`, request: { operationId: value.receipt.operationId, plan: value.plan, preparationRef: value.receipt.preparationRef,
+        contextBindings: baseline.contextBindings, createdAt: value.source.createdAt, executionBaseline: baseline }, scope: { scope: request.scope, taskId: request.taskId, unitId: request.unitId },
+        releaseLease, releaseBridge: this.retain(ownerId), release: () => { recovered.releaseLease(); recovered.releaseBridge() },
+        blocks: new Map(facts.blocks.map(block => [block.request.revisionId, { ...block }])), events: new Map(), sequence: facts.taskSequence,
+        finishSequence: null, outputBytes: facts.outputBytes, historySaved: true, sourceSaved: true, preparationSaved: true, preparationStorageError: null, storageError: null, storage: 'saved' }
+      this.tasks.set(this.key(ownerId, request.taskId), recovered); task = recovered
+    }
+    const unit = this.unit(task)!, record = unit.tasks.find(item => item.taskId === request.taskId)!, facts = record.executionFacts
+    if (!facts) return bad('execution_baseline_missing', '旧任务缺少可恢复的真实执行基线。')
+    const prior = facts.controls.find(control => control.operationId === request.operationId)
+    if (prior) {
+      return prior.expectedTaskVersion === request.expectedTaskVersion && prior.kind === request.kind && prior.hostGeneration === request.hostGeneration && prior.status === request.status &&
+        same(prior.planRef, request.plan ? { id: request.plan.id, version: request.plan.version } : undefined) && same(prior.preparationRef, request.preparationRef) && same(prior.baseline, request.executionBaseline)
+        && same(prior.supplementRef, request.supplement ? { id: request.supplement.id, version: request.supplement.version } : undefined)
+        && (!request.supplement || facts.supplements?.some(supplement => same(supplement, request.supplement)))
+        ? ok(this.receipt(task)) : bad('idempotency_conflict', '同一控制标识已有不同意图或版本。')
+    }
+    if (facts.taskVersion !== request.expectedTaskVersion || request.taskSequence !== task.sequence + 1) return bad('stale_task_version', '任务控制版本或父序号已变化，请查询当前任务。')
+    if (request.kind === 'resume' && (!['paused', 'waiting_user', 'waiting_context', 'failed', 'cancelled', 'interrupted'].includes(record.status) || [...task.blocks.values()].some(block => block.phase !== 'settled'))) return bad('prior_call_unconfirmed', '此任务仍有未确认调用，不能继续。')
+    if (request.kind === 'resume' && this.options.isSessionBusy?.(request.scope.translationSessionId)) return bad('busy', '此翻译会话已有另一执行操作。')
+    if (['pause', 'update', 'cancel'].includes(request.kind) && request.status !== 'unknown' && [...task.blocks.values()].some(block => block.phase !== 'settled')) return bad('prior_call_unconfirmed', '在途块尚未结算，任务控制不能伪造停止事实。')
+    if (request.plan) {
+      try { parseDocumentChunkPlan(request.plan, documentSourceLength(unit.sourceVersions.find(source => source.version === record.sourceVersion)!)) }
+      catch { return bad('plan_mismatch', '新计划没有完整覆盖准确原稿。') }
+      if (request.plan.sourceVersion !== record.sourceVersion || !request.preparationRef || !sameVersionReference(request.plan.preparationRef, request.preparationRef) || !request.executionBaseline) return bad('plan_mismatch', '新计划必须绑定准确原稿、准备和执行基线。')
+    }
+    const activePlan = request.plan ?? task.request.plan, activePreparation = request.preparationRef ?? task.request.preparationRef
+    if (request.executionBaseline && (request.executionBaseline.contextBindings.length !== activePlan.items.length || request.executionBaseline.contextBindings.some((binding, index) =>
+      binding.chunkId !== activePlan.items[index]!.chunkId || !sameVersionReference(binding.contextRef.preparationRef, activePreparation)))) return bad('context_mismatch', '新执行基线没有逐块绑定准确准备。')
+    const supplements = facts.supplements ?? [], supplement = request.supplement
+    if (supplement && (request.kind !== 'resume' || !activePlan.items.some(item => item.chunkId === supplement.chunkId && item.mode === 'translate') || supplements.length >= 3 ||
+      supplements.some(old => old.chunkId === supplement.chunkId || sameVersionReference(old, supplement)))) return bad('supplement_budget_exceeded', '本块已登记补充或整篇三次补充预算已用尽。')
+    for (const chunk of unit.chunkRevisions.filter(chunk => chunk.taskId === request.taskId && chunk.status === 'completed')) if (request.plan) {
+      const oldPlan = unit.plans.find(plan => sameVersionReference(plan, chunk.planRef))!, old = oldPlan.items.find(item => item.chunkId === chunk.chunkId)!, next = request.plan.items.find(item => item.chunkId === chunk.chunkId)
+      if (!next || !same(old.outputRange, next.outputRange) || old.mode !== next.mode) return bad('completed_range_changed', '新计划不能改变已完成块范围或模式。')
+    }
+    const nextFacts: DocumentExecutionFacts = { ...facts, taskVersion: facts.taskVersion + 1, taskSequence: request.taskSequence,
+      controls: [...facts.controls, { operationId: request.operationId, expectedTaskVersion: request.expectedTaskVersion, taskVersion: facts.taskVersion + 1,
+        hostGeneration: request.hostGeneration, taskSequence: request.taskSequence, status: request.status, kind: request.kind, at: request.at,
+        ...(request.plan ? { planRef: { id: request.plan.id, version: request.plan.version } } : {}), ...(request.preparationRef ? { preparationRef: request.preparationRef } : {}), ...(request.executionBaseline ? { baseline: request.executionBaseline } : {}),
+        ...(supplement ? { supplementRef: { id: supplement.id, version: supplement.version } } : {}) }],
+      reviewIssues: [...facts.reviewIssues, ...(request.reviewIssues ?? [])].filter((issue, index, items) => items.findIndex(other => same(issue, other)) === index) }
+    const resolvedFacts: DocumentExecutionFacts = supplement ? { ...nextFacts, supplements: [...supplements, supplement], automaticSupplementCalls: facts.automaticSupplementCalls + 1 } : nextFacts
+    if (!this.store.updateTranslationHistory(request.scope.translationSessionId, history => {
+      let next = history
+      if (request.preparationRef) next = applyDocumentMutation(next, request.unitId, { kind: 'preparation', preparation: { ...request.preparationRef, sourceVersion: record.sourceVersion } }, request.at)
+      if (request.plan) next = applyDocumentMutation(next, request.unitId, { kind: 'plan', plan: request.plan }, request.at)
+      return applyDocumentMutation(next, request.unitId, { kind: 'task_facts', taskId: request.taskId, facts: resolvedFacts, status: request.status,
+        ...(request.plan ? { planRef: { id: request.plan.id, version: request.plan.version } } : {}), ...(request.preparationRef ? { preparationRef: request.preparationRef } : {}) }, request.at)
+    })) return bad('history_update_failed', '任务控制事实未完成写回。')
+    task.sequence = request.taskSequence
+    if (request.plan || request.preparationRef || request.executionBaseline) task.request = { ...task.request, plan: request.plan ?? task.request.plan,
+      preparationRef: request.preparationRef ?? task.request.preparationRef, contextBindings: request.executionBaseline?.contextBindings ?? task.request.contextBindings,
+      ...(request.executionBaseline ? { executionBaseline: request.executionBaseline } : {}) }
+    if (request.kind === 'resume') {
+      task.finishSequence = null
+      // Completed/failed tasks have relinquished their old retains; every explicit resume owns fresh retains.
+      task.releaseLease()
+      task.releaseLease = this.store.claimDocumentLease(request.scope.translationSessionId, request.taskId) ?? (() => {})
+      const retainNext = this.retain(ownerId); task.releaseBridge(); task.releaseBridge = retainNext
+    }
+    task.historySaved = this.store.getSettings().rememberHistory && await this.store.saveTranslationHistoryAsync(request.scope.translationSessionId)
+    this.refreshStorage(task)
+    if (request.kind === 'cancel') { task.finishSequence = request.taskSequence; task.releaseLease() }
+    return ok(this.receipt(task))
+  }
   observe(ownerId: string, raw: DocumentTaskScope): AnalysisResult<DocumentTaskReceipt | null> {
     let scope: DocumentTaskScope
     try { scope = parseDocumentTaskScope(raw) } catch { return bad('invalid_input', '文档查询范围无效。') }
     const task = this.locate(ownerId, scope)
     return scope.scope.ownerId !== ownerId || scope.scope.mainSessionId !== ownerId ? bad('scope_mismatch', '文档查询不属于当前主会话。') : ok(task ? this.receipt(task) : null)
   }
-  dispose(): void { this.disposed = true; this.stopBridge?.(); for (const task of this.tasks.values()) task.release(); this.tasks.clear(); this.admissions.clear() }
+  subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
+  private emit(): void { for (const listener of this.listeners) listener() }
+  uiState(sessionId: string, taskId: string): { readonly pending: boolean; readonly pausing: boolean; readonly cancelling: boolean; readonly message: string | null; readonly canResume: boolean; readonly recoverability: string | null } {
+    const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === taskId))
+    const task = unit && isDocumentUnit(unit) ? unit.tasks.find(task => task.taskId === taskId) : undefined, key = session ? this.key(session.ownerId, taskId) : ''
+    const uncertain = task?.executionFacts?.blocks.some(block => block.phase !== 'settled') || unit && isDocumentUnit(unit) && unit.chunkRevisions.some(chunk => chunk.taskId === taskId && ['running', 'unknown', 'interrupted'].includes(chunk.status))
+    const recoverability = !task?.executionFacts ? '此旧任务缺少执行恢复事实；已有原稿与结果可查阅。' : uncertain && ['interrupted', 'unknown'].includes(task.status) ? '旧调用未确认结束，请查询任务状态。' : null
+    return { pending: Boolean(this.controlsPending.get(key)?.size), pausing: this.controlsPending.get(key)?.has('pause') ?? false,
+      cancelling: this.controlsPending.get(key)?.has('cancel') ?? false, message: this.notices.get(key) ?? null,
+      canResume: Boolean(task?.executionFacts && !uncertain && ['paused', 'failed', 'cancelled', 'interrupted'].includes(task.status)), recoverability }
+  }
+  async requestControl(sessionId: string, taskId: string, kind: 'pause' | 'cancel' | 'resume' | 'status'): Promise<void> {
+    const session = this.store.getSession(sessionId), history = this.store.getTranslationHistory(sessionId), unit = history?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === taskId))
+    if (this.disposed || !session || !unit || !isDocumentUnit(unit)) return
+    const record = unit.tasks.find(task => task.taskId === taskId)!, facts = record.executionFacts, key = this.key(session.ownerId, taskId)
+    const pending = this.controlsPending.get(key) ?? new Set<'pause' | 'cancel' | 'resume' | 'status'>()
+    if (pending.has(kind) || pending.size && !(kind === 'cancel' && pending.has('pause') && !pending.has('cancel'))) return
+    if (kind !== 'status' && (!facts || kind === 'resume' && !this.uiState(sessionId, taskId).canResume)) { this.notices.set(key, '此任务目前只能查询执行状态。'); this.emit(); return }
+    const scope = { ownerId: session.ownerId, mainSessionId: session.ownerId, topicId: session.topicId, translationSessionId: sessionId }, release = this.retain(session.ownerId)
+    const noticeOwner = crypto.randomUUID(); this.noticeOwners.set(key, noticeOwner)
+    pending.add(kind); this.controlsPending.set(key, pending); this.notices.delete(key); this.emit()
+    try {
+      const port = typeof this.options.remote === 'function' ? await this.options.remote() : this.options.remote
+      if (!port) throw new Error('整篇控制服务尚未就绪。')
+      const request = kind === 'status' ? { scope, taskId, afterTaskSequence: 0, limit: 50 } : parseTranslationBatchControl({ scope, taskId, operationId: `document-${kind}:${crypto.randomUUID()}`, expectedTaskVersion: facts!.taskVersion })
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      const raw = await Promise.race([kind === 'status' ? port.status(request as import('../shared/document-execution.js').TranslationBatchStatus) : port[kind](request as TranslationBatchControl),
+        new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error('控制回执未知，请查询此任务；未自动重发。')), 15000) })]).finally(() => clearTimeout(timeout)) as { ok?: boolean; value?: { ok?: boolean; value?: unknown; error?: { message?: string } } }
+      if (raw?.ok !== true || raw.value?.ok !== true) throw new Error(raw?.value?.error?.message ?? '任务控制结果未知，请查询原任务。')
+      const result = kind === 'status' ? parseDocumentBatchStatusView(raw.value.value) : parseDocumentTaskReceipt(raw.value.value)
+      if (result.taskId !== taskId || result.unitId !== unit.id || !same(result.scope, scope)) throw new Error('任务控制回执所属范围不符。')
+      if (this.noticeOwners.get(key) === noticeOwner) this.notices.set(key, kind === 'status' ? result.status === 'unknown' ? '执行结果仍未知；保留已有块和残稿。' : '已查询此任务状态。' : kind === 'pause' ? '已暂停；在途块已结算，后续块未派发。' : kind === 'cancel' ? '已取消；完成块和残稿已保留。' : '已继续此任务。')
+    } catch (error) { if (this.noticeOwners.get(key) === noticeOwner) this.notices.set(key, error instanceof Error ? error.message : '任务控制未完成，请查询原任务。') }
+    finally { pending.delete(kind); if (!pending.size) this.controlsPending.delete(key); release(); this.emit() }
+  }
+  dispose(): void { this.disposed = true; this.stopBridge?.(); for (const task of this.tasks.values()) task.release(); this.tasks.clear(); this.admissions.clear(); this.listeners.clear(); this.controlsPending.clear(); this.notices.clear(); this.noticeOwners.clear() }
 }

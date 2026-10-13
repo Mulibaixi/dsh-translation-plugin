@@ -1,7 +1,8 @@
-import { parseSourceIdentity, type SourceIdentity } from './translation-sources.js'
+import { parseSourceIdentity, parseTranslationSourceScope, type SourceIdentity } from './translation-sources.js'
 import { parseTranslationSourceReference, parseTranslationSourceStorageRequest,
   type TranslationSourceReference } from './translation-source-storage.js'
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
+import type { TranslationMaterialRoute } from './translation-material.js'
 
 export interface VersionReference { readonly id: string; readonly version: number }
 export type SourceBody = { readonly kind: 'inline'; readonly text: string }
@@ -35,7 +36,58 @@ export interface DocumentChunkPlan extends VersionReference {
   readonly createdAt: string
   readonly operationId: string
 }
-export type DocumentTaskStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted'
+export type DocumentTaskStatus = 'running' | 'paused' | 'waiting_context' | 'waiting_user' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted'
+/** Actual execution facts are optional only for records written before batch control existed. */
+export interface DocumentExecutionBaseline {
+  readonly hostGeneration: string
+  readonly route: TranslationMaterialRoute
+  readonly capacity: { readonly contextWindow: number | null; readonly maxOutputTokens: number | null; readonly countKind: 'estimated' }
+  readonly analysisActualCalls: number
+  readonly maxInputChars: number
+  readonly contextBindings: readonly { readonly chunkId: string; readonly contextRef: DocumentCallContextReference }[]
+}
+export interface DocumentExecutionBlock {
+  readonly request: { readonly scope: import('./translation-sources.js').TranslationSourceScope; readonly taskId: string; readonly unitId: string;
+    readonly chunkId: string; readonly childOperationId: string; readonly attemptId: string | null; readonly callId: string | null;
+    readonly revisionId: string; readonly createdAt: string; readonly planRef?: VersionReference; readonly preparationRef?: VersionReference;
+    readonly contextRef?: DocumentCallContextReference; readonly outputRange?: TranslationSourceRange }
+  readonly sequence: number
+  readonly phase: 'registered' | 'claimed' | 'dispatched' | 'settled'
+}
+export interface DocumentControlFact {
+  readonly operationId: string
+  readonly expectedTaskVersion: number
+  readonly taskVersion: number
+  readonly hostGeneration: string
+  readonly taskSequence: number
+  readonly status: DocumentTaskStatus
+  readonly kind: 'pause' | 'cancel' | 'resume' | 'update'
+  readonly at: string
+  readonly planRef?: VersionReference
+  readonly preparationRef?: VersionReference
+  readonly baseline?: DocumentExecutionBaseline
+  readonly supplementRef?: VersionReference
+}
+export interface DocumentExecutionFacts {
+  readonly baseline: DocumentExecutionBaseline
+  readonly taskVersion: number
+  readonly taskSequence: number
+  readonly actualCalls: number
+  readonly outputBytes: number
+  readonly automaticSupplementCalls: number
+  readonly blocks: readonly DocumentExecutionBlock[]
+  readonly controls: readonly DocumentControlFact[]
+  readonly reviewIssues: readonly { readonly code: string; readonly range: TranslationSourceRange; readonly message: string }[]
+  readonly supplements?: readonly DocumentSupplementFact[]
+}
+/** One immutable resolved answer; actual calls retain only its id/version. */
+export interface DocumentSupplementFact extends VersionReference {
+  readonly chunkId: string
+  readonly answerText: string
+  readonly organizedRequirements: string
+  readonly references: readonly VersionReference[]
+  readonly createdAt: string
+}
 export interface DocumentTaskRecord {
   readonly taskId: string
   readonly operationId: string
@@ -44,6 +96,7 @@ export interface DocumentTaskRecord {
   readonly preparationRef: VersionReference
   readonly createdAt: string
   readonly status: DocumentTaskStatus
+  readonly executionFacts?: DocumentExecutionFacts
 }
 export type DocumentTermReference = { readonly kind: 'topic_term'; readonly id: string; readonly entryVersion: number }
   | { readonly kind: 'candidate'; readonly id: string; readonly version: number }
@@ -159,7 +212,7 @@ function ref(value: unknown): VersionReference {
   return { id: value.id, version: value.version }
 }
 function taskStatus(value: unknown): asserts value is DocumentTaskStatus {
-  if (!['running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted'].includes(value as string)) throw new TypeError('Invalid document status')
+  if (!['running', 'paused', 'waiting_context', 'waiting_user', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted'].includes(value as string)) throw new TypeError('Invalid document status')
 }
 export function parseDocumentSourceVersion(value: unknown): DocumentSourceVersion {
   exact(value, ['version', 'body', 'createdAt', 'operationId'], ['historyCommit']); integer(value.version); time(value.createdAt)
@@ -222,10 +275,67 @@ export function parseDocumentChunkPlan(value: unknown, sourceLength: number): Do
   return result
 }
 export function parseDocumentTaskRecord(value: unknown): DocumentTaskRecord {
-  exact(value, ['taskId', 'operationId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'status'])
+  exact(value, ['taskId', 'operationId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'status'], ['executionFacts'])
   string(value.taskId); string(value.operationId); integer(value.sourceVersion); time(value.createdAt); taskStatus(value.status)
   return { taskId: value.taskId, operationId: value.operationId, sourceVersion: value.sourceVersion,
-    planRef: ref(value.planRef), preparationRef: ref(value.preparationRef), createdAt: value.createdAt, status: value.status }
+    planRef: ref(value.planRef), preparationRef: ref(value.preparationRef), createdAt: value.createdAt, status: value.status,
+    ...(value.executionFacts === undefined ? {} : { executionFacts: parseDocumentExecutionFacts(value.executionFacts) }) }
+}
+export function parseDocumentExecutionBaseline(value: unknown): DocumentExecutionBaseline {
+  exact(value, ['hostGeneration', 'route', 'capacity', 'analysisActualCalls', 'maxInputChars', 'contextBindings']); string(value.hostGeneration); integer(value.maxInputChars)
+  exact(value.route, ['provider', 'model'], ['reasoningEffort']); string(value.route.provider, 512); string(value.route.model, 512)
+  if (value.route.reasoningEffort !== undefined) string(value.route.reasoningEffort, 64)
+  exact(value.capacity, ['contextWindow', 'maxOutputTokens', 'countKind'])
+  for (const count of [value.capacity.contextWindow, value.capacity.maxOutputTokens]) if (count !== null) integer(count, 0)
+  if (value.capacity.countKind !== 'estimated') throw new TypeError('Invalid execution capacity')
+  integer(value.analysisActualCalls, 0, 512); array(value.contextBindings, 256)
+  const contextBindings = value.contextBindings.map(raw => { exact(raw, ['chunkId', 'contextRef']); string(raw.chunkId); return { chunkId: raw.chunkId, contextRef: parseDocumentCallContextReference(raw.contextRef, Number.MAX_SAFE_INTEGER) } })
+  if (new Set(contextBindings.map(item => item.chunkId)).size !== contextBindings.length) throw new TypeError('Duplicate execution context')
+  return { hostGeneration: value.hostGeneration, route: { provider: value.route.provider, model: value.route.model,
+    ...(value.route.reasoningEffort === undefined ? {} : { reasoningEffort: value.route.reasoningEffort as string }) },
+    capacity: { contextWindow: value.capacity.contextWindow as number | null, maxOutputTokens: value.capacity.maxOutputTokens as number | null, countKind: 'estimated' }, analysisActualCalls: value.analysisActualCalls, maxInputChars: value.maxInputChars, contextBindings }
+}
+export function parseDocumentExecutionFacts(value: unknown): DocumentExecutionFacts {
+  exact(value, ['baseline', 'taskVersion', 'taskSequence', 'actualCalls', 'outputBytes', 'automaticSupplementCalls', 'blocks', 'controls', 'reviewIssues'], ['supplements'])
+  integer(value.taskVersion); integer(value.taskSequence, 0); integer(value.actualCalls, 0, 512); integer(value.outputBytes, 0, 16 * 1024 * 1024); integer(value.automaticSupplementCalls, 0, 3)
+  array(value.blocks, 512); array(value.controls, 512); array(value.reviewIssues, 256)
+  const blocks = value.blocks.map(raw => {
+    exact(raw, ['request', 'sequence', 'phase']); integer(raw.sequence, 0)
+    if (!['registered', 'claimed', 'dispatched', 'settled'].includes(raw.phase as string)) throw new TypeError('Invalid execution block phase')
+    const request = raw.request
+    exact(request, ['scope', 'taskId', 'unitId', 'chunkId', 'childOperationId', 'attemptId', 'callId', 'revisionId', 'createdAt'], ['planRef', 'preparationRef', 'contextRef', 'outputRange'])
+    const scope = parseTranslationSourceScope(request.scope)
+    for (const key of ['taskId', 'unitId', 'chunkId', 'childOperationId', 'revisionId']) string(request[key])
+    for (const key of ['attemptId', 'callId']) if (request[key] !== null) string(request[key])
+    time(request.createdAt)
+    if ((request.attemptId === null) !== (request.callId === null)) throw new TypeError('Invalid execution block identities')
+    return { request: { ...request, scope, ...(request.planRef === undefined ? {} : { planRef: ref(request.planRef) }),
+      ...(request.preparationRef === undefined ? {} : { preparationRef: ref(request.preparationRef) }),
+      ...(request.contextRef === undefined ? {} : { contextRef: parseDocumentCallContextReference(request.contextRef, Number.MAX_SAFE_INTEGER) }),
+      ...(request.outputRange === undefined ? {} : { outputRange: range(request.outputRange) }) } as unknown as DocumentExecutionBlock['request'], sequence: raw.sequence, phase: raw.phase as DocumentExecutionBlock['phase'] }
+  })
+  const controls = value.controls.map(raw => {
+    exact(raw, ['operationId', 'expectedTaskVersion', 'taskVersion', 'hostGeneration', 'taskSequence', 'status', 'kind', 'at'], ['planRef', 'preparationRef', 'baseline', 'supplementRef'])
+    string(raw.operationId); string(raw.hostGeneration); integer(raw.expectedTaskVersion); integer(raw.taskVersion); integer(raw.taskSequence, 0); taskStatus(raw.status); time(raw.at)
+    if (!['pause', 'cancel', 'resume', 'update'].includes(raw.kind as string) || raw.taskVersion !== raw.expectedTaskVersion + 1) throw new TypeError('Invalid control fact')
+    return { ...raw, ...(raw.planRef === undefined ? {} : { planRef: ref(raw.planRef) }), ...(raw.preparationRef === undefined ? {} : { preparationRef: ref(raw.preparationRef) }),
+      ...(raw.baseline === undefined ? {} : { baseline: parseDocumentExecutionBaseline(raw.baseline) }), ...(raw.supplementRef === undefined ? {} : { supplementRef: ref(raw.supplementRef) }) } as unknown as DocumentControlFact
+  })
+  const reviewIssues = value.reviewIssues.map(raw => { exact(raw, ['code', 'range', 'message']); string(raw.code, 128); string(raw.message, 2048); return { code: raw.code, range: range(raw.range), message: raw.message } })
+  const baseline = parseDocumentExecutionBaseline(value.baseline)
+  const supplements = value.supplements === undefined ? undefined : (() => { array(value.supplements, 3); return value.supplements.map(parseDocumentSupplementFact) })()
+  if (supplements && (new Set(supplements.map(item => item.chunkId)).size !== supplements.length || new Set(supplements.map(item => JSON.stringify({ id: item.id, version: item.version }))).size !== supplements.length || value.automaticSupplementCalls !== supplements.length)) throw new TypeError('Resolved supplement budget changed')
+  if (value.actualCalls < baseline.analysisActualCalls || new Set(blocks.map(block => block.request.revisionId)).size !== blocks.length ||
+    new Set(controls.map(control => control.operationId)).size !== controls.length || controls.some((control, index) => control.expectedTaskVersion !== index + 1) || value.taskVersion !== controls.length + 1) throw new TypeError('Execution facts do not match their identities')
+  return { baseline, taskVersion: value.taskVersion, taskSequence: value.taskSequence, actualCalls: value.actualCalls, outputBytes: value.outputBytes,
+    automaticSupplementCalls: value.automaticSupplementCalls, blocks, controls, reviewIssues, ...(supplements === undefined ? {} : { supplements }) }
+}
+export function parseDocumentSupplementFact(value: unknown): DocumentSupplementFact {
+  exact(value, ['id', 'version', 'chunkId', 'answerText', 'organizedRequirements', 'references', 'createdAt'])
+  string(value.id); integer(value.version); string(value.chunkId); string(value.answerText, 32768, false); string(value.organizedRequirements, 32768, false); time(value.createdAt); array(value.references, 32)
+  if (!(value.answerText.trim() || value.organizedRequirements.trim()) || new TextEncoder().encode(value.answerText + value.organizedRequirements).byteLength > 32768) throw new TypeError('Invalid resolved supplement body')
+  return { id: value.id, version: value.version, chunkId: value.chunkId, answerText: value.answerText, organizedRequirements: value.organizedRequirements,
+    references: value.references.map(ref), createdAt: value.createdAt }
 }
 export function parseDocumentCallRecord(value: unknown, sourceLength: number): DocumentCallRecord {
   exact(value, ['callId', 'attemptId', 'promptVersion', 'model', 'configVersion', 'maxOutputTokens', 'usage', 'contextRef'])

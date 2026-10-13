@@ -7,8 +7,9 @@ import { sourceCodePointLength, type TranslationSourceRange } from '../shared/tr
 import { RecordObjectText, type RecordObjectsProps } from './record-object-view.js'
 import { recordObjectPlainText } from './record-object-export.js'
 import { openDocumentOriginal, projectDocumentResult } from './document-open.js'
+import type { DocumentTasksClient } from './document-tasks.js'
 
-export interface DocumentViewProps { readonly documents?: TranslationDocumentReader | undefined }
+export interface DocumentViewProps { readonly documents?: TranslationDocumentReader | undefined; readonly documentTasks?: DocumentTasksClient | undefined }
 type Failure = Pick<EvidenceUnavailableResult, 'status' | 'reason'>
 function readNotice(failure: Failure): string {
   if (failure.reason === 'document_incomplete') return '结果包含缺项，完整打开尚不可用；可明确选择部分导出。'
@@ -114,7 +115,7 @@ function DocumentPage({ handle, block, side, session, unitId, objects, objectAss
   const label = side === 'source' ? '原文' : '译文'
   const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId, side: side === 'source' ? 'source' as const : 'revision' as const, revisionId: side === 'source' ? null : handle.manifest?.id ?? null }
   const offset = side === 'source' ? block.outputRange.start : targetOffset
-  const statusLabels = { running: '正在翻译。', failed: '翻译失败，缺口保留。', cancelled: '已取消，缺口保留。', unknown: '执行状态未知，缺口保留。', interrupted: '执行已中断，缺口保留。', completed: '已完成' }
+  const statusLabels = { running: '正在翻译。', paused: '已暂停。', waiting_context: '等待补充。', waiting_user: '等待讨论。', failed: '翻译失败，缺口保留。', cancelled: '已取消，缺口保留。', unknown: '执行状态未知，缺口保留。', interrupted: '执行已中断，缺口保留。', completed: '已完成' }
   return h('div', { ref: element, className: side === 'source' ? 'dsh-tp-record-source' : 'dsh-tp-record-target', 'aria-label': label }, h('h4', null, label),
     page ? h(RecordObjectText, { text: page.text, target, objects, objectAssets, range: offset === null ? { start: 0, end: 0 } : { start: offset + page.start, end: offset + page.end }, totalCodePoints: side === 'source' ? handle.totalSourceCodePoints : targetTotal, hideUnavailable: true }) : null,
     side === 'target' && !revision ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '此块尚无结果，缺口保留。') : null,
@@ -128,9 +129,11 @@ function DocumentPage({ handle, block, side, session, unitId, objects, objectAss
       page && page.end < total ? h('button', { type: 'button', disabled: pending, onClick: () => { void load(page.end) } }, '下一页') : null) : null)
 }
 
-export function DocumentUnitView({ unit, session, documents, objects, objectAssets, visible = true, navigationRevision }: RecordObjectsProps & DocumentViewProps & {
+export function DocumentUnitView({ unit, session, documents, documentTasks, objects, objectAssets, visible = true, navigationRevision }: RecordObjectsProps & DocumentViewProps & {
   readonly unit: DocumentUnit; readonly session: LocalSession; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
+  const [, refresh] = react.useState(0)
+  react.useEffect(() => documentTasks?.subscribe(() => refresh(value => value + 1)), [documentTasks])
   const source = unit.sourceVersions.find(version => version.version === unit.sourceVersion), final = currentDocumentFinalRevision(unit)
   const manifest = final ?? [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
   const handle = react.useMemo(() => documents?.captureDocument({ ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }), [documents, session.ownerId, session.topicId, session.id, unit])
@@ -138,8 +141,9 @@ export function DocumentUnitView({ unit, session, documents, objects, objectAsse
   const identity = JSON.stringify([session.ownerId, session.topicId, session.id, unit.id, unit.sourceVersion, manifest?.id ?? null])
   const readable = handle && !('status' in handle) ? handle : undefined
   const missing: Failure = handle && 'status' in handle ? handle : { status: 'unloaded', reason: 'reader_unavailable' }
-  const actualStatus = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion)?.status
-  const status = final ? '已定稿' : actualStatus === 'unknown' ? '执行状态未知' : actualStatus === 'running' ? '正在翻译' : actualStatus === 'interrupted' ? '已中断' : actualStatus === 'failed' ? '翻译失败' : actualStatus === 'cancelled' ? '已取消' : manifest ? '待定稿' : '待准备'
+  const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion), actualStatus = task?.status
+  const controls = task && documentTasks?.uiState(session.id, task.taskId)
+  const status = final ? '已定稿' : actualStatus === 'unknown' ? '执行状态未知' : actualStatus === 'running' ? '正在翻译' : actualStatus === 'paused' ? '已暂停' : actualStatus === 'waiting_context' ? '等待补充' : actualStatus === 'waiting_user' ? '等待讨论' : actualStatus === 'interrupted' ? '已中断' : actualStatus === 'failed' ? '翻译失败' : actualStatus === 'cancelled' ? '已取消' : manifest ? '待定稿' : '待准备'
   const originalAction: OpenAction = { label: '打开原稿', native: source?.body.kind === 'asset' && Boolean(source.historyCommit), run: async signal => readable ? openDocumentOriginal(readable, signal) : missing }
   const resultAction: OpenAction = { label: '打开结果', run: async () => {
     if (!readable) return missing
@@ -158,6 +162,13 @@ export function DocumentUnitView({ unit, session, documents, objects, objectAsse
   return h('article', { className: 'dsh-tp-record-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'data-source-version': unit.sourceVersion, 'data-manifest-id': manifest?.id, 'aria-label': `文档 ${unit.order}` },
     h('div', { className: 'dsh-tp-record-unit-heading' }, h('h3', null, `文档 ${unit.order} · ${name} · ${status}`), h('small', { className: 'dsh-tp-muted' }, `原文版本 ${unit.sourceVersion} · 目标语言：${unit.targetLanguage}`),
       h('span', { className: 'dsh-tp-actions dsh-tp-record-open-links' }, h(RecordOpenLink, { identity, visible, navigationRevision, action: originalAction }), h(RecordOpenLink, { identity, visible, navigationRevision, action: resultAction }))),
+    task && controls ? h('div', { className: 'dsh-tp-actions' },
+      actualStatus === 'running' ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'pause') }, controls.pausing ? '正在暂停…' : '暂停') : null,
+      controls.canResume ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'resume') }, '继续') : null,
+      ['running', 'paused', 'waiting_context', 'waiting_user', 'unknown'].includes(actualStatus ?? '') ? h('button', { type: 'button', disabled: controls.cancelling || controls.pending && !controls.pausing, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'cancel') }, '取消') : null,
+      ['unknown', 'interrupted'].includes(actualStatus ?? '') ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'status') }, '查询状态') : null) : null,
+    controls?.message || controls?.recoverability ? h('p', { role: 'status', className: 'dsh-tp-muted' }, controls.message ?? controls.recoverability) : null,
+    task?.executionFacts?.reviewIssues.length ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '已完成块的准备依赖有变化，整篇结果需要复核。') : null,
     !readable ? h('p', { role: 'status', className: 'dsh-tp-muted' }, readNotice(missing)) : null,
     readable && !readable.manifest ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '尚无固定译文清单；原稿可查阅，结果暂不可完整打开或导出。') : null,
     ...blocks.map((block, index) => {

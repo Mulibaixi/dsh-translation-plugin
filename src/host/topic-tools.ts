@@ -13,6 +13,7 @@ export interface MainAgent {
   readonly id: string
   readonly session: { readonly id: string }
   readonly ctx: { readonly tools: { register(definition: unknown): () => void } }
+  whenIdle?(): Promise<void>
 }
 export interface TopicHostContext extends DshExecutionContext {
   provide(key: string, service: unknown): unknown
@@ -129,7 +130,7 @@ class ManagementConnection {
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
         preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page', preparation_capture: 'preparation_captured',
-        document_accept: 'document_accepted', document_register: 'document_registered', document_event: 'document_updated', document_finish: 'document_updated', document_observe: 'document_observed', document_release: 'document_updated' }[pending.frame.command.kind]
+        document_accept: 'document_accepted', document_register: 'document_registered', document_event: 'document_updated', document_finish: 'document_updated', document_observe: 'document_observed', document_release: 'document_updated', document_control: 'document_updated', document_restore: 'document_restored' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -170,6 +171,15 @@ export class TopicToolsService {
     const connection = this.connections.get(ownerId)
     return !this.disposed && !!connection?.ready && !connection.closed && !!agent && agent.id === ownerId &&
       agent.session.id === ownerId && (this.ctx.get?.('agents') as Agents | undefined)?.get(ownerId) === agent
+  }
+  /** In-process authorization evidence for saved document recovery. */
+  ownerPeer(ownerId: string, agent: MainAgent): string | undefined {
+    return this.ownsAgent(ownerId, agent) ? this.connections.get(ownerId)?.peerId : undefined
+  }
+  ownerAgent(ownerId: string, peerId: string): MainAgent | undefined {
+    if (!this.ownsConnection(ownerId, peerId)) return undefined
+    const agent = (this.ctx.get?.('agents') as Agents | undefined)?.get(ownerId)
+    return this.ownsAgent(ownerId, agent) ? agent : undefined
   }
   /** Host services use this existing owner channel; the browser remains the sole record authority. */
   requestOwned(ownerId: string, command: TopicBridgeCommand, exec: ToolExecution): Promise<TopicBridgeValue> {
@@ -405,11 +415,16 @@ export class TopicToolsService {
         const scope = { type: 'object', additionalProperties: false, required: true, properties: {
           ownerId: { type: 'string', required: true }, mainSessionId: { type: 'string', required: true }, topicId: { type: 'string', required: true }, translationSessionId: { type: 'string', required: true },
         } }
-        const definitions: readonly { name: string; method: 'execute' | 'status'; description: string; parameters: Record<string, unknown> }[] = [
+        const control = { scope, taskId: { type: 'string', required: true }, operationId: { type: 'string', required: true }, expectedTaskVersion: { type: 'integer', required: true } }
+        const definitions: readonly { name: string; method: 'execute' | 'status' | 'pause' | 'cancel' | 'resume' | 'update'; description: string; parameters: Record<string, unknown> }[] = [
           { name: 'translation_batch_execute', method: 'execute', parameters: { target: { required: true, oneOf: [materialTargetParameter, unitTargetParameter] }, operationId: { type: 'string', required: true }, planRef: reference, preparationRef: reference },
-            description: 'Accept one document from exact delivered material with ready preparation and runtime plan references. The Client confirms one real document unit before consuming only that submitted draft. Translation then runs serially in the background with one chunk in flight; explicit copy chunks make no model call. Reuse the same operationId for the same intent. Unknown acceptance or writeback never automatically retries a provider. Do not replace source, route or terminology through execution arguments. This stage cannot execute saved UnitTarget preparations, pause, resume or request model assistance. A completed task produces a candidate awaiting document review; it is not automatically final.' },
+            description: 'Accept one document from exact delivered material and immutable preparation/plan references. Runs one chunk at a time in the background. Unknown ACK never retries a provider. A completed task creates a candidate awaiting whole-document review.' },
           { name: 'translation_batch_status', method: 'status', parameters: { scope, taskId: { type: 'string', required: true }, afterTaskSequence: { type: 'integer' }, limit: { type: 'integer' } },
             description: 'Read exact document progress, actual-call/output budgets and bounded short event facts, at most 50 items and 32768 UTF-8 bytes. Follow nextCursor as afterTaskSequence. Parent task sequences and each child sequence are independent. Observe unknown registration without dispatching a model. This does not resume or retry the task, and does not return translated bodies.' },
+          { name: 'translation_batch_pause', method: 'pause', parameters: control, description: 'On explicit pause intent, let the in-flight chunk settle and prevent the next dispatch. Uses independent taskVersion, unchanged by text deltas. Reuse the operationId for the same intent.' },
+          { name: 'translation_batch_cancel', method: 'cancel', parameters: control, description: 'Cancel the actual in-flight stream and stop later dispatch. Preserve completed chunks and partial output. Unknown cancellation is queried, never reported as completed.' },
+          { name: 'translation_batch_resume', method: 'resume', parameters: control, description: 'On explicit continue or retry intent, continue only remaining chunks with fresh IDs for known failed attempts. Saved recovery verifies source, preparation, plan, actual counters, prior Host generation and no unconfirmed in-flight call. Unknown outcomes are only queried.' },
+          { name: 'translation_batch_update', method: 'update', parameters: { ...control, planRef: reference, preparationRef: reference, route: { type: 'object', additionalProperties: false, properties: { provider: { type: 'string', required: true }, model: { type: 'string', required: true }, reasoningEffort: { type: 'string' } } } }, description: 'Explicitly pause dispatch and select new immutable preparation, plan or route for remaining chunks. Completed call facts stay immutable; affected completed dependencies require review. Continue needs a separate explicit resume intent.' },
         ]
         for (const definition of definitions) disposers.push(agent.ctx.tools.register(helpers.defineTool({ name: definition.name, description: definition.description, parameters: definition.parameters,
           output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
