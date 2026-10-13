@@ -15,6 +15,7 @@ import {
   type TopicIdentity,
 } from './topics.js'
 import type { TopicPersistence, TopicSessionStart } from '../shared/topic-bridge.js'
+import { PREPARATION_STORAGE_PREFIX, type PreparationStoreOptions } from './preparation-store.js'
 export interface LocalStoragePort {
   readonly length: number
   key(index: number): string | null
@@ -90,6 +91,30 @@ export class SessionStore {
   getSession(id: string): LocalSession | undefined { return this.seats.get(id)?.session }
   isSessionDeleted(id: string): boolean { return this.isDeleted(id) }
   getTranslationHistory(id: string): TranslationHistory | undefined { return this.seats.get(id)?.translationHistory }
+  /** Separate preparation audit storage shares history settings and the existing structure lock. */
+  createPreparationStoreOptions(): PreparationStoreOptions {
+    const validKey = (key: string): void => { if (!key.startsWith(PREPARATION_STORAGE_PREFIX)) throw new Error('Preparation storage key is outside its namespace') }
+    return {
+      ...(this.storage && this.locks ? { storage: {
+        keys: () => {
+          const keys: string[] = []
+          for (let index = 0; index < this.storage!.length; index++) { const key = this.storage!.key(index); if (key?.startsWith(PREPARATION_STORAGE_PREFIX)) keys.push(key) }
+          return keys
+        },
+        getItem: (key: string) => { validKey(key); return this.storage!.getItem(key) },
+        setItem: (key: string, value: string) => { validKey(key); this.storage!.setItem(key, value) },
+      } } : {}),
+      withLock: async <T>(action: () => T | Promise<T>): Promise<T> => this.storage && this.locks
+        ? this.locks.request(TOPIC_LOCK_NAME, async () => { if (this.disposed) throw new Error('Session store is disposed'); return await action() })
+        : await action(),
+      isEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
+      isScopeCurrent: scope => {
+        const session = this.getSession(scope.translationSessionId)
+        return !this.disposed && !!session && !this.isSessionDeleted(session.id) && scope.ownerId === scope.mainSessionId &&
+          session.ownerId === scope.ownerId && session.topicId === scope.topicId && this.getTopics(scope.ownerId).some(topic => topic.id === scope.topicId)
+      },
+    }
+  }
   /** Bind storage acknowledgments to an existing document source; this never admits a task. */
   createSourceHistoryCallbacks(target: SourceHistoryTarget): TranslationSourceHistoryCallbacks {
     const fixed = { ...target }, session = this.getSession(fixed.sessionId)

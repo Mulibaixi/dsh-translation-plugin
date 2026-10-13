@@ -2,6 +2,7 @@ import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope, typ
 import { parseTranslationMaterialResult, type TranslationMaterialsPort, type TranslationMaterialCapability, type TranslationMaterialReceipt, type TranslationMaterialQuery, type TranslationMaterialResult } from '../shared/translation-material-remote.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES } from '../shared/topic-bridge.js'
 import { INLINE_TRANSLATION_SOURCE_CODE_POINTS } from '../shared/translation-source-read.js'
+import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
@@ -303,6 +304,13 @@ export class MaterialSubmissionsClient {
       !['prepared', 'submitted', 'attached', 'unknown'].includes(item.stage) ||
       JSON.stringify(item.envelope) !== JSON.stringify(parseTranslationMaterialEnvelope(envelope))) return undefined
     return structuredClone(item.envelope)
+  }
+  /** Read the submitted A snapshot by exact identity; later draft B is unrelated. */
+  resolveSubmittedTarget(target: NormalTranslationMaterialTarget): Extract<TranslationMaterialEnvelope, { kind: 'material' }> | undefined {
+    const item = this.submissions.get(JSON.stringify([target.mainSessionId, target.requestId])), envelope = item?.envelope
+    if (envelope?.kind !== 'material' || envelope.mainSessionId !== target.mainSessionId || envelope.material.materialId !== target.materialId ||
+      envelope.material.sourceVersion !== target.sourceVersion) return undefined
+    return this.resolveSubmittedMaterial(envelope)
   }
   /** Business acceptance consumes only the unchanged submitted draft, including its edit history. */
   consumeSubmittedMaterial(envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }): void {

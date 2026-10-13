@@ -12,6 +12,7 @@ import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type NativeMaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
+import { PreparationStore } from './preparation-store.js'
 import { NormalTranslationClient, type NormalTranslationRemotePort, type NormalTranslationV2RemotePort } from './normal-translation.js'
 import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
 import { adaptTranslationSourceStorageRemote, type TranslationSourceStorageRemotePort } from './source-storage-client.js'
@@ -154,6 +155,8 @@ export function apply(ctx: ClientPluginContext): void {
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationMaterials')
       } : ctx.remote.translationMaterials,
     })
+    const preparations = new PreparationStore({ ...store.createPreparationStoreOptions(), isTopicTermsCurrent: snapshot => terms.isSnapshotCurrent(snapshot) })
+    topics.setPreparation(preparations, envelope => materials.resolveSubmittedMaterial(envelope), target => materials.resolveSubmittedTarget(target))
     const objectAssets = new ObjectAssetsClient(adaptObjectAssetsRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationObjects')
@@ -182,6 +185,7 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => async () => {
       remoteDisposed = true
       materials.dispose()
+      preparations.dispose()
       normal.dispose()
       quick.dispose()
       await topics.dispose()

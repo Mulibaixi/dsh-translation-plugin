@@ -11,6 +11,10 @@ import type { NormalTranslationUnitRequest, NormalTranslationSourceCorrection } 
 import type { NormalTranslationResolution, NormalTranslationV2Event } from '../shared/normal-translation-v2.js'
 import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import type { NormalTranslationReply } from './normal-translation.js'
+import type { PreparationStore } from './preparation-store.js'
+import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
+import { MAX_ANALYSIS_PAGE_BYTES, type PreparationReceipt, type PreparationPage } from '../shared/translation-preparation.js'
+import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
 
 export interface TopicBridgeRemotePort {
   capabilities(): Promise<unknown>
@@ -66,12 +70,18 @@ export class TopicBridgeClient {
   private readonly stopStore: () => void
   private disposed = false
   private normal: NormalPort | undefined
+  private preparation: PreparationStore | undefined
+  private resolvePreparationMaterial: ((envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>) => Extract<TranslationMaterialEnvelope, { kind: 'material' }> | undefined) | undefined
+  private resolvePreparationTarget: ((target: NormalTranslationMaterialTarget) => Extract<TranslationMaterialEnvelope, { kind: 'material' }> | undefined) | undefined
   constructor(private readonly remote: TopicBridgeRemotePort | (() => Promise<TopicBridgeRemotePort | undefined>) | undefined,
     private readonly sessions: SessionStore, private readonly terms: TopicBridgeTermsPort, private readonly archive: TopicBridgeArchivePort) {
     this.stopStore = sessions.subscribe(() => this.reconcile())
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   setNormalTranslation(port: NormalPort): void { this.normal = port }
+  setPreparation(port: PreparationStore, resolveMaterial: NonNullable<TopicBridgeClient['resolvePreparationMaterial']>, resolveTarget?: TopicBridgeClient['resolvePreparationTarget']): void {
+    this.preparation = port; this.resolvePreparationMaterial = resolveMaterial; this.resolvePreparationTarget = resolveTarget
+  }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private key(ownerId: string, sessionId: string, unitId: string): string { return JSON.stringify([ownerId, sessionId, unitId]) }
   getStatus(ownerId: string): { readonly ready: boolean; readonly reason: string | undefined } {
@@ -177,6 +187,25 @@ export class TopicBridgeClient {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
+    if (command.kind === 'preparation_prepare' || command.kind === 'preparation_set' || command.kind === 'preparation_status' || command.kind === 'preparation_read') {
+      if (!this.preparation || command.request.target.mainSessionId !== ownerId) return error(request.requestId, 'scope_mismatch', '准备记录不属于当前主会话或通道尚未就绪。')
+      const measure = (page: PreparationPage) => new TextEncoder().encode(JSON.stringify(success({ kind: 'preparation_page', page }))).byteLength
+      let result
+      if (command.kind === 'preparation_prepare' || command.kind === 'preparation_set') {
+        const envelope = this.resolvePreparationMaterial?.(command.envelope), session = envelope && this.sessions.getSession(envelope.material.translationSessionId)
+        if (!envelope || envelope.ownerId !== ownerId || envelope.mainSessionId !== ownerId || !session || session.ownerId !== ownerId ||
+          session.topicId !== envelope.material.topicId || this.sessions.isSessionDeleted(session.id) || session.mode !== 'normal') return error(request.requestId, 'material_mismatch', '准备要求的材料不是当前主会话确切交付的固定材料。')
+        const topicTerms = await (this.terms.reconcileAsync?.(ownerId, session.topicId) ?? this.terms.getSnapshot(ownerId, session.topicId))
+        result = command.kind === 'preparation_prepare' ? await this.preparation.prepare(command.request, { envelope, analysis: command.analysis, topicTerms }, measure)
+          : await this.preparation.set(command.request, { envelope, topicTerms }, measure)
+      } else if (command.kind === 'preparation_status') result = this.preparation.status(command.request, this.resolvePreparationTarget?.(command.request.target))
+      else result = this.preparation.read(command.request, measure)
+      if (!result.ok) return error(request.requestId, result.error.code, result.error.message)
+      const value: TopicBridgeValue = command.kind === 'preparation_read' ? { kind: 'preparation_page', page: result.value as PreparationPage }
+        : { kind: 'preparation_receipt', receipt: result.value as PreparationReceipt }
+      if (new TextEncoder().encode(JSON.stringify(success(value))).byteLength > MAX_ANALYSIS_PAGE_BYTES) return error(request.requestId, 'reply_too_large', '完整准备回执超过 32768 字节，未截断字段。')
+      return success(value)
+    }
     if (command.kind === 'normal_resolve' || command.kind === 'normal_correct_source') {
       const target = command.target, publication = this.publications.get(this.key(ownerId, target.translationSessionId, target.unitId))
       if (target.mainSessionId !== ownerId || !publication) return error(request.requestId, 'reference_not_published', '此单元尚未明确提供给当前主模型。')

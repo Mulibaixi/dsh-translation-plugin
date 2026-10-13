@@ -3,6 +3,7 @@ import type { DshExecutionContext } from './dsh-text-adapter.js'
 import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection } from '../shared/normal-translation.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TerminologyAnalysisService } from './terminology-analysis.js'
+import type { TranslationPreparationService } from './translation-preparation.js'
 import { parseTranslationAnalysisStart, parseTranslationAnalysisQuery, parseTranslationAnalysisRead } from '../shared/translation-preparation.js'
 
 export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
@@ -124,7 +125,8 @@ class ManagementConnection {
     if (reply.ok) {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
-        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected' }[pending.frame.command.kind]
+        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
+        preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -171,6 +173,7 @@ export class TopicToolsService {
     if (!this.ownsAgent(ownerId, exec.agent)) throw bridgeError('scope_mismatch', '翻译操作不属于已连接的主 Agent。')
     const parsed = parseTopicBridgeCommand(command, this.connections.get(ownerId)!.protocol)
     if (new TextEncoder().encode(JSON.stringify(parsed)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '本次业务材料和要求超过通道上限，未截断或受理。')
+    if (parsed.kind.startsWith('preparation_') && new TextEncoder().encode(JSON.stringify({ kind: 'request', requestId: 'x'.repeat(36), mainSessionId: ownerId, callId: exec.callId, command: parsed })).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '完整准备传输包超过通道上限，未截断候选或登记准备。')
     const connection = this.connections.get(ownerId)!, before = this.ownedRequests.get(connection) ?? Promise.resolve()
     const result = before.then(async () => {
       exec.signal.throwIfAborted()
@@ -330,6 +333,41 @@ export class TopicToolsService {
           parameters: { ...queryParameters, section: { type: 'string', enum: ['candidates', 'coverage', 'calls'], required: true }, cursor: { type: 'string' }, limit: { type: 'integer' } },
           output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
           execute: (args: unknown, exec: ToolExecution) => { checkAgent(exec); return analysis.read(parseTranslationAnalysisRead(args), exec) },
+        })))
+      }
+      const preparation = this.ctx.get?.('translationPreparation') as TranslationPreparationService | undefined
+      if (preparation && connection.protocol === 2) {
+        const range = { type: 'object', additionalProperties: false, properties: { start: { type: 'integer', required: true }, end: { type: 'integer', required: true } } }
+        const reference = { oneOf: [
+          { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['candidate'], required: true }, id: { type: 'string', required: true }, version: { type: 'integer', enum: [1], required: true } } },
+          { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['topic_term'], required: true }, id: { type: 'string', required: true }, entryVersion: { type: 'integer', required: true } } },
+        ], required: true }
+        const common = { target: { ...materialTargetParameter, required: true }, preparationId: { type: 'string', required: true } }
+        const query = { ...common, version: { type: 'integer', required: true } }
+        const definitions: readonly { name: string; method: 'prepare' | 'set' | 'status' | 'read'; description: string; parameters: Record<string, unknown> }[] = [
+          { name: 'translation_batch_prepare', method: 'prepare', parameters: { ...common, operationId: { type: 'string', required: true }, analysisId: { type: 'string', required: true }, analysisVersion: { type: 'integer', enum: [1], required: true } },
+            description: 'Freeze a task preparation catalog from one actual authorized terminology analysis and exact delivered material. Use the returned preparation version; repeated operationId with identical input does not repeat analysis or create translation history. Host supplies real coverage and candidate facts, Client supplies current topic terms. Partial or failed scans may be inspected but cannot become ready. The preparation is saved as an audit snapshot only when history saving is enabled; source and analysis remain runtime-only.' },
+          { name: 'translation_batch_set_preparation', method: 'set', parameters: { ...common, expectedVersion: { type: 'integer', required: true }, operationId: { type: 'string', required: true }, organizedRequirements: { type: 'string', required: true },
+            termSelections: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
+              ref: reference, ranges: { type: 'array', items: range, required: true },
+              descriptionRef: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, version: { type: 'integer', enum: [1], required: true } } },
+              content: { type: 'object', additionalProperties: false, properties: { original: { type: 'string', required: true }, preferred: { type: 'string', required: true }, description: { type: 'string' } } },
+            } } },
+            reviewedRanges: { type: 'array', items: range, required: true }, backgroundRanges: { type: 'array', items: range },
+            referenceRefs: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, version: { type: 'integer', required: true }, range: { ...range, required: true } } } },
+            questions: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, question: { type: 'string', required: true }, ranges: { type: 'array', items: range, required: true }, decision: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true } } } } },
+            description: 'Append an immutable task preparation version using exact candidate or topic-term references and source ranges. Query candidates/conflicts first; preserve homonymous meanings by assigning nonoverlapping contexts. Client freezes actual selected translations and descriptions and enforces current user-fixed rules. Candidate content can adjust task wording only while retaining the exact original candidate spelling. organizedRequirements supplements frozen userRequirements from the delivered material and cannot replace them. Adoption is task-local and does not edit permanent topic terminology. reviewedRanges records the main model review independently from mechanical scan coverage. backgroundRanges references only fixed source context. External referenceRefs must be empty until an authorized reference registry is implemented. preparationReady means preparation gates passed; executionReady remains false because plan and call budget are pending.' },
+          { name: 'translation_batch_preparation_status', method: 'status', parameters: query,
+            description: 'Read the exact preparation version and accurate preparationReady, executionReady, editable and storage facts. Saved audit snapshots can be read after restart while their owning translation Session still exists. This does not restore source material, analysis, model calls or permission to edit; no translation is started.' },
+          { name: 'translation_batch_read_preparation', method: 'read', parameters: { ...query, section: { type: 'string', enum: ['summary', 'candidates', 'terms', 'coverage', 'background', 'references', 'questions', 'conflicts'], required: true }, cursor: { type: 'string' }, limit: { type: 'integer' } },
+            description: 'Read a complete bounded preparation page, at most 50 items and 32768 UTF-8 bytes; follow nextCursor. Summary, adopted terms, coverage, background ranges, references, questions and conflicts are saved audit facts. Candidate catalogs remain runtime-only and are unavailable after restart. Original and reference bodies are never copied into this response. Reading does not invoke a model or execute a document.' },
+        ]
+        for (const definition of definitions) disposers.push(agent.ctx.tools.register(helpers.defineTool({ name: definition.name, description: definition.description, parameters: definition.parameters,
+          output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+          execute: (args: unknown, exec: ToolExecution) => {
+            if (exec.agent !== agent || !this.ownsAgent(agent.id, exec.agent)) throw bridgeError('scope_mismatch', '准备工具不属于已连接的实际主 Agent。')
+            return preparation[definition.method](args, exec)
+          },
         })))
       }
       const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown>; correctSource(args: unknown, exec: ToolExecution): Promise<unknown> } | undefined

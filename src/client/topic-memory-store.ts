@@ -85,6 +85,13 @@ export class TopicMemoryStore {
     this.seats.set(topicId, seat); return seat
   }
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot { return this.seat(ownerId, topicId).snapshot }
+  /** Preparation freezes only the current authoritative topic version under the shared lock. */
+  isSnapshotCurrent(snapshot: TopicTermSnapshot): boolean {
+    const seat = this.seats.get(snapshot.topicId)
+    return !this.disposed && !!seat && seat.status !== 'conflict' && seat.snapshot.ownerId === snapshot.ownerId &&
+      JSON.stringify(seat.snapshot) === JSON.stringify(snapshot) && this.currentRaw(seat) &&
+      this.sessions.getTopics(snapshot.ownerId).some(topic => topic.id === snapshot.topicId)
+  }
   readEvidenceAvailability(ownerId: string, topicId: string, ref: TermEvidenceRef): 'ready' | 'unloaded' | 'unavailable' {
     if (isTopicEvidenceUnloaded(this.sessions, { ownerId, topicId }, ref)) return 'unloaded'
     return resolveTermEvidence({ ownerId, topicId }, ref, (sessionId, unitId) => this.readEvidence(sessionId, unitId)) !== undefined ? 'ready' : 'unavailable'

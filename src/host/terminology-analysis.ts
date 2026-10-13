@@ -311,6 +311,17 @@ export class TerminologyAnalysisService {
     const found = this.lookup(query, exec)
     return found.ok ? ok(found.value.run) : found
   }
+  /** Preparation consumes real Host facts, never coverage or fixed labels supplied by a model. */
+  preparationFacts(args: unknown, exec: ToolExecution): AnalysisResult<{ readonly run: AnalysisRun; readonly candidates: readonly AnalysisCandidate[]; readonly coverage: readonly AnalysisCoverage[] }> {
+    let query: TranslationAnalysisQuery
+    try { query = parseTranslationAnalysisQuery(args) } catch { return bad('invalid_input', '准备引用的分析参数无效。', 'freeze_preparation_analysis') }
+    const found = this.lookup(query, exec)
+    if (!found.ok) return found
+    const job = found.value
+    if (!this.current(job)) return bad('scope_mismatch', '分析与当前已交付的固定材料不一致。', 'freeze_preparation_analysis')
+    if (['frozen', 'preparing', 'running'].includes(job.run.status)) return bad('analysis_running', '分析仍在进行，请查询原分析后形成准备包。', 'freeze_preparation_analysis')
+    return ok({ run: job.run, candidates: job.candidates, coverage: job.coverage })
+  }
   read(args: unknown, exec: ToolExecution): AnalysisResult<AnalysisPage> {
     let request: ReturnType<typeof parseTranslationAnalysisRead>
     try { request = parseTranslationAnalysisRead(args) } catch { return bad('invalid_input', '分析分页参数无效。', 'read_analysis') }
