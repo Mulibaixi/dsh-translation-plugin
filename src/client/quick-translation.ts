@@ -78,7 +78,7 @@ export class QuickTranslationClient {
   blockedReason(session: LocalSession): string | undefined {
     if (session.mode !== 'quick') return '普通模式需主模型协作，尚未接入。'
     if (session.archivedAt !== null) return '归档会话需恢复后才能翻译。'
-    if (this.isBusy(session.id)) return '当前会话仍有未结束或结果未知的翻译，请先查询或取消。'
+    if (this.store.hasDocumentLease(session.id) || this.isBusy(session.id)) return '当前会话仍有未结束或结果未知的翻译，请先查询或取消。'
     if (this.readiness !== 'ready') return this.reason
     if (!session.input.trim()) return '请输入待翻译内容。'
     if (Array.from(session.input).length > session.maxInputChars) return `原文超过单次上限 ${session.maxInputChars} 个字符。`

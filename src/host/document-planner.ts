@@ -20,6 +20,17 @@ export interface DocumentPlanningInput {
   readonly readSource: (range: TranslationSourceRange) => string | Promise<string>
   readonly isCurrent: () => boolean
 }
+/** Private Host execution capture. Immutable references and capacity facts, without source or prompt bodies. */
+export interface DocumentExecutionFreeze {
+  readonly target: TranslationPlanQuery['target']
+  readonly sourceSha256: string
+  readonly plan: DocumentChunkPlan
+  readonly preparation: PreparationSnapshot
+  readonly protectedRanges: readonly TranslationSourceRange[]
+  readonly budgets: readonly DocumentChunkBudget[]
+  readonly capacity: DocumentPreparedCapacity
+  readonly callBudget: DocumentPlanCallBudget
+}
 interface PlanningRecord {
   readonly target: TranslationPlanQuery['target']
   readonly sourceSha256: string
@@ -284,7 +295,8 @@ export class DocumentPlanner {
       if (previous && !same(previous.target, request.target)) return bad('source_mismatch', '计划标识已绑定另一固定材料。')
       const protectedRanges = request.protectedRanges ?? previous?.protectedRanges ?? []
       const plan = parseDocumentChunkPlan({ id: request.planId, version: request.expectedVersion + 1, sourceVersion: request.target.sourceVersion,
-        preparationRef: request.preparationRef, items: request.items, createdAt: new Date().toISOString(), operationId: request.operationId }, preparation.totalCodePoints)
+        preparationRef: request.preparationRef, items: request.items, protectedRanges,
+        createdAt: new Date().toISOString(), operationId: request.operationId }, preparation.totalCodePoints)
       this.validatePlan(preparation, plan, protectedRanges)
       const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
       const budgets = plan.items.map(item => {
@@ -320,6 +332,46 @@ export class DocumentPlanner {
   private lookup(query: TranslationPlanQuery): AnalysisResult<PlanningRecord> {
     const record = this.plans.get(key(query.target, query.planId))?.find(item => item.plan.version === query.version)
     return record && same(record.target, query.target) ? ok(record) : bad('not_found', '未找到此已授权固定材料的运行期计划版本。', 'query_plan')
+  }
+  /** Recheck the actual prepared route and all complete prompts before business admission. */
+  async freezeExecution(input: DocumentPlanningInput, query: TranslationPlanQuery, preparationRef: VersionReference,
+    signal = new AbortController().signal): Promise<AnalysisResult<DocumentExecutionFreeze>> {
+    const preparedId = `document-admission:${crypto.randomUUID()}`
+    try {
+      const found = this.lookup(query)
+      if (!found.ok) return found
+      const record = found.value, preparation = this.check(input, query.target, preparationRef)
+      if (!same(preparationRef, record.plan.preparationRef) || record.sourceSha256 !== preparation.sourceSha256) throw reject('source_mismatch', '执行引用不属于此固定计划与准备版本。', 'freeze_document')
+      this.validatePlan(preparation, record.plan, record.protectedRanges)
+      const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
+      if (!same(capacity.route, record.receipt.capacity.route)) throw reject('model_mismatch', '实际默认推理等级或路由已变化，请重新准备并规划。', 'freeze_document')
+      const budgets = record.plan.items.map(item => this.budget(preparation, item, source.points, capacity,
+        input.envelope.material.maxInputChars, record.protectedRanges).budget)
+      return ok(frozen({ target: record.target, sourceSha256: record.sourceSha256,
+        plan: { ...record.plan, protectedRanges: record.protectedRanges },
+        preparation: frozen(structuredClone(preparation)), protectedRanges: record.protectedRanges, budgets, capacity,
+        callBudget: callBudget(input.analysis.actualCalls, record.plan.items) }))
+    } catch (error) { return errorResult(error) }
+    finally { this.adapter.discard(preparedId) }
+  }
+  /** The serial worker uses the exact same prompt and capacity helper as planning. */
+  async readExecutionSource(input: DocumentPlanningInput, snapshot: DocumentExecutionFreeze, signal: AbortSignal): Promise<readonly string[]> {
+    return (await this.source(input, snapshot.preparation, signal)).points
+  }
+  async reconstructExecution(input: DocumentPlanningInput, snapshot: DocumentExecutionFreeze, chunkId: string,
+    capacity: DocumentPreparedCapacity, signal: AbortSignal, frozenSource?: readonly string[]): Promise<AnalysisResult<DocumentTranslationPrompt>> {
+    try {
+      if (!same(capacity.route, snapshot.capacity.route)) throw reject('model_mismatch', '执行时实际模型路由或默认推理等级已变化。', 'prepare_document')
+      const item = snapshot.plan.items.find(item => item.chunkId === chunkId)
+      if (!item || item.mode === 'copy') return bad('copy_has_no_call', 'copy 块不装配模型提示。', 'prepare_document')
+      signal.throwIfAborted()
+      if (!input.isCurrent()) throw reject('scope_mismatch', '整篇原会话或源授权已失效。', 'prepare_document')
+      const points = frozenSource ?? (await this.source(input, snapshot.preparation, signal)).points
+      const assembled = this.budget(snapshot.preparation, item, points, capacity, input.envelope.material.maxInputChars, snapshot.protectedRanges)
+      const expected = snapshot.budgets.find(item => item.chunkId === chunkId)
+      if (!expected || !same(assembled.budget.contextRef, expected.contextRef)) throw reject('context_mismatch', '实际上下文引用与受理时冻结集合不一致。', 'prepare_document')
+      return ok(assembled.prompt!)
+    } catch (error) { return errorResult(error) }
   }
   status(query: TranslationPlanQuery): AnalysisResult<DocumentPlanReceipt> { const found = this.lookup(query); return found.ok ? ok(found.value.receipt) : found }
   read(request: TranslationPlanRead): AnalysisResult<DocumentPlanPage> {

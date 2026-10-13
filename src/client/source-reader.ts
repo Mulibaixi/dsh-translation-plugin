@@ -139,11 +139,15 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     const manifest = target.manifestRevisionId === undefined ? (selected?.sourceVersion === sourceVersion ? selected : undefined) ?? [...unit.revisions].reverse().find(revision => revision.sourceVersion === sourceVersion) ?? null
       : target.manifestRevisionId === null ? null : unit.revisions.find(revision => revision.id === target.manifestRevisionId) ?? null
     if (target.manifestRevisionId && !manifest || manifest && manifest.sourceVersion !== sourceVersion) return unavailable(request, 'missing', 'manifest_missing')
+    const task = [...unit.tasks].reverse().find(task => task.sourceVersion === sourceVersion)
     const plan = manifest ? unit.plans.find(plan => sameVersionReference(plan, manifest.planRef)) ?? null
-      : [...unit.plans].reverse().find(plan => plan.sourceVersion === sourceVersion) ?? null
+      : task ? unit.plans.find(plan => sameVersionReference(plan, task.planRef)) ?? null : null
     const blocks: DocumentReadBlock[] = (plan?.items ?? []).map(item => {
       const entry = manifest?.entries.find(entry => entry.chunkId === item.chunkId)
-      return { ...item, revisionId: entry?.revisionId ?? null, revision: entry ? unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId) ?? null : null }
+      const revision = entry ? unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId) ?? null : !manifest && task && plan
+        ? [...unit.chunkRevisions].reverse().find(chunk => chunk.chunkId === item.chunkId && chunk.taskId === task.taskId && chunk.sourceVersion === sourceVersion &&
+          sameVersionReference(chunk.planRef, plan) && sameVersionReference(chunk.preparationRef, task.preparationRef)) ?? null : null
+      return { ...item, revisionId: revision?.id ?? null, revision }
     })
     const scope: TranslationSourceScope = { ownerId: target.ownerId, mainSessionId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId }
     const check = (): EvidenceUnavailableResult | null => {
@@ -166,7 +170,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       if (manifest && retainedManifest !== manifest && !same(manifest, retainedManifest)) return unavailable(request, 'corrupt', 'manifest_identity_changed')
       for (const block of blocks) if (block.revision) {
         const retained = current.chunkRevisions.find(chunk => chunk.id === block.revision!.id)
-        if (!retained || retained !== block.revision && !same(block.revision, retained)) return unavailable(request, 'corrupt', 'chunk_identity_changed')
+        if (!retained || retained !== block.revision && !same(block.revision, retained)) return manifest ? unavailable(request, 'corrupt', 'chunk_identity_changed') : unavailable(request, 'unloaded', 'evidence_changed')
       }
       return null
     }
@@ -185,7 +189,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       let loaded: LoadedText
       try {
         if (!chunk) loaded = await this.sourceText(fixed, reading, range)
-        else if (chunk.status !== 'completed' || chunk.sourceVersion !== sourceVersion) return unavailable(fixed, 'missing', 'chunk_not_completed', length)
+        else if (chunk.sourceVersion !== sourceVersion || chunk.content.kind !== 'text' && chunk.status !== 'completed') return unavailable(fixed, 'missing', 'chunk_not_completed', length)
         else if (chunk.content.kind === 'text') loaded = { text: slicePoints(chunk.content.text, range) }
         else {
           const prepared = await this.prepareAsset(fixed, reading)
@@ -222,8 +226,9 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       }, readChunk: (revisionId, range) => {
         const block = blocks.find(block => block.revisionId === revisionId), chunk = block?.revision
         const entry = manifest?.entries.find(entry => entry.revisionId === revisionId)
-        if (!chunk || !block || !entry || entry.reuseRef || chunk.chunkId !== block.chunkId || !same(entry.outputRange, block.outputRange) ||
-          chunk.taskId !== manifest!.taskId || !sameVersionReference(chunk.planRef, manifest!.planRef) || !sameVersionReference(chunk.preparationRef, manifest!.preparationRef) ||
+        const binding = manifest ?? task
+        if (!chunk || !block || !binding || !plan || manifest && (!entry || entry.reuseRef || !same(entry.outputRange, block.outputRange)) || chunk.chunkId !== block.chunkId ||
+          chunk.taskId !== binding.taskId || !sameVersionReference(chunk.planRef, binding.planRef) || !sameVersionReference(chunk.preparationRef, binding.preparationRef) ||
           (block.mode === 'copy' ? chunk.kind !== 'copy' || chunk.content.kind !== 'source_copy' : chunk.kind === 'copy') ||
           chunk.content.kind === 'source_copy' && (chunk.content.sourceVersion !== sourceVersion || !same(chunk.content.range, block.outputRange))) {
           return Promise.resolve(unavailable(request, 'corrupt', 'manifest_invalid'))

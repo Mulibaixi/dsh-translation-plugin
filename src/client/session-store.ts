@@ -77,6 +77,7 @@ export class SessionStore {
   private readonly sessionOrders = new Map<string, readonly string[]>()
   private readonly workspaces = new Map<string, Workspace>()
   private readonly listeners = new Set<Disposer>()
+  private readonly executionLeases = new Map<string, string>()
   private notice: string | undefined
   private readonly stop: Disposer | undefined
   private disposed = false
@@ -91,6 +92,23 @@ export class SessionStore {
   getSession(id: string): LocalSession | undefined { return this.seats.get(id)?.session }
   isSessionDeleted(id: string): boolean { return this.isDeleted(id) }
   getTranslationHistory(id: string): TranslationHistory | undefined { return this.seats.get(id)?.translationHistory }
+  /** A document parent owns this session; its children use the same lease. */
+  claimDocumentLease(sessionId: string, taskId: string): (() => void) | undefined {
+    if (this.disposed || !this.seats.has(sessionId) || this.executionLeases.has(sessionId)) return undefined
+    this.executionLeases.set(sessionId, taskId)
+    let released = false
+    return () => { if (!released && this.executionLeases.get(sessionId) === taskId) { released = true; this.executionLeases.delete(sessionId); this.emit() } }
+  }
+  hasDocumentLease(sessionId: string): boolean { return this.executionLeases.has(sessionId) }
+  /** Await the current history write without treating queued work as saved. */
+  async saveTranslationHistoryAsync(sessionId: string): Promise<boolean> {
+    if (!this.readSettings() || !this.settings.rememberHistory) return false
+    await this.pendingSaves.get(sessionId)
+    const queued = this.pendingSaves.get(sessionId)
+    if (queued) await queued
+    if (this.seats.get(sessionId)?.status === 'saved') return true
+    return this.saveSessionAsync(sessionId)
+  }
   /** Separate preparation audit storage shares history settings and the existing structure lock. */
   createPreparationStoreOptions(): PreparationStoreOptions {
     const validKey = (key: string): void => { if (!key.startsWith(PREPARATION_STORAGE_PREFIX)) throw new Error('Preparation storage key is outside its namespace') }

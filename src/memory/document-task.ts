@@ -29,7 +29,7 @@ function unique<T>(items: readonly T[], key: (item: T) => string): void {
 function versions(items: readonly VersionReference[]): void {
   const latest = new Map<string, number>()
   for (const item of items) {
-    if (item.version !== (latest.get(item.id) ?? 0) + 1) throw new TypeError('Document reference versions must be consecutive')
+    if (item.version <= (latest.get(item.id) ?? 0)) throw new TypeError('Document reference versions must increase')
     latest.set(item.id, item.version)
   }
 }
@@ -62,7 +62,8 @@ function validateChunk(unit: DocumentUnit, revision: ChunkRevision): void {
   const plan = binding(unit, revision), item = plan.items.find(item => item.chunkId === revision.chunkId)
   if (!item || (revision.kind === 'copy' ? item.mode !== 'copy' : item.mode !== 'translate')) throw new TypeError('Document chunk does not belong to the fixed plan')
   if (revision.content.kind === 'source_copy' && (revision.content.sourceVersion !== revision.sourceVersion || !same(revision.content.range, item.outputRange))) throw new TypeError('Copy must reference the exact source output range')
-  if (revision.callRecord && !same(revision.callRecord.contextRef.contextRanges, item.contextRanges)) throw new TypeError('Call context must use the fixed plan background ranges')
+  // Actual contexts include preparation background and exclude output overlap. Admission
+  // checks their frozen budget; history retains their exact immutable references.
 }
 /** Invalid references are rejected; an ended but incomplete chunk remains a visible candidate. */
 export function documentManifestEligibility(unit: DocumentUnit, revision: Omit<DocumentRevision, 'eligibility'>): DocumentEligibility {
@@ -139,7 +140,7 @@ function appendVersion<T extends VersionReference>(items: readonly T[], added: T
     if (same(old, added)) return items
     throw new TypeError('Document reference already has different content')
   }
-  if (added.version !== (items.filter(item => item.id === added.id).at(-1)?.version ?? 0) + 1) throw new TypeError('Stale document reference version')
+  if (added.version <= (items.filter(item => item.id === added.id).at(-1)?.version ?? 0)) throw new TypeError('Stale document reference version')
   return [...items, added]
 }
 /** Admission and receipts mutate one unit. Late old-source receipts never select a current final. */
@@ -188,6 +189,11 @@ export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutatio
     if (Object.keys(mutation.patch).some(key => !['status', 'content', 'callRecord', 'updatedAt'].includes(key))) throw new TypeError('Document chunk identity is immutable')
     const revision = parseChunkRevision({ ...old, ...mutation.patch }, documentSourceLength(sourceOf(unit, old.sourceVersion)))
     if (same(old, revision)) return unit
+    if (old.callRecord) {
+      if (!revision.callRecord) throw new TypeError('Actual document call cannot be removed')
+      const { usage: oldUsage, ...oldCall } = old.callRecord, { usage: newUsage, ...newCall } = revision.callRecord
+      if (!same(oldCall, newCall) || (['inputTokens', 'outputTokens'] as const).some(key => oldUsage[key] !== null && oldUsage[key] !== newUsage[key])) throw new TypeError('Actual document call facts are immutable')
+    }
     if (!['running', 'unknown'].includes(old.status)) throw new TypeError('Ended document chunks are immutable')
     if (unit.revisions.some(manifest => manifest.entries.some(entry => entry.revisionId === old.id))) throw new TypeError('A fixed manifest chunk is immutable')
     next = { ...unit, chunkRevisions: unit.chunkRevisions.map(item => item.id === revision.id ? revision : item) }

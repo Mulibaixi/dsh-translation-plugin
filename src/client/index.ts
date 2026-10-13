@@ -13,9 +13,10 @@ import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePor
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type NativeMaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
 import { PreparationStore } from './preparation-store.js'
+import { DocumentTasksClient } from './document-tasks.js'
 import { NormalTranslationClient, type NormalTranslationRemotePort, type NormalTranslationV2RemotePort } from './normal-translation.js'
 import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
-import { adaptTranslationSourceStorageRemote, type TranslationSourceStorageRemotePort } from './source-storage-client.js'
+import { adaptTranslationSourceStorageRemote, TranslationSourceStorageClient, type TranslationSourceStorageRemotePort } from './source-storage-client.js'
 import { adaptTranslationSourceIntegrityRemote, type TranslationSourceIntegrityRemotePort } from './source-integrity-client.js'
 import { TranslationSourceReader } from './source-reader.js'
 export { adaptTranslationSourceStorageRemote, TranslationSourceStorageClient } from './source-storage-client.js'
@@ -176,6 +177,11 @@ export function apply(ctx: ClientPluginContext): void {
       } : ctx.remote.translationNormalV2,
     })
     topics.setNormalTranslation(normal)
+    const documents = new DocumentTasksClient(store, materials, preparations, ownerId => topics.retain(ownerId), {
+      isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId), reader: evidence,
+      sourceStorage: new TranslationSourceStorageClient(storage), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
+    })
+    topics.setDocumentTasks(documents)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
     ctx.effect(() => () => terms.dispose(), 'translation topic terms')
@@ -185,6 +191,7 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => async () => {
       remoteDisposed = true
       materials.dispose()
+      documents.dispose()
       preparations.dispose()
       normal.dispose()
       quick.dispose()

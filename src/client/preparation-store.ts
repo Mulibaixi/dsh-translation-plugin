@@ -338,6 +338,31 @@ export class PreparationStore {
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '准备查询参数或保存记录无效。', 'read_preparation') }
   }
   /** Private planning capture: saved audits alone never recreate runtime preparation authority. */
+  async documentPreparation(args: unknown, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): Promise<AnalysisResult<PreparationSnapshot>> {
+    try {
+      const query = parseTranslationPreparationQuery(args), hash = await sourceHash(envelope)
+      return await this.locked(() => {
+        const { seat, snapshot } = this.lookup(query)
+        if (!matchesTarget(envelope, query.target) || !same(materialScope(envelope), snapshot.scope) || hash !== snapshot.sourceSha256 ||
+          !seat.catalog || seat.catalog.binding !== binding(envelope, hash) || !seat.planningBindings?.[snapshot.version]) return bad('analysis_unavailable', '受理需要原运行期确切原稿、准备与真实分析事实。', 'accept_document')
+        if (!snapshot.preparationReady || !snapshot.mechanicalCoverage.complete || !snapshot.modelReview.complete || snapshot.conflicts.length || snapshot.questions.some(question => question.decision === null)) return bad('preparation_not_ready', '受理的准备包尚不完整。', 'accept_document')
+        if (!(this.options.isEnabled?.() ?? true) || snapshot.storage === 'saved') return ok(snapshot)
+        if (!this.options.storage || !this.options.withLock) return ok({ ...snapshot, storage: 'runtime_only', storageError: '准备保存不可用；整篇事实仅在运行期保留。' })
+        const storageKey = key(snapshot.scope.ownerId, snapshot.id)
+        try {
+          if (this.options.storage.getItem(storageKey) !== seat.stored) return bad('stale_preparation', '准备记录在受理前变化，请重新查询。', 'accept_document')
+          const audit: StoredPreparation = { ...seat.audit, versions: seat.audit.versions.map(item => ({ ...item, storage: 'saved', storageError: null })) }
+          const encoded = JSON.stringify(audit)
+          this.options.storage.setItem(storageKey, encoded)
+          if (this.options.storage.getItem(storageKey) !== encoded) throw new Error('Preparation save acknowledgment unavailable')
+          const next: Seat = { ...seat, stored: encoded, audit: immutable(audit) }
+          this.seats.set(storageKey, next)
+          return ok(next.audit.versions.find(item => item.version === snapshot.version)!)
+        } catch { return ok({ ...snapshot, storage: 'runtime_only', storageError: '准备保存失败；本版本仅在运行期保留。' }) }
+      })
+    } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '文档准备引用或固定材料无效。', 'accept_document') }
+  }
+  /** Private planning capture: saved audits alone never recreate runtime preparation authority. */
   async capture(args: unknown, rawFacts: PreparationCurrentFacts, relevantFixedIds: readonly string[], measureReply: (snapshot: PreparationSnapshot) => number): Promise<AnalysisResult<PreparationSnapshot>> {
     try {
       const query = parseTranslationPreparationQuery(args), facts = parsePreparationCurrentFacts(rawFacts), hash = await sourceHash(facts.envelope)

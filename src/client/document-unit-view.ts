@@ -82,7 +82,7 @@ function DocumentPage({ handle, block, side, session, unitId, objects, objectAss
   lifetime.current.visible = visible; lifetime.current.navigationRevision = navigationRevision
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false } }, [])
   async function load(start = 0): Promise<void> {
-    if (!lifetime.current.mounted || !lifetime.current.visible || lifetime.current.busy || start >= total || side === 'target' && (!revision || revision.status !== 'completed')) return
+    if (!lifetime.current.mounted || !lifetime.current.visible || lifetime.current.busy || start >= total || side === 'target' && (!revision || revision.content.kind !== 'text' && revision.status !== 'completed')) return
     lifetime.current.busy = true; setPending(true)
     requestedStart.current = start
     const navigation = navigationRevision, active = (): boolean => lifetime.current.mounted && lifetime.current.visible && lifetime.current.navigationRevision === navigation
@@ -107,7 +107,7 @@ function DocumentPage({ handle, block, side, session, unitId, objects, objectAss
     finally { lifetime.current.busy = false; if (lifetime.current.mounted) setPending(false) }
   }
   react.useEffect(() => {
-    if (!visible || page || !element.current || typeof IntersectionObserver === 'undefined' || !total || side === 'target' && revision?.status !== 'completed') return
+    if (!visible || page || !element.current || typeof IntersectionObserver === 'undefined' || !total || side === 'target' && (!revision || revision.content.kind !== 'text' && revision.status !== 'completed')) return
     const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) { observer.disconnect(); void load() } }, { rootMargin: '200px' })
     observer.observe(element.current); return () => observer.disconnect()
   }, [visible, navigationRevision])
@@ -121,7 +121,7 @@ function DocumentPage({ handle, block, side, session, unitId, objects, objectAss
     side === 'target' && revision && revision.status !== 'completed' ? h('p', { role: revision.status === 'unknown' ? 'alert' : 'status', className: 'dsh-tp-muted' }, statusLabels[revision.status]) : null,
     total === 0 && revision?.status === 'completed' ? h('p', { className: 'dsh-tp-muted' }, '此范围没有文本。') : null,
     failure ? h('p', { role: 'status', className: 'dsh-tp-muted' }, readNotice(failure)) : null,
-    total > 0 && (side === 'source' || revision?.status === 'completed') ? h('div', { className: 'dsh-tp-actions dsh-tp-record-page-actions' },
+    total > 0 && (side === 'source' || revision?.status === 'completed' || revision?.content.kind === 'text') ? h('div', { className: 'dsh-tp-actions dsh-tp-record-page-actions' },
       page ? h('small', { className: 'dsh-tp-muted' }, `${page.start + 1}–${page.end} / ${total}`) : null,
       !page || failure ? h('button', { type: 'button', disabled: pending, onClick: () => { void load(requestedStart.current) } }, pending ? '正在加载…' : failure ? '重试加载' : `加载${label}`) : null,
       page && page.start > 0 ? h('button', { type: 'button', disabled: pending, onClick: () => { void load(previous.current.at(-1) ?? 0) } }, '上一页') : null,
@@ -164,7 +164,7 @@ export function DocumentUnitView({ unit, session, documents, objects, objectAsse
       const offset = targetOffset
       if (!block.revision || block.revision.status !== 'completed') targetOffset = null
       else if (targetOffset !== null) targetOffset += block.revision.content.kind === 'text' ? sourceCodePointLength(block.revision.content.text) : block.revision.content.range.end - block.revision.content.range.start
-      return h('section', { key: JSON.stringify([identity, readable?.plan?.id, readable?.plan?.version, block.chunkId, block.revisionId, block.revision?.status]), 'data-chunk-id': block.chunkId, className: 'dsh-tp-record-block' },
+      return h('section', { key: JSON.stringify([identity, readable?.plan?.id, readable?.plan?.version, block.chunkId, block.revisionId, block.revision?.status, block.revision?.updatedAt, block.revision?.content.kind === 'text' ? block.revision.content.text.length : null]), 'data-chunk-id': block.chunkId, className: 'dsh-tp-record-block' },
         h('small', { className: 'dsh-tp-muted dsh-tp-record-block-heading' }, `块 ${index + 1} · 原文范围 ${block.outputRange.start}–${block.outputRange.end}${block.mode === 'copy' ? ' · 保留原文' : ''}`),
         h('div', { className: 'dsh-tp-record-pair' }, ...(['source', 'target'] as const).map(side => h(DocumentPage, { key: side, handle: readable!, block, side, session, unitId: unit.id, objects, objectAssets, visible, navigationRevision, targetOffset: offset, targetTotal }))))
     }),

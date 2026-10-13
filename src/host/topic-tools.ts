@@ -5,6 +5,7 @@ import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TerminologyAnalysisService } from './terminology-analysis.js'
 import type { TranslationPreparationService } from './translation-preparation.js'
 import type { DocumentPlanningService } from './document-planning-service.js'
+import type { DocumentExecutionService } from './document-execution-service.js'
 import { parseTranslationAnalysisStart, parseTranslationAnalysisQuery, parseTranslationAnalysisRead } from '../shared/translation-preparation.js'
 
 export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
@@ -127,7 +128,8 @@ class ManagementConnection {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
-        preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page', preparation_capture: 'preparation_captured' }[pending.frame.command.kind]
+        preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page', preparation_capture: 'preparation_captured',
+        document_accept: 'document_accepted', document_register: 'document_registered', document_event: 'document_updated', document_finish: 'document_updated', document_observe: 'document_observed', document_release: 'document_updated' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -174,7 +176,7 @@ export class TopicToolsService {
     if (!this.ownsAgent(ownerId, exec.agent)) throw bridgeError('scope_mismatch', '翻译操作不属于已连接的主 Agent。')
     const parsed = parseTopicBridgeCommand(command, this.connections.get(ownerId)!.protocol)
     if (new TextEncoder().encode(JSON.stringify(parsed)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '本次业务材料和要求超过通道上限，未截断或受理。')
-    if (parsed.kind.startsWith('preparation_') && new TextEncoder().encode(JSON.stringify({ kind: 'request', requestId: 'x'.repeat(36), mainSessionId: ownerId, callId: exec.callId, command: parsed })).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '完整准备传输包超过通道上限，未截断候选或登记准备。')
+    if ((parsed.kind.startsWith('preparation_') || parsed.kind.startsWith('document_')) && new TextEncoder().encode(JSON.stringify({ kind: 'request', requestId: 'x'.repeat(36), mainSessionId: ownerId, callId: exec.callId, command: parsed })).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw bridgeError('request_too_large', '完整业务传输包超过通道上限，未截断正文或登记事实。')
     const connection = this.connections.get(ownerId)!, before = this.ownedRequests.get(connection) ?? Promise.resolve()
     const result = before.then(async () => {
       exec.signal.throwIfAborted()
@@ -394,6 +396,26 @@ export class TopicToolsService {
           execute: (args: unknown, exec: ToolExecution) => {
             if (exec.agent !== agent || !this.ownsAgent(agent.id, exec.agent)) throw bridgeError('scope_mismatch', '规划工具不属于已连接的实际主 Agent。')
             return planning[definition.method](args, exec)
+          },
+        })))
+      }
+      const batch = this.ctx.get?.('translationBatch') as DocumentExecutionService | undefined
+      if (batch && connection.protocol === 2) {
+        const reference = { type: 'object', additionalProperties: false, required: true, properties: { id: { type: 'string', required: true }, version: { type: 'integer', required: true } } }
+        const scope = { type: 'object', additionalProperties: false, required: true, properties: {
+          ownerId: { type: 'string', required: true }, mainSessionId: { type: 'string', required: true }, topicId: { type: 'string', required: true }, translationSessionId: { type: 'string', required: true },
+        } }
+        const definitions: readonly { name: string; method: 'execute' | 'status'; description: string; parameters: Record<string, unknown> }[] = [
+          { name: 'translation_batch_execute', method: 'execute', parameters: { target: { required: true, oneOf: [materialTargetParameter, unitTargetParameter] }, operationId: { type: 'string', required: true }, planRef: reference, preparationRef: reference },
+            description: 'Accept one document from exact delivered material with ready preparation and runtime plan references. The Client confirms one real document unit before consuming only that submitted draft. Translation then runs serially in the background with one chunk in flight; explicit copy chunks make no model call. Reuse the same operationId for the same intent. Unknown acceptance or writeback never automatically retries a provider. Do not replace source, route or terminology through execution arguments. This stage cannot execute saved UnitTarget preparations, pause, resume or request model assistance. A completed task produces a candidate awaiting document review; it is not automatically final.' },
+          { name: 'translation_batch_status', method: 'status', parameters: { scope, taskId: { type: 'string', required: true }, afterTaskSequence: { type: 'integer' }, limit: { type: 'integer' } },
+            description: 'Read exact document progress, actual-call/output budgets and bounded short event facts, at most 50 items and 32768 UTF-8 bytes. Follow nextCursor as afterTaskSequence. Parent task sequences and each child sequence are independent. Observe unknown registration without dispatching a model. This does not resume or retry the task, and does not return translated bodies.' },
+        ]
+        for (const definition of definitions) disposers.push(agent.ctx.tools.register(helpers.defineTool({ name: definition.name, description: definition.description, parameters: definition.parameters,
+          output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+          execute: (args: unknown, exec: ToolExecution) => {
+            if (exec.agent !== agent || !this.ownsAgent(agent.id, exec.agent)) throw bridgeError('scope_mismatch', '整篇工具不属于已连接的实际主 Agent。')
+            return batch[definition.method](args, exec)
           },
         })))
       }

@@ -6,7 +6,8 @@ import { NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_V
 import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
 import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
 import type { TranslationMaterialRoute } from '../shared/translation-material.js'
-import type { DocumentPreparedCapacity } from '../shared/document-planning.js'
+import { DOCUMENT_TRANSLATION_PROMPT_VERSION, type DocumentPreparedCapacity, type DocumentTranslationPrompt } from '../shared/document-planning.js'
+import type { DocumentCallRecord } from '../shared/translation-batch.js'
 export { QUICK_SYSTEM_PROMPT } from '../shared/translation-call.js'
 
 /** Narrow views of the 0.2.0-rc.2 public runtime, checked against the installed packages. */
@@ -61,6 +62,10 @@ export interface AnalysisExecutionPacket {
   readonly model: ModelSelection
   readonly systemPrompt: string
   readonly userMessage: string
+}
+export interface DocumentExecutionPacket extends AnalysisExecutionPacket {
+  readonly attemptId: string
+  readonly prompt: DocumentTranslationPrompt
 }
 export interface AnalysisExecutionBudget {
   readonly tokens: number
@@ -221,6 +226,29 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     return Math.min(196608, bound.call.context && bound.call.config.maxTokens !== undefined
       ? bound.call.context.contextWindow - bound.call.config.maxTokens - 16 : 196608)
   }
+  /** Document calls keep their actual prompt version and reference-only context metadata. */
+  preflightDocument(packet: DocumentExecutionPacket): DocumentCallRecord {
+    const actual = this.preflightAnalysis(packet)
+    if (packet.prompt.promptVersion !== DOCUMENT_TRANSLATION_PROMPT_VERSION || packet.systemPrompt !== packet.prompt.systemPrompt ||
+      packet.userMessage !== packet.prompt.userMessage) throw Object.assign(new Error('Document prompt identity changed'), { code: 'INVALID_PREPARED_CALL' })
+    return frozen({ callId: packet.callId, attemptId: packet.attemptId, promptVersion: packet.prompt.promptVersion,
+      model: { provider: actual.route.provider, model: actual.route.model, reasoningEffort: actual.route.reasoningEffort ?? null },
+      configVersion: null, maxOutputTokens: actual.maxOutputTokens, usage: { inputTokens: null, outputTokens: null },
+      contextRef: structuredClone(packet.prompt.contextRef) })
+  }
+  async *executeDocument(packet: DocumentExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncGenerator<TextExecutionEvent> {
+    const bound = this.prepared.get(packet.operationId)
+    this.prepared.delete(packet.operationId)
+    if (!bound || key(bound.route) !== key(packet.model) || !bound.analysisContext ||
+      bound.analysisContext.systemPrompt !== packet.systemPrompt || bound.analysisContext.userMessage !== packet.userMessage) {
+      throw Object.assign(new Error('Document preparation does not match'), { code: 'INVALID_PREPARED_CALL' })
+    }
+    for await (const event of this.executePrepared(packet.operationId, packet.callId, bound.call, 'document', packet.prompt,
+      signal, undefined, onDispatch)) {
+      if (event.type === 'needs_context') throw Object.assign(new Error('Document tools are disabled'), { code: 'INVALID_STREAM' })
+      yield event
+    }
+  }
   /** Same native route preparation, stream validator, and detached Session as translation calls. */
   async *executeAnalysis(packet: AnalysisExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncGenerator<TextExecutionEvent> {
     const bound = this.prepared.get(packet.operationId)
@@ -297,7 +325,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, bound.exchangeResume),
       signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion)
   }
-  private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal' | 'analysis',
+  private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal' | 'analysis' | 'document',
     context: { readonly systemPrompt: string; readonly userMessage: string }, signal: AbortSignal, normalContext?: NormalTranslationContext,
     onDispatch?: () => void, requestContext = false, sourceCodePointLength = 0,
     exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>, exchangeContextVersion = 1): AsyncGenerator<NormalExecutionEvent> {
@@ -319,7 +347,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       }, reason: 'initial', startsSeries: true,
     })
     const options = Object.freeze({ ...call.config, messages: frozen([...session.deriveMessages()]), signal,
-      ...(mode === 'normal' || mode === 'analysis' ? { tools: requestContext ? Object.freeze([requestContextTool]) : Object.freeze([]) } : {}) })
+      ...(mode !== 'quick' ? { tools: requestContext ? Object.freeze([requestContextTool]) : Object.freeze([]) } : {}) })
     const stream = new helpers.AssistantStreamAccumulator()
     const assembler = new helpers.BlockAssembler()
     const blocks = new Map<number, { type: 'text' | 'reasoning' | 'tool-call'; declared: boolean; text: string }>()
@@ -331,7 +359,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     let settlementDone = false
     try {
       signal.throwIfAborted()
-      if (mode !== 'analysis') this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal'
+      if (mode !== 'analysis' && mode !== 'document') this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal'
         ? requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION,
         model: Object.freeze({ provider: call.config.provider, model: call.config.model, reasoningEffort: call.config.reasoningEffort ?? null }),
         configVersion: null, maxOutputTokens: call.config.maxTokens ?? null, ...(normalContext ? { context: normalContext } : {}),
@@ -370,7 +398,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
           blocks.set(chunk.index as number, block)
           if (type === 'text') {
             totalText += chunk.text.length
-            if (totalText > (mode === 'analysis' ? 131072 : 2_000_000)) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
+            if (mode !== 'document' && totalText > (mode === 'analysis' ? 131072 : 2_000_000)) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
             emittedText += chunk.text
             yield { type: 'text', text: chunk.text }
           }
@@ -395,7 +423,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
           if (block.type === 'text' && !partial?.text) {
             const blockText = block.text!
             totalText += blockText.length
-            if (totalText > (mode === 'analysis' ? 131072 : 2_000_000)) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
+            if (mode !== 'document' && totalText > (mode === 'analysis' ? 131072 : 2_000_000)) throw Object.assign(new Error('Output exceeds limit'), { code: 'OUTPUT_LIMIT' })
             emittedText += blockText
             yield { type: 'text', text: blockText }
           }

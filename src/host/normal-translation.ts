@@ -79,6 +79,7 @@ export class NormalTranslationService {
   private readonly corrections = new Map<string, { readonly signature: string; readonly result: Promise<NormalTranslationCorrectionReceipt> }>()
   private readonly unitRequests = new Map<string, { readonly signature: string; readonly result: Promise<NormalTranslationResult<NormalTranslationUnitReceipt>> }>()
   private readonly activeSessions = new Set<string>()
+  private readonly documentSessions = new Map<string, string>()
   private readonly resumeTokens = new Map<string, ResumeToken>()
   private readonly resumesByResolution = new Map<string, ResumeToken>()
   private exchange: TranslationExchangeService | undefined
@@ -114,6 +115,19 @@ export class NormalTranslationService {
   }
   private get topics(): TopicToolsService { return this.ctx.get?.('translationTopics') as TopicToolsService }
   private get materials(): TranslationMaterialsService { return this.ctx.get?.('translationMaterials') as TranslationMaterialsService }
+  /** One parent reservation shares the short-text occupancy rule; its children do not reacquire it. */
+  claimDocumentSession(ownerId: string, translationSessionId: string, taskId: string): boolean {
+    const sessionId = identity(ownerId, translationSessionId), current = this.documentSessions.get(sessionId)
+    if (current === taskId) return true
+    if (this.disposed || this.activeSessions.has(sessionId)) return false
+    this.activeSessions.add(sessionId); this.documentSessions.set(sessionId, taskId)
+    return true
+  }
+  releaseDocumentSession(ownerId: string, translationSessionId: string, taskId: string): void {
+    const sessionId = identity(ownerId, translationSessionId)
+    if (this.documentSessions.get(sessionId) !== taskId) return
+    this.documentSessions.delete(sessionId); this.activeSessions.delete(sessionId)
+  }
   async inspectOperation(ref: ExecutorOperationRef): Promise<unknown> {
     const job = this.jobs.get(identity(ref.mainSessionId, ref.operationId)), operation = job?.operation
     const latest = job?.attempts.snapshot().attempts.at(-1)
@@ -717,7 +731,7 @@ export class NormalTranslationService {
     for (const job of this.jobs.values()) { job.controller.abort(); job.delivery.abort(); this.adapter.discard(job.packet?.operationId ?? job.internalId) }
     for (const entry of this.resumeTokens.values()) if (entry.packet) this.adapter.discard(entry.packet.operationId)
     this.resumeTokens.clear(); this.resumesByResolution.clear()
-    this.admissions.clear(); this.resolved.clear(); this.corrections.clear(); this.unitRequests.clear(); this.activeSessions.clear()
+    this.admissions.clear(); this.resolved.clear(); this.corrections.clear(); this.unitRequests.clear(); this.activeSessions.clear(); this.documentSessions.clear()
   }
 }
 export function installNormalTranslation(ctx: TopicHostContext, loadModule?: LlmModuleLoader, registerRemote = true): NormalTranslationService {

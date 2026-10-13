@@ -143,7 +143,7 @@ export class NormalTranslationClient {
       if (material.sourceVersion !== 1 || material.revises) return failure('stale_version', '此材料的源版本尚不可受理。')
     }
     if (!material.model) return failure('invalid_input', '此材料未选择翻译模型，请重新提交已选模型的材料。')
-    if (this.options.isSessionBusy?.(session.id) || this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit)
+    if (this.store.hasDocumentLease(session.id) || this.options.isSessionBusy?.(session.id) || this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit)
       ? unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status)) : unit.tasks.some(task => ['running', 'unknown'].includes(task.status))) ||
       this.isBusy(session.id)) return failure('busy', '此翻译会话仍有执行中或结果未知的操作。')
     if (!material.unitReference && this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit) && unit.material?.materialId === material.materialId)) return failure('already_admitted', '此材料已建立处理单元，请引用原单元重译。')

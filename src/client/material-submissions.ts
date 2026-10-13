@@ -315,11 +315,14 @@ export class MaterialSubmissionsClient {
   /** Business acceptance consumes only the unchanged submitted draft, including its edit history. */
   consumeSubmittedMaterial(envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }): void {
     const item = this.submissions.get(JSON.stringify([envelope.ownerId, envelope.requestId]))
-    if (!item || !this.resolveSubmittedMaterial(envelope) || item.consumed || envelope.material.sourceRef) return
+    if (!item || !this.resolveSubmittedMaterial(envelope) || item.consumed) return
     item.consumed = true
     const session = this.options.store.getSession(envelope.material.translationSessionId)
+    const carrier = item.draft?.carrier
+    if (carrier?.kind === 'selected_file' && this.files.get(envelope.material.translationSessionId)?.version === carrier.selected.version)
+      this.setFileSelected(envelope.material.translationSessionId, undefined)
     if (session && session.ownerId === envelope.ownerId && session.topicId === envelope.material.topicId &&
-      this.draftVersion(session) === envelope.material.draftVersion && signature(session, this.fileVersions.get(session.id) ?? 0) === item.draft?.signature)
+      carrier?.kind !== 'selected_file' && this.draftVersion(session) === envelope.material.draftVersion && signature(session, this.fileVersions.get(session.id) ?? 0) === item.draft?.signature)
       this.options.store.updateSession(session.id, { input: '' })
     this.reconcile(); this.emit()
   }

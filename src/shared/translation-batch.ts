@@ -31,6 +31,7 @@ export interface DocumentChunkPlan extends VersionReference {
   readonly sourceVersion: number
   readonly preparationRef: VersionReference
   readonly items: readonly ChunkPlanItem[]
+  readonly protectedRanges?: readonly TranslationSourceRange[]
   readonly createdAt: string
   readonly operationId: string
 }
@@ -191,7 +192,7 @@ export function parseDocumentPreparationReference(value: unknown): DocumentPrepa
   return { id: value.id, version: value.version, sourceVersion: value.sourceVersion }
 }
 export function parseDocumentChunkPlan(value: unknown, sourceLength: number): DocumentChunkPlan {
-  exact(value, ['id', 'version', 'sourceVersion', 'preparationRef', 'items', 'createdAt', 'operationId'])
+  exact(value, ['id', 'version', 'sourceVersion', 'preparationRef', 'items', 'createdAt', 'operationId'], ['protectedRanges'])
   string(value.id); integer(value.version); integer(value.sourceVersion); time(value.createdAt); string(value.operationId); array(value.items, 256)
   const preparationRef = ref(value.preparationRef), items: ChunkPlanItem[] = [], ids = new Set<string>()
   let end = 0
@@ -204,8 +205,19 @@ export function parseDocumentChunkPlan(value: unknown, sourceLength: number): Do
     items.push({ chunkId: raw.chunkId, outputRange, mode: raw.mode as ChunkPlanItem['mode'], contextRanges })
   }
   if (!items.length || end !== sourceLength) throw new TypeError('Document plan does not cover the entire source')
+  let protectedRanges: TranslationSourceRange[] | undefined
+  if (Object.hasOwn(value, 'protectedRanges')) {
+    array(value.protectedRanges, 256)
+    protectedRanges = []
+    let protectedEnd = 0
+    for (const raw of value.protectedRanges) {
+      const protectedRange = range(raw, sourceLength)
+      if (protectedRange.start < protectedEnd) throw new TypeError('Document protected ranges must be ordered and disjoint')
+      protectedRanges.push(protectedRange); protectedEnd = protectedRange.end
+    }
+  }
   const result: DocumentChunkPlan = { id: value.id, version: value.version, sourceVersion: value.sourceVersion, preparationRef,
-    items, createdAt: value.createdAt, operationId: value.operationId }
+    items, ...(protectedRanges ? { protectedRanges } : {}), createdAt: value.createdAt, operationId: value.operationId }
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > 32768) throw new TypeError('Document plan exceeds metadata budget')
   return result
 }
@@ -215,7 +227,7 @@ export function parseDocumentTaskRecord(value: unknown): DocumentTaskRecord {
   return { taskId: value.taskId, operationId: value.operationId, sourceVersion: value.sourceVersion,
     planRef: ref(value.planRef), preparationRef: ref(value.preparationRef), createdAt: value.createdAt, status: value.status }
 }
-function call(value: unknown, sourceLength: number): DocumentCallRecord {
+export function parseDocumentCallRecord(value: unknown, sourceLength: number): DocumentCallRecord {
   exact(value, ['callId', 'attemptId', 'promptVersion', 'model', 'configVersion', 'maxOutputTokens', 'usage', 'contextRef'])
   string(value.callId); string(value.attemptId); string(value.promptVersion, 128)
   exact(value.model, ['provider', 'model', 'reasoningEffort']); string(value.model.provider, 512); string(value.model.model, 512)
@@ -224,25 +236,29 @@ function call(value: unknown, sourceLength: number): DocumentCallRecord {
   if (value.maxOutputTokens !== null) integer(value.maxOutputTokens, 0)
   exact(value.usage, ['inputTokens', 'outputTokens'])
   for (const count of [value.usage.inputTokens, value.usage.outputTokens]) if (count !== null) integer(count, 0)
-  exact(value.contextRef, ['preparationRef', 'termRefs', 'referenceRefs', 'contextRanges', 'supplementRefs'])
-  array(value.contextRef.termRefs, 100); array(value.contextRef.referenceRefs, 32); array(value.contextRef.contextRanges, 8); array(value.contextRef.supplementRefs, 4)
-  const termRefs: DocumentTermReference[] = value.contextRef.termRefs.map(raw => {
+  return { callId: value.callId, attemptId: value.attemptId, promptVersion: value.promptVersion,
+    model: { provider: value.model.provider, model: value.model.model, reasoningEffort: value.model.reasoningEffort as string | null }, configVersion: null,
+    maxOutputTokens: value.maxOutputTokens as number | null, usage: { inputTokens: value.usage.inputTokens as number | null, outputTokens: value.usage.outputTokens as number | null },
+    contextRef: parseDocumentCallContextReference(value.contextRef, sourceLength) }
+}
+export function parseDocumentCallContextReference(value: unknown, sourceLength: number): DocumentCallContextReference {
+  exact(value, ['preparationRef', 'termRefs', 'referenceRefs', 'contextRanges', 'supplementRefs'])
+  const contextRef = value
+  array(contextRef.termRefs, 100); array(contextRef.referenceRefs, 32); array(contextRef.contextRanges, 8); array(contextRef.supplementRefs, 4)
+  const termRefs: DocumentTermReference[] = contextRef.termRefs.map(raw => {
     exact(raw, ['kind', 'id'], ['entryVersion', 'version']); string(raw.id)
     if (raw.kind === 'topic_term') { exact(raw, ['kind', 'id', 'entryVersion']); integer(raw.entryVersion); return { kind: 'topic_term', id: raw.id, entryVersion: raw.entryVersion } }
     if (raw.kind !== 'candidate') throw new TypeError('Invalid document term reference')
     exact(raw, ['kind', 'id', 'version']); integer(raw.version); return { kind: 'candidate', id: raw.id, version: raw.version }
   })
-  const referenceRefs = value.contextRef.referenceRefs.map(raw => {
+  const referenceRefs = contextRef.referenceRefs.map(raw => {
     exact(raw, ['id', 'version', 'range']); string(raw.id); integer(raw.version)
     return { id: raw.id, version: raw.version, range: range(raw.range) }
   })
-  const supplementRefs = value.contextRef.supplementRefs.map(ref)
+  const supplementRefs = contextRef.supplementRefs.map(ref)
   for (const refs of [termRefs, referenceRefs, supplementRefs]) if (new Set(refs.map(item => JSON.stringify(item))).size !== refs.length) throw new TypeError('Duplicate document context reference')
-  return { callId: value.callId, attemptId: value.attemptId, promptVersion: value.promptVersion,
-    model: { provider: value.model.provider, model: value.model.model, reasoningEffort: value.model.reasoningEffort as string | null }, configVersion: null,
-    maxOutputTokens: value.maxOutputTokens as number | null, usage: { inputTokens: value.usage.inputTokens as number | null, outputTokens: value.usage.outputTokens as number | null },
-    contextRef: { preparationRef: ref(value.contextRef.preparationRef), termRefs, referenceRefs,
-      contextRanges: value.contextRef.contextRanges.map(item => range(item, sourceLength)), supplementRefs } }
+  return { preparationRef: ref(contextRef.preparationRef), termRefs, referenceRefs,
+    contextRanges: contextRef.contextRanges.map(item => range(item, sourceLength)), supplementRefs }
 }
 export function parseChunkRevision(value: unknown, sourceLength: number): ChunkRevision {
   exact(value, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'])
@@ -252,7 +268,8 @@ export function parseChunkRevision(value: unknown, sourceLength: number): ChunkR
   exact(value.content, ['kind'], ['text', 'sourceVersion', 'range', 'sha256'])
   let content: ChunkContent
   if (value.content.kind === 'text') {
-    exact(value.content, ['kind', 'text']); string(value.content.text, 2_000_000, value.status === 'completed')
+    exact(value.content, ['kind', 'text']); string(value.content.text, 16 * 1024 * 1024, value.status === 'completed')
+    if (new TextEncoder().encode(value.content.text).byteLength > 16 * 1024 * 1024 || /[\uD800-\uDFFF]/u.test(value.content.text)) throw new TypeError('Document chunk exceeds text encoding or byte budget')
     content = { kind: 'text', text: value.content.text }
   } else {
     if (value.content.kind !== 'source_copy') throw new TypeError('Invalid document chunk content')
@@ -265,7 +282,7 @@ export function parseChunkRevision(value: unknown, sourceLength: number): ChunkR
     string(value.callId); string(value.attemptId)
     if (content.kind !== 'text') throw new TypeError('Machine chunks must own their translated text')
     if (value.callRecord !== null) {
-      callRecord = call(value.callRecord, sourceLength)
+      callRecord = parseDocumentCallRecord(value.callRecord, sourceLength)
       if (callRecord.callId !== value.callId || callRecord.attemptId !== value.attemptId || !sameVersionReference(callRecord.contextRef.preparationRef, preparationRef)) throw new TypeError('Document call identity changed')
     }
     if (value.status === 'completed' && callRecord === null) throw new TypeError('Completed machine chunks require the actual call record')
@@ -320,7 +337,7 @@ export function parseDocumentUnitShape(value: unknown): DocumentUnit {
     if (!['automatic', 'user_fixed'].includes(value.final.selection as string)) throw new TypeError('Invalid document final selection')
     final = { revisionId: value.final.revisionId, selection: value.final.selection as DocumentFinalPointer['selection'], selectedAt: value.final.selectedAt }
   }
-  const plans = value.plans.map(raw => { exact(raw, ['id', 'version', 'sourceVersion', 'preparationRef', 'items', 'createdAt', 'operationId']); return parseDocumentChunkPlan(raw, sourceLength(raw.sourceVersion)) })
+  const plans = value.plans.map(raw => { exact(raw, ['id', 'version', 'sourceVersion', 'preparationRef', 'items', 'createdAt', 'operationId'], ['protectedRanges']); return parseDocumentChunkPlan(raw, sourceLength(raw.sourceVersion)) })
   const chunkRevisions = value.chunkRevisions.map(raw => { exact(raw, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt']); return parseChunkRevision(raw, sourceLength(raw.sourceVersion)) })
   const revisions = value.revisions.map(raw => { exact(raw, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility']); return parseDocumentRevision(raw, sourceLength(raw.sourceVersion)) })
   return { kind: 'document', id: value.id, order: value.order, targetLanguage: value.targetLanguage, instruction: value.instruction, sourceVersion: value.sourceVersion,

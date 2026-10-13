@@ -15,6 +15,7 @@ import type { PreparationStore } from './preparation-store.js'
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import { MAX_ANALYSIS_PAGE_BYTES, type PreparationReceipt, type PreparationPage } from '../shared/translation-preparation.js'
 import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
+import type { DocumentTasksClient } from './document-tasks.js'
 
 export interface TopicBridgeRemotePort {
   capabilities(): Promise<unknown>
@@ -71,6 +72,7 @@ export class TopicBridgeClient {
   private disposed = false
   private normal: NormalPort | undefined
   private preparation: PreparationStore | undefined
+  private documents: DocumentTasksClient | undefined
   private resolvePreparationMaterial: ((envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>) => Extract<TranslationMaterialEnvelope, { kind: 'material' }> | undefined) | undefined
   private resolvePreparationTarget: ((target: NormalTranslationMaterialTarget) => Extract<TranslationMaterialEnvelope, { kind: 'material' }> | undefined) | undefined
   constructor(private readonly remote: TopicBridgeRemotePort | (() => Promise<TopicBridgeRemotePort | undefined>) | undefined,
@@ -79,6 +81,7 @@ export class TopicBridgeClient {
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   setNormalTranslation(port: NormalPort): void { this.normal = port }
+  setDocumentTasks(port: DocumentTasksClient): void { this.documents = port }
   setPreparation(port: PreparationStore, resolveMaterial: NonNullable<TopicBridgeClient['resolvePreparationMaterial']>, resolveTarget?: TopicBridgeClient['resolvePreparationTarget']): void {
     this.preparation = port; this.resolvePreparationMaterial = resolveMaterial; this.resolvePreparationTarget = resolveTarget
   }
@@ -187,6 +190,27 @@ export class TopicBridgeClient {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
+    if (command.kind === 'document_accept' || command.kind === 'document_register' || command.kind === 'document_event' || command.kind === 'document_finish' || command.kind === 'document_release' || command.kind === 'document_observe') {
+      if (!this.documents) return error(request.requestId, 'execution_unavailable', '整篇执行登记尚未就绪。')
+      if (command.kind === 'document_accept') {
+        const result = await this.documents.accept(ownerId, command.request)
+        return result.ok ? success({ kind: 'document_accepted', receipt: result.value }) : error(request.requestId, result.error.code, result.error.message)
+      }
+      if (command.kind === 'document_register') {
+        const result = this.documents.register(ownerId, command.request)
+        return result.ok ? success({ kind: 'document_registered', registration: result.value }) : error(request.requestId, result.error.code, result.error.message)
+      }
+      if (command.kind === 'document_observe') {
+        const result = this.documents.observe(ownerId, command.request)
+        return result.ok ? success({ kind: 'document_observed', receipt: result.value }) : error(request.requestId, result.error.code, result.error.message)
+      }
+      if (command.kind === 'document_release') {
+        const result = this.documents.releaseAcknowledgedFinish(ownerId, command.request)
+        return result.ok ? success({ kind: 'document_updated', receipt: result.value }) : error(request.requestId, result.error.code, result.error.message)
+      }
+      const result = command.kind === 'document_event' ? await this.documents.event(ownerId, command.event) : await this.documents.finish(ownerId, command.request)
+      return result.ok ? success({ kind: 'document_updated', receipt: result.value }) : error(request.requestId, result.error.code, result.error.message)
+    }
     if (command.kind === 'preparation_capture') {
       if (!this.preparation || command.request.target.mainSessionId !== ownerId) return error(request.requestId, 'scope_mismatch', '规划准备不属于当前主会话或通道尚未就绪。')
       const envelope = this.resolvePreparationTarget?.(command.request.target), session = envelope && this.sessions.getSession(envelope.material.translationSessionId)

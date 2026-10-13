@@ -33,8 +33,8 @@ export class TranslationPreparationService {
       if (new TextEncoder().encode(JSON.stringify({ kind: 'request', requestId: 'x'.repeat(36), mainSessionId: ownerId, callId: exec.callId, command })).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) return failure('request_too_large', '完整准备传输包超过 196608 字节，请调整分析或任务范围；候选未截断、准备未登记。', 'preparation_budget')
       const value = await this.topics!.requestOwned(ownerId, command, exec)
       if (value.kind !== expected) return failure('invalid_reply', '准备记录回执类型不一致。', 'preparation_bridge')
-      if ('request' in command && command.kind.startsWith('preparation_')) {
-        const response = 'receipt' in value ? value.receipt : 'page' in value ? value.page : undefined
+      if (command.kind === 'preparation_prepare' || command.kind === 'preparation_set' || command.kind === 'preparation_status' || command.kind === 'preparation_read') {
+        const response = value.kind === 'preparation_receipt' ? value.receipt : value.kind === 'preparation_page' ? value.page : undefined
         if (!response || response.preparationId !== command.request.preparationId || JSON.stringify(response.target) !== JSON.stringify(command.request.target)) return failure('invalid_reply', '准备回执与请求的固定材料或标识不一致。', 'preparation_bridge')
         const version = command.kind === 'preparation_prepare' ? 1 : command.kind === 'preparation_set' ? command.request.expectedVersion + 1 : command.request.version
         if (response.version !== version) return failure('invalid_reply', '准备回执版本与明确操作不一致。', 'preparation_bridge')

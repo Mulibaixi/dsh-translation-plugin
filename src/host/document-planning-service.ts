@@ -7,7 +7,8 @@ import type { NormalTranslationMaterialTarget } from '../shared/normal-translati
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import type { AnalysisResult } from '../shared/translation-preparation.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength } from '../shared/translation-source-read.js'
-import { DocumentPlanner, type DocumentPlanningInput } from './document-planner.js'
+import { DocumentPlanner, type DocumentPlanningInput, type DocumentExecutionFreeze } from './document-planner.js'
+import type { VersionReference } from '../shared/translation-batch.js'
 import { DshTextExecutionAdapter } from './dsh-text-adapter.js'
 import type { TopicHostContext, TopicToolsService, ToolExecution } from './topic-tools.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
@@ -30,7 +31,7 @@ export class DocumentPlanningService {
     exec.signal.throwIfAborted()
     return this.materials?.deliveredForAgent(target, exec.agent!) ?? failure('unavailable', '固定材料服务尚未就绪。', 'authorize_plan')
   }
-  private async input(request: TranslationPlanSuggest | TranslationPlanSet, exec: ToolExecution): Promise<AnalysisResult<DocumentPlanningInput>> {
+  private async input(request: Pick<TranslationPlanSuggest, 'target' | 'preparationRef'>, exec: ToolExecution): Promise<AnalysisResult<DocumentPlanningInput>> {
     const material = this.material(request.target, exec)
     if (!material.ok) return material
     let captured
@@ -110,6 +111,14 @@ export class DocumentPlanningService {
     try { request = parseTranslationPlanRead(args) } catch { return failure('invalid_input', '分块计划分页参数无效。', 'read_plan') }
     const authorized = this.material(request.target, exec)
     return authorized.ok ? this.bounded(this.planner.read(request)) : authorized
+  }
+  /** Private authorized capture; never registered as a model tool or Remote method. */
+  async captureExecution(target: NormalTranslationMaterialTarget, planRef: VersionReference, preparationRef: VersionReference,
+    exec: ToolExecution): Promise<AnalysisResult<{ readonly input: DocumentPlanningInput; readonly snapshot: DocumentExecutionFreeze }>> {
+    const input = await this.input({ target, preparationRef }, exec)
+    if (!input.ok) return input
+    const snapshot = await this.planner.freezeExecution(input.value, { target, planId: planRef.id, version: planRef.version }, preparationRef, exec.signal)
+    return snapshot.ok ? { ok: true, value: { input: input.value, snapshot: snapshot.value } } : snapshot
   }
   dispose(): void { this.disposed = true; this.planner.dispose() }
 }
