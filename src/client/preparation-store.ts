@@ -40,7 +40,7 @@ interface Catalog {
   readonly candidates: readonly PreparationCandidate[]
   readonly binding: string
 }
-interface Seat { stored: string | null; audit: StoredPreparation; catalog?: Catalog }
+interface Seat { stored: string | null; audit: StoredPreparation; catalog?: Catalog; planningBindings?: Readonly<Record<number, Readonly<Record<string, number>>>> }
 const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right)
 const now = (): string => new Date().toISOString()
 function immutable<T>(value: T): T {
@@ -105,6 +105,9 @@ function sharedForms(left: PreparationFrozenTerm, right: PreparationFrozenTerm):
 function fixed(entry: TopicTerm): boolean {
   return entry.origin === 'user_explicit' && entry.confirmation !== null && entry.confirmation.adoptedEntryVersion < entry.version
 }
+function fixedBinding(snapshot: TopicTermSnapshot, targetLanguage: string): Readonly<Record<string, number>> {
+  return Object.fromEntries(snapshot.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === targetLanguage && fixed(entry)).map(entry => [entry.id, entry.version]))
+}
 function analysisBusinessFacts(analysis: PreparationAnalysisFacts): unknown {
   const { notification: _notification, updatedAt: _updatedAt, ...run } = analysis.run
   return { ...analysis, run }
@@ -163,7 +166,7 @@ export class PreparationStore {
     if (raw === null) { if (local?.stored !== null && local?.stored !== undefined) reject('stale_preparation', '已保存准备记录被移除，请重新读取。'); return local }
     const audit = this.decode(raw), first = audit.versions[0]!
     if (storageKey !== key(first.scope.ownerId, first.id)) reject('invalid_storage', '准备记录身份与存储位置不一致。')
-    const seat: Seat = { stored: raw, audit, ...(local?.catalog === undefined ? {} : { catalog: local.catalog }) }
+    const seat: Seat = { stored: raw, audit, ...(local?.catalog === undefined ? {} : { catalog: local.catalog }), ...(local?.planningBindings === undefined ? {} : { planningBindings: local.planningBindings }) }
     this.seats.set(storageKey, seat); return seat
   }
   private lookup(query: TranslationPreparationQuery): { seat: Seat; snapshot: PreparationSnapshot } {
@@ -199,7 +202,7 @@ export class PreparationStore {
         audit = { ...audit, versions: [...seat.audit.versions, { ...snapshot, storage: 'runtime_only', storageError: '准备记录保存失败，本版本仅在运行期保留。' }] }
       }
     }
-    const next: Seat = { stored, audit: immutable(audit), ...(seat.catalog === undefined ? {} : { catalog: seat.catalog }) }
+    const next: Seat = { stored, audit: immutable(audit), ...(seat.catalog === undefined ? {} : { catalog: seat.catalog }), ...(seat.planningBindings === undefined ? {} : { planningBindings: seat.planningBindings }) }
     this.seats.set(storageKey, next); return next
   }
   async prepare(args: unknown, rawFacts: PreparationPrepareFacts, measurePage?: (page: PreparationPage) => number): Promise<AnalysisResult<PreparationReceipt>> {
@@ -297,7 +300,8 @@ export class PreparationStore {
       storage: 'runtime_only', storageError: null, updatedAt: at, operationId: request.operationId }
     if (preparationPacketBytes(snapshot) > MAX_PREPARATION_PACKET_BYTES) return bad('preparation_too_large', '固定准备快照超过单包预算；未截字段或静默漏选。')
     this.readable(seat, snapshot, measurePage)
-    const next = this.commit(storageKey, seat, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
+    const bound: Seat = { ...seat, planningBindings: { ...seat.planningBindings, [snapshot.version]: fixedBinding(facts.topicTerms, snapshot.targetLanguage) } }
+    const next = this.commit(storageKey, bound, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
     return ok(this.receipt(next, next.audit.versions.at(-1)!, true))
   }
   private conflicts(candidates: readonly PreparationCandidate[], topic: TopicTermSnapshot, terms: readonly PreparationFrozenTerm[], required: readonly TranslationSourceRange[], request: TranslationPreparationSet, targetLanguage: string): readonly PreparationConflict[] {
@@ -332,6 +336,28 @@ export class PreparationStore {
       const query = parseTranslationPreparationQuery(args), { seat, snapshot } = this.lookup(query)
       return ok(this.receipt(seat, snapshot, !!seat.catalog && !!envelope && matchesTarget(envelope, query.target)))
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '准备查询参数或保存记录无效。', 'read_preparation') }
+  }
+  /** Private planning capture: saved audits alone never recreate runtime preparation authority. */
+  async capture(args: unknown, rawFacts: PreparationCurrentFacts, relevantFixedIds: readonly string[], measureReply: (snapshot: PreparationSnapshot) => number): Promise<AnalysisResult<PreparationSnapshot>> {
+    try {
+      const query = parseTranslationPreparationQuery(args), facts = parsePreparationCurrentFacts(rawFacts), hash = await sourceHash(facts.envelope)
+      return await this.locked(() => {
+        const { seat, snapshot } = this.lookup(query)
+        if (!matchesTarget(facts.envelope, query.target) || !same(materialScope(facts.envelope), snapshot.scope) || hash !== snapshot.sourceSha256) return bad('source_mismatch', '规划准备与当前固定原稿不一致。', 'capture_preparation')
+        if (!seat.catalog || seat.catalog.binding !== binding(facts.envelope, hash)) return bad('analysis_unavailable', '已保存准备仅供审计；规划需要原运行期的真实材料与分析。', 'capture_preparation')
+        if (!snapshot.preparationReady || !snapshot.mechanicalCoverage.complete || !snapshot.modelReview.complete || snapshot.conflicts.length || snapshot.questions.some(question => question.decision === null) || seat.planningBindings?.[snapshot.version] === undefined) return bad('preparation_not_ready', '准备扫描、主模型审阅或关键问题尚未完整解决；请形成新的准备版本。', 'capture_preparation')
+        if (!this.currentTerms(facts.topicTerms)) return bad('stale_terms', '主题术语在规划捕获时已变化，请重新读取。', 'capture_preparation')
+        const baseline = seat.planningBindings[snapshot.version]!, adoptedFixed = snapshot.terms.filter(term => term.userFixed), knownForms = new Set([...seat.catalog.candidates.map(candidate => candidate.original), ...snapshot.terms.flatMap(term => [...term.sourceForms, ...term.aliases])])
+        const currentFixed = facts.topicTerms.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === snapshot.targetLanguage && fixed(entry))
+        if (adoptedFixed.some(term => term.ref.kind !== 'topic_term' || !currentFixed.some(entry => entry.id === term.ref.id && entry.version === (term.ref as Extract<PreparationTermRef, { kind: 'topic_term' }>).entryVersion && same(entry.confirmation, term.confirmation) && entry.preferred === term.preferred && same(entry.forbidden, term.forbidden) && same(entry.sourceForms, term.sourceForms) && same(entry.aliases, term.aliases) && entry.sourceLanguage === term.sourceLanguage && entry.sense === term.sense && entry.sense === term.description && entry.origin === term.origin && same(entry.evidence, term.evidence)))) return bad('stale_fixed_terms', '已采用的用户固定条目已更新或删除，请重新形成准备版本。', 'capture_preparation')
+        const related = currentFixed.filter(entry => relevantFixedIds.includes(entry.id) || [...entry.sourceForms, ...entry.aliases].some(form => knownForms.has(form)))
+        const missing = related.filter(entry => relevantFixedIds.includes(entry.id) && !adoptedFixed.some(term => [...term.sourceForms, ...term.aliases].some(form => [...entry.sourceForms, ...entry.aliases].includes(form))))
+        if (missing.length) return bad('preparation_incomplete', `原稿命中的用户固定原词尚未采用，请在新准备版本分配实际语义范围：${missing.map(entry => entry.id).join(', ').slice(0, 700)}`, 'capture_preparation')
+        if (related.some(entry => baseline[entry.id] !== entry.version)) return bad('stale_fixed_terms', '原稿相关的用户固定条目已变化，请重新形成准备版本。', 'capture_preparation')
+        if (measureReply(snapshot) > MAX_PREPARATION_PACKET_BYTES) return bad('preparation_too_large', '完整私有准备回包超过 196608 字节；未截字段或开始规划。', 'capture_preparation')
+        return ok(snapshot)
+      })
+    } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '规划准备捕获参数或当前事实无效。', 'capture_preparation') }
   }
   read(args: unknown, measureReply: (page: PreparationPage) => number = page => preparationPacketBytes({ ok: true, value: page })): AnalysisResult<PreparationPage> {
     try {

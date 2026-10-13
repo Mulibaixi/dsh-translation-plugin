@@ -4,6 +4,7 @@ import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection }
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TerminologyAnalysisService } from './terminology-analysis.js'
 import type { TranslationPreparationService } from './translation-preparation.js'
+import type { DocumentPlanningService } from './document-planning-service.js'
 import { parseTranslationAnalysisStart, parseTranslationAnalysisQuery, parseTranslationAnalysisRead } from '../shared/translation-preparation.js'
 
 export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
@@ -126,7 +127,7 @@ class ManagementConnection {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
-        preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page' }[pending.frame.command.kind]
+        preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page', preparation_capture: 'preparation_captured' }[pending.frame.command.kind]
       if (reply.value.kind !== expected) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
       if (['rename_topic', 'set_session_remark', 'archive_session'].includes(pending.frame.command.kind) && reply.value.kind === 'sessions' && reply.value.persistence === undefined) throw bridgeError('invalid_reply', '主题管理回执缺少实际保存状态。')
       pending.resolve(reply.value)
@@ -367,6 +368,32 @@ export class TopicToolsService {
           execute: (args: unknown, exec: ToolExecution) => {
             if (exec.agent !== agent || !this.ownsAgent(agent.id, exec.agent)) throw bridgeError('scope_mismatch', '准备工具不属于已连接的实际主 Agent。')
             return preparation[definition.method](args, exec)
+          },
+        })))
+      }
+      const planning = this.ctx.get?.('translationPlanning') as DocumentPlanningService | undefined
+      if (planning && connection.protocol === 2) {
+        const range = { type: 'object', additionalProperties: false, properties: { start: { type: 'integer', required: true }, end: { type: 'integer', required: true } } }
+        const common = { target: { ...materialTargetParameter, required: true } }
+        const preparationRef = { type: 'object', additionalProperties: false, required: true, properties: { id: { type: 'string', required: true }, version: { type: 'integer', required: true } } }
+        const query = { ...common, planId: { type: 'string', required: true }, version: { type: 'integer', required: true } }
+        const definitions: readonly { name: string; method: 'suggest' | 'set' | 'status' | 'read'; description: string; parameters: Record<string, unknown> }[] = [
+          { name: 'translation_batch_suggest_plan', method: 'suggest', parameters: { ...common, preparationRef, cursor: { type: 'string' }, limit: { type: 'integer' } },
+            description: 'Suggest complete bounded chapter, paragraph, sentence and capacity boundaries for exact delivered material and a ready immutable preparation version. The Host privately captures the actual Client preparation, reads only the fixed source and prepares the frozen model route to measure capacity. Follow nextCursor for at most 50 items and 32768 UTF-8 bytes per page. Suggestions do not register a translation plan, invoke a provider stream, consume a draft or create a unit. Changed relevant user-fixed terms require a new preparation. Token counts are estimated when the runtime has no tokenizer.' },
+          { name: 'translation_batch_set_plan', method: 'set', parameters: { ...common, preparationRef, planId: { type: 'string', required: true }, expectedVersion: { type: 'integer', required: true }, operationId: { type: 'string', required: true },
+            items: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: { chunkId: { type: 'string', required: true }, outputRange: { ...range, required: true }, mode: { type: 'string', enum: ['translate', 'copy'], required: true }, contextRanges: { type: 'array', items: range, required: true } } } },
+            protectedRanges: { type: 'array', items: range } },
+            description: 'Freeze a complete ordered plan for exact delivered material and a ready preparation reference. expectedVersion 0 creates the first version; later changes append immutable versions. outputRange must cover the whole fixed source exactly once, including explicit copy ranges; contextRanges are input only and are never repeated in output. At most 256 chunks and 8 context ranges each. Validate single-body limits, prepared model capacity, relevant frozen terminology/background, output reserve and the 512 actual-call task budget including previous analysis and limited automatic supplements. An over-capacity or incomplete plan fails without truncation or execution. Plans are runtime-only; this call creates no unit, consumes no material and starts no translation.' },
+          { name: 'translation_batch_plan_status', method: 'status', parameters: query,
+            description: 'Read the exact runtime plan reference, fixed preparation and route, chunk counts and actual-call budget. budgetReady records the validated plan; executionAvailable remains false until document execution is implemented. Restart does not restore a plan or authorize model calls.' },
+          { name: 'translation_batch_read_plan', method: 'read', parameters: { ...query, section: { type: 'string', enum: ['items', 'budgets', 'protected'], required: true }, cursor: { type: 'string' }, limit: { type: 'integer' } },
+            description: 'Read exact runtime plan items, per-chunk capacity budgets or protected ranges with at most 50 items and 32768 UTF-8 bytes per complete page. Follow nextCursor. Source bodies and prompts remain in their authoritative records and are not copied into plan pages. Reading does not invoke a model or execute a document.' },
+        ]
+        for (const definition of definitions) disposers.push(agent.ctx.tools.register(helpers.defineTool({ name: definition.name, description: definition.description, parameters: definition.parameters,
+          output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+          execute: (args: unknown, exec: ToolExecution) => {
+            if (exec.agent !== agent || !this.ownsAgent(agent.id, exec.agent)) throw bridgeError('scope_mismatch', '规划工具不属于已连接的实际主 Agent。')
+            return planning[definition.method](args, exec)
           },
         })))
       }

@@ -6,6 +6,7 @@ import { NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_V
 import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
 import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
 import type { TranslationMaterialRoute } from '../shared/translation-material.js'
+import type { DocumentPreparedCapacity } from '../shared/document-planning.js'
 export { QUICK_SYSTEM_PROMPT } from '../shared/translation-call.js'
 
 /** Narrow views of the 0.2.0-rc.2 public runtime, checked against the installed packages. */
@@ -180,6 +181,22 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   }
 
   discard(operationId: string): void { this.prepared.delete(operationId) }
+  /** Prepare the real selected route without dispatching a stream or retaining any document body. */
+  async prepareDocumentCapacity(operationId: string, route: ModelSelection, signal: AbortSignal): Promise<DocumentPreparedCapacity> {
+    await this.prepareOperation(operationId, route, signal)
+    const bound = this.prepared.get(operationId)!
+    const contextWindow = bound.call.context?.contextWindow ?? null, maxOutputTokens = bound.call.config.maxTokens ?? null
+    for (const count of [contextWindow, maxOutputTokens]) {
+      if (count !== null && (!Number.isSafeInteger(count) || count <= 0)) {
+        this.discard(operationId)
+        throw Object.assign(new Error('Prepared capacity is invalid'), { code: 'INVALID_PREPARED_CALL' })
+      }
+    }
+    // The public rc.2 prepared-call contract exposes no tokenizer. UTF-8 accounting remains estimated.
+    return frozen({ route: { provider: bound.call.config.provider, model: bound.call.config.model,
+      ...(bound.call.config.reasoningEffort === undefined ? {} : { reasoningEffort: bound.call.config.reasoningEffort }) },
+      contextWindow, maxOutputTokens, countKind: 'estimated' as const })
+  }
   diagnostic(operationId: string): SafeExecutionFailure | undefined { return this.failures.get(operationId) }
   callMetadata(operationId: string): Omit<TranslationCallMetadata, 'usage'> | undefined { return this.calls.get(operationId) }
   /** rc.2 has no public structured-output declaration. Use strict, bounded JSON parsing in the caller. */

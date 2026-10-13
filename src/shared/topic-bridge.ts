@@ -5,9 +5,9 @@ import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } fr
 import { parseNormalTranslationV2Event, type NormalTranslationResolution, type NormalTranslationV2Event } from './normal-translation-v2.js'
 import {
   parseTranslationPreparationPrepare, parseTranslationPreparationSet, parseTranslationPreparationQuery, parseTranslationPreparationRead,
-  parsePreparationAnalysisFacts, parsePreparationReceipt, parsePreparationPage,
+  parsePreparationAnalysisFacts, parsePreparationReceipt, parsePreparationPage, parsePreparationSnapshot,
   type TranslationPreparationPrepare, type TranslationPreparationSet, type TranslationPreparationQuery, type TranslationPreparationRead,
-  type PreparationAnalysisFacts, type PreparationReceipt, type PreparationPage,
+  type PreparationAnalysisFacts, type PreparationReceipt, type PreparationPage, type PreparationSnapshot,
 } from './translation-preparation.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
@@ -56,6 +56,7 @@ export type TopicBridgeCommand =
   | { readonly kind: 'preparation_set'; readonly request: TranslationPreparationSet; readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }> }
   | { readonly kind: 'preparation_status'; readonly request: TranslationPreparationQuery }
   | { readonly kind: 'preparation_read'; readonly request: TranslationPreparationRead }
+  | { readonly kind: 'preparation_capture'; readonly request: TranslationPreparationQuery; readonly relevantFixedIds: readonly string[]; readonly topicTermsVersion: number }
   | { readonly kind: 'normal_resolve'; readonly target: NormalTranslationUnitTarget; readonly operationId: string }
   | ({ readonly kind: 'normal_correct_source' } & NormalTranslationSourceCorrection)
   | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
@@ -81,6 +82,7 @@ export type TopicBridgeCommand =
 export type TopicBridgeValue =
   | { readonly kind: 'preparation_receipt'; readonly receipt: PreparationReceipt }
   | { readonly kind: 'preparation_page'; readonly page: PreparationPage }
+  | { readonly kind: 'preparation_captured'; readonly snapshot: PreparationSnapshot }
   | { readonly kind: 'normal_resolved'; readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }> }
   | { readonly kind: 'normal_source_corrected'; readonly correction: NormalTranslationCorrectionReceipt }
   | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
@@ -140,7 +142,7 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
 }
 export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 = 1): TopicBridgeCommand {
   object(value)
-  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
+  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
   switch (value.kind) {
       case 'preparation_prepare': {
         exact(value, ['kind', 'request', 'envelope', 'analysis'])
@@ -156,6 +158,7 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 = 1): To
       }
       case 'preparation_status': exact(value, ['kind', 'request']); return { kind: 'preparation_status', request: parseTranslationPreparationQuery(value.request) }
       case 'preparation_read': exact(value, ['kind', 'request']); return { kind: 'preparation_read', request: parseTranslationPreparationRead(value.request) }
+      case 'preparation_capture': exact(value, ['kind', 'request', 'relevantFixedIds', 'topicTermsVersion']); strings(value.relevantFixedIds); integer(value.topicTermsVersion); return { kind: 'preparation_capture', request: parseTranslationPreparationQuery(value.request), relevantFixedIds: value.relevantFixedIds, topicTermsVersion: value.topicTermsVersion }
       case 'normal_resolve': {
         exact(value, ['kind', 'target', 'operationId']); text(value.operationId)
         const target = parseNormalTranslationTarget(value.target)
@@ -283,10 +286,11 @@ function sessionSummary(value: unknown): void {
 }
 function parseValue(value: unknown, protocol: 1 | 2): TopicBridgeValue {
   object(value)
-  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
+  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
     case 'preparation_receipt': exact(value, ['kind', 'receipt']); return { kind: 'preparation_receipt', receipt: parsePreparationReceipt(value.receipt) }
     case 'preparation_page': exact(value, ['kind', 'page']); return { kind: 'preparation_page', page: parsePreparationPage(value.page) }
+    case 'preparation_captured': exact(value, ['kind', 'snapshot']); return { kind: 'preparation_captured', snapshot: parsePreparationSnapshot(value.snapshot) }
     case 'normal_resolved': {
       exact(value, ['kind', 'envelope']); const envelope = parseTranslationMaterialEnvelope(value.envelope)
       if (envelope.kind !== 'material' || !envelope.material.unitReference) throw new TypeError('Invalid unit resolution')

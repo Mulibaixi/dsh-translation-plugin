@@ -187,6 +187,16 @@ export class TopicBridgeClient {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
+    if (command.kind === 'preparation_capture') {
+      if (!this.preparation || command.request.target.mainSessionId !== ownerId) return error(request.requestId, 'scope_mismatch', '规划准备不属于当前主会话或通道尚未就绪。')
+      const envelope = this.resolvePreparationTarget?.(command.request.target), session = envelope && this.sessions.getSession(envelope.material.translationSessionId)
+      if (!envelope || envelope.ownerId !== ownerId || envelope.mainSessionId !== ownerId || !session || session.ownerId !== ownerId ||
+        session.topicId !== envelope.material.topicId || this.sessions.isSessionDeleted(session.id) || session.mode !== 'normal') return error(request.requestId, 'material_mismatch', '规划要求的材料不是当前主会话确切交付的固定材料。')
+      const topicTerms = await (this.terms.reconcileAsync?.(ownerId, session.topicId) ?? this.terms.getSnapshot(ownerId, session.topicId))
+      if (topicTerms.version !== command.topicTermsVersion) return error(request.requestId, 'stale_terms', '固定条目在原稿核对后已变化，请重新取得规划准备。')
+      const result = await this.preparation.capture(command.request, { envelope, topicTerms }, command.relevantFixedIds, snapshot => new TextEncoder().encode(JSON.stringify(success({ kind: 'preparation_captured', snapshot }))).byteLength)
+      return result.ok ? success({ kind: 'preparation_captured', snapshot: result.value }) : error(request.requestId, result.error.code, result.error.message)
+    }
     if (command.kind === 'preparation_prepare' || command.kind === 'preparation_set' || command.kind === 'preparation_status' || command.kind === 'preparation_read') {
       if (!this.preparation || command.request.target.mainSessionId !== ownerId) return error(request.requestId, 'scope_mismatch', '准备记录不属于当前主会话或通道尚未就绪。')
       const measure = (page: PreparationPage) => new TextEncoder().encode(JSON.stringify(success({ kind: 'preparation_page', page }))).byteLength
