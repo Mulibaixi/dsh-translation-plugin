@@ -3,7 +3,7 @@ import { downloadExport } from './browser-download.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
 import type { SessionStore } from './session-store.js'
 import type { QuickTranslationClient } from './quick-translation.js'
-import { currentFinalRevision, isTextUnit, type TextRevision } from './translation-history.js'
+import { currentFinalRevision, isTextUnit, revisionDeletionChanged, type TextRevision } from './translation-history.js'
 import { DocumentUnitView, TextUnitOpenLinks, type DocumentViewProps } from './document-unit-view.js'
 import { allowPartialTranslationExport, type TopicTranslationExport, type TranslationExportSession, type TranslationExportTopic } from './translation-export.js'
 import { buildRecordObjectExportAsync, recordObjectPlainText } from './record-object-export.js'
@@ -47,9 +47,10 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   function rememberScroll(): void { if (visible && reader.current) scrollPositions.current.set(scrollKey, reader.current.scrollTop) }
   react.useEffect(() => store.subscribe(() => {
     refresh(value => value + 1)
+    setExportRequest(request => request?.entries.some(entry => revisionDeletionChanged(entry.history, store.getTranslationHistory(entry.session.id))) ? undefined : request)
     setDrafts(current => new Map([...current].filter(([key, draft]) => {
       const [id, unitId] = JSON.parse(key) as [string, string]
-      return !store.isSessionDeleted(id) && Boolean(store.getTranslationHistory(id)?.units.find(unit => unit.id === unitId)?.revisions.some(revision => revision.id === draft.baseRevisionId))
+      return !store.isSessionDeleted(id) && Boolean(store.getTranslationHistory(id)?.units.find(unit => unit.id === unitId)?.revisions.some(revision => revision.id === draft.baseRevisionId && (!('status' in revision) || revision.status !== 'deleted')))
     })))
   }), [store])
   react.useEffect(() => objects?.subscribe(() => refresh(value => value + 1)), [objects])
@@ -69,9 +70,9 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     try { await navigator.clipboard.writeText(text); setMessage('已复制。') } catch { setMessage('复制失败，请重试。') }
   }
   function deliverExport(result: TopicTranslationExport, request: Omit<PendingRecordsExport, 'result'>): void {
-    if (request.entries.some(({ session }) => {
+    if (request.entries.some(({ session, history }) => {
       const current = store.getSession(session.id)
-      return !current || store.isSessionDeleted(session.id) || current.ownerId !== request.topic.ownerId || current.topicId !== request.topic.topicId
+      return !current || store.isSessionDeleted(session.id) || current.ownerId !== request.topic.ownerId || current.topicId !== request.topic.topicId || revisionDeletionChanged(history, store.getTranslationHistory(session.id))
     })) { setMessage('导出范围已不可用，请重新导出。'); return }
     try {
       const download = allowPartialTranslationExport(result)
@@ -102,6 +103,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
       setExportLabel(scope === 'topic' ? `主题「${topic.name}」` : `会话「${selectedSession!.remark || selectedSession!.name}」`)
       const result = await projectExport(frozen, documents)
       if (!active()) return
+      if (frozen.entries.some(entry => revisionDeletionChanged(entry.history, store.getTranslationHistory(entry.session.id)))) { setMessage('导出期间版本已删除，请重新导出。'); return }
       if (!result.complete) { setExportRequest({ ...frozen, result }); return }
       if (!result.content) { setMessage('当前范围没有可导出的译文。'); return }
       deliverExport(result, frozen)

@@ -51,6 +51,7 @@ export class NormalTranslationClient {
   private readonly unitRequests = new Map<string, { operationId: string; pending: boolean; outcome: 'pending' | 'submitted' | 'failed' | 'unknown'; message: string; release: (() => void) | undefined }>()
   private readonly listeners = new Set<() => void>()
   private readonly stopBridge: (() => void) | undefined
+  private readonly stopStore: () => void
   private disposed = false
   constructor(private readonly store: SessionStore, private readonly materials: MaterialSubmissionsClient,
     private readonly terms: TopicBridgeTermsPort, private readonly retain: (ownerId: string) => () => void,
@@ -64,6 +65,15 @@ export class NormalTranslationClient {
       readonly publishUnit?: (ownerId: string, sessionId: string, unitId: string) => boolean } = {}) {
     this.stopBridge = options.subscribeBridge?.(() => {
       for (const item of this.operations.values()) if (['accepted', 'running'].includes(item.operation.status) && options.bridgeReady?.(item.operation.mainSessionId) === false) this.unknown(item, '普通翻译连接中断，请查询本轮状态；未自动重发。')
+    })
+    this.stopStore = store.subscribe(() => {
+      for (const [key, item] of this.operations) {
+        const unit = store.getTranslationHistory(item.operation.translationSessionId)?.units.find(unit => unit.id === item.operation.unitId)
+        if (unit && isTextUnit(unit) && unit.revisions.some(revision => revision.status === 'deleted' &&
+          (revision.id === item.callId || item.v2Attempts.has(revision.id)))) {
+          item.release?.(); this.operations.delete(key)
+        }
+      }
     })
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
@@ -208,6 +218,7 @@ export class NormalTranslationClient {
     if (event.sequence !== item.v2Sequence + 1) { item.v2Status = 'unknown'; item.operation = { ...op, status: 'unknown' }; return failure('sequence_gap', 'v2执行事件缺失，请查询原操作；未重发模型。') }
     const history = this.store.getTranslationHistory(session.id)!, unit = history.units.find(unit => unit.id === op.unitId)
     if (!unit || !isTextUnit(unit) || !unit.sourceVersions.some(source => source.version === input.sourceVersion)) return failure('stale_version', '处理单元的源记录已不可用。')
+    if (event.callId && unit.revisions.find(revision => revision.id === event.callId)?.status === 'deleted') return failure('revision_deleted', '此版本已由用户删除，旧正文回执未采用。')
     const at = new Date().toISOString(), callId = event.callId
     let attempt = callId ? item.v2Attempts.get(callId) : undefined
     const appendFact = (current: typeof history, revisionId: string | null, status: TextRevisionStatus | null): typeof history => appendTranslationEvent(current, {
@@ -363,6 +374,7 @@ export class NormalTranslationClient {
     const history = this.store.getTranslationHistory(session.id)!, unit = history.units.find(unit => unit.id === op.unitId)
     if (!unit || !isTextUnit(unit) || !unit.sourceVersions.some(source => source.version === update.sourceVersion)) return failure('stale_version', '处理单元的源记录已不可用。')
     const existing = unit.revisions.find(revision => revision.id === update.callId)
+    if (existing?.status === 'deleted') return failure('revision_deleted', '此版本已由用户删除，旧正文回执未采用。')
     const text = item.text + update.textDelta, at = new Date().toISOString()
     if (['completed', 'failed', 'cancelled'].includes(op.status) && update.status !== op.status) return failure('invalid_state', '操作已经结束，迟到状态未采用。')
     if (update.status === 'completed' && !text.trim()) return failure('incomplete_result', '空输出不能记为完成。')
@@ -416,9 +428,9 @@ export class NormalTranslationClient {
       const accepted = history?.events.find(event => event.operationId === operationId && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null)
       if (!unit || event?.type === 'source.corrected' || (material && material.mainSessionId !== ownerId) || this.store.isSessionDeleted(session.id)) continue
       const revision = [...unit.revisions].reverse().find(revision => revision.operationId === operationId)
-      if (!accepted && !['normal-text-v1', 'normal-text-exchange-v1'].includes(revision?.callRecord?.promptVersion ?? '')) continue
+      if (!accepted && !['normal-text-v1', 'normal-text-exchange-v1'].includes((revision?.callRecord ?? revision?.deletion?.callFacts)?.promptVersion ?? '')) continue
       const receipt = [...history!.events].reverse().find(event => event.operationId === operationId && event.normalSequence !== undefined)
-      const state = revision?.status ?? event?.status
+      const state = revision?.deletion?.originalStatus ?? revision?.status ?? event?.status
       const restoredV2Status: NormalTranslationV2Status = ['completed', 'failed', 'cancelled'].includes(state ?? '')
         ? state as NormalTranslationV2Status : 'unknown'
       const item: AcceptedOperation = { signature: '', operation: { operationId, mainSessionId: ownerId, topicId: session.topicId,
@@ -441,7 +453,7 @@ export class NormalTranslationClient {
   }
   getUnitStatus(sessionId: string, unitId: string): { readonly operationId: string; readonly status: NormalTranslationV2Status; readonly message: string | undefined; readonly querying: boolean } | undefined {
     const session = this.store.getSession(sessionId), history = this.store.getTranslationHistory(sessionId)
-    const event = [...history?.events ?? []].reverse().find(event => event.unitId === unitId && event.operationId !== null && event.type !== 'final.selected' && event.type !== 'revision.manual_saved' && event.type !== 'source.corrected')
+    const event = [...history?.events ?? []].reverse().find(event => event.unitId === unitId && event.operationId !== null && event.type !== 'final.selected' && event.type !== 'revision.manual_saved' && event.type !== 'revision.deleted' && event.type !== 'source.corrected')
     const item = session && event?.operationId ? this.locate(session.ownerId, event.operationId) : undefined
     return item ? { operationId: item.operation.operationId, status: item.v2Status, message: item.message, querying: item.querying } : undefined
   }
@@ -590,7 +602,7 @@ export class NormalTranslationClient {
   }
   reset(): void { for (const item of this.operations.values()) if (['accepted', 'running'].includes(item.operation.status)) this.unknown(item, '连接已重置，请查询原操作；未自动重发。') }
   dispose(): void {
-    this.disposed = true; this.stopBridge?.()
+    this.disposed = true; this.stopBridge?.(); this.stopStore()
     for (const item of this.operations.values()) item.release?.()
     for (const item of this.unitRequests.values()) item.release?.()
     this.operations.clear(); this.unitSnapshots.clear(); this.unitRequests.clear(); this.listeners.clear()

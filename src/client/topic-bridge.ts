@@ -434,11 +434,11 @@ export class TopicBridgeClient {
     const unit = history?.units.find(unit => unit.id === unitId)
     if (!unit || !isTextUnit(unit)) return false
     const latest = unit.revisions.at(-1)
-    if (this.disposed || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || session.mode !== 'normal' || !unit || !latest || !['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(latest.status)) return false
+    if (this.disposed || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict' || session.mode !== 'normal' || !unit || !latest || !['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(latest.status)) return false
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
     const final = currentFinalRevision(unit)
     const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      revisions: unit.revisions.map(({ id, order, kind, status, text, baseRevisionId, sourceVersion }) => ({ id, order, kind, status, text, baseRevisionId, sourceVersion })),
+      revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, sourceVersion: revision.sourceVersion }]),
       final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
     // Include the largest allowed correlation ID so every future request fits without truncation.
     const reply: TopicBridgeReply = { requestId: 'x'.repeat(2048), ok: true, value: { kind: 'unit', unit: fact } }
@@ -449,11 +449,11 @@ export class TopicBridgeClient {
   private publishAdmittedUnit(ownerId: string, sessionId: string, unitId: string, automatic = true): void {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     const unit = history?.units.find(unit => unit.id === unitId)
-    if (!session || session.ownerId !== ownerId || !unit || !isTextUnit(unit)) return
+    if (!session || session.ownerId !== ownerId || this.sessions.getStatus(session.id) === 'conflict' || !unit || !isTextUnit(unit)) return
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
     const final = currentFinalRevision(unit)
     const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      revisions: unit.revisions.map(({ id, order, kind, status, text, baseRevisionId, sourceVersion }) => ({ id, order, kind, status, text, baseRevisionId, sourceVersion })),
+      revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, sourceVersion: revision.sourceVersion }]),
       final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
     this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact, automatic })
     this.emit()
@@ -473,7 +473,9 @@ export class TopicBridgeClient {
     }
     for (const [key, publication] of this.publications) {
       const session = this.sessions.getSession(publication.sessionId)
-      if (!session || this.sessions.isSessionDeleted(publication.sessionId) || session.topicId !== publication.topicId || !this.sessions.getTranslationHistory(publication.sessionId)?.units.some(unit => unit.id === publication.fact.id)) {
+      const unit = this.sessions.getTranslationHistory(publication.sessionId)?.units.find(unit => unit.id === publication.fact.id)
+      if (!session || this.sessions.isSessionDeleted(publication.sessionId) || this.sessions.getStatus(session.id) === 'conflict' || session.topicId !== publication.topicId || !unit ||
+        isTextUnit(unit) && publication.fact.revisions.some(revision => unit.revisions.find(item => item.id === revision.id)?.status === 'deleted')) {
         this.publications.delete(key); changed = true
       } else if (publication.automatic) this.publishAdmittedUnit(session.ownerId, session.id, publication.fact.id)
     }

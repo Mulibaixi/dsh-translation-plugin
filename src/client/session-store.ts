@@ -5,7 +5,8 @@ import {
 } from './sessions.js'
 import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKey, encodeModelPreference, decodeModelPreference } from './model-preferences.js'
 import { SESSION_ORDER_PREFIX, sessionOrderKey, encodeSessionOrder, decodeSessionOrder, reconcileSessionOrder, moveSessionOrder } from './session-order.js'
-import { decodeTranslationHistory, emptyTranslationHistory, isDocumentUnit, persistedTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
+import { decodeTranslationHistory, emptyTranslationHistory, isDocumentUnit, isTextUnit, deleteTextRevision, textRevisionDeletionBlockedReason,
+  persistedTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
 import { parseTranslationSourceReference, parseTranslationSourceStorageRequest, type TranslationSourceQueryReference, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
 import type { TranslationSourceScope } from '../shared/translation-sources.js'
 import type { TranslationSourceHistoryCallbacks, TranslationSourceHistoryCommit } from './source-storage-client.js'
@@ -32,6 +33,16 @@ interface Seat { session: LocalSession; savedSession: LocalSession | undefined; 
 interface TopicSeat { identity: TopicIdentity; name: string; persistedName: string | undefined; stored: string | null; durable: boolean; nameDirty: boolean }
 interface Workspace { active: string | undefined }
 export interface HistoryVersion { readonly id: string; readonly stored: string | null; readonly legacyRaw: string | null; readonly current: string }
+export interface TextRevisionDeletionPlan {
+  readonly sessionId: string; readonly unitId: string; readonly revisionId: string; readonly eventId: string; readonly version: HistoryVersion
+}
+export interface TextRevisionDeletionResult {
+  readonly status: 'deleted' | 'blocked' | 'stale' | 'failed' | 'unknown'; readonly operationId: string; readonly message: string
+}
+interface PendingRevisionDeletion {
+  readonly plan: TextRevisionDeletionPlan; readonly at: string; readonly serialized: string
+  readonly saved: SessionSnapshot; readonly release: () => void
+}
 export interface SourceHistoryTarget { readonly sessionId: string; readonly unitId: string; readonly sourceVersion: number }
 export interface StructureLockPort { request<T>(name: string, action: () => T | Promise<T>): Promise<T> }
 export type SessionManagementResult =
@@ -53,8 +64,8 @@ interface SessionSnapshot { readonly session: LocalSession; readonly translation
 function readSnapshot(raw: string): SessionSnapshot | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
-    const hasTranslations = [4, 5, 6, 7, 8, 9, 10].includes(value.schemaVersion as number)
+    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    const hasTranslations = [4, 5, 6, 7, 8, 9, 10, 11].includes(value.schemaVersion as number)
     const fields = hasTranslations ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
     if (Object.keys(value).length !== fields.length || fields.some(key => !Object.hasOwn(value, key))) return undefined
     if (hasTranslations && (value.translationHistory as { schemaVersion?: unknown } | null)?.schemaVersion !== (value.schemaVersion as number) - 3) return undefined
@@ -80,6 +91,7 @@ export class SessionStore {
   private readonly workspaces = new Map<string, Workspace>()
   private readonly listeners = new Set<Disposer>()
   private readonly executionLeases = new Map<string, string>()
+  private readonly revisionDeletions = new Map<string, PendingRevisionDeletion>()
   private notice: string | undefined
   private readonly stop: Disposer | undefined
   private disposed = false
@@ -243,7 +255,7 @@ export class SessionStore {
   }
   subscribe(listener: Disposer): Disposer { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const fn of this.listeners) fn() }
-  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); this.workspaces.clear(); this.seats.clear(); this.topics.clear(); this.migrationSources.clear(); this.lastModels.clear(); this.sessionOrders.clear() }
+  dispose(): void { this.disposed = true; this.stop?.(); this.listeners.clear(); for (const item of this.revisionDeletions.values()) item.release(); this.revisionDeletions.clear(); this.workspaces.clear(); this.seats.clear(); this.topics.clear(); this.migrationSources.clear(); this.lastModels.clear(); this.sessionOrders.clear() }
 
   private readModelPreference(key: string): ModelRoute | null | undefined {
     try {
@@ -805,6 +817,9 @@ export class SessionStore {
   updateTranslationHistory(id: string, update: (history: TranslationHistory) => TranslationHistory): boolean {
     const seat = this.seats.get(id)
     if (!seat || this.disposed) return false
+    if ([...this.revisionDeletions.values()].some(item => item.plan.sessionId === id)) {
+      this.notice = '此会话的删除回执尚未确认，请先查询本次删除结果。'; this.emit(); return false
+    }
     try {
       if (this.isDeleted(id)) { this.notice = '会话已删除，迟到的翻译记录未采用。'; this.emit(); return false }
       const next = decodeTranslationHistory(update(structuredClone(seat.translationHistory)))
@@ -817,6 +832,106 @@ export class SessionStore {
       if (this.settings.rememberHistory) this.persist(id)
       this.emit(); return true
     } catch { this.notice = '翻译记录更新失败，之前的材料与版本仍保留。'; this.emit(); return false }
+  }
+  captureTextRevisionDeletion(sessionId: string, unitId: string, revisionId: string): TextRevisionDeletionPlan | undefined {
+    const version = this.captureHistoryVersions([sessionId])[0]
+    return version ? { sessionId, unitId, revisionId, version, eventId: `revision-delete:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}:${Math.random()}`}` } : undefined
+  }
+  getPendingTextRevisionDeletion(sessionId: string, unitId: string, revisionId: string): string | undefined {
+    return [...this.revisionDeletions.values()].find(item => item.plan.sessionId === sessionId && item.plan.unitId === unitId && item.plan.revisionId === revisionId)?.plan.eventId
+  }
+  getTextRevisionDeletionBlockedReason(sessionId: string, unitId: string, revisionId: string): string | undefined {
+    return this.revisionDeletionBlockedReason(sessionId, unitId, revisionId)
+  }
+  private revisionDeletionBlockedReason(sessionId: string, unitId: string, revisionId: string, leaseId?: string): string | undefined {
+    const seat = this.seats.get(sessionId)
+    if (!seat || this.disposed || this.isDeleted(sessionId)) return '此会话已不可用。'
+    if (seat.session.archivedAt !== null) return '归档会话不能删除版本，请先恢复会话。'
+    if (seat.status === 'conflict') return '会话副本存在冲突，请先读取最新副本。'
+    if (this.executionLeases.has(sessionId) && this.executionLeases.get(sessionId) !== leaseId) return '此会话仍有未结算操作，请先结束或查询。'
+    const active = (history: TranslationHistory): boolean => history.units.some(unit => isDocumentUnit(unit)
+      ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status))
+      : unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
+      history.exchanges.some(exchange => ['open', 'waiting_user', 'resuming', 'unknown'].includes(exchange.status)) ||
+      history.events.some(event => event.revisionId === null && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) &&
+        !history.units.filter(isTextUnit).some(unit => unit.revisions.some(revision => revision.operationId === event.operationId)) &&
+        ['submitting', 'running', 'unknown'].includes([...history.events].reverse().find(item => item.operationId === event.operationId)?.status ?? ''))
+    if (active(seat.translationHistory) || seat.stored !== null && active(seat.savedTranslationHistory)) return '此会话仍有运行中、等待处理或结果未知的翻译，请先结束或查询。'
+    const runtime = textRevisionDeletionBlockedReason(seat.translationHistory, unitId, revisionId)
+    if (runtime) return runtime
+    const savedUnit = seat.savedTranslationHistory.units.find(unit => unit.id === unitId)
+    if (seat.stored !== null && savedUnit?.revisions.some(revision => revision.id === revisionId)) {
+      const saved = textRevisionDeletionBlockedReason(seat.savedTranslationHistory, unitId, revisionId)
+      if (saved) return `已保存副本：${saved} 请先保存当前状态或调整最终选择。`
+    }
+    return undefined
+  }
+  /** Explicit deletion writes only the saved target conversion, regardless of automatic history saving. */
+  async deleteTextRevisionAsync(plan: TextRevisionDeletionPlan | undefined, guards: { readonly blockedReason?: () => string | undefined } = {}): Promise<TextRevisionDeletionResult> {
+    const stopped = (status: TextRevisionDeletionResult['status'], message: string): TextRevisionDeletionResult => ({ status, operationId: plan?.eventId ?? '', message })
+    if (!plan) return stopped('stale', '删除目标已不可用，请重新打开确认。')
+    const fixed = structuredClone(plan), blocked = this.revisionDeletionBlockedReason(fixed.sessionId, fixed.unitId, fixed.revisionId) ?? guards.blockedReason?.()
+    if (blocked) return stopped('blocked', blocked)
+    const release = this.claimDocumentLease(fixed.sessionId, fixed.eventId)
+    if (!release) return stopped('blocked', '此会话仍有未结算操作，请先结束或查询。')
+    const run = (): TextRevisionDeletionResult => {
+      const seat = this.seats.get(fixed.sessionId)
+      if (!seat || currentVersion(seat) !== fixed.version.current || seat.stored !== fixed.version.stored || seat.legacyRaw !== fixed.version.legacyRaw ||
+        (this.storage?.getItem(historyKey(fixed.sessionId)) ?? null) !== fixed.version.stored) return stopped('stale', '会话或版本已变化，请重新打开删除确认。')
+      const reason = this.revisionDeletionBlockedReason(fixed.sessionId, fixed.unitId, fixed.revisionId, fixed.eventId) ?? guards.blockedReason?.()
+      if (reason) return stopped('blocked', reason)
+      const at = new Date().toISOString(), input = { eventId: fixed.eventId, at }
+      const runtime = deleteTextRevision(seat.translationHistory, fixed.unitId, fixed.revisionId, input)
+      const savedHasTarget = seat.stored !== null && seat.savedTranslationHistory.units.find(unit => unit.id === fixed.unitId)?.revisions.some(revision => revision.id === fixed.revisionId)
+      if (!savedHasTarget) {
+        seat.translationHistory = runtime; seat.session = { ...seat.session, updatedAt: at }; seat.status = 'memory'; this.emit()
+        return stopped('deleted', '已删除此旧版本的正文；未保存内容仍只保留在本次运行。')
+      }
+      if (!this.storage || !seat.savedSession) return stopped('failed', '保存副本不可用，本次未删除正文。')
+      const saved: SessionSnapshot = { session: { ...seat.savedSession, updatedAt: at },
+        translationHistory: deleteTextRevision(seat.savedTranslationHistory, fixed.unitId, fixed.revisionId, input) }
+      const serialized = JSON.stringify({ schemaVersion: 11, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
+      const pending: PendingRevisionDeletion = { plan: fixed, at, saved, serialized, release }
+      this.revisionDeletions.set(fixed.eventId, pending)
+      try { this.storage.setItem(historyKey(fixed.sessionId), serialized) } catch { /* Read the original operation below; a thrown write is not proof of failure. */ }
+      return this.observeRevisionDeletionLocked(pending)
+    }
+    try {
+      const seat = this.seats.get(fixed.sessionId)
+      return seat?.stored !== null ? await this.withStructureLock(stopped('failed', '无法取得存储锁，本次未删除正文。'), run) : run()
+    } catch { return stopped('failed', '无法读取删除目标，正文仍保留；请核对当前副本。') }
+    finally { if (!this.revisionDeletions.has(fixed.eventId)) release() }
+  }
+  /** Query the original write only; never repeat an uncertain deletion write. */
+  async observeTextRevisionDeletionAsync(operationId: string): Promise<TextRevisionDeletionResult> {
+    const pending = this.revisionDeletions.get(operationId)
+    if (!pending) return { status: 'stale', operationId, message: '未找到待确认的删除操作，请核对当前记录。' }
+    return this.withStructureLock({ status: 'unknown', operationId, message: '删除回执仍未确认，请再次查询原操作。' } as TextRevisionDeletionResult,
+      () => this.observeRevisionDeletionLocked(pending))
+  }
+  private observeRevisionDeletionLocked(pending: PendingRevisionDeletion): TextRevisionDeletionResult {
+    const { plan } = pending, seat = this.seats.get(plan.sessionId)
+    const result = (status: TextRevisionDeletionResult['status'], message: string): TextRevisionDeletionResult => ({ status, operationId: plan.eventId, message })
+    let raw: string | null
+    try { raw = this.storage!.getItem(historyKey(plan.sessionId)) } catch { return result('unknown', '删除回执尚未确认，请查询本次删除结果；未重复写入。') }
+    const snapshot = raw === pending.serialized ? pending.saved : raw === null ? undefined : readSnapshot(raw)
+    const removed = snapshot?.translationHistory.units.filter(isTextUnit).find(unit => unit.id === plan.unitId)?.revisions.find(revision => revision.id === plan.revisionId)
+    if (seat && removed?.deletion?.eventId === plan.eventId && removed.deletion.at === pending.at) {
+      seat.translationHistory = deleteTextRevision(seat.translationHistory, plan.unitId, plan.revisionId, { eventId: plan.eventId, at: pending.at })
+      seat.session = { ...seat.session, updatedAt: pending.at }; seat.savedSession = snapshot!.session
+      seat.savedTranslationHistory = snapshot!.translationHistory; seat.stored = raw
+      const laterChange = raw !== pending.serialized
+      seat.status = laterChange ? 'conflict' : currentVersion(seat) === JSON.stringify(snapshot) ? 'saved' : 'memory'
+      delete seat.storageError; this.revisionDeletions.delete(plan.eventId); pending.release(); this.emit()
+      return result('deleted', laterChange ? '版本正文已删除；保存副本随后变化，请读取最新副本，当前临时修改仍保留。' : '已删除此旧版本的正文。')
+    }
+    if (raw === plan.version.stored || raw !== pending.serialized) {
+      this.revisionDeletions.delete(plan.eventId); pending.release()
+      if (seat && raw !== plan.version.stored) seat.status = 'conflict'
+      this.emit(); return result(raw === plan.version.stored ? 'failed' : 'stale', raw === plan.version.stored
+        ? '删除未写入，正文和旧保存副本仍保留，请重新确认后重试。' : '保存副本已变化，未重复写入删除，请读取最新副本。')
+    }
+    return result('unknown', '删除回执尚未确认，请查询本次删除结果；未重复写入。')
   }
   renameSession(id: string, name: string): boolean {
     const seat = this.seats.get(id)
@@ -963,8 +1078,15 @@ export class SessionStore {
       if (!overwrite && (raw !== seat.stored || seat.status === 'conflict')) {
         seat.status = 'conflict'; this.notice = '会话历史已在其他窗口修改或删除，当前输入保留。请选择读取本地副本或明确覆盖。'; return false
       }
+      if (raw !== null) {
+        const saved = readSnapshot(raw)
+        if (!saved || saved.translationHistory.units.filter(isTextUnit).some(unit => unit.revisions.some(revision => revision.status === 'deleted' &&
+          seat.translationHistory.units.filter(isTextUnit).find(item => item.id === unit.id)?.revisions.find(item => item.id === revision.id)?.deletion?.eventId !== revision.deletion?.eventId))) {
+          seat.status = 'conflict'; this.notice = '保存副本含已删除版本或无法读取的格式，不能覆盖恢复旧正文。请读取最新副本。'; return false
+        }
+      }
       const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
-      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 10 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
+      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 11 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
         ...(hasTranslations ? { translationHistory: persistedTranslationHistory(seat.translationHistory) } : {}) })
       this.storage.setItem(historyKey(id), serialized)
       if (this.storage.getItem(historyKey(id)) !== serialized) throw new Error('history read-back failed')
@@ -993,6 +1115,9 @@ export class SessionStore {
   reloadSession(id: string): boolean {
     const seat = this.seats.get(id)
     if (!seat || !this.storage) return false
+    if ([...this.revisionDeletions.values()].some(item => item.plan.sessionId === id)) {
+      this.notice = '删除回执尚未确认，请先查询本次删除结果，再读取其他副本。'; this.emit(); return false
+    }
     try {
       const raw = this.storage.getItem(historyKey(id))
       const snapshot = raw === null ? undefined : readSnapshot(raw), session = snapshot?.session

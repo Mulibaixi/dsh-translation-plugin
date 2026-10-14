@@ -59,6 +59,21 @@ export interface TranslationCallMetadata {
   /** Present only for the versioned control-capable normal prompt. */
   readonly exchangeContext?: NormalExchangeCallContext
 }
+/** Actual invocation facts retained after a user removes a revision's body and prepared content. */
+export type TranslationCallFacts = Omit<TranslationCallMetadata, 'context'>
+export function translationCallFacts(metadata: TranslationCallMetadata): TranslationCallFacts {
+  const { context: _context, ...facts } = metadata
+  return structuredClone(facts)
+}
+export function parseTranslationCallFacts(value: unknown): TranslationCallFacts {
+  const normal = !!value && typeof value === 'object' && 'promptVersion' in value &&
+    (value.promptVersion === NORMAL_TRANSLATION_PROMPT_VERSION || value.promptVersion === NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION)
+  const exchange = normal && value.promptVersion === NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION
+  exact(value, ['promptVersion', 'model', 'configVersion', 'maxOutputTokens', 'usage', ...(exchange ? ['exchangeContext'] : [])])
+  // Validate the unchanged invocation fields with the existing codec; prepared content is never retained.
+  parseTranslationCallMetadata(normal ? { ...value, context: { organizedRequirements: '', terms: [] } } : value)
+  return structuredClone(value) as unknown as TranslationCallFacts
+}
 export function reconstructNormalTranslationContext(material: { readonly source: string; readonly targetLanguage: string; readonly instruction: string }, context: NormalTranslationContext): {
   readonly systemPrompt: string; readonly userMessage: string
 } {

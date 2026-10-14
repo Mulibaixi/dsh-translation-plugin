@@ -90,6 +90,18 @@ export class RecordObjectStore {
     const scope: RecordObjectTarget = { ownerId, topicId, sessionId, unitId, side: 'revision', revisionId }
     return this.seat(ownerId, topicId, sessionId).snapshot.references.some(ref => recordObjectTargetMatches(ref, scope))
   }
+  /** Synchronous saved/runtime check, also used inside the shared structure lock before deletion. */
+  revisionDeletionBlockedReason(scope: RecordObjectTarget): string | undefined {
+    try {
+      const seat = this.seat(scope.ownerId, scope.topicId, scope.sessionId)
+      if (seat.status === 'conflict') return '对象引用存在存储冲突，请读取最新副本后再删除。'
+      const raw = this.storage?.getItem(recordObjectsKey(scope.sessionId)) ?? null
+      const saved = raw === null ? undefined : decodeRecordObjectSnapshot(JSON.parse(raw))
+      if (raw !== null && (!saved || saved.ownerId !== scope.ownerId || saved.topicId !== scope.topicId || saved.sessionId !== scope.sessionId)) return '已保存对象引用无法核对，不能删除此版本。'
+      if ([...seat.snapshot.references, ...(saved?.references ?? [])].some(ref => recordObjectTargetMatches(ref, scope))) return '此版本仍有对象位置引用，不能删除。'
+    } catch { return '对象引用无法核对，不能删除此版本。' }
+    return undefined
+  }
   private body(scope: RecordObjectTarget, requireEnded = false): string | undefined {
     const session = this.sessions.getSession(scope.sessionId)
     if (!session || session.ownerId !== scope.ownerId || session.topicId !== scope.topicId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict') return undefined
@@ -97,7 +109,7 @@ export class RecordObjectStore {
     if (!unit || !isTextUnit(unit)) return undefined
     if (scope.side === 'source') return scope.revisionId === null ? unit.source : undefined
     const revision = scope.revisionId === null ? undefined : unit.revisions.find(revision => revision.id === scope.revisionId)
-    return revision && (!requireEnded || canEditTextRevision(revision)) ? revision.text : undefined
+    return revision && revision.status !== 'deleted' && (!requireEnded || canEditTextRevision(revision)) ? revision.text : undefined
   }
   getAvailability(reference: RecordObjectReference): RecordObjectAvailability {
     if (this.seat(reference.ownerId, reference.topicId, reference.sessionId).status === 'conflict') return 'storage_conflict'

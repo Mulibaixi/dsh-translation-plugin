@@ -12,7 +12,7 @@ import { currentDocumentCandidateRevision, currentDocumentFinalRevision, current
   type TextRevision, type TranslationUnit } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 
-export type EvidenceSessionPort = Pick<SessionStore, 'getSession' | 'getTranslationHistory' | 'getStatus' | 'isSessionDeleted' | 'readStoredSourceRequest'>
+export type EvidenceSessionPort = Pick<SessionStore, 'getSession' | 'getTranslationHistory' | 'getStatus' | 'isSessionDeleted' | 'readStoredSourceRequest'> & Partial<Pick<SessionStore, 'subscribe'>>
 export interface TranslationEvidenceReader {
   capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult
   read(request: EvidenceReadRequest): Promise<EvidenceReadResult>
@@ -66,6 +66,7 @@ interface CacheStamp {
   readonly source: WeakRef<Snapshot['source']>
   readonly final: WeakRef<DocumentRevision | TextRevision> | null
   readonly chunks: readonly WeakRef<ChunkRevision>[]
+  readonly deletionEvents: string
 }
 type LoadedText = { readonly text: string } | EvidenceUnavailableResult
 function unavailable(request: EvidenceReadRequest | null, status: EvidenceUnavailableResult['status'], reason: string,
@@ -108,11 +109,21 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
   private readonly sourceLeases = new Set<string>()
   private readonly copyHashes = new Map<string, WeakRef<Snapshot['source']>>()
   private readonly maximum: number
+  private readonly stopSessions: (() => void) | undefined
   private disposed = false
   constructor(private readonly options: TranslationSourceReaderOptions) {
     const maximum = options.maxCachedPages ?? 16
     if (!Number.isSafeInteger(maximum) || maximum < 0 || maximum > 64) throw new TypeError('Invalid evidence page cache limit')
     this.maximum = maximum
+    this.stopSessions = options.sessions.subscribe?.(() => {
+      for (const [key, page] of this.pages) {
+        const unit = options.sessions.getTranslationHistory(page.result.request.sessionId)?.units.find(unit => unit.id === page.result.request.unitId)
+        if (unit && !isDocumentUnit(unit) && page.stamp.deletionEvents !== this.deletionEvents(page.result.request)) this.pages.delete(key)
+      }
+    })
+  }
+  private deletionEvents(request: EvidenceReadRequest): string {
+    return JSON.stringify(this.options.sessions.getTranslationHistory(request.sessionId)?.events.filter(event => event.unitId === request.unitId && event.type === 'revision.deleted').map(event => event.id) ?? [])
   }
   capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult {
     const unit = this.options.sessions.getTranslationHistory(ref.sessionId)?.units.find(unit => unit.id === ref.unitId)
@@ -245,7 +256,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       } }
   }
   clearCache(): void { this.pages.clear(); this.sourceLeases.clear(); this.copyHashes.clear() }
-  dispose(): void { this.disposed = true; this.clearCache() }
+  dispose(): void { this.disposed = true; this.stopSessions?.(); this.clearCache() }
 
   private inspect(request: EvidenceReadRequest): Snapshot | EvidenceUnavailableResult {
     if (this.disposed) return unavailable(request, 'unloaded', 'reader_disposed')
@@ -329,7 +340,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     if (translationSourceResultBytes({ ok: true, value: result }) > MAX_TRANSLATION_SOURCE_PAGE_BYTES) return unavailable(fixed, 'unloaded', 'range_required', snapshot.totalCodePoints)
     if (this.maximum) {
       this.pages.set(key, { stamp: { source: new WeakRef(snapshot.source), final: snapshot.final ? new WeakRef(snapshot.final) : null,
-        chunks: snapshot.chunks.map(chunk => new WeakRef(chunk)) }, result })
+        chunks: snapshot.chunks.map(chunk => new WeakRef(chunk)), deletionEvents: this.deletionEvents(fixed) }, result })
       while (this.pages.size > this.maximum) this.pages.delete(this.pages.keys().next().value!)
     }
     return structuredClone(result)

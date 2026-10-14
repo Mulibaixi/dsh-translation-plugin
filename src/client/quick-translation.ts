@@ -144,6 +144,9 @@ export class QuickTranslationClient {
   private reconcile(): void {
     for (const [id, list] of this.records) {
       const session = this.store.getSession(id)
+      const deleted = new Set(this.store.getTranslationHistory(id)?.units.filter(isTextUnit).flatMap(unit => unit.revisions
+        .filter(revision => revision.status === 'deleted').map(revision => revision.operationId)) ?? [])
+      if (deleted.size) this.records.set(id, list.filter(record => !deleted.has(record.id)))
       if (session) this.draftStamp(session)
       if (!session) {
         for (const record of list) this.stop(record.id, false)
