@@ -14,6 +14,7 @@ import { sourceCodePointLength, type TranslationSourceRange } from '../shared/tr
 import type { TranslationSourceScope } from '../shared/translation-sources.js'
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
+import { storageSaveFailureMessage } from './storage-errors.js'
 
 export const PREPARATION_STORAGE_PREFIX = 'dsh-translation-plugin:preparation:v1:'
 export interface PreparationStoragePort {
@@ -204,7 +205,7 @@ export class PreparationStore {
         stored = encoded
       } catch (error) {
         if ((error as { code?: string }).code === 'stale_preparation') throw error
-        audit = { ...audit, versions: [...seat.audit.versions, { ...snapshot, storage: 'runtime_only', storageError: '准备记录保存失败，本版本仅在运行期保留。' }] }
+        audit = { ...audit, versions: [...seat.audit.versions, { ...snapshot, storage: 'runtime_only', storageError: storageSaveFailureMessage(error, '准备记录', '准备记录保存失败，本版本仅在运行期保留。') }] }
       }
     }
     const next: Seat = { stored, audit: immutable(audit), ...(seat.catalog === undefined ? {} : { catalog: seat.catalog }), ...(seat.planningBindings === undefined ? {} : { planningBindings: seat.planningBindings }) }
@@ -467,7 +468,11 @@ export class PreparationStore {
           const next: Seat = { ...seat, stored: encoded, audit: immutable(audit) }
           this.seats.set(storageKey, next)
           return ok(next.audit.versions.find(item => item.version === snapshot.version)!)
-        } catch { return ok({ ...snapshot, storage: 'runtime_only', storageError: '准备保存失败；本版本仅在运行期保留。' }) }
+        } catch (error) {
+          const failed: PreparationSnapshot = { ...snapshot, storage: 'runtime_only', storageError: storageSaveFailureMessage(error, '准备记录', '准备保存失败；本版本仅在运行期保留。') }
+          this.seats.set(storageKey, { ...seat, audit: immutable({ ...seat.audit, versions: seat.audit.versions.map(item => item.version === snapshot.version ? failed : item) }) })
+          return ok(failed)
+        }
       })
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '文档准备引用或固定材料无效。', 'accept_document') }
   }

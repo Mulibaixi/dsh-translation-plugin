@@ -16,6 +16,8 @@ import {
 } from './topics.js'
 import type { TopicPersistence, TopicSessionStart } from '../shared/topic-bridge.js'
 import { PREPARATION_STORAGE_PREFIX, type PreparationStoreOptions } from './preparation-store.js'
+import { storageSaveFailureMessage } from './storage-errors.js'
+import { readPluginStorageUsage, type PluginStorageUsage } from './storage-usage.js'
 export interface LocalStoragePort {
   readonly length: number
   key(index: number): string | null
@@ -26,7 +28,7 @@ export interface LocalStoragePort {
 
 type Disposer = () => void
 export type HistoryStatus = 'memory' | 'saved' | 'conflict' | 'error'
-interface Seat { session: LocalSession; savedSession: LocalSession | undefined; translationHistory: TranslationHistory; savedTranslationHistory: TranslationHistory; stored: string | null; legacyRaw: string | null; status: HistoryStatus }
+interface Seat { session: LocalSession; savedSession: LocalSession | undefined; translationHistory: TranslationHistory; savedTranslationHistory: TranslationHistory; stored: string | null; legacyRaw: string | null; status: HistoryStatus; storageError?: string }
 interface TopicSeat { identity: TopicIdentity; name: string; persistedName: string | undefined; stored: string | null; durable: boolean; nameDirty: boolean }
 interface Workspace { active: string | undefined }
 export interface HistoryVersion { readonly id: string; readonly stored: string | null; readonly legacyRaw: string | null; readonly current: string }
@@ -88,7 +90,11 @@ export class SessionStore {
   }
 
   getSettings(): SessionSettings { return this.settings }
-  getNotice(): string | undefined { return this.notice }
+  getStorageUsage(): PluginStorageUsage { return readPluginStorageUsage(this.storage) }
+  getNotice(): string | undefined {
+    const errors = [...this.seats.values()].flatMap(seat => seat.storageError ? [seat.storageError] : [])
+    return [...new Set([...(this.notice ? [this.notice] : []), ...errors])].join(' ') || undefined
+  }
   getSession(id: string): LocalSession | undefined { return this.seats.get(id)?.session }
   isSessionDeleted(id: string): boolean { return this.isDeleted(id) }
   getTranslationHistory(id: string): TranslationHistory | undefined { return this.seats.get(id)?.translationHistory }
@@ -263,7 +269,7 @@ export class SessionStore {
       // Temporary session IDs cannot be restored; retain only their owner's next-session preference.
       if ((seat.stored !== null || seat.legacyRaw !== null) && !this.isDeleted(id)) this.storage.setItem(sessionModelKey(id), raw)
       this.storage.setItem(ownerModelKey(ownerId), raw)
-    } catch { this.notice = '模型与推理等级偏好未完整保存，当前选择仍保留在本次运行中。' }
+    } catch (error) { this.notice = storageSaveFailureMessage(error, '模型与推理等级偏好', '模型与推理等级偏好未完整保存，当前选择仍保留在本次运行中。') }
   }
 
   private readSettings(): boolean {
@@ -303,7 +309,7 @@ export class SessionStore {
       this.settings = next; this.notice = undefined
       if (!wasEnabled && next.rememberHistory) this.queueHistorySaves()
       this.emit(); return true
-    } catch { this.notice = '设置保存失败，编辑值仍保留，请检查本地存储后重试修改。'; this.emit(); return false }
+    } catch (error) { this.notice = storageSaveFailureMessage(error, '设置', '设置保存失败，编辑值仍保留，请检查本地存储后重试修改。'); this.emit(); return false }
   }
 
   private queueHistorySaves(): void {
@@ -516,7 +522,7 @@ export class SessionStore {
     try {
       if (!this.storage) throw new Error('storage unavailable')
       this.storage.setItem(sessionOrderKey(ownerId), encodeSessionOrder(ids)); return true
-    } catch { this.notice = '会话排序未保存，当前顺序仍保留在本次运行中。'; return false }
+    } catch (error) { this.notice = storageSaveFailureMessage(error, '会话排序', '会话排序未保存，当前顺序仍保留在本次运行中。'); return false }
   }
   moveSessionInDisplay(ownerId: string, id: string, targetId: string, after = false): boolean {
     const session = this.getSession(id), target = this.getSession(targetId)
@@ -586,7 +592,7 @@ export class SessionStore {
       this.notice = '当前环境缺少 Web Locks 或本地存储。持久主题的新建、重命名与迁移保存已暂停；当前输入仍保留。'; this.emit(); return failure
     }
     try { return await this.locks.request(TOPIC_LOCK_NAME, () => this.disposed ? failure : action()) }
-    catch { this.notice = '主题编号或名称保存失败，当前输入仍保留；请检查本地存储后重试。'; this.emit(); return failure }
+    catch (error) { this.notice = storageSaveFailureMessage(error, '主题编号或名称', '主题编号或名称保存失败，当前输入仍保留；请检查本地存储后重试。'); this.emit(); return failure }
   }
 
   /** 有历史保存或既有持久身份时，先可靠发号；正文保存失败可留下空号。 */
@@ -929,8 +935,8 @@ export class SessionStore {
         this.adoptTopic(current)
         const result = this.persistLocked(id, overwrite)
         this.emit(); return result
-      } catch {
-        current.status = 'error'; this.notice = '主题或会话历史保存失败，当前输入仍保留。'; this.emit(); return false
+      } catch (error) {
+        current.status = 'error'; current.storageError = this.notice = storageSaveFailureMessage(error, '主题或会话历史', '主题或会话历史保存失败，当前输入仍保留。'); this.emit(); return false
       }
     }).then(result => {
       if (!result && !this.locks && this.seats.get(id)?.status !== 'conflict') { seat.status = 'error'; this.emit() }
@@ -963,8 +969,10 @@ export class SessionStore {
       this.storage.setItem(historyKey(id), serialized)
       if (this.storage.getItem(historyKey(id)) !== serialized) throw new Error('history read-back failed')
       seat.stored = serialized; seat.savedSession = seat.session; seat.savedTranslationHistory = seat.translationHistory; seat.status = 'saved'
+      if (this.notice === seat.storageError) this.notice = undefined
+      delete seat.storageError
       return true
-    } catch { seat.status = 'error'; this.notice = '会话历史保存失败，当前输入仍保留在窗口内存中。'; return false }
+    } catch (error) { seat.status = 'error'; seat.storageError = this.notice = storageSaveFailureMessage(error, '会话历史', '会话历史保存失败，当前输入仍保留在窗口内存中。'); return false }
   }
   overwriteSession(id: string): boolean { this.notice = '覆盖保存需要等待主题锁，请使用异步覆盖操作。'; this.emit(); return false }
   async overwriteSessionAsync(id: string): Promise<boolean> { this.notice = undefined; return this.saveSessionAsync(id, true) }
@@ -992,6 +1000,7 @@ export class SessionStore {
       this.notice = undefined
       seat.session = this.restoreModel(session); seat.savedSession = session; seat.translationHistory = restoreTranslationHistory(snapshot!.translationHistory)
       seat.savedTranslationHistory = snapshot!.translationHistory; seat.stored = raw; seat.status = 'saved'
+      delete seat.storageError
       const topic = this.topics.get(session.topicId)
       if (topic) { topic.nameDirty = false; topic.name = topic.persistedName ?? session.topicName }
       if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(id, session)

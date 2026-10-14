@@ -15,6 +15,7 @@ import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPan
 import { type TopicTermsViewPort } from './topic-terms-view.js'
 import { downloadExport } from './browser-download.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
+import { StorageUsageView } from './storage-usage-view.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import type { NormalTranslationClient } from './normal-translation.js'
@@ -821,6 +822,7 @@ export function SettingsView({ store, onClose, terms }: StoreProps & { readonly 
       store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
       h(HistorySection, { store, terms }),
     ),
+    h(StorageUsageView, { store }),
     errors.length ? h('div', { role: 'alert', className: 'dsh-tp-message' }, ...errors.map(error => h('p', { key: error }, error))) : null,
     storeNotice(store),
     Object.keys(pending).length && !errors.length && !saving ? button('重试保存失败的修改', () => change({})) : null,
