@@ -8,6 +8,7 @@ import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore } from './topic-memory-store.js'
 import { TopicArchiveStore } from './topic-archive-store.js'
+import { ThemeMemoryClearing } from './theme-memory-clearing.js'
 import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
@@ -182,6 +183,11 @@ export function apply(ctx: ClientPluginContext): void {
       } : ctx.remote.translationNormalV2,
     })
     topics.setNormalTranslation(normal)
+    const memoryClearing = new ThemeMemoryClearing(store, terms, archive, {
+      isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId) ||
+        (store.getTranslationHistory(sessionId)?.units.some(unit => normal.getRetranslationStatus(sessionId, unit.id)?.pending || normal.getUnitStatus(sessionId, unit.id)?.querying) ?? false),
+      subscribeBusy: listener => { const stops = [quick.subscribe(listener), normal.subscribe(listener)]; return () => { for (const stop of stops) stop() } },
+    })
     const documents = new DocumentTasksClient(store, materials, preparations, ownerId => topics.retain(ownerId), {
       canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId), reader: evidence,
@@ -243,7 +249,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, objects, objectAssets, documents: evidence, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, objects, objectAssets, documents: evidence, memoryClearing, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })

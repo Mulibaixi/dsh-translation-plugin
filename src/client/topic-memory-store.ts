@@ -9,6 +9,7 @@ import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import { isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
 import { TranslationSourceReader, type TranslationEvidenceReader } from './source-reader.js'
 import type { EvidenceReadResult } from '../shared/translation-evidence.js'
+import { storageSaveFailureMessage } from './storage-errors.js'
 
 export const TOPIC_TERMS_PREFIX = 'dsh-translation-plugin:topic-terms:v1:'
 export function topicTermsKey(topicId: string): string { return `${TOPIC_TERMS_PREFIX}${encodeURIComponent(topicId)}` }
@@ -17,6 +18,12 @@ export interface TopicTermVersion {
   readonly topicId: string
   readonly stored: string | null
   readonly current: string
+}
+export interface TopicTermClearVersion extends TopicTermVersion {
+  readonly storageAvailable: boolean
+  readonly version: number
+  readonly currentCount: number
+  readonly storedCount: number
 }
 export type TopicTermCommand = { readonly kind: 'put'; readonly input: TopicTermPut }
   | { readonly kind: 'user_put'; readonly input: TopicTermUserPut }
@@ -168,7 +175,7 @@ export class TopicMemoryStore {
       const raw = JSON.stringify(seat.snapshot)
       this.storage.setItem(topicTermsKey(seat.snapshot.topicId), raw)
       seat.stored = raw; seat.dirty = false; seat.status = 'saved'; return true
-    } catch { seat.status = 'error'; this.notice = '主题术语保存失败，当前修改仍保留在本次运行。'; return false }
+    } catch (error) { seat.status = 'error'; this.notice = storageSaveFailureMessage(error, '主题术语', '主题术语保存失败，当前修改仍保留在本次运行。'); return false }
   }
   private queuePersist(seat: Seat): void {
     const id = seat.snapshot.topicId
@@ -271,6 +278,42 @@ export class TopicMemoryStore {
   captureForSessions(ids: readonly string[]): readonly TopicTermVersion[] {
     return this.captureVersions(ids.flatMap(id => { const session = this.sessions.getSession(id); return session ? [{ ownerId: session.ownerId, topicId: session.topicId }] : [] }))
   }
+  captureClearVersion(ownerId: string, topicId: string): TopicTermClearVersion {
+    const seat = this.seat(ownerId, topicId), saved = seat.stored === null ? null : decodeTopicTermSnapshot(JSON.parse(seat.stored))
+    const version = { ownerId, topicId, stored: seat.stored, current: JSON.stringify(seat.snapshot), version: seat.snapshot.version, storageAvailable: !!this.storage,
+      currentCount: seat.snapshot.entries.length, storedCount: saved?.entries.length ?? 0 }
+    if (!this.isClearVersionCurrent(version)) throw new Error('Topic terms have changed; reload before clearing')
+    return version
+  }
+  isClearVersionCurrent(version: TopicTermVersion): boolean {
+    try { return !this.disposed && this.sessions.getTopics(version.ownerId).some(topic => topic.id === version.topicId) && this.matches(version) }
+    catch { return false }
+  }
+  /** The clearing coordinator takes this existing topic lock once for both asset stores. */
+  async withTopicLock<T>(action: () => T): Promise<T> {
+    if (this.disposed || this.storage && !this.locks) throw new Error('Topic storage lock is unavailable')
+    return this.storage && this.locks ? this.locks.request(TOPIC_LOCK_NAME, () => {
+      if (this.disposed) throw new Error('Topic memory store is disposed')
+      return action()
+    }) : action()
+  }
+  /** Caller holds TOPIC_LOCK_NAME. Explicit clearing persists a content-free version barrier even with history off. */
+  clearLocked(version: TopicTermVersion): boolean {
+    if (!this.isClearVersionCurrent(version)) return false
+    const seat = this.seat(version.ownerId, version.topicId)
+    try {
+      if (this.storage && !this.locks) throw new Error('storage lock unavailable')
+      const saved = seat.stored === null ? null : decodeTopicTermSnapshot(JSON.parse(seat.stored))
+      const snapshot: TopicTermSnapshot = { ...emptyTopicTerms(version.ownerId, version.topicId, now()),
+        version: Math.max(seat.snapshot.version, saved?.version ?? 0) + 1,
+        activeVersion: Math.max(seat.snapshot.activeVersion, saved?.activeVersion ?? 0) +
+          (seat.snapshot.entries.some(entry => entry.status === 'active') || saved?.entries.some(entry => entry.status === 'active') ? 1 : 0) }
+      const raw = JSON.stringify(snapshot)
+      this.storage?.setItem(topicTermsKey(version.topicId), raw)
+      seat.snapshot = snapshot; seat.stored = this.storage ? raw : null; seat.dirty = false; seat.status = this.storage ? 'saved' : 'memory'
+      this.notice = undefined; this.emit(); return true
+    } catch { this.notice = '主题术语清空失败，该范围的当前与已保存内容保留。'; this.emit(); return false }
+  }
   private matches(version: TopicTermVersion): boolean {
     const seat = this.seat(version.ownerId, version.topicId)
     return seat.status !== 'conflict' && seat.stored === version.stored && JSON.stringify(seat.snapshot) === version.current &&
@@ -279,12 +322,8 @@ export class TopicMemoryStore {
   private removeTopics(versions: readonly TopicTermVersion[]): boolean {
     const removed: string[] = [], failed: string[] = []
     for (const version of versions) {
-      const seat = this.seat(version.ownerId, version.topicId)
-      try {
-        this.storage?.removeItem(topicTermsKey(version.topicId))
-        seat.snapshot = { ...emptyTopicTerms(version.ownerId, version.topicId, now()), version: seat.snapshot.version + 1, activeVersion: seat.snapshot.activeVersion + (seat.snapshot.entries.some(entry => entry.status === 'active') ? 1 : 0) }
-        seat.stored = null; seat.dirty = false; seat.status = 'memory'; removed.push(version.topicId)
-      } catch { failed.push(version.topicId) }
+      if (this.clearLocked(version)) removed.push(version.topicId)
+      else failed.push(version.topicId)
     }
     this.notice = failed.length ? `主题术语清理未完成：已删除 ${removed.length} 个主题，未删除 ${failed.length} 个主题（${failed.join('、')}）。` : undefined
     this.emit(); return failed.length === 0
@@ -313,7 +352,11 @@ export class TopicMemoryStore {
           const saved = decodeTopicTermSnapshot(JSON.parse(seat.stored))!
           const next = saved.entries.some(entry => entry.id === id) ? remove(saved) : saved
           if (next.entries.length) { const raw = JSON.stringify(next); this.storage.setItem(topicTermsKey(topicId), raw); seat.stored = raw }
-          else { this.storage.removeItem(topicTermsKey(topicId)); seat.stored = null }
+          else {
+            const barrier = { ...next, version: Math.max(next.version, seat.snapshot.version + 1),
+              activeVersion: Math.max(next.activeVersion, seat.snapshot.activeVersion + (entry.status === 'active' ? 1 : 0)) }
+            const raw = JSON.stringify(barrier); this.storage.setItem(topicTermsKey(topicId), raw); seat.stored = raw
+          }
         }
         seat.snapshot = remove(seat.snapshot); seat.dirty = seat.stored === null ? seat.snapshot.entries.length > 0 : JSON.stringify(seat.snapshot) !== seat.stored; seat.status = seat.dirty ? 'memory' : 'saved'
         this.notice = undefined; this.emit(); return true

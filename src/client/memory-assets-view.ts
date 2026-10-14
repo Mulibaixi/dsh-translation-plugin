@@ -17,16 +17,19 @@ import { resolveMemoryAssetsSelection } from './memory-assets-window.js'
 import { Menu, IconChevronDownOutlineRegular } from './native-ui.js'
 import type { RecordObjectsProps } from './record-object-view.js'
 import type { DocumentViewProps } from './document-unit-view.js'
+import type { ThemeMemoryClearing } from './theme-memory-clearing.js'
+import { useThemeMemoryClearing } from './theme-memory-clearing-view.js'
 
 interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
   readonly archive: TopicArchiveStore
+  readonly memoryClearing?: ThemeMemoryClearing | undefined
   readonly topics?: TopicBridgeClient | undefined; readonly ownerId: string; readonly topicId: string
   readonly onDeleteTerm: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly onSelectTopic?: ((topicId: string) => void) | undefined
 }): unknown {
@@ -66,7 +69,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, objects
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: `${ownerId}:${id}`, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
-        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
+        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
           active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
           navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
     }),
@@ -74,7 +77,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, objects
   )
 }
 
-function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
+function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
   readonly topicName: string; readonly active: boolean
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined
 }): unknown {
@@ -82,6 +85,7 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
   const exportFeedback = useExportDownloadFeedback(active && category === 'terms')
+  const memoryClear = useThemeMemoryClearing({ clearing: memoryClearing, ownerId, topicId, visible: active && category === 'terms' })
   const evidenceContextKey = JSON.stringify([ownerId, topicId, associatedSessionId, navigationRevision])
   function exportArchive(format: 'json' | 'markdown'): void {
     exportFeedback.clear(); setExportNotice(undefined)
@@ -123,8 +127,9 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
                   if (value === 'terms' || value === 'entity' || value === 'fact' || value === 'relation') setKind(value)
                 } }, h('option', { value: 'terms' }, '术语'), h('option', { value: 'entity' }, '实体'), h('option', { value: 'fact' }, '事实'), h('option', { value: 'relation' }, '关系')),
                 h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('json') }, '导出 JSON'),
-                  h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('markdown') }, '导出 Markdown'))),
-              exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null),
+                  h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('markdown') }, '导出 Markdown'), memoryClear.menu)),
+              exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null,
+              memoryClear.feedback, memoryClear.dialog),
             h('div', { className: 'dsh-tp-assets-module', hidden: kind !== 'terms' },
               h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName, hideExport: true,
                 active: active && category === 'terms' && kind === 'terms', evidenceContextKey,
