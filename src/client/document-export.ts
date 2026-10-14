@@ -50,7 +50,7 @@ function marker(missing: DocumentMissingRange): string {
   return `\n[缺失：原文码点 ${missing.range.start}–${missing.range.end}；${reason}]\n`
 }
 /** The projection is disposable. The fixed manifest and chunk records remain authoritative. */
-export async function projectDocument(snapshot: DocumentReadSnapshot, includeSource = false): Promise<DocumentProjection> {
+export async function projectDocument(snapshot: DocumentReadSnapshot, includeSource = false, selection: 'final' | 'candidate' = 'final'): Promise<DocumentProjection> {
   const missingRanges: DocumentMissingRange[] = [], blocks: DocumentExportBlock[] = [], parts: string[] = []
   let hasTranslation = false, end = 0
   const { manifest, plan } = snapshot
@@ -70,8 +70,9 @@ export async function projectDocument(snapshot: DocumentReadSnapshot, includeSou
     const missing: DocumentMissingRange = { range: whole, chunkId: null, side: 'translation', status: 'incomplete', reason: !validPlan ? 'plan_missing_or_invalid' : 'manifest_missing_or_invalid' }
     missingRanges.push(missing)
   }
-  const fixedFinal = !!manifest && manifest.id === snapshot.finalRevisionId && manifest.eligibility.complete && manifest.eligibility.finalEligible
-  if (validManifest && !fixedFinal) missingRanges.push({ range: whole, chunkId: null, side: 'translation', status: 'incomplete', reason: 'manifest_not_final' })
+  // finalRevisionId was fixed through the domain's sole qualification rule during capture.
+  const fixedFinal = !!manifest && manifest.id === snapshot.finalRevisionId
+  if (selection === 'final' && validManifest && !fixedFinal) missingRanges.push({ range: whole, chunkId: null, side: 'translation', status: 'incomplete', reason: 'manifest_not_final' })
   for (const block of validPlan ? snapshot.blocks : []) {
     let source: string | null = null, translation: string | null = null
     if (includeSource) {
@@ -80,7 +81,7 @@ export async function projectDocument(snapshot: DocumentReadSnapshot, includeSou
       else missingRanges.push({ range: block.outputRange, chunkId: block.chunkId, side: 'source', status: loaded.status, reason: loaded.reason })
     }
     let missing: DocumentMissingRange | null = null
-    if (!validManifest || !block.revision || !block.revisionId) missing = { range: block.outputRange, chunkId: block.chunkId, side: 'translation', status: 'incomplete', reason: 'chunk_missing' }
+    if (manifest && !validManifest || !block.revision || !block.revisionId) missing = { range: block.outputRange, chunkId: block.chunkId, side: 'translation', status: 'incomplete', reason: 'chunk_missing' }
     else if (block.revision.status !== 'completed') missing = { range: block.outputRange, chunkId: block.chunkId, side: 'translation', status: 'incomplete', reason: `chunk_${block.revision.status}` }
     else {
       const length = block.revision.content.kind === 'text' ? sourceCodePointLength(block.revision.content.text) : block.revision.content.range.end - block.revision.content.range.start
@@ -98,8 +99,8 @@ export async function projectDocument(snapshot: DocumentReadSnapshot, includeSou
     missingRanges.push({ range: whole, chunkId: null, side: 'translation', status: after.status, reason: after.reason })
     return { text: null, complete: false, hasTranslation: false, blocks: [], missingRanges, manifestRevisionId: manifest?.id ?? null, sourceVersion: snapshot.target.sourceVersion }
   }
-  const complete = fixedFinal && !!manifest && manifest.entries.length === snapshot.blocks.length && missingRanges.length === 0
-  const qualification = validManifest && !fixedFinal ? '\n[未定稿：此文档清单尚未成为最终译文]\n' : ''
+  const complete = (selection === 'candidate' ? Boolean(manifest?.eligibility.complete) : fixedFinal) && !!manifest && manifest.entries.length === snapshot.blocks.length && missingRanges.length === 0
+  const qualification = selection === 'final' && validManifest && !fixedFinal ? '\n[未定稿：此文档清单尚未成为最终译文]\n' : ''
   return { text: hasTranslation ? qualification + parts.join('') : null, complete, hasTranslation, blocks, missingRanges,
     manifestRevisionId: manifest?.id ?? null, sourceVersion: snapshot.target.sourceVersion }
 }

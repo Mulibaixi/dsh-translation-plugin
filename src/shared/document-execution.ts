@@ -173,8 +173,8 @@ export interface DocumentBatchStatusView {
   readonly restartExecutable: boolean
   readonly automaticSupplementCalls: number
   readonly reviewIssues: DocumentExecutionFacts['reviewIssues']
-  readonly review: 'pending' | 'review_required'
-  readonly finalEligible: false
+  readonly review: 'pending' | 'review_required' | 'passed' | 'failed'
+  readonly finalEligible: boolean
   readonly phaseNotification: 'unavailable' | 'available' | 'not_enqueued' | 'enqueued' | 'claimed' | 'discarded'
 }
 
@@ -363,7 +363,7 @@ export function parseDocumentBatchStatusView(value: unknown): DocumentBatchStatu
   for (const key of ['pauseRequested', 'cancelRequested', 'restartExecutable']) if (typeof value[key] !== 'boolean') throw new TypeError('Invalid document status flag')
   if (value.nextCursor !== null) integer(value.nextCursor, 0)
   integer(value.automaticSupplementCalls, 0, 3)
-  if (value.maximumCalls !== 512 || value.maximumOutputBytes !== MAX_DOCUMENT_OUTPUT_BYTES || value.finalEligible !== false || !['pending', 'review_required'].includes(value.review as string) || !['unavailable', 'available', 'not_enqueued', 'enqueued', 'claimed', 'discarded'].includes(value.phaseNotification as string) || !['running', 'paused', 'waiting_context', 'waiting_user', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted'].includes(value.status as string)) throw new TypeError('Invalid document status facts')
+  if (value.maximumCalls !== 512 || value.maximumOutputBytes !== MAX_DOCUMENT_OUTPUT_BYTES || typeof value.finalEligible !== 'boolean' || !['pending', 'review_required', 'passed', 'failed'].includes(value.review as string) || !['unavailable', 'available', 'not_enqueued', 'enqueued', 'claimed', 'discarded'].includes(value.phaseNotification as string) || !['running', 'paused', 'waiting_context', 'waiting_user', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted'].includes(value.status as string)) throw new TypeError('Invalid document status facts')
   if (value.error !== null) { exact(value.error, ['code', 'message', 'stage']); text(value.error.code, 128); text(value.error.message, 2048); text(value.error.stage, 128) }
   if (!Array.isArray(value.events) || value.events.length > 50 || !Array.isArray(value.reviewIssues) || value.reviewIssues.length > 256) throw new TypeError('Invalid document status page')
   value.events.forEach(raw => { exact(raw, ['taskSequence', 'kind', 'chunkId', 'childOperationId', 'sequence', 'at']); integer(raw.taskSequence); text(raw.kind, 128); nullableIdentity(raw.chunkId); nullableIdentity(raw.childOperationId); if (raw.sequence !== null) integer(raw.sequence, 0); time(raw.at) })

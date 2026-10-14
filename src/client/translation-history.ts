@@ -136,10 +136,20 @@ function status(value: unknown): value is TextRevisionStatus { return typeof val
 function eligible(revision: TextRevision): boolean { return revision.accepted && revision.status === 'completed' && !!revision.text.trim() }
 export function currentFinalRevision(unit: TranslationUnit): TextRevision | undefined {
   if (!isTextUnit(unit)) return undefined
+  if (unit.final?.selection === 'automatic') {
+    const latest = [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
+    if (!latest || !eligible(latest)) return undefined
+  }
   return unit.revisions.find(revision => revision.id === unit.final?.revisionId && revision.sourceVersion === unit.sourceVersion && eligible(revision))
 }
 export function currentDocumentFinalRevision(unit: TranslationUnit): DocumentRevision | undefined {
   return isDocumentUnit(unit) ? currentDocumentFinal(unit) : undefined
+}
+/** The current task may have no manifest; an earlier task is still only a historical candidate. */
+export function currentDocumentCandidateRevision(unit: TranslationUnit): DocumentRevision | undefined {
+  if (!isDocumentUnit(unit)) return undefined
+  const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion)
+  return [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion && revision.taskId === task?.taskId)
 }
 export function canEditTextRevision(revision: TextRevision): boolean {
   return ['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(revision.status) && !!revision.text.trim()
@@ -613,10 +623,16 @@ export function restoreTranslationHistory(history: TranslationHistory, at = new 
 function documentOperationIds(unit: DocumentUnit): readonly string[] {
   return [...unit.tasks.map(task => task.operationId), ...unit.plans.map(plan => plan.operationId),
     ...unit.tasks.flatMap(task => task.executionFacts?.controls.map(control => control.operationId) ?? []),
-    ...unit.sourceVersions.flatMap(source => source.operationId === null ? [] : [source.operationId]), ...unit.chunkRevisions.map(chunk => chunk.childOperationId)]
+    ...unit.sourceVersions.flatMap(source => source.operationId === null ? [] : [source.operationId]), ...unit.chunkRevisions.map(chunk => chunk.childOperationId),
+    ...(unit.reviewAudits?.map(audit => audit.operationId) ?? [])]
 }
 function revisionOperationId(unit: TranslationUnit, revision: TextRevision | DocumentRevision): string | undefined {
-  return 'operationId' in revision ? revision.operationId : isDocumentUnit(unit) ? unit.tasks.find(task => task.taskId === revision.taskId)?.operationId : undefined
+  if ('operationId' in revision) return revision.operationId
+  if (!isDocumentUnit(unit)) return undefined
+  if (revision.reviewAuditId) return unit.reviewAudits?.find(audit => audit.id === revision.reviewAuditId)?.operationId
+  const manual = revision.parentRevisionId ? revision.entries.map(entry => unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId))
+    .find(chunk => chunk && chunk.manualBase?.manifestRevisionId === revision.parentRevisionId && chunk.createdAt === revision.createdAt) : undefined
+  return manual?.childOperationId ?? unit.tasks.find(task => task.taskId === revision.taskId)?.operationId
 }
 function documentEvent(history: TranslationHistory, unit: DocumentUnit, type: TranslationEvent['type'], at: string,
   revisionId: string | null = null, operationId: string | null | undefined = null, reason: TranslationEvent['reason'] = null, sourceVersion = unit.sourceVersion): TranslationHistory {
@@ -651,11 +667,14 @@ export function applyDocumentMutation(history: TranslationHistory, unitId: strin
   const updated = reduceDocumentUnit(unit, mutation)
   if (updated === unit) return history
   const revision = mutation.kind === 'manifest' ? updated.revisions.find(item => item.id === mutation.revision.id)
-    : mutation.kind === 'final' ? updated.revisions.find(item => item.id === mutation.revisionId) : undefined
+    : mutation.kind === 'final' ? updated.revisions.find(item => item.id === mutation.revisionId)
+    : mutation.kind === 'manual' ? updated.revisions.find(item => item.id === mutation.edit.manifestId)
+    : mutation.kind === 'review' ? updated.revisions.find(item => item.id === mutation.audit.reviewedRevisionId) : undefined
   const operationId = revision ? revisionOperationId(updated, revision) : mutation.kind === 'task' ? mutation.task.operationId
     : mutation.kind === 'task_update' || mutation.kind === 'task_facts' ? updated.tasks.find(item => item.taskId === mutation.taskId)?.operationId
     : mutation.kind === 'source' ? mutation.source.operationId : mutation.kind === 'plan' ? mutation.plan.operationId
-    : mutation.kind === 'chunk' ? mutation.revision.childOperationId : mutation.kind === 'chunk_update' ? updated.chunkRevisions.find(item => item.id === mutation.revisionId)?.childOperationId : null
+    : mutation.kind === 'chunk' ? mutation.revision.childOperationId : mutation.kind === 'chunk_update' ? updated.chunkRevisions.find(item => item.id === mutation.revisionId)?.childOperationId
+    : mutation.kind === 'review' ? mutation.audit.operationId : null
   const sourceVersion = revision?.sourceVersion ?? (mutation.kind === 'chunk' ? mutation.revision.sourceVersion
     : mutation.kind === 'chunk_update' ? updated.chunkRevisions.find(item => item.id === mutation.revisionId)!.sourceVersion
     : mutation.kind === 'task' ? mutation.task.sourceVersion : mutation.kind === 'task_update' || mutation.kind === 'task_facts' ? updated.tasks.find(item => item.taskId === mutation.taskId)!.sourceVersion

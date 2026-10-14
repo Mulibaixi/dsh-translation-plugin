@@ -6,6 +6,8 @@ import type { AnalysisResult } from '../shared/translation-preparation.js'
 import type { DocumentTaskStatus, DocumentExecutionBaseline, DocumentSourceVersion, DocumentSupplementFact } from '../shared/translation-batch.js'
 import { verifyDocumentReuse } from '../memory/document-correction.js'
 import type { DocumentCorrectionService } from './document-correction-service.js'
+import type { DocumentReviewService } from './document-review-service.js'
+import type { DocumentReviewTarget } from '../shared/document-review.js'
 import { documentPlanningBytes, MAX_DOCUMENT_PLAN_CALLS, MAX_DOCUMENT_PLAN_PAGE_BYTES } from '../shared/document-planning.js'
 import { DshTextExecutionAdapter, type DocumentExecutionPacket } from './dsh-text-adapter.js'
 import type { DocumentExecutionFreeze, DocumentPlanningInput } from './document-planner.js'
@@ -90,6 +92,7 @@ export class DocumentExecutionService {
   private readonly children = new Map<string, Job>()
   private readonly exchangeRegistrations = new Map<TopicHostContext, ExchangeRegistration>()
   private readonly phaseFacts = new Map<string, BatchTaskPhaseEvent>()
+  private readonly reviewPhaseFacts = new Map<string, { readonly event: BatchTaskPhaseEvent; readonly target: DocumentReviewTarget; readonly reviewVersion: number; readonly owner: TopicHostContext; readonly exec: ToolExecution }>()
   private disposed = false
   constructor(readonly ctx: TopicHostContext) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationBatch', property: 'ctx' } })
@@ -106,7 +109,13 @@ export class DocumentExecutionService {
       typeof exchange.batchCapabilities !== 'function' || exchange.batchCapabilities().batchProtocol !== 1) return undefined
     const unregister = exchange.registerBatch(owner as unknown as Parameters<TranslationExchangeService['registerBatch']>[0], this)
     const unregisterPhase = exchange.registerBatchTaskPhaseInspector(owner as unknown as Parameters<TranslationExchangeService['registerBatchTaskPhaseInspector']>[0], {
-      inspectBatchTaskPhase: event => {
+      inspectBatchTaskPhase: async event => {
+        const review = this.reviewPhaseFacts.get(event.eventId)
+        if (review) {
+          const service = this.ctx.get?.('translationReview') as DocumentReviewService | undefined
+          return !this.disposed && review.owner === owner && same(review.event, event) && this.exchangeRegistrations.get(owner)?.exchange.hostGeneration === exchange.hostGeneration &&
+            await service?.notificationCurrent(review.target, review.reviewVersion, review.exec) ? review.event : null
+        }
         const fixed = this.phaseFacts.get(event.eventId), job = this.jobs.get(event.result.taskId)
         return !this.disposed && this.exchangeRegistrations.get(owner)?.exchange.hostGeneration === exchange.hostGeneration && job?.exchangeOwner === owner &&
           fixed && !job?.superseded && same(fixed, event) && job.taskVersion === event.result.version && job.taskSequence === event.result.taskSequence ? fixed : null
@@ -124,6 +133,19 @@ export class DocumentExecutionService {
     this.phaseFacts.set(event.eventId, event)
     try { const result = await exchange.notifyBatchTaskPhase(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['notifyBatchTaskPhase']>[0], event); job.phaseNotification = result.ok ? result.value.state : 'unavailable' }
     catch { job.phaseNotification = 'unavailable' }
+  }
+  /** The existing E inspector validates every distinct pending candidate against the Client. */
+  async notifyReviewCandidate(target: DocumentReviewTarget, exec: ToolExecution): Promise<string> {
+    const review = this.ctx.get?.('translationReview') as DocumentReviewService | undefined, owner = this.ctx, exchange = this.attachExchange(owner)
+    if (!review || !exchange || exchange.batchCapabilities().taskPhase.state !== 'available' || !this.topics.ownsAgent(target.scope.mainSessionId, exec.agent)) return 'unavailable'
+    const captured = await review.page({ scope: target.scope, unitId: target.unitId, sourceVersion: target.sourceVersion, manifestRevisionId: target.manifestRevisionId }, exec)
+    if (!captured.ok || captured.value.summary.semanticStatus !== 'pending') return 'unavailable'
+    const fact = captured.value.summary, event: BatchTaskPhaseEvent = { eventId: JSON.stringify([fact.taskId, target.manifestRevisionId, 'document_review_required']), hostGeneration: exchange.hostGeneration,
+      scope: target.scope, operationId: fact.operationId, phase: 'document_review_required', result: { kind: 'task', taskId: fact.taskId, unitId: target.unitId, sourceVersion: target.sourceVersion, version: fact.taskVersion, taskSequence: fact.taskSequence } }
+    const previous = this.reviewPhaseFacts.get(event.eventId)
+    if (!previous) this.reviewPhaseFacts.set(event.eventId, { event, target, reviewVersion: captured.value.reviewVersion, owner, exec })
+    try { const result = await exchange.notifyBatchTaskPhase(owner as unknown as Parameters<TranslationExchangeService['notifyBatchTaskPhase']>[0], event); return result.ok ? result.value.state : 'unavailable' }
+    catch { return 'unavailable' }
   }
   private get topics(): TopicToolsService { return this.ctx.get?.('translationTopics') as TopicToolsService }
   private get planning(): DocumentPlanningService { return this.ctx.get?.('translationPlanning') as DocumentPlanningService }
@@ -302,7 +324,10 @@ export class DocumentExecutionService {
       scope: job.scope, taskId: job.taskId, unitId: job.unitId, taskSequence, status, manifestId: `document-manifest:${crypto.randomUUID()}`, at } }, this.execution(job))
     if (value.kind !== 'document_updated') throw rejected('invalid_reply', 'Client 未准确确认整篇结算。', 'document_writeback')
     this.assertReceipt(job, value.receipt, taskSequence); job.receipt = value.receipt; job.status = status
-    if (status === 'completed') await this.notifyPhase(job, 'document_review_required')
+    if (status === 'completed') {
+      const review = this.ctx.get?.('translationReview') as DocumentReviewService | undefined
+      job.phaseNotification = review ? await review.completed(job.scope, job.unitId, job.request.target.sourceVersion, this.execution(job)) : 'unavailable'
+    }
     if (status !== 'unknown') {
       this.release(job)
       if (!job.cancelRequested) {
@@ -758,6 +783,8 @@ export class DocumentExecutionService {
         if (after > facts.taskSequence) return failure('invalid_cursor', '查询位置超过已保存实际序号。', 'status_document')
         const events = facts.controls.filter(control => control.taskSequence > after).slice(0, request.limit ?? 50).map(control => ({ taskSequence: control.taskSequence, kind: control.kind, chunkId: null, childOperationId: null, sequence: null, at: control.at }))
         const available = facts.controls.filter(control => control.taskSequence > after)
+        const reviewed = await (this.ctx.get?.('translationReview') as DocumentReviewService | undefined)?.page({ scope: receipt.scope, unitId: receipt.unitId, sourceVersion: receipt.sourceVersion }, exec)
+        const review = reviewed?.ok && reviewed.value.summary.taskId === receipt.taskId ? reviewed.value.summary : null
         const view = { scope: receipt.scope, taskId: receipt.taskId, unitId: receipt.unitId, operationId: receipt.operationId, sourceVersion: receipt.sourceVersion,
           planRef: receipt.planRef, preparationRef: receipt.preparationRef, status: receipt.status, receipt, taskSequence: facts.taskSequence, taskVersion: facts.taskVersion,
           hostGeneration: receipt.hostGeneration!, pauseRequested: receipt.status === 'paused', cancelRequested: receipt.status === 'cancelled',
@@ -765,7 +792,7 @@ export class DocumentExecutionService {
           actualCalls: facts.actualCalls, outputBytes: facts.outputBytes, maximumCalls: MAX_DOCUMENT_PLAN_CALLS, maximumOutputBytes: MAX_OUTPUT_BYTES,
           error: null, events, afterTaskSequence: after, nextCursor: events.length < available.length ? events.at(-1)?.taskSequence ?? after : null,
           restartExecutable: receipt.restartExecutable, automaticSupplementCalls: facts.automaticSupplementCalls, reviewIssues: facts.reviewIssues,
-          review: facts.reviewIssues.length ? 'review_required' : 'pending', finalEligible: false, phaseNotification: 'unavailable' }
+          review: review?.semanticStatus === 'passed' ? 'passed' : review?.mechanicalStatus === 'failed' ? 'failed' : review?.semanticStatus === 'review_required' || facts.reviewIssues.length ? 'review_required' : 'pending', finalEligible: review?.finalEligible ?? false, phaseNotification: 'unavailable' }
         return documentPlanningBytes({ ok: true, value: view }) > MAX_DOCUMENT_PLAN_PAGE_BYTES ? failure('reply_too_large', '保存状态完整回包超过 32768 字节。', 'status_document') : { ok: true, value: view }
       } catch (error) { const known = error as { code?: string; message?: string }; return failure(known.code ?? 'not_found', known.message ?? '未找到准确保存的任务事实。', 'status_document') }
     }
@@ -789,6 +816,8 @@ export class DocumentExecutionService {
     const after = request.afterTaskSequence ?? 0
     if (after > job.taskSequence) return failure('invalid_cursor', '状态位置超过此任务实际序号。', 'status_document')
     const available = job.facts.filter(item => item.taskSequence > after), events: ProgressFact[] = []
+    const reviewed = await (this.ctx.get?.('translationReview') as DocumentReviewService | undefined)?.page({ scope: job.scope, unitId: job.unitId, sourceVersion: job.request.target.sourceVersion }, exec)
+    const review = reviewed?.ok && reviewed.value.summary.taskId === job.taskId ? reviewed.value.summary : null
     const view = () => ({ scope: job.scope, taskId: job.taskId, unitId: job.unitId, operationId: job.request.operationId,
       sourceVersion: job.request.target.sourceVersion, planRef: job.request.planRef, preparationRef: job.request.preparationRef,
       status: job.status, receipt: job.receipt, taskSequence: job.taskSequence, taskVersion: job.taskVersion, hostGeneration: this.hostGeneration,
@@ -797,7 +826,7 @@ export class DocumentExecutionService {
       maximumCalls: MAX_DOCUMENT_PLAN_CALLS, maximumOutputBytes: MAX_OUTPUT_BYTES, error: job.error, events,
       afterTaskSequence: after, nextCursor: events.length < available.length ? events.at(-1)?.taskSequence ?? after : null,
       restartExecutable: job.receipt?.restartExecutable ?? false, automaticSupplementCalls: job.automaticSupplementCalls, reviewIssues: job.reviewIssues,
-      review: job.reviewIssues.length ? 'review_required' : 'pending', finalEligible: false, phaseNotification: job.phaseNotification })
+      review: review?.semanticStatus === 'passed' ? 'passed' : review?.mechanicalStatus === 'failed' ? 'failed' : review?.semanticStatus === 'review_required' || job.reviewIssues.length ? 'review_required' : 'pending', finalEligible: review?.finalEligible ?? false, phaseNotification: job.phaseNotification })
     for (const fact of available.slice(0, request.limit ?? 50)) {
       events.push(fact)
       if (documentPlanningBytes({ ok: true, value: view() }) > MAX_DOCUMENT_PLAN_PAGE_BYTES) { events.pop(); break }

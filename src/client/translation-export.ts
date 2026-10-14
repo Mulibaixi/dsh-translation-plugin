@@ -1,5 +1,5 @@
 import type { LocalSession } from './sessions.js'
-import { persistedTranslationHistory, currentDocumentFinalRevision, currentFinalRevision, isTextUnit, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
+import { persistedTranslationHistory, currentDocumentCandidateRevision, currentDocumentFinalRevision, currentFinalRevision, isTextUnit, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
 import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION, NORMAL_SYSTEM_PROMPT, NORMAL_TRANSLATION_PROMPT_VERSION } from '../shared/translation-call.js'
 import type { RecordObjectReference } from '../shared/record-objects.js'
 import type { DocumentRevision, DocumentSourceVersion } from '../shared/translation-batch.js'
@@ -209,7 +209,7 @@ export async function buildTranslationExportAsync(request: TranslationExportRequ
         status: final ? 'final' : 'missing', translation: final?.text ?? null, finalRevisionId: final?.id ?? null, latestStatus: unit.revisions.at(-1)?.status ?? null }
     }
     const final = currentDocumentFinalRevision(unit)
-    const manifest = final ?? [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion) ?? null
+    const manifest = final ?? currentDocumentCandidateRevision(unit) ?? null
     const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id,
       sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }
     const captured = reader?.captureDocument(target) ?? { status: 'unloaded' as const, request: null, reason: 'document_reader_unavailable' }

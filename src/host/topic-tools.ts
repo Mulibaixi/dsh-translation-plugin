@@ -8,6 +8,8 @@ import type { DocumentPlanningService } from './document-planning-service.js'
 import type { DocumentCorrectionService } from './document-correction-service.js'
 import { parseTranslationSourceRead, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, MAX_TRANSLATION_SOURCE_PAGE_BYTES } from '../shared/translation-source-read.js'
 import type { DocumentExecutionService } from './document-execution-service.js'
+import type { DocumentReviewService } from './document-review-service.js'
+import { registerDocumentReviewTools } from './document-review-tools.js'
 import { parseTranslationAnalysisStart, parseTranslationAnalysisQuery, parseTranslationAnalysisRead } from '../shared/translation-preparation.js'
 
 export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
@@ -129,6 +131,7 @@ class ManagementConnection {
     if (!pending || reply.requestId !== pending.frame.requestId) throw bridgeError('invalid_reply', '主题管理回执与请求不一致。')
     if (reply.ok) {
       const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
+        document_review_page: 'document_review_page', document_review_read: 'document_review_text', document_review_begin: 'document_review_receipt', document_review_submit: 'document_review_receipt', document_review_manual: 'document_review_receipt', document_review_observe: 'document_review_observed',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
         preparation_review_correction: 'preparation_receipt', preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page', preparation_capture: 'preparation_captured',
@@ -427,6 +430,8 @@ export class TopicToolsService {
         })))
       }
       const batch = this.ctx.get?.('translationBatch') as DocumentExecutionService | undefined
+      const review = this.ctx.get?.('translationReview') as DocumentReviewService | undefined
+      if (review && connection.protocol === 2) disposers.push(...registerDocumentReviewTools(review, this, agent, options => helpers.defineTool(options)))
       if (batch && connection.protocol === 2) {
         const reference = { type: 'object', additionalProperties: false, required: true, properties: { id: { type: 'string', required: true }, version: { type: 'integer', required: true } } }
         const scope = { type: 'object', additionalProperties: false, required: true, properties: {

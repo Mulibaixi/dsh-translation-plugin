@@ -20,8 +20,8 @@ export async function openDocumentOriginal(snapshot: DocumentReadSnapshot, signa
   const after = snapshot.check()
   return after ?? { status: 'ready', text: loaded.text, fileName: name(snapshot), mimeType: 'text/plain;charset=utf-8' }
 }
-export async function projectDocumentResult(snapshot: DocumentReadSnapshot, allowPartial = false): Promise<DocumentProjection & { readonly fileName: string; readonly mimeType: 'text/plain;charset=utf-8' }> {
-  const projection = await projectDocument(snapshot)
+export async function projectDocumentResult(snapshot: DocumentReadSnapshot, allowPartial = false, selection: 'final' | 'candidate' = 'final'): Promise<DocumentProjection & { readonly fileName: string; readonly mimeType: 'text/plain;charset=utf-8' }> {
+  const projection = await projectDocument(snapshot, false, selection)
   return { ...projection, text: projection.complete || allowPartial ? projection.text : null,
     fileName: `${name(snapshot).replace(/\.txt$/iu, '')}-translation${projection.complete ? '' : '-partial'}.txt`, mimeType: 'text/plain;charset=utf-8' }
 }

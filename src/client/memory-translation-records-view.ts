@@ -22,7 +22,7 @@ function editable(revision: TextRevision): boolean {
 function projectExport(request: Omit<PendingRecordsExport, 'result'>, documents: DocumentViewProps['documents']): Promise<TopicTranslationExport> {
   return buildRecordObjectExportAsync(request, documents, true)
 }
-export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, documents, documentTasks, ownerId, topicId, associatedSessionId, navigationRevision, visible = true }: RecordObjectsProps & DocumentViewProps & {
+export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, documents, documentTasks, documentReviews, ownerId, topicId, associatedSessionId, navigationRevision, visible = true }: RecordObjectsProps & DocumentViewProps & {
   readonly store: SessionStore; readonly quick: QuickTranslationClient; readonly ownerId: string; readonly topicId: string
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined; readonly visible?: boolean
 }): unknown {
@@ -137,7 +137,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
         h('h3', null, session.remark || session.name),
         session.archivedAt !== null ? h('p', { className: 'dsh-tp-muted' }, '会话已归档，请先在翻译工作区恢复后编辑。') : null,
         ...units.map(unit => {
-          if (!isTextUnit(unit)) return h(DocumentUnitView, { key: unit.id, unit, session, store, documents, documentTasks, objects, objectAssets, visible, navigationRevision })
+          if (!isTextUnit(unit)) return h(DocumentUnitView, { key: unit.id, unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, visible, navigationRevision })
           const revisions = unit.revisions
           const key = JSON.stringify([session.id, unit.id]), draft = drafts.get(key), open = expanded.has(key)
           const pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
@@ -207,7 +207,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
                 candidate ? revisionView(candidate, 'candidate') : null,
                 !final && !candidate ? h('p', { className: 'dsh-tp-muted' }, '尚无最终译文。') : null,
                 h('div', { className: 'dsh-tp-record-actions', hidden: !open },
-                  pointed && pointed.sourceVersion !== unit.sourceVersion ? h('p', { className: 'dsh-tp-muted' }, `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}`) : null))),
+                  pointed && !final ? h('p', { className: 'dsh-tp-muted' }, pointed.sourceVersion !== unit.sourceVersion ? `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中`) : null))),
             h('div', { className: 'dsh-tp-record-actions', hidden: !open }, h(RecordObjectEditor, { session, unit, objects, objectAssets }))
           )
         })))))

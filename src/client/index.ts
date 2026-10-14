@@ -14,6 +14,7 @@ import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type NativeMaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
 import { PreparationStore } from './preparation-store.js'
 import { DocumentTasksClient, type TranslationBatchRemotePort } from './document-tasks.js'
+import { DocumentReviewClient, type DocumentReviewRemotePort } from './document-review-client.js'
 import { NormalTranslationClient, type NormalTranslationRemotePort, type NormalTranslationV2RemotePort } from './normal-translation.js'
 import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
 import { adaptTranslationSourceStorageRemote, TranslationSourceStorageClient, type TranslationSourceStorageRemotePort } from './source-storage-client.js'
@@ -55,6 +56,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   get(name: 'remote.translationNormal'): NormalTranslationRemotePort | undefined
   get(name: 'remote.translationNormalV2'): NormalTranslationV2RemotePort | undefined
   get(name: 'remote.translationBatch'): TranslationBatchRemotePort | undefined
+  get(name: 'remote.translationReview'): DocumentReviewRemotePort | undefined
   get(name: 'remote.translationSources'): (TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort) | undefined
   readonly conversation?: { readonly submissions?: NativeMaterialSubmissionRegistry }
   readonly composerExtension?: ComposerExtensionService
@@ -68,6 +70,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
     readonly translationNormal?: NormalTranslationRemotePort
     readonly translationNormalV2?: NormalTranslationV2RemotePort
     readonly translationBatch?: TranslationBatchRemotePort
+    readonly translationReview?: DocumentReviewRemotePort
     readonly translationSources?: TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
@@ -189,6 +192,14 @@ export function apply(ctx: ClientPluginContext): void {
       } : ctx.remote.translationBatch,
     })
     topics.setDocumentTasks(documents)
+    const documentReviews = new DocumentReviewClient(store, preparations, evidence, ownerId => topics.retain(ownerId), {
+      isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId),
+      remote: ctx.remote.$mount ? async () => {
+        const unmountRemote = await mountedRemote
+        return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationReview')
+      } : ctx.remote.translationReview,
+    })
+    topics.setDocumentReviews(documentReviews)
     ctx.effect(() => () => store.dispose(), 'translation client store')
     ctx.effect(() => () => models.dispose(), 'translation model catalog')
     ctx.effect(() => () => terms.dispose(), 'translation topic terms')
@@ -199,6 +210,7 @@ export function apply(ctx: ClientPluginContext): void {
       remoteDisposed = true
       materials.dispose()
       documents.dispose()
+      documentReviews.dispose()
       preparations.dispose()
       normal.dispose()
       quick.dispose()
@@ -215,7 +227,7 @@ export function apply(ctx: ClientPluginContext): void {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, objects, objectAssets, documents: evidence, documentTasks: documents, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, terms, objects, objectAssets, documents: evidence, documentTasks: documents, documentReviews, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId },

@@ -5,7 +5,7 @@ import {
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryVersion, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
-import { isTextUnit } from './translation-history.js'
+import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import { isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
 import { TranslationSourceReader, type TranslationEvidenceReader } from './source-reader.js'
 import type { EvidenceReadResult } from '../shared/translation-evidence.js'
@@ -113,7 +113,7 @@ export class TopicMemoryStore {
     if (!session || !history || this.sessions.isSessionDeleted(sessionId) || this.sessions.getStatus(sessionId) === 'conflict') return undefined
     const unit = history.units.find(unit => unit.id === unitId)
     if (!unit || !isTextUnit(unit)) return undefined
-    const revision = unit.final && unit.revisions.find(revision => revision.id === unit.final?.revisionId)
+    const revision = currentFinalRevision(unit)
     const event = [...history.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
     return { ownerId: session.ownerId, topicId: session.topicId, sourceVersion: unit.sourceVersion, source: unit.source,
       final: revision && event?.revisionId === revision.id ? { revisionId: revision.id, selectionEventId: event.id, sourceVersion: revision.sourceVersion, text: revision.text } : null }

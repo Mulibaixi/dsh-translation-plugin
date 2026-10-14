@@ -8,8 +8,12 @@ import { RecordObjectText, type RecordObjectsProps } from './record-object-view.
 import { recordObjectPlainText } from './record-object-export.js'
 import { openDocumentOriginal, projectDocumentResult } from './document-open.js'
 import type { DocumentTasksClient } from './document-tasks.js'
+import type { DocumentReviewClient } from './document-review-client.js'
+import { documentReviewVersion, documentManifestFinalEligibility } from '../memory/document-review.js'
+import type { DocumentReviewTarget } from '../shared/document-review.js'
+import { readDocumentText } from './document-export.js'
 
-export interface DocumentViewProps { readonly documents?: TranslationDocumentReader | undefined; readonly documentTasks?: DocumentTasksClient | undefined }
+export interface DocumentViewProps { readonly documents?: TranslationDocumentReader | undefined; readonly documentTasks?: DocumentTasksClient | undefined; readonly documentReviews?: DocumentReviewClient | undefined }
 type Failure = Pick<EvidenceUnavailableResult, 'status' | 'reason'>
 function readNotice(failure: Failure): string {
   if (failure.reason === 'document_incomplete') return '结果包含缺项，完整打开尚不可用；可明确选择部分导出。'
@@ -129,27 +133,48 @@ function DocumentPage({ handle, block, side, session, unitId, objects, objectAss
       page && page.end < total ? h('button', { type: 'button', disabled: pending, onClick: () => { void load(page.end) } }, '下一页') : null) : null)
 }
 
-export function DocumentUnitView({ unit, session, documents, documentTasks, objects, objectAssets, visible = true, navigationRevision }: RecordObjectsProps & DocumentViewProps & {
+interface ManualDraft {
+  readonly target: DocumentReviewTarget; readonly reviewVersion: number; readonly chunkId: string; readonly baseRevisionId: string
+  readonly original: string; readonly text: string
+}
+export function DocumentUnitView({ unit, session, documents, documentTasks, documentReviews, objects, objectAssets, visible = true, navigationRevision }: RecordObjectsProps & DocumentViewProps & {
   readonly unit: DocumentUnit; readonly session: LocalSession; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => documentTasks?.subscribe(() => refresh(value => value + 1)), [documentTasks])
+  react.useEffect(() => documentReviews?.subscribe(() => refresh(value => value + 1)), [documentReviews])
+  const [selectedManifestId, setSelectedManifestId] = react.useState<string | undefined>(undefined)
+  const followReview = react.useRef<string | undefined>(undefined)
+  const [draft, setDraft] = react.useState<ManualDraft | undefined>(undefined)
+  const [pending, setPending] = react.useState(false), [message, setMessage] = react.useState<string | undefined>(undefined)
+  const lifetime = react.useRef({ mounted: true, visible, navigationRevision, identity: '' })
+  lifetime.current.visible = visible; lifetime.current.navigationRevision = navigationRevision
+  react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false } }, [])
+  react.useEffect(() => {
+    const reviewed = unit.reviewAudits?.find(audit => audit.manifestRevisionId === followReview.current && audit.reviewedRevisionId)
+    if (!reviewed?.reviewedRevisionId) return
+    if (selectedManifestId === followReview.current) setSelectedManifestId(reviewed.reviewedRevisionId)
+    followReview.current = undefined
+  }, [unit, selectedManifestId])
   const source = unit.sourceVersions.find(version => version.version === unit.sourceVersion), final = currentDocumentFinalRevision(unit)
-  const manifest = final ?? [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
-  const handle = react.useMemo(() => documents?.captureDocument({ ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }), [documents, session.ownerId, session.topicId, session.id, unit])
+  const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion), actualStatus = task?.status
+  const manifests = unit.revisions.filter(revision => revision.sourceVersion === unit.sourceVersion)
+  const currentCandidate = [...manifests].reverse().find(revision => revision.taskId === task?.taskId)
+  const manifest = selectedManifestId === '' ? undefined : selectedManifestId ? manifests.find(revision => revision.id === selectedManifestId) : currentCandidate
+  const handle = react.useMemo(() => documents?.captureDocument({ ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }), [documents, session.ownerId, session.topicId, session.id, unit, manifest?.id])
   const name = source?.body.kind === 'asset' ? source.body.reference.name : '长原稿'
   const identity = JSON.stringify([session.ownerId, session.topicId, session.id, unit.id, unit.sourceVersion, manifest?.id ?? null])
+  lifetime.current.identity = identity
   const readable = handle && !('status' in handle) ? handle : undefined
   const missing: Failure = handle && 'status' in handle ? handle : { status: 'unloaded', reason: 'reader_unavailable' }
-  const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion), actualStatus = task?.status
   const controls = task && documentTasks?.uiState(session.id, task.taskId)
-  const status = final ? '已定稿' : actualStatus === 'unknown' ? '执行状态未知' : actualStatus === 'running' ? '正在翻译' : actualStatus === 'paused' ? '已暂停' : actualStatus === 'waiting_context' ? '等待补充' : actualStatus === 'waiting_user' ? '等待讨论' : actualStatus === 'interrupted' ? '已中断' : actualStatus === 'failed' ? '翻译失败' : actualStatus === 'cancelled' ? '已取消' : manifest ? '待定稿' : '待准备'
+  const status = actualStatus === 'unknown' ? '执行状态未知' : actualStatus === 'running' ? '正在翻译' : actualStatus === 'paused' ? '已暂停' : actualStatus === 'waiting_context' ? '等待补充' : actualStatus === 'waiting_user' ? '等待讨论' : final?.id === manifest?.id && final ? '已定稿' : actualStatus === 'interrupted' ? '已中断' : actualStatus === 'failed' ? '翻译失败' : actualStatus === 'cancelled' ? '已取消' : manifest?.review.status === 'pending' ? '待复核' : manifest ? '待定稿' : '待准备'
   const originalAction: OpenAction = { label: '打开原稿', native: source?.body.kind === 'asset' && Boolean(source.historyCommit), run: async signal => readable ? openDocumentOriginal(readable, signal) : missing }
-  const resultAction: OpenAction = { label: '打开结果', run: async () => {
+  const resultAction: OpenAction = { label: '打开此版本', run: async () => {
     if (!readable) return missing
     const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision' as const, revisionId: readable.manifest?.id ?? null }
     const references = structuredClone(objects?.getReferences(target) ?? [])
-    const result = await projectDocumentResult(readable)
+    const result = await projectDocumentResult(readable, false, 'candidate')
     return result.text ? { text: recordObjectPlainText(result.text, target, references), fileName: result.fileName, mimeType: result.mimeType } : { status: 'missing', reason: result.complete ? 'result_empty' : 'document_incomplete' }
   } }
   const blocks = readable?.blocks.length ? readable.blocks : readable ? [{ chunkId: 'source', outputRange: { start: 0, end: readable.totalSourceCodePoints }, mode: 'translate' as const, contextRanges: [], revisionId: null, revision: null }] : []
@@ -158,17 +183,71 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, obje
   const resultTarget = { ...sourceTarget, side: 'revision' as const, revisionId: manifest?.id ?? null }
   const unplacedSource = (objects?.getReferences(sourceTarget) ?? []).filter(ref => !readable || ref.offset < 0 || ref.offset > readable.totalSourceCodePoints).map(ref => ({ ...ref, offset: -1 }))
   const unplacedResult = (objects?.getReferences(resultTarget) ?? []).filter(ref => targetTotal === undefined || ref.offset < 0 || ref.offset > targetTotal).map(ref => ({ ...ref, offset: -1 }))
+  const qualification = manifest ? documentManifestFinalEligibility(unit, manifest.id) : undefined
+  const canMutate = Boolean(documentReviews && manifest && session.archivedAt === null && task && !['running', 'unknown', 'waiting_context', 'waiting_user'].includes(task.status))
+  const editable = canMutate && manifest?.id === currentCandidate?.id
+  const audit = manifest && [...(unit.reviewAudits ?? [])].reverse().find(audit => audit.manifestRevisionId === manifest.id || audit.reviewedRevisionId === manifest.id)
+  const reviewIssues = audit ? [...audit.mechanical.issues, ...audit.semantic.issues, ...(audit.semantic.status === 'pending' ? audit.mechanical.suspicions : [])] : manifest?.review.issues ?? []
+  const viewedTask = manifest ? unit.tasks.find(task => task.taskId === manifest.taskId) : task
+  const unresolvedDependencies = (viewedTask?.executionFacts?.reviewIssues ?? []).filter(issue => !audit?.semantic.resolvedIssues.some(resolved =>
+    resolved.code === issue.code && resolved.message === issue.message && resolved.range.start === issue.range.start && resolved.range.end === issue.range.end))
+  const reviewTarget = manifest ? { scope: { ownerId: session.ownerId, mainSessionId: session.ownerId, topicId: session.topicId, translationSessionId: session.id }, unitId: unit.id,
+    sourceVersion: unit.sourceVersion, manifestRevisionId: manifest.id } : undefined
+  function operationId(): string { return `document-ui:${globalThis.crypto.randomUUID()}` }
+  async function startEditing(block: DocumentReadBlock): Promise<void> {
+    if (!readable || !reviewTarget || !block.revision || !editable || pending || draft) return
+    const target = structuredClone(reviewTarget), revision = block.revision, reviewVersion = documentReviewVersion(unit)
+    const navigation = navigationRevision
+    setPending(true); setMessage(undefined)
+    try {
+      const length = revision.content.kind === 'text' ? sourceCodePointLength(revision.content.text) : revision.content.range.end - revision.content.range.start
+      const loaded = await readDocumentText(range => readable.readChunk(revision.id, range), { start: 0, end: length })
+      if (!lifetime.current.mounted || !lifetime.current.visible || lifetime.current.navigationRevision !== navigation || lifetime.current.identity !== identity) return
+      if (!('text' in loaded)) { setMessage(readNotice(loaded)); return }
+      setDraft({ target, reviewVersion, chunkId: block.chunkId, baseRevisionId: revision.id, original: loaded.text, text: loaded.text })
+    } catch { if (lifetime.current.mounted) setMessage('未能加载编辑基准，可重试。') }
+    finally { if (lifetime.current.mounted) setPending(false) }
+  }
+  async function saveDraft(): Promise<void> {
+    if (!draft || !documentReviews || pending) return
+    const fixed = draft
+    setPending(true); setMessage(undefined)
+    try {
+      const result = await documentReviews.manual({ target: fixed.target, operationId: operationId(), expectedReviewVersion: fixed.reviewVersion,
+        chunkId: fixed.chunkId, baseRevisionId: fixed.baseRevisionId, text: fixed.text })
+      if (!lifetime.current.mounted) return
+      if (!result.ok) { setMessage(result.error.message); return }
+      setDraft(undefined); followReview.current = result.value.manifestRevisionId; setSelectedManifestId(result.value.manifestRevisionId); setMessage('已保存为新的人工候选，等待整篇复核。')
+    } catch { if (lifetime.current.mounted) setMessage('保存未确认，编辑内容仍保留。') }
+    finally { if (lifetime.current.mounted) setPending(false) }
+  }
+  async function selectFinal(): Promise<void> {
+    if (!documentReviews || !reviewTarget || !qualification?.eligible || pending || draft) return
+    setPending(true); setMessage(undefined)
+    try {
+      const result = await documentReviews.selectFinal({ target: structuredClone(reviewTarget), operationId: operationId(), expectedReviewVersion: documentReviewVersion(unit) })
+      if (lifetime.current.mounted) setMessage(result.ok ? '已设为最终。' : result.error.message)
+    } catch { if (lifetime.current.mounted) setMessage('最终选择未确认，请核对当前版本。') }
+    finally { if (lifetime.current.mounted) setPending(false) }
+  }
   let targetOffset: number | null = 0
   return h('article', { className: 'dsh-tp-record-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'data-source-version': unit.sourceVersion, 'data-manifest-id': manifest?.id, 'aria-label': `文档 ${unit.order}` },
     h('div', { className: 'dsh-tp-record-unit-heading' }, h('h3', null, `文档 ${unit.order} · ${name} · ${status}`), h('small', { className: 'dsh-tp-muted' }, `原文版本 ${unit.sourceVersion} · 目标语言：${unit.targetLanguage}`),
       h('span', { className: 'dsh-tp-actions dsh-tp-record-open-links' }, h(RecordOpenLink, { identity, visible, navigationRevision, action: originalAction }), h(RecordOpenLink, { identity, visible, navigationRevision, action: resultAction }))),
+    manifests.length ? h('div', { className: 'dsh-tp-actions' },
+      h('select', { 'aria-label': `文档 ${unit.order} 清单版本`, value: manifest?.id ?? '', disabled: pending || Boolean(draft), onChange: (event: { currentTarget: { value: string } }) => { setSelectedManifestId(event.currentTarget.value); setMessage(undefined) } },
+        h('option', { value: '' }, '当前任务进度'), ...manifests.map((revision, index) => h('option', { key: revision.id, value: revision.id }, `候选 ${index + 1}${final?.id === revision.id ? ` · ${unit.final?.selection === 'user_fixed' ? '用户固定最终' : '自动最终'}` : ''}${revision.review.status === 'pending' ? ' · 待复核' : revision.review.status === 'failed' ? ' · 有问题' : ' · 已复核'}`))),
+      manifest && final?.id !== manifest.id ? h('button', { type: 'button', disabled: !canMutate || pending || Boolean(draft) || !qualification?.eligible, title: !qualification?.eligible ? '须完成机械检查和主模型整篇复核，且无未解决问题。' : undefined, onClick: () => { void selectFinal() } }, '设为最终') : null) : null,
+    manifest ? h('p', { role: 'status', className: 'dsh-tp-muted' }, `${audit ? audit.mechanical.status === 'passed' ? '机械检查通过' : '机械检查发现问题' : manifest.eligibility.complete ? '覆盖完整，待机械检查' : '覆盖未完整'} · ${audit ? audit.semantic.status === 'passed' ? '主模型复核已完成' : audit.semantic.status === 'review_required' ? '主模型复核发现问题' : '主模型复核待完成' : '主模型复核待完成'}`) : null,
+    reviewIssues.length ? h('ul', { className: 'dsh-tp-muted' }, ...reviewIssues.map((issue, index) => h('li', { key: index }, `原文 ${issue.range.start}–${issue.range.end}：${issue.message}`))) : null,
+    message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null,
     task && controls ? h('div', { className: 'dsh-tp-actions' },
       actualStatus === 'running' ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'pause') }, controls.pausing ? '正在暂停…' : '暂停') : null,
       controls.canResume ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'resume') }, '继续') : null,
       ['running', 'paused', 'waiting_context', 'waiting_user', 'unknown'].includes(actualStatus ?? '') ? h('button', { type: 'button', disabled: controls.cancelling || controls.pending && !controls.pausing, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'cancel') }, '取消') : null,
       ['unknown', 'interrupted'].includes(actualStatus ?? '') ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'status') }, '查询状态') : null) : null,
     controls?.message || controls?.recoverability ? h('p', { role: 'status', className: 'dsh-tp-muted' }, controls.message ?? controls.recoverability) : null,
-    task?.executionFacts?.reviewIssues.length ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '已完成块的准备依赖有变化，整篇结果需要复核。') : null,
+    unresolvedDependencies.length ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '已完成块的准备依赖有变化，整篇结果需要复核。') : null,
     !readable ? h('p', { role: 'status', className: 'dsh-tp-muted' }, readNotice(missing)) : null,
     readable && !readable.manifest ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '尚无固定译文清单；原稿可查阅，结果暂不可完整打开或导出。') : null,
     ...blocks.map((block, index) => {
@@ -176,7 +255,13 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, obje
       if (!block.revision || block.revision.status !== 'completed') targetOffset = null
       else if (targetOffset !== null) targetOffset += block.revision.content.kind === 'text' ? sourceCodePointLength(block.revision.content.text) : block.revision.content.range.end - block.revision.content.range.start
       return h('section', { key: JSON.stringify([identity, readable?.plan?.id, readable?.plan?.version, block.chunkId, block.revisionId, block.revision?.status, block.revision?.updatedAt, block.revision?.content.kind === 'text' ? block.revision.content.text.length : null]), 'data-chunk-id': block.chunkId, className: 'dsh-tp-record-block' },
-        h('small', { className: 'dsh-tp-muted dsh-tp-record-block-heading' }, `块 ${index + 1} · 原文范围 ${block.outputRange.start}–${block.outputRange.end}${block.mode === 'copy' ? ' · 保留原文' : ''}${block.reuseRef ? ` · 复用原文版本 ${block.reuseRef.sourceVersion} 的完整结果` : ''}`),
+        h('div', { className: 'dsh-tp-actions' }, h('small', { className: 'dsh-tp-muted dsh-tp-record-block-heading' }, `块 ${index + 1} · 原文范围 ${block.outputRange.start}–${block.outputRange.end}${block.mode === 'copy' ? ' · 保留原文' : ''}${block.revision?.kind === 'manual' ? ' · 人工版' : ''}${block.reuseRef ? ` · 复用原文版本 ${block.reuseRef.sourceVersion} 的完整结果` : ''}`),
+          manifest && block.revision && block.mode === 'translate' ? h('button', { type: 'button', disabled: !editable || pending || Boolean(draft) || !['completed', 'failed', 'cancelled', 'interrupted'].includes(block.revision.status), title: !editable && canMutate ? '请先选择当前任务的最新候选。' : undefined, onClick: () => { void startEditing(block) } }, '编辑此块') : null),
+        draft?.chunkId === block.chunkId ? h('div', { className: 'dsh-tp-version-editor dsh-tp-record-inline-editor' },
+          h('small', { className: 'dsh-tp-muted' }, `基于当前清单的块 ${index + 1} 修订 ${unit.chunkRevisions.findIndex(revision => revision.id === draft.baseRevisionId) + 1}；保存追加人工候选，不产生翻译模型用量。`),
+          h('textarea', { 'aria-label': `文档 ${unit.order} 编辑块 ${index + 1}`, rows: 8, value: draft.text, disabled: pending, onChange: (event: { currentTarget: { value: string } }) => setDraft({ ...draft, text: event.currentTarget.value }) }),
+          h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || !draft.text.trim() || draft.text === draft.original, onClick: () => { void saveDraft() } }, '保存人工版本'),
+            h('button', { type: 'button', disabled: pending, onClick: () => setDraft(undefined) }, '取消编辑'))) : null,
         h('div', { className: 'dsh-tp-record-pair' }, ...(['source', 'target'] as const).map(side => h(DocumentPage, { key: side, handle: readable!, block, side, session, unitId: unit.id, objects, objectAssets, visible, navigationRevision, targetOffset: offset, targetTotal }))))
     }),
     unplacedSource.length ? h(RecordObjectText, { text: '', target: sourceTarget, references: unplacedSource, objectAssets }) : null,

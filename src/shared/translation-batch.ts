@@ -4,6 +4,7 @@ import { parseTranslationSourceReference, parseTranslationSourceStorageRequest,
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
 import type { TranslationMaterialRoute } from './translation-material.js'
 import { parseDocumentCorrectionFact, parseDocumentReuseApproval, type DocumentCorrectionFact, type DocumentReuseApproval } from './document-correction.js'
+import { parseDocumentManualRevisionBase, parseDocumentReviewAudit, type DocumentManualRevisionBase, type DocumentReviewAudit } from './document-review.js'
 
 export interface VersionReference { readonly id: string; readonly version: number }
 export type SourceBody = { readonly kind: 'inline'; readonly text: string }
@@ -138,6 +139,7 @@ export interface ChunkRevision {
   readonly callRecord: DocumentCallRecord | null
   readonly createdAt: string
   readonly updatedAt: string
+  readonly manualBase?: DocumentManualRevisionBase
 }
 export interface ManifestEntry {
   readonly chunkId: string
@@ -161,11 +163,14 @@ export interface DocumentRevision {
   readonly entries: readonly ManifestEntry[]
   readonly review: DocumentReview
   readonly eligibility: DocumentEligibility
+  readonly parentRevisionId?: string
+  readonly reviewAuditId?: string
 }
 export interface DocumentFinalPointer {
   readonly revisionId: string
   readonly selection: 'automatic' | 'user_fixed'
   readonly selectedAt: string
+  readonly selectionEventId?: string
 }
 export interface DocumentUnit {
   readonly kind: 'document'
@@ -184,6 +189,7 @@ export interface DocumentUnit {
   readonly final: DocumentFinalPointer | null
   readonly corrections?: readonly DocumentCorrectionFact[]
   readonly reuseApprovals?: readonly DocumentReuseApproval[]
+  readonly reviewAudits?: readonly DocumentReviewAudit[]
 }
 
 type Data = Record<string, unknown>
@@ -374,7 +380,7 @@ export function parseDocumentCallContextReference(value: unknown, sourceLength: 
     contextRanges: contextRef.contextRanges.map(item => range(item, sourceLength)), supplementRefs }
 }
 export function parseChunkRevision(value: unknown, sourceLength: number): ChunkRevision {
-  exact(value, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'])
+  exact(value, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'], ['manualBase'])
   string(value.id); string(value.taskId); string(value.childOperationId); integer(value.sourceVersion); string(value.chunkId); time(value.createdAt); time(value.updatedAt); taskStatus(value.status)
   if (!['machine', 'manual', 'copy'].includes(value.kind as string)) throw new TypeError('Invalid document revision kind')
   const planRef = ref(value.planRef), preparationRef = ref(value.preparationRef)
@@ -401,12 +407,14 @@ export function parseChunkRevision(value: unknown, sourceLength: number): ChunkR
     if (value.status === 'completed' && callRecord === null) throw new TypeError('Completed machine chunks require the actual call record')
   } else if (value.callId !== null || value.attemptId !== null || value.callRecord !== null || value.status !== 'completed' ||
     (value.kind === 'copy' ? content.kind !== 'source_copy' : content.kind !== 'text')) throw new TypeError('Local chunks cannot pretend to be model calls')
+  if (value.manualBase !== undefined && value.kind !== 'manual') throw new TypeError('Only manual chunks have an edit baseline')
   return { id: value.id, taskId: value.taskId, childOperationId: value.childOperationId, attemptId: value.attemptId as string | null,
     callId: value.callId as string | null, sourceVersion: value.sourceVersion, chunkId: value.chunkId, planRef, preparationRef,
-    kind: value.kind as ChunkRevision['kind'], status: value.status, content, callRecord, createdAt: value.createdAt, updatedAt: value.updatedAt }
+    kind: value.kind as ChunkRevision['kind'], status: value.status, content, callRecord, createdAt: value.createdAt, updatedAt: value.updatedAt,
+    ...(value.manualBase === undefined ? {} : { manualBase: parseDocumentManualRevisionBase(value.manualBase) }) }
 }
 export function parseDocumentRevision(value: unknown, sourceLength: number): DocumentRevision {
-  exact(value, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility'])
+  exact(value, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility'], ['parentRevisionId', 'reviewAuditId'])
   string(value.id); string(value.taskId); integer(value.sourceVersion); time(value.createdAt); array(value.entries, 256)
   const entries: ManifestEntry[] = value.entries.map(raw => {
     exact(raw, ['chunkId', 'outputRange', 'revisionId'], ['reuseRef']); string(raw.chunkId); string(raw.revisionId)
@@ -417,25 +425,28 @@ export function parseDocumentRevision(value: unknown, sourceLength: number): Doc
     return { ...entry, reuseRef: { sourceVersion: raw.reuseRef.sourceVersion, planVersion: raw.reuseRef.planVersion, revisionId: raw.reuseRef.revisionId,
       ...(raw.reuseRef.approvalId === undefined ? {} : { approvalId: raw.reuseRef.approvalId }) } }
   })
-  exact(value.review, ['status', 'checkedAt', 'issues']); array(value.review.issues, 50)
+  exact(value.review, ['status', 'checkedAt', 'issues']); array(value.review.issues, 1024)
   if (!['pending', 'passed', 'failed'].includes(value.review.status as string)) throw new TypeError('Invalid document review')
   if (value.review.status === 'pending' ? value.review.checkedAt !== null : value.review.checkedAt === null) throw new TypeError('Document review lacks its actual check time')
   if (value.review.checkedAt !== null) time(value.review.checkedAt)
   const issues = value.review.issues.map(raw => {
-    exact(raw, ['code', 'range', 'message']); string(raw.code, 80); string(raw.message, 1000)
+    exact(raw, ['code', 'range', 'message']); string(raw.code, 128); string(raw.message, 2048)
     return { code: raw.code, range: range(raw.range, sourceLength), message: raw.message }
   })
   if (value.review.status === 'passed' && issues.length) throw new TypeError('Passed document review has unresolved issues')
   exact(value.eligibility, ['complete', 'finalEligible'])
   if (typeof value.eligibility.complete !== 'boolean' || typeof value.eligibility.finalEligible !== 'boolean') throw new TypeError('Invalid document eligibility')
+  for (const name of ['parentRevisionId', 'reviewAuditId'] as const) if (value[name] !== undefined) string(value[name])
+  if (value.reviewAuditId !== undefined && value.parentRevisionId === undefined) throw new TypeError('Reviewed manifest needs its original fixed candidate')
   return { id: value.id, taskId: value.taskId, sourceVersion: value.sourceVersion, planRef: ref(value.planRef), preparationRef: ref(value.preparationRef),
     createdAt: value.createdAt, entries, review: { status: value.review.status as DocumentReview['status'], checkedAt: value.review.checkedAt as string | null, issues },
-    eligibility: { complete: value.eligibility.complete, finalEligible: value.eligibility.finalEligible } }
+    eligibility: { complete: value.eligibility.complete, finalEligible: value.eligibility.finalEligible },
+    ...(value.parentRevisionId === undefined ? {} : { parentRevisionId: value.parentRevisionId as string }), ...(value.reviewAuditId === undefined ? {} : { reviewAuditId: value.reviewAuditId as string }) }
 }
 
 /** Validates structural facts only; document-task validates their cross references and eligibility. */
 export function parseDocumentUnitShape(value: unknown): DocumentUnit {
-  exact(value, ['kind', 'id', 'order', 'targetLanguage', 'instruction', 'sourceVersion', 'sourceVersions', 'createdAt', 'preparations', 'plans', 'tasks', 'chunkRevisions', 'revisions', 'final'], ['corrections', 'reuseApprovals'])
+  exact(value, ['kind', 'id', 'order', 'targetLanguage', 'instruction', 'sourceVersion', 'sourceVersions', 'createdAt', 'preparations', 'plans', 'tasks', 'chunkRevisions', 'revisions', 'final'], ['corrections', 'reuseApprovals', 'reviewAudits'])
   if (value.kind !== 'document') throw new TypeError('Invalid document unit kind')
   string(value.id); integer(value.order); string(value.targetLanguage, 80); string(value.instruction, 4000, false); integer(value.sourceVersion); time(value.createdAt)
   array(value.sourceVersions); array(value.preparations); array(value.plans); array(value.tasks); array(value.chunkRevisions); array(value.revisions)
@@ -448,17 +459,20 @@ export function parseDocumentUnitShape(value: unknown): DocumentUnit {
   }
   let final: DocumentFinalPointer | null = null
   if (value.final !== null) {
-    exact(value.final, ['revisionId', 'selection', 'selectedAt']); string(value.final.revisionId); time(value.final.selectedAt)
+    exact(value.final, ['revisionId', 'selection', 'selectedAt'], ['selectionEventId']); string(value.final.revisionId); time(value.final.selectedAt)
+    if (value.final.selectionEventId !== undefined) string(value.final.selectionEventId)
     if (!['automatic', 'user_fixed'].includes(value.final.selection as string)) throw new TypeError('Invalid document final selection')
-    final = { revisionId: value.final.revisionId, selection: value.final.selection as DocumentFinalPointer['selection'], selectedAt: value.final.selectedAt }
+    final = { revisionId: value.final.revisionId, selection: value.final.selection as DocumentFinalPointer['selection'], selectedAt: value.final.selectedAt,
+      ...(value.final.selectionEventId === undefined ? {} : { selectionEventId: value.final.selectionEventId }) }
   }
   const plans = value.plans.map(raw => { exact(raw, ['id', 'version', 'sourceVersion', 'preparationRef', 'items', 'createdAt', 'operationId'], ['protectedRanges']); return parseDocumentChunkPlan(raw, sourceLength(raw.sourceVersion)) })
-  const chunkRevisions = value.chunkRevisions.map(raw => { exact(raw, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt']); return parseChunkRevision(raw, sourceLength(raw.sourceVersion)) })
-  const revisions = value.revisions.map(raw => { exact(raw, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility']); return parseDocumentRevision(raw, sourceLength(raw.sourceVersion)) })
+  const chunkRevisions = value.chunkRevisions.map(raw => { exact(raw, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'], ['manualBase']); return parseChunkRevision(raw, sourceLength(raw.sourceVersion)) })
+  const revisions = value.revisions.map(raw => { exact(raw, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility'], ['parentRevisionId', 'reviewAuditId']); return parseDocumentRevision(raw, sourceLength(raw.sourceVersion)) })
   const corrections = value.corrections === undefined ? undefined : (() => { array(value.corrections); return value.corrections.map(parseDocumentCorrectionFact) })()
   const reuseApprovals = value.reuseApprovals === undefined ? undefined : (() => { array(value.reuseApprovals); return value.reuseApprovals.map(parseDocumentReuseApproval) })()
+  const reviewAudits = value.reviewAudits === undefined ? undefined : (() => { array(value.reviewAudits); return value.reviewAudits.map(parseDocumentReviewAudit) })()
   return { kind: 'document', id: value.id, order: value.order, targetLanguage: value.targetLanguage, instruction: value.instruction, sourceVersion: value.sourceVersion,
     sourceVersions, createdAt: value.createdAt, preparations: value.preparations.map(parseDocumentPreparationReference), plans,
     tasks: value.tasks.map(parseDocumentTaskRecord), chunkRevisions, revisions, final,
-    ...(corrections === undefined ? {} : { corrections }), ...(reuseApprovals === undefined ? {} : { reuseApprovals }) }
+    ...(corrections === undefined ? {} : { corrections }), ...(reuseApprovals === undefined ? {} : { reuseApprovals }), ...(reviewAudits === undefined ? {} : { reviewAudits }) }
 }

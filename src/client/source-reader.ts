@@ -8,7 +8,7 @@ import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POI
 import type { TranslationSourceStoragePort } from '../shared/translation-source-storage.js'
 import { parseTranslationSourceResult, toSourceIdentity, translationSourceResultBytes,
   type TranslationSourceScope, type TranslationSourcesPort } from '../shared/translation-sources.js'
-import { currentDocumentFinalRevision, currentFinalRevision, isDocumentUnit,
+import { currentDocumentCandidateRevision, currentDocumentFinalRevision, currentFinalRevision, isDocumentUnit,
   type TextRevision, type TranslationUnit } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 
@@ -138,7 +138,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     const source = unit.sourceVersions.find(source => source.version === sourceVersion)
     if (!source) return unavailable(request, 'missing', 'source_version_missing')
     const selected = currentDocumentFinalRevision(unit)
-    const manifest = target.manifestRevisionId === undefined ? (selected?.sourceVersion === sourceVersion ? selected : undefined) ?? [...unit.revisions].reverse().find(revision => revision.sourceVersion === sourceVersion) ?? null
+    const manifest = target.manifestRevisionId === undefined ? (selected?.sourceVersion === sourceVersion ? selected : undefined) ?? (sourceVersion === unit.sourceVersion ? currentDocumentCandidateRevision(unit) : [...unit.revisions].reverse().find(revision => revision.sourceVersion === sourceVersion)) ?? null
       : target.manifestRevisionId === null ? null : unit.revisions.find(revision => revision.id === target.manifestRevisionId) ?? null
     if (target.manifestRevisionId && !manifest || manifest && manifest.sourceVersion !== sourceVersion) return unavailable(request, 'missing', 'manifest_missing')
     const task = [...unit.tasks].reverse().find(task => task.sourceVersion === sourceVersion)
@@ -152,7 +152,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       const revision = entry ? unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId) ?? null : reusable ? unit.chunkRevisions.find(chunk => chunk.id === approvedEntry.revisionId) ?? null : !manifest && task && plan
         ? [...unit.chunkRevisions].reverse().find(chunk => chunk.chunkId === item.chunkId && chunk.taskId === task.taskId && chunk.sourceVersion === sourceVersion &&
           unit.plans.some(actual => sameVersionReference(actual, chunk.planRef) && actual.items.some(original => original.chunkId === item.chunkId && same(original.outputRange, item.outputRange) && original.mode === item.mode))) ?? null : null
-      return { ...item, revisionId: revision?.id ?? null, revision, ...((entry?.reuseRef ?? (reusable ? approvedEntry.reuseRef : undefined)) ? { reuseRef: entry?.reuseRef ?? approvedEntry!.reuseRef } : {}) }
+      return { ...item, revisionId: entry?.revisionId ?? revision?.id ?? null, revision, ...((entry?.reuseRef ?? (reusable ? approvedEntry.reuseRef : undefined)) ? { reuseRef: entry?.reuseRef ?? approvedEntry!.reuseRef } : {}) }
     })
     const scope: TranslationSourceScope = { ownerId: target.ownerId, mainSessionId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId }
     const check = (): EvidenceUnavailableResult | null => {

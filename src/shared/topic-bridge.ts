@@ -19,6 +19,10 @@ import { parseDocumentUnitCaptureRequest, parseDocumentUnitCapture, parseDocumen
 import { parseDocumentCorrectionCommit, parseDocumentCorrectionReceipt, type DocumentCorrectionCommit, type DocumentCorrectionReceipt } from './document-correction.js'
 import { parseDocumentUnitAcceptRequest, type DocumentUnitAcceptRequest } from './document-execution.js'
 import { parseTranslationPreparationCorrectionReview, parsePreparationCorrectionReviewFacts, type TranslationPreparationCorrectionReview, type PreparationCorrectionReviewFacts } from './translation-preparation.js'
+import { parseDocumentReviewBeginRequest, parseDocumentReviewSubmitRequest, parseDocumentReviewQueryRequest, parseDocumentReviewReceipt, parseDocumentManualRevisionRequest,
+  type DocumentReviewBeginRequest, type DocumentReviewSubmitRequest, type DocumentReviewQueryRequest, type DocumentReviewReceipt, type DocumentManualRevisionRequest } from './document-review.js'
+import { parseDocumentReviewPageRequest, parseDocumentReviewPage, parseDocumentReviewRead, parseDocumentReviewTextPage,
+  type DocumentReviewPageRequest, type DocumentReviewPage, type DocumentReviewRead, type DocumentReviewTextPage } from './document-review-bridge.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
@@ -62,6 +66,12 @@ export interface TopicUnitFact {
   readonly final: { readonly revisionId: string; readonly selection: 'automatic' | 'user_fixed'; readonly selectionEventId: string } | null
 }
 export type TopicBridgeCommand =
+  | { readonly kind: 'document_review_page'; readonly request: DocumentReviewPageRequest }
+  | { readonly kind: 'document_review_read'; readonly request: DocumentReviewRead }
+  | { readonly kind: 'document_review_begin'; readonly request: DocumentReviewBeginRequest }
+  | { readonly kind: 'document_review_submit'; readonly request: DocumentReviewSubmitRequest }
+  | { readonly kind: 'document_review_observe'; readonly request: DocumentReviewQueryRequest }
+  | { readonly kind: 'document_review_manual'; readonly request: DocumentManualRevisionRequest }
   | { readonly kind: 'document_correct_observe'; readonly request: DocumentCorrectionQuery }
   | { readonly kind: 'preparation_review_correction'; readonly request: TranslationPreparationCorrectionReview; readonly facts: PreparationCorrectionReviewFacts }
   | { readonly kind: 'document_accept_unit'; readonly request: DocumentUnitAcceptRequest }
@@ -103,6 +113,10 @@ export type TopicBridgeCommand =
   | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
+  | { readonly kind: 'document_review_page'; readonly page: DocumentReviewPage }
+  | { readonly kind: 'document_review_text'; readonly page: DocumentReviewTextPage }
+  | { readonly kind: 'document_review_receipt'; readonly receipt: DocumentReviewReceipt }
+  | { readonly kind: 'document_review_observed'; readonly receipt: DocumentReviewReceipt | null }
   | { readonly kind: 'document_correct_observed'; readonly receipt: DocumentCorrectionReceipt | null }
   | { readonly kind: 'document_captured'; readonly capture: DocumentUnitCapture }
   | { readonly kind: 'document_corrected'; readonly receipt: DocumentCorrectionReceipt }
@@ -172,8 +186,15 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
 }
 export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 = 1): TopicBridgeCommand {
   object(value)
+  if (protocol === 1 && String(value.kind).startsWith('document_review_')) throw new TypeError('Document review requires topic bridge v2')
   if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe', 'document_control', 'document_restore', 'document_capture', 'document_correct', 'document_accept_unit', 'preparation_review_correction', 'document_correct_observe'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
   switch (value.kind) {
+      case 'document_review_page': exact(value, ['kind', 'request']); return { kind: 'document_review_page', request: parseDocumentReviewPageRequest(value.request) }
+      case 'document_review_read': exact(value, ['kind', 'request']); return { kind: 'document_review_read', request: parseDocumentReviewRead(value.request) }
+      case 'document_review_begin': exact(value, ['kind', 'request']); return { kind: 'document_review_begin', request: parseDocumentReviewBeginRequest(value.request) }
+      case 'document_review_submit': exact(value, ['kind', 'request']); return { kind: 'document_review_submit', request: parseDocumentReviewSubmitRequest(value.request) }
+      case 'document_review_observe': exact(value, ['kind', 'request']); return { kind: 'document_review_observe', request: parseDocumentReviewQueryRequest(value.request) }
+      case 'document_review_manual': exact(value, ['kind', 'request']); return { kind: 'document_review_manual', request: parseDocumentManualRevisionRequest(value.request) }
       case 'document_correct_observe': exact(value, ['kind', 'request']); return { kind: 'document_correct_observe', request: parseDocumentCorrectionQuery(value.request) }
       case 'preparation_review_correction': exact(value, ['kind', 'request', 'facts']); return { kind: 'preparation_review_correction', request: parseTranslationPreparationCorrectionReview(value.request), facts: parsePreparationCorrectionReviewFacts(value.facts) }
       case 'document_accept_unit': exact(value, ['kind', 'request']); return { kind: 'document_accept_unit', request: parseDocumentUnitAcceptRequest(value.request) }
@@ -329,8 +350,12 @@ function sessionSummary(value: unknown): void {
 }
 function parseValue(value: unknown, protocol: 1 | 2): TopicBridgeValue {
   object(value)
-  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
+  if (protocol === 1 && (String(value.kind).startsWith('document_review_') || ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string))) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
+    case 'document_review_page': exact(value, ['kind', 'page']); return { kind: 'document_review_page', page: parseDocumentReviewPage(value.page) }
+    case 'document_review_text': exact(value, ['kind', 'page']); return { kind: 'document_review_text', page: parseDocumentReviewTextPage(value.page) }
+    case 'document_review_receipt': exact(value, ['kind', 'receipt']); return { kind: 'document_review_receipt', receipt: parseDocumentReviewReceipt(value.receipt) }
+    case 'document_review_observed': exact(value, ['kind', 'receipt']); return { kind: 'document_review_observed', receipt: value.receipt === null ? null : parseDocumentReviewReceipt(value.receipt) }
     case 'document_correct_observed': exact(value, ['kind', 'receipt']); return { kind: 'document_correct_observed', receipt: value.receipt === null ? null : parseDocumentCorrectionReceipt(value.receipt) }
     case 'document_captured': exact(value, ['kind', 'capture']); return { kind: 'document_captured', capture: parseDocumentUnitCapture(value.capture) }
     case 'document_corrected': exact(value, ['kind', 'receipt']); return { kind: 'document_corrected', receipt: parseDocumentCorrectionReceipt(value.receipt) }

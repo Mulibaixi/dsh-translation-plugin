@@ -5,6 +5,7 @@ import { documentSourceLength, parseChunkRevision, parseDocumentChunkPlan, parse
   type VersionReference } from '../shared/translation-batch.js'
 import { isDocumentManifestReuse, validateDocumentCorrectionFact, validateDocumentReuseApproval } from './document-correction.js'
 import { parseDocumentCorrectionFact, type DocumentCorrectionFact, type DocumentReuseApproval } from '../shared/document-correction.js'
+import { parseDocumentReviewAudit, type DocumentReviewAudit, type DocumentReviewIssue } from '../shared/document-review.js'
 
 export type NewDocumentUnit = Pick<DocumentUnit, 'id' | 'targetLanguage' | 'instruction' | 'createdAt'> & {
   readonly source: DocumentSourceVersion
@@ -24,7 +25,9 @@ export type DocumentMutation =
   | { readonly kind: 'chunk'; readonly revision: ChunkRevision; readonly executionFacts?: NonNullable<DocumentTaskRecord['executionFacts']> }
   | { readonly kind: 'chunk_update'; readonly revisionId: string; readonly patch: Partial<Pick<ChunkRevision, 'status' | 'content' | 'callRecord' | 'updatedAt'>>; readonly executionFacts?: NonNullable<DocumentTaskRecord['executionFacts']> }
   | { readonly kind: 'manifest'; readonly revision: Omit<DocumentRevision, 'eligibility'> }
-  | { readonly kind: 'final'; readonly revisionId: string; readonly at: string }
+  | { readonly kind: 'review'; readonly audit: DocumentReviewAudit; readonly expectedReviewVersion: number }
+  | { readonly kind: 'manual'; readonly edit: DocumentManualEdit }
+  | { readonly kind: 'final'; readonly revisionId: string; readonly at: string; readonly expectedSourceVersion?: number; readonly expectedReviewVersion?: number; readonly operationId?: string }
 
 const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right)
 function at(value: string): void { if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw new TypeError('Invalid document transition time') }
@@ -68,6 +71,12 @@ function validateChunk(unit: DocumentUnit, revision: ChunkRevision): void {
   const plan = binding(unit, revision), item = plan.items.find(item => item.chunkId === revision.chunkId)
   if (!item || (revision.kind === 'copy' ? item.mode !== 'copy' : item.mode !== 'translate')) throw new TypeError('Document chunk does not belong to the fixed plan')
   if (revision.content.kind === 'source_copy' && (revision.content.sourceVersion !== revision.sourceVersion || !same(revision.content.range, item.outputRange))) throw new TypeError('Copy must reference the exact source output range')
+  if (revision.manualBase) {
+    const base = unit.revisions.find(manifest => manifest.id === revision.manualBase!.manifestRevisionId)
+    const entry = base?.entries.find(entry => entry.chunkId === revision.manualBase!.chunkId && entry.revisionId === revision.manualBase!.revisionId)
+    if (!base || !entry || revision.chunkId !== entry.chunkId || base.taskId !== revision.taskId || base.sourceVersion !== revision.sourceVersion ||
+      !sameVersionReference(base.planRef, revision.planRef) || !sameVersionReference(base.preparationRef, revision.preparationRef)) throw new TypeError('Manual revision baseline changed')
+  }
   // Actual contexts include preparation background and exclude output overlap. Admission
   // checks their frozen budget; history retains their exact immutable references.
 }
@@ -95,7 +104,42 @@ export function documentManifestEligibility(unit: DocumentUnit, revision: Omit<D
     if (!sameVersionReference(chunk.planRef, revision.planRef) || !sameVersionReference(chunk.preparationRef, revision.preparationRef)) mixedDependencies = true
     if (chunk.status !== 'completed') complete = false
   }
-  return { complete, finalEligible: complete && !mixedDependencies && revision.review.status === 'passed' && revision.review.issues.length === 0 }
+  const audited = passedDocumentAudit(unit, revision)
+  return { complete, finalEligible: complete && revision.review.status === 'passed' && revision.review.issues.length === 0 &&
+    (revision.reviewAuditId ? audited : !mixedDependencies) }
+}
+
+export function documentReviewVersion(unit: DocumentUnit): number { return unit.reviewAudits?.length ?? 0 }
+function passedDocumentAudit(unit: DocumentUnit, revision: Omit<DocumentRevision, 'eligibility'>): boolean {
+  const audit = unit.reviewAudits?.find(item => item.id === revision.reviewAuditId)
+  return !!audit && audit.reviewedRevisionId === revision.id && audit.manifestRevisionId === revision.parentRevisionId &&
+    audit.mechanical.status === 'passed' && audit.semantic.status === 'passed'
+}
+function validateDocumentAudit(unit: DocumentUnit, audit: DocumentReviewAudit): void {
+  const manifest = unit.revisions.find(revision => revision.id === audit.manifestRevisionId)
+  if (!manifest || manifest.sourceVersion !== audit.sourceVersion || !sameVersionReference(manifest.planRef, audit.planRef) ||
+    !sameVersionReference(manifest.preparationRef, audit.preparationRef)) throw new TypeError('Review audit references another fixed manifest')
+  const source = sourceOf(unit, audit.sourceVersion)
+  if (source.body.kind === 'asset' && source.body.reference.sha256 !== audit.mechanical.sourceSha256) throw new TypeError('Review source hash changed')
+  if (!same(audit.mechanical.entries.map(({ chunkId, revisionId, outputRange }) => ({ chunkId, revisionId, outputRange })), manifest.entries.map(({ chunkId, revisionId, outputRange }) => ({ chunkId, revisionId, outputRange })))) throw new TypeError('Mechanical review did not check the exact manifest entries')
+  const length = documentSourceLength(source)
+  if ([...audit.mechanical.issues, ...audit.mechanical.criticalIssues, ...audit.mechanical.suspicions, ...audit.semantic.issues, ...audit.semantic.resolvedIssues].some(issue => issue.range.end > length)) throw new TypeError('Review issue is outside its source')
+  const actualCritical = unit.tasks.find(task => task.taskId === manifest.taskId)?.executionFacts?.reviewIssues ?? []
+  if (audit.mechanical.criticalIssues.some(issue => !actualCritical.some(actual => same(issue, actual)))) throw new TypeError('Review invented a critical execution issue')
+  if (audit.semantic.status === 'pending') return
+  const parent = unit.reviewAudits?.find(item => item.id === audit.parentAuditId)
+  if (!parent || parent.version >= audit.version || parent.semantic.status !== 'pending' || parent.reviewId !== audit.reviewId || parent.manifestRevisionId !== audit.manifestRevisionId ||
+    !same(parent.mechanical, audit.mechanical) || unit.reviewAudits?.some(item => item.parentAuditId === parent.id && item.id !== audit.id)) throw new TypeError('Semantic audit does not complete its exact mechanical check once')
+  if (!same(audit.semantic.reviewedEntries, manifest.entries.map(({ chunkId, revisionId }) => ({ chunkId, revisionId }))) ||
+    !audit.semantic.preparationRef || !sameVersionReference(audit.semantic.preparationRef, manifest.preparationRef)) throw new TypeError('Main model did not review the exact manifest and preparation')
+  const critical = audit.mechanical.criticalIssues
+  if (audit.semantic.resolvedIssues.some(issue => !critical.some(old => same(issue, old))) || audit.semantic.status === 'passed' && critical.some(issue => !audit.semantic.resolvedIssues.some(resolved => same(issue, resolved)))) throw new TypeError('Main model did not resolve each actual critical issue')
+  const reviewed = unit.revisions.find(revision => revision.id === audit.reviewedRevisionId)
+  const issues = [...audit.mechanical.issues, ...audit.semantic.issues]
+  const passed = audit.mechanical.status === 'passed' && audit.semantic.status === 'passed'
+  if (!reviewed || reviewed.parentRevisionId !== manifest.id || reviewed.reviewAuditId !== audit.id || reviewed.taskId !== manifest.taskId || reviewed.sourceVersion !== manifest.sourceVersion ||
+    !same(reviewed.entries, manifest.entries) || !sameVersionReference(reviewed.planRef, manifest.planRef) || !sameVersionReference(reviewed.preparationRef, manifest.preparationRef) ||
+    reviewed.review.status !== (passed ? 'passed' : 'failed') || reviewed.review.checkedAt !== audit.checkedAt || !same(reviewed.review.issues, issues)) throw new TypeError('Reviewed manifest disagrees with its immutable audit')
 }
 
 /** Strict saved-history boundary; no I/O, execution capability, or replay is reconstructed. */
@@ -125,6 +169,12 @@ export function parseDocumentUnit(value: unknown): DocumentUnit {
   unique(unit.corrections ?? [], fact => fact.operationId)
   unique(unit.corrections ?? [], fact => String(fact.toSourceVersion))
   unique(unit.reuseApprovals ?? [], approval => approval.id)
+  unique(unit.reviewAudits ?? [], audit => audit.id)
+  unique(unit.reviewAudits ?? [], audit => audit.operationId)
+  for (const [index, audit] of (unit.reviewAudits ?? []).entries()) {
+    if (audit.version !== index + 1) throw new TypeError('Document review audit versions must increase once')
+    validateDocumentAudit(unit, audit)
+  }
   for (const fact of unit.corrections ?? []) validateDocumentCorrectionFact(unit, fact)
   for (const approval of unit.reuseApprovals ?? []) validateDocumentReuseApproval(unit, approval)
   for (const task of unit.tasks) if (task.executionFacts) {
@@ -147,7 +197,11 @@ export function parseDocumentUnit(value: unknown): DocumentUnit {
     if (unit.tasks.some(task => task.operationId === chunk.childOperationId) || unit.plans.some(plan => plan.operationId === chunk.childOperationId) ||
       unit.sourceVersions.some(source => source.operationId === chunk.childOperationId)) throw new TypeError('Child operation collides with a parent operation')
   }
-  for (const revision of unit.revisions) if (!same(revision.eligibility, documentManifestEligibility(unit, revision))) throw new TypeError('Stored document qualification does not match its facts')
+  for (const revision of unit.revisions) {
+    if (revision.parentRevisionId && !unit.revisions.some(parent => parent.id === revision.parentRevisionId && parent.sourceVersion === revision.sourceVersion)) throw new TypeError('Document candidate baseline unavailable')
+    if (revision.reviewAuditId && !unit.reviewAudits?.some(audit => audit.id === revision.reviewAuditId && audit.reviewedRevisionId === revision.id)) throw new TypeError('Document reviewed candidate lacks its audit')
+    if (!same(revision.eligibility, documentManifestEligibility(unit, revision))) throw new TypeError('Stored document qualification does not match its facts')
+  }
   for (const task of unit.tasks) if (task.status === 'completed' && !unit.revisions.some(revision => revision.taskId === task.taskId && revision.eligibility.complete)) throw new TypeError('Completed document task lacks a complete manifest')
   if (unit.final && !unit.revisions.some(revision => revision.id === unit.final!.revisionId && revision.eligibility.finalEligible)) throw new TypeError('Document final does not reference an eligible manifest')
   return unit
@@ -170,6 +224,8 @@ function appendVersion<T extends VersionReference>(items: readonly T[], added: T
 }
 /** Admission and receipts mutate one unit. Late old-source receipts never select a current final. */
 export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutation): DocumentUnit {
+  if (mutation.kind === 'review') return appendDocumentReviewAudit(unit, mutation.audit, mutation.expectedReviewVersion)
+  if (mutation.kind === 'manual') return appendDocumentManualRevision(unit, mutation.edit)
   let next: DocumentUnit
   if (mutation.kind === 'correction') {
     const source = parseDocumentSourceVersion(mutation.source), fact = parseDocumentCorrectionFact(mutation.fact)
@@ -226,6 +282,7 @@ export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutatio
     if (!same(old.executionFacts.baseline, facts.baseline) || facts.taskSequence < old.executionFacts.taskSequence || facts.taskVersion < old.executionFacts.taskVersion ||
       facts.actualCalls < old.executionFacts.actualCalls || facts.outputBytes < old.executionFacts.outputBytes || facts.automaticSupplementCalls < old.executionFacts.automaticSupplementCalls ||
       old.executionFacts.supplements?.some((supplement, index) => !same(supplement, facts.supplements?.[index])) ||
+      old.executionFacts.reviewIssues.some((issue, index) => !same(issue, facts.reviewIssues[index])) ||
       old.executionFacts.controls.some((control, index) => !same(control, facts.controls[index])) || old.executionFacts.blocks.some(block => {
         const next = facts.blocks.find(item => item.request.revisionId === block.request.revisionId)
         return !next || !same(block.request, next.request) || next.sequence < block.sequence || block.phase === 'settled' && next.phase !== 'settled'
@@ -257,7 +314,14 @@ export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutatio
     const old = unit.revisions.find(item => item.id === revision.id)
     if (old) { if (same(old, revision)) return unit; throw new TypeError('Document manifest already has different content') }
     next = { ...unit, revisions: [...unit.revisions, revision] }
-  } else return selectDocumentFinal(unit, mutation.revisionId, mutation.at)
+  } else {
+    if (mutation.operationId && unit.final?.selectionEventId === mutation.operationId) {
+      if (unit.final.revisionId === mutation.revisionId) return unit
+      throw new TypeError('Document final operation already has different content')
+    }
+    if (mutation.expectedSourceVersion !== undefined && mutation.expectedSourceVersion !== unit.sourceVersion || mutation.expectedReviewVersion !== undefined && mutation.expectedReviewVersion !== documentReviewVersion(unit)) throw new TypeError('Stale document final version')
+    return selectDocumentFinal(unit, mutation.revisionId, mutation.at, mutation.operationId)
+  }
   if ((mutation.kind === 'chunk' || mutation.kind === 'chunk_update') && mutation.executionFacts) {
     const taskId = mutation.kind === 'chunk' ? mutation.revision.taskId : unit.chunkRevisions.find(chunk => chunk.id === mutation.revisionId)!.taskId
     const old = unit.tasks.find(task => task.taskId === taskId)!, facts = mutation.executionFacts
@@ -267,21 +331,120 @@ export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutatio
   return parseDocumentUnit(next)
 }
 export function currentDocumentFinal(unit: DocumentUnit): DocumentRevision | undefined {
-  return unit.revisions.find(revision => revision.id === unit.final?.revisionId && revision.sourceVersion === unit.sourceVersion && revision.eligibility.finalEligible)
+  const revision = unit.revisions.find(revision => revision.id === unit.final?.revisionId && revision.sourceVersion === unit.sourceVersion && documentManifestFinalEligibility(unit, revision.id).eligible)
+  return revision && (unit.final?.selection === 'user_fixed' || latestDocumentAttemptEligible(unit, revision)) ? revision : undefined
+}
+function latestDocumentAttemptEligible(unit: DocumentUnit, revision: DocumentRevision): boolean {
+  const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion)
+  const latest = [...unit.revisions].reverse().find(item => item.sourceVersion === unit.sourceVersion)
+  const pendingAudit = [...(unit.reviewAudits ?? [])].reverse().find(audit => audit.sourceVersion === unit.sourceVersion)
+  if (!task || latest?.id !== revision.id || revision.taskId !== task.taskId || ['running', 'paused', 'waiting_context', 'waiting_user', 'unknown', 'interrupted'].includes(task.status)) return false
+  if (pendingAudit && pendingAudit.version > (unit.reviewAudits?.find(audit => audit.id === revision.reviewAuditId)?.version ?? 0) && pendingAudit.semantic.status !== 'passed') return false
+  // A reviewed manual candidate can finish an ended failed attempt without changing its call facts.
+  return task.status === 'completed' || !!revision.reviewAuditId && revision.entries.some(entry => unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId)?.kind === 'manual')
+}
+export function documentManifestFinalEligibility(unit: DocumentUnit, manifestId: string): { readonly eligible: boolean; readonly issues: readonly DocumentReviewIssue[] } {
+  const revision = unit.revisions.find(item => item.id === manifestId)
+  if (!revision || revision.sourceVersion !== unit.sourceVersion) return { eligible: false, issues: [{ code: 'source_changed', range: { start: 0, end: documentSourceLength(sourceOf(unit, unit.sourceVersion)) }, message: '当前原稿版本已变化。' }] }
+  let eligible: boolean
+  try { eligible = documentManifestEligibility(unit, revision).finalEligible }
+  catch (failure) {
+    if (!(failure instanceof TypeError)) throw failure
+    return { eligible: false, issues: [{ code: 'manifest_invalid', range: { start: 0, end: documentSourceLength(sourceOf(unit, revision.sourceVersion)) }, message: '固定清单缺少实际完整块或范围引用不成立。' }] }
+  }
+  const audit = unit.reviewAudits?.find(audit => audit.id === revision.reviewAuditId)
+  const critical = unit.tasks.find(task => task.taskId === revision.taskId)?.executionFacts?.reviewIssues ?? []
+  const unresolved = critical.filter(issue => !audit?.semantic.resolvedIssues.some(resolved => same(issue, resolved)))
+  if (unresolved.length) eligible = false
+  const issues = unresolved.length ? unresolved : revision.review.issues.length ? revision.review.issues : eligible ? [] : [{ code: 'review_required', range: { start: 0, end: documentSourceLength(sourceOf(unit, revision.sourceVersion)) }, message: '候选仍需完成机械检查和主模型语义复核。' }]
+  return { eligible, issues }
 }
 export function advanceDocumentFinal(unit: DocumentUnit, selectedAt: string): DocumentUnit {
   at(selectedAt)
   if (unit.final?.selection === 'user_fixed' && currentDocumentFinal(unit)) return unit
   const latest = [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
-  if (!latest?.eligibility.finalEligible || latest.id === unit.final?.revisionId || unit.tasks.find(task => task.taskId === latest.taskId)?.executionFacts?.reviewIssues.length) return unit
+  if (!latest || !documentManifestFinalEligibility(unit, latest.id).eligible || !latestDocumentAttemptEligible(unit, latest) || latest.id === unit.final?.revisionId) return unit
   return { ...unit, final: { revisionId: latest.id, selection: 'automatic', selectedAt } }
 }
-export function selectDocumentFinal(unit: DocumentUnit, revisionId: string, selectedAt: string): DocumentUnit {
+export function selectDocumentFinal(unit: DocumentUnit, revisionId: string, selectedAt: string, operationId?: string): DocumentUnit {
   at(selectedAt)
   const revision = unit.revisions.find(item => item.id === revisionId)
-  if (!revision || revision.sourceVersion !== unit.sourceVersion || !revision.eligibility.finalEligible || unit.tasks.find(task => task.taskId === revision.taskId)?.executionFacts?.reviewIssues.length) throw new TypeError('Only an eligible current-source manifest can be final')
+  if (!revision || !documentManifestFinalEligibility(unit, revisionId).eligible) throw new TypeError('Only an eligible current-source manifest can be final')
   if (unit.final?.selection === 'user_fixed' && unit.final.revisionId === revisionId) return unit
-  return { ...unit, final: { revisionId, selection: 'user_fixed', selectedAt } }
+  if (operationId !== undefined && !operationId.trim()) throw new TypeError('Invalid document final operation')
+  return { ...unit, final: { revisionId, selection: 'user_fixed', selectedAt, ...(operationId === undefined ? {} : { selectionEventId: operationId }) } }
+}
+
+export interface DocumentManualEdit {
+  readonly manifestRevisionId: string
+  readonly expectedReviewVersion: number
+  readonly chunkId: string
+  readonly baseRevisionId: string
+  readonly revisionId: string
+  readonly manifestId: string
+  readonly operationId: string
+  readonly text: string
+  readonly at: string
+  /** Transient exact source for copy byte accounting; never copied into history. */
+  readonly sourceText?: string
+}
+/** Saves one explicit edit and derives a fresh pending candidate in one history mutation. */
+export function appendDocumentManualRevision(unit: DocumentUnit, edit: DocumentManualEdit): DocumentUnit {
+  const old = unit.chunkRevisions.find(chunk => chunk.kind === 'manual' && chunk.childOperationId === edit.operationId)
+  if (old) {
+    const manifest = unit.revisions.find(revision => revision.id === edit.manifestId)
+    if (old.id === edit.revisionId && old.manualBase?.manifestRevisionId === edit.manifestRevisionId && old.manualBase.chunkId === edit.chunkId && old.manualBase.revisionId === edit.baseRevisionId && old.content.kind === 'text' && old.content.text === edit.text && manifest?.parentRevisionId === edit.manifestRevisionId && manifest.entries.some(entry => entry.revisionId === old.id)) return unit
+    throw new TypeError('Manual operation already has different content')
+  }
+  if (documentReviewVersion(unit) !== edit.expectedReviewVersion) throw new TypeError('Stale document review version')
+  at(edit.at)
+  const base = unit.revisions.find(revision => revision.id === edit.manifestRevisionId)
+  const entry = base?.entries.find(entry => entry.chunkId === edit.chunkId && entry.revisionId === edit.baseRevisionId)
+  const chunk = unit.chunkRevisions.find(chunk => chunk.id === edit.baseRevisionId)
+  const item = base && planOf(unit, base.planRef).items.find(item => item.chunkId === edit.chunkId)
+  if (!base || base.sourceVersion !== unit.sourceVersion || !entry || !chunk || item?.mode !== 'translate' || chunk.content.kind !== 'text' || chunk.content.text === edit.text) throw new TypeError('Manual edit requires a changed text and exact current-source manifest block')
+  const revision = parseChunkRevision({ id: edit.revisionId, taskId: base.taskId, childOperationId: edit.operationId, attemptId: null, callId: null,
+    sourceVersion: base.sourceVersion, chunkId: edit.chunkId, planRef: base.planRef, preparationRef: base.preparationRef, kind: 'manual', status: 'completed',
+    content: { kind: 'text', text: edit.text }, callRecord: null, createdAt: edit.at, updatedAt: edit.at,
+    manualBase: { manifestRevisionId: base.id, chunkId: entry.chunkId, revisionId: entry.revisionId } }, documentSourceLength(sourceOf(unit, base.sourceVersion)))
+  const withChunk = { ...unit, chunkRevisions: [...unit.chunkRevisions, revision] }
+  const manifest = { id: edit.manifestId, taskId: base.taskId, sourceVersion: base.sourceVersion, planRef: base.planRef, preparationRef: base.preparationRef,
+    parentRevisionId: base.id, createdAt: edit.at, entries: base.entries.map(old => old.chunkId === entry.chunkId ? { chunkId: entry.chunkId, outputRange: entry.outputRange, revisionId: revision.id } : old),
+    review: { status: 'pending' as const, checkedAt: null, issues: [] } }
+  const source = sourceOf(unit, base.sourceVersion), sourceText = source.body.kind === 'inline' ? source.body.text : edit.sourceText
+  const sourcePoints = sourceText === undefined ? null : Array.from(sourceText)
+  if (sourcePoints && sourcePoints.length !== documentSourceLength(source)) throw new TypeError('Manual revision source byte evidence changed')
+  let outputBytes = 0
+  for (const candidateEntry of manifest.entries) {
+    const candidateChunk = withChunk.chunkRevisions.find(chunk => chunk.id === candidateEntry.revisionId)!
+    let text: string
+    if (candidateChunk.content.kind === 'text') text = candidateChunk.content.text
+    else {
+      if (!sourcePoints) throw new TypeError('Manual revision needs actual copy source byte evidence')
+      text = sourcePoints.slice(candidateEntry.outputRange.start, candidateEntry.outputRange.end).join('')
+    }
+    outputBytes += new TextEncoder().encode(text).byteLength
+    if (outputBytes > 16 * 1024 * 1024) throw new TypeError('Manual document candidate exceeds the 16 MiB output budget')
+  }
+  return reduceDocumentUnit(withChunk, { kind: 'manifest', revision: manifest })
+}
+/** Semantic completion derives a new immutable manifest from the exact checked candidate. */
+export function appendDocumentReviewAudit(unit: DocumentUnit, supplied: DocumentReviewAudit, expectedReviewVersion: number): DocumentUnit {
+  const audit = parseDocumentReviewAudit(supplied), old = unit.reviewAudits?.find(item => item.operationId === audit.operationId || item.id === audit.id)
+  if (old) { if (same(old, audit) && expectedReviewVersion === audit.version - 1) return unit; throw new TypeError('Document audit operation already has different content') }
+  if (documentReviewVersion(unit) !== expectedReviewVersion || audit.version !== expectedReviewVersion + 1) throw new TypeError('Stale document review version')
+  const base = unit.revisions.find(revision => revision.id === audit.manifestRevisionId)
+  if (!base || base.sourceVersion !== unit.sourceVersion || [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)?.id !== base.id) throw new TypeError('Stale document candidate: review requires the latest exact current-source manifest')
+  if (!same(audit.mechanical.criticalIssues, unit.tasks.find(task => task.taskId === base.taskId)?.executionFacts?.reviewIssues ?? [])) throw new TypeError('Stale actual review dependencies')
+  let next: DocumentUnit = { ...unit, reviewAudits: [...(unit.reviewAudits ?? []), audit] }
+  if (audit.semantic.status !== 'pending') {
+    if (!audit.reviewedRevisionId || unit.revisions.some(item => item.id === audit.reviewedRevisionId)) throw new TypeError('Review completion needs a new fixed manifest identity')
+    const revision = { ...base, id: audit.reviewedRevisionId, parentRevisionId: base.id, reviewAuditId: audit.id, createdAt: audit.checkedAt,
+      review: { status: audit.mechanical.status === 'passed' && audit.semantic.status === 'passed' ? 'passed' as const : 'failed' as const,
+        checkedAt: audit.checkedAt, issues: [...audit.mechanical.issues, ...audit.semantic.issues] } }
+    next = { ...next, revisions: [...unit.revisions, { ...revision, eligibility: documentManifestEligibility(next, revision) }] }
+  }
+  return parseDocumentUnit(next)
 }
 export function restoreDocumentUnit(unit: DocumentUnit): DocumentUnit {
   const interrupted = (status: DocumentTaskRecord['status']): boolean => ['running', 'paused', 'waiting_context', 'waiting_user', 'unknown'].includes(status)
