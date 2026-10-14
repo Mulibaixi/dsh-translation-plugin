@@ -110,6 +110,8 @@ export class TranslationSourceStorageClient {
     if (queried.state !== 'prepared') return queried
     return this.confirmCommit(commit)
   }
+  /** Read only: a retained prepared history commit alone does not prove confirmation. */
+  queryPersistedReference(value: TranslationSourceHistoryCommit): Promise<TranslationSourceSaveOutcome> { return this.queryCommit(parseCommit(value)) }
 
   private async prepareAndPersist(transaction: TranslationSourceSaveTransaction, history: TranslationSourceHistoryCallbacks): Promise<TranslationSourceSaveOutcome> {
     let result: TranslationSourceStorageResult<TranslationSourceReference>

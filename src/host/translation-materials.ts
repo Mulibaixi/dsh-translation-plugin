@@ -149,6 +149,7 @@ export class TranslationMaterialsService {
   /** Read exact frozen source positions without accepting, executing or changing the material. */
   readSource(args: unknown, agent: { readonly id: string; readonly session: { readonly id: string } }): TranslationMaterialResult<TranslationSourcePage> {
     const request = parseTranslationSourceRead(args)
+    if (request.target.kind !== 'material') return bad('invalid_input', '此材料读取入口只接受已交付材料。', 'read_source')
     const delivered = this.deliveredForAgent(request.target, agent)
     if (!delivered.ok) return delivered
     const { start, end } = request.range

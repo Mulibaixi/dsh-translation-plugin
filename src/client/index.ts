@@ -180,6 +180,7 @@ export function apply(ctx: ClientPluginContext): void {
     })
     topics.setNormalTranslation(normal)
     const documents = new DocumentTasksClient(store, materials, preparations, ownerId => topics.retain(ownerId), {
+      canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId), reader: evidence,
       sourceStorage: new TranslationSourceStorageClient(storage), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
       remote: ctx.remote.$mount ? async () => {

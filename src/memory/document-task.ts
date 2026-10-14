@@ -3,6 +3,8 @@ import { documentSourceLength, parseChunkRevision, parseDocumentChunkPlan, parse
   type ChunkRevision, type DocumentChunkPlan, type DocumentEligibility, type DocumentPreparationReference,
   type DocumentRevision, type DocumentSourceVersion, type DocumentTaskRecord, type DocumentUnit,
   type VersionReference } from '../shared/translation-batch.js'
+import { isDocumentManifestReuse, validateDocumentCorrectionFact, validateDocumentReuseApproval } from './document-correction.js'
+import { parseDocumentCorrectionFact, type DocumentCorrectionFact, type DocumentReuseApproval } from '../shared/document-correction.js'
 
 export type NewDocumentUnit = Pick<DocumentUnit, 'id' | 'targetLanguage' | 'instruction' | 'createdAt'> & {
   readonly source: DocumentSourceVersion
@@ -12,6 +14,8 @@ export type NewDocumentUnit = Pick<DocumentUnit, 'id' | 'targetLanguage' | 'inst
 }
 export type DocumentMutation =
   | { readonly kind: 'source'; readonly expectedVersion: number; readonly source: DocumentSourceVersion }
+  | { readonly kind: 'correction'; readonly expectedVersion: number; readonly source: DocumentSourceVersion; readonly fact: DocumentCorrectionFact }
+  | { readonly kind: 'reuse'; readonly approval: DocumentReuseApproval }
   | { readonly kind: 'preparation'; readonly preparation: DocumentPreparationReference }
   | { readonly kind: 'plan'; readonly plan: DocumentChunkPlan }
   | { readonly kind: 'task'; readonly task: DocumentTaskRecord }
@@ -77,12 +81,16 @@ export function documentManifestEligibility(unit: DocumentUnit, revision: Omit<D
   for (let index = 0; index < plan.items.length; index++) {
     const item = plan.items[index]!, entry = revision.entries[index]!
     const chunk = unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId)
-    if (!chunk || revisionIds.has(entry.revisionId) || entry.chunkId !== item.chunkId || chunk.chunkId !== item.chunkId ||
+    if (!chunk || revisionIds.has(entry.revisionId) || entry.chunkId !== item.chunkId ||
       !same(entry.outputRange, item.outputRange)) throw new TypeError('Document manifest reference or output range changed')
     revisionIds.add(entry.revisionId)
-    // Source equality alone cannot prove that terminology and background dependencies are unchanged.
-    // A later reuse implementation must supply those facts before this branch can be admitted.
-    if (entry.reuseRef) throw new TypeError('Document reuse requires verified source and preparation dependencies')
+    if (entry.reuseRef) {
+      if (!isDocumentManifestReuse(unit, revision, entry)) throw new TypeError('Document reuse requires verified source and preparation dependencies')
+      const approval = unit.reuseApprovals!.find(approval => approval.id === entry.reuseRef!.approvalId)!
+      if (!sameVersionReference(approval.planRef, revision.planRef) || !sameVersionReference(approval.preparationRef, revision.preparationRef)) mixedDependencies = true
+      continue
+    }
+    if (chunk.chunkId !== item.chunkId) throw new TypeError('Document manifest chunk identity changed')
     if (chunk.taskId !== revision.taskId || chunk.sourceVersion !== revision.sourceVersion) throw new TypeError('Document manifest mixes source or task identities')
     if (!sameVersionReference(chunk.planRef, revision.planRef) || !sameVersionReference(chunk.preparationRef, revision.preparationRef)) mixedDependencies = true
     if (chunk.status !== 'completed') complete = false
@@ -114,6 +122,11 @@ export function parseDocumentUnit(value: unknown): DocumentUnit {
   for (const preparation of unit.preparations) sourceOf(unit, preparation.sourceVersion)
   for (const plan of unit.plans) binding(unit, { sourceVersion: plan.sourceVersion, planRef: plan, preparationRef: plan.preparationRef })
   for (const task of unit.tasks) binding(unit, task)
+  unique(unit.corrections ?? [], fact => fact.operationId)
+  unique(unit.corrections ?? [], fact => String(fact.toSourceVersion))
+  unique(unit.reuseApprovals ?? [], approval => approval.id)
+  for (const fact of unit.corrections ?? []) validateDocumentCorrectionFact(unit, fact)
+  for (const approval of unit.reuseApprovals ?? []) validateDocumentReuseApproval(unit, approval)
   for (const task of unit.tasks) if (task.executionFacts) {
     const facts = task.executionFacts
     for (const block of facts.blocks) {
@@ -158,7 +171,23 @@ function appendVersion<T extends VersionReference>(items: readonly T[], added: T
 /** Admission and receipts mutate one unit. Late old-source receipts never select a current final. */
 export function reduceDocumentUnit(unit: DocumentUnit, mutation: DocumentMutation): DocumentUnit {
   let next: DocumentUnit
-  if (mutation.kind === 'source') {
+  if (mutation.kind === 'correction') {
+    const source = parseDocumentSourceVersion(mutation.source), fact = parseDocumentCorrectionFact(mutation.fact)
+    const old = unit.corrections?.find(item => item.operationId === fact.operationId)
+    if (old) {
+      const prior = unit.sourceVersions.find(item => item.version === fact.toSourceVersion)
+      const { historyCommit: _newCommit, ...newSource } = source, { historyCommit: _oldCommit, ...oldSource } = prior!
+      if (same(old, fact) && same(oldSource, newSource) && mutation.expectedVersion === fact.fromSourceVersion) return unit
+      throw new TypeError('Document correction operation already has different content')
+    }
+    if (fact.fromSourceVersion !== mutation.expectedVersion || source.version !== fact.toSourceVersion || source.operationId !== fact.operationId || source.createdAt !== fact.createdAt) throw new TypeError('Document correction identity changed')
+    next = reduceDocumentUnit(unit, { kind: 'source', expectedVersion: mutation.expectedVersion, source })
+    next = { ...next, corrections: [...(unit.corrections ?? []), fact] }
+  } else if (mutation.kind === 'reuse') {
+    const approval = validateDocumentReuseApproval(unit, mutation.approval), old = unit.reuseApprovals?.find(item => item.id === approval.id)
+    if (old) { if (same(old, approval)) return unit; throw new TypeError('Document reuse approval already has different content') }
+    next = { ...unit, reuseApprovals: [...(unit.reuseApprovals ?? []), approval] }
+  } else if (mutation.kind === 'source') {
     const source = parseDocumentSourceVersion(mutation.source), old = unit.sourceVersions.find(item => item.operationId === source.operationId)
     if (!source.operationId) throw new TypeError('Document source correction needs its operation identity')
     if (old) {

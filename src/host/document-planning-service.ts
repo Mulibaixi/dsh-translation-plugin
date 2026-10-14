@@ -3,7 +3,8 @@ import {
   documentPlanningBytes, MAX_DOCUMENT_PLAN_PAGE_BYTES, type TranslationPlanSuggest, type TranslationPlanSet,
   type TranslationPlanQuery, type TranslationPlanRead,
 } from '../shared/document-planning.js'
-import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
+import type { NormalTranslationMaterialTarget, NormalTranslationTarget } from '../shared/normal-translation.js'
+import type { DocumentCorrectionService } from './document-correction-service.js'
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import type { AnalysisResult } from '../shared/translation-preparation.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength } from '../shared/translation-source-read.js'
@@ -32,6 +33,31 @@ export class DocumentPlanningService {
     return this.materials?.deliveredForAgent(target, exec.agent!) ?? failure('unavailable', '固定材料服务尚未就绪。', 'authorize_plan')
   }
   private async input(request: Pick<TranslationPlanSuggest, 'target' | 'preparationRef'>, exec: ToolExecution): Promise<AnalysisResult<DocumentPlanningInput>> {
+    if (request.target.kind === 'unit') {
+      const correction = this.ctx.get?.('translationCorrection') as DocumentCorrectionService
+      const captured = await correction.captureUnit(request.target, request.preparationRef, exec, { requireReady: true })
+      if (!captured.ok) return captured
+      const { capture, readSource, text } = captured.value
+      let preparation = capture.preparation!
+      const baseline = [...capture.tasks].reverse().find(task => task.baseline)?.baseline
+      if (capture.currentSourceVersion !== request.target.sourceVersion || !preparation || !baseline) return failure('preparation_not_ready', '当前原稿的准备复核或真实执行基线缺失。', 'capture_preparation')
+      const terms = await this.topics!.requestOwned(request.target.mainSessionId, { kind: 'list_terms', translationSessionId: request.target.translationSessionId }, exec)
+      if (terms.kind !== 'terms' || terms.snapshot.topicId !== capture.scope.topicId || terms.snapshot.ownerId !== capture.scope.ownerId) return failure('invalid_reply', '文档固定条目查询范围不一致。', 'capture_preparation')
+      const excluded = preparation.correctionReview?.excludedRanges ?? [], relevantFixedIds = terms.snapshot.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === preparation.targetLanguage && entry.origin === 'user_explicit' && entry.confirmation !== null && [...entry.sourceForms, ...entry.aliases].some(form => {
+        let offset = text.indexOf(form)
+        while (offset >= 0) { const start = Array.from(text.slice(0, offset)).length, end = start + Array.from(form).length
+          if (!excluded.some(range => start >= range.start && end <= range.end)) return true
+          offset = text.indexOf(form, offset + 1)
+        }
+        return false
+      })).map(entry => entry.id)
+      const checked = await this.topics!.requestOwned(request.target.mainSessionId, { kind: 'preparation_capture', request: { target: request.target, preparationId: request.preparationRef.id, version: request.preparationRef.version }, relevantFixedIds, topicTermsVersion: terms.snapshot.version }, exec)
+      if (checked.kind !== 'preparation_captured') return failure('invalid_reply', '新版本固定准备捕获未确认。', 'capture_preparation')
+      preparation = checked.snapshot
+      return { ok: true, value: { restoredSource: capture.source, maxInputChars: baseline.maxInputChars, preparation,
+        analysis: { analysisId: preparation.mechanicalCoverage.analysisId, version: preparation.mechanicalCoverage.analysisVersion, actualCalls: baseline.analysisActualCalls },
+        isCurrent: () => !this.disposed && !exec.signal.aborted && Boolean(this.topics?.ownsAgent(request.target.mainSessionId, exec.agent)), readSource } }
+    }
     const material = this.material(request.target, exec)
     if (!material.ok) return material
     let captured
@@ -67,7 +93,8 @@ export class DocumentPlanningService {
     if (!facts) return failure('unavailable', '真实术语分析服务尚未就绪。', 'authorize_plan')
     if (!facts.ok) return facts
     if (facts.value.run.totalCodePoints !== snapshot.totalCodePoints || facts.value.run.sourceVersion !== snapshot.sourceVersion) return failure('source_mismatch', '规划准备与真实分析的固定原稿不一致。', 'authorize_plan')
-    const isCurrent = (): boolean => !exec.signal.aborted && this.material(request.target, exec).ok
+    const materialTarget = request.target
+    const isCurrent = (): boolean => !exec.signal.aborted && this.material(materialTarget, exec).ok
     return { ok: true, value: {
       envelope: material.value, preparation: snapshot,
       analysis: { analysisId: facts.value.run.analysisId, version: facts.value.run.version, actualCalls: facts.value.run.actualCalls }, isCurrent,
@@ -103,17 +130,21 @@ export class DocumentPlanningService {
   status(args: unknown, exec: ToolExecution): AnalysisResult<unknown> {
     let request: TranslationPlanQuery
     try { request = parseTranslationPlanQuery(args) } catch { return failure('invalid_input', '分块计划查询参数无效。', 'status_plan') }
-    const authorized = this.material(request.target, exec)
+    const authorized = request.target.kind === 'material' ? this.material(request.target, exec) : this.unitAuthorized(request.target, exec)
     return authorized.ok ? this.bounded(this.planner.status(request)) : authorized
   }
   read(args: unknown, exec: ToolExecution): AnalysisResult<unknown> {
     let request: TranslationPlanRead
     try { request = parseTranslationPlanRead(args) } catch { return failure('invalid_input', '分块计划分页参数无效。', 'read_plan') }
-    const authorized = this.material(request.target, exec)
+    const authorized = request.target.kind === 'material' ? this.material(request.target, exec) : this.unitAuthorized(request.target, exec)
     return authorized.ok ? this.bounded(this.planner.read(request)) : authorized
   }
   /** Private authorized capture; never registered as a model tool or Remote method. */
-  async captureExecution(target: NormalTranslationMaterialTarget, planRef: VersionReference, preparationRef: VersionReference,
+  private unitAuthorized(target: NormalTranslationTarget, exec: ToolExecution): AnalysisResult<true> {
+    return !this.disposed && this.topics?.ownsAgent(target.mainSessionId, exec.agent) && this.topics.protocolFor(target.mainSessionId) === 2
+      ? { ok: true, value: true } : failure('scope_mismatch', '规划不属于当前实际主 Agent。', 'authorize_plan')
+  }
+  async captureExecution(target: NormalTranslationTarget, planRef: VersionReference, preparationRef: VersionReference,
     exec: ToolExecution): Promise<AnalysisResult<{ readonly input: DocumentPlanningInput; readonly snapshot: DocumentExecutionFreeze }>> {
     const input = await this.input({ target, preparationRef }, exec)
     if (!input.ok) return input

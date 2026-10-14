@@ -176,7 +176,7 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, obje
       if (!block.revision || block.revision.status !== 'completed') targetOffset = null
       else if (targetOffset !== null) targetOffset += block.revision.content.kind === 'text' ? sourceCodePointLength(block.revision.content.text) : block.revision.content.range.end - block.revision.content.range.start
       return h('section', { key: JSON.stringify([identity, readable?.plan?.id, readable?.plan?.version, block.chunkId, block.revisionId, block.revision?.status, block.revision?.updatedAt, block.revision?.content.kind === 'text' ? block.revision.content.text.length : null]), 'data-chunk-id': block.chunkId, className: 'dsh-tp-record-block' },
-        h('small', { className: 'dsh-tp-muted dsh-tp-record-block-heading' }, `块 ${index + 1} · 原文范围 ${block.outputRange.start}–${block.outputRange.end}${block.mode === 'copy' ? ' · 保留原文' : ''}`),
+        h('small', { className: 'dsh-tp-muted dsh-tp-record-block-heading' }, `块 ${index + 1} · 原文范围 ${block.outputRange.start}–${block.outputRange.end}${block.mode === 'copy' ? ' · 保留原文' : ''}${block.reuseRef ? ` · 复用原文版本 ${block.reuseRef.sourceVersion} 的完整结果` : ''}`),
         h('div', { className: 'dsh-tp-record-pair' }, ...(['source', 'target'] as const).map(side => h(DocumentPage, { key: side, handle: readable!, block, side, session, unitId: unit.id, objects, objectAssets, visible, navigationRevision, targetOffset: offset, targetTotal }))))
     }),
     unplacedSource.length ? h(RecordObjectText, { text: '', target: sourceTarget, references: unplacedSource, objectAssets }) : null,

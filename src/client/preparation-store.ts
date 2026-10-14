@@ -2,11 +2,13 @@ import {
   MAX_PREPARATION_PACKET_BYTES, MAX_PREPARATION_PAGE_BYTES, MAX_PREPARATION_PAGE_ITEMS,
   parsePreparationAnalysisFacts, parsePreparationCurrentFacts, parsePreparationSnapshot, parseTranslationPreparationPrepare,
   parseTranslationPreparationSet, parseTranslationPreparationQuery, parseTranslationPreparationRead,
+  parseTranslationPreparationCorrectionReview, parsePreparationCorrectionReviewFacts,
   preparationPacketBytes, type AnalysisResult, type AnalysisCandidate, type PreparationAnalysisFacts,
   type PreparationCurrentFacts, type PreparationPrepareFacts, type PreparationCandidate,
   type PreparationFrozenTerm, type PreparationConflict, type PreparationSnapshot, type PreparationReceipt,
   type PreparationPage, type PreparationTermRef, type TranslationPreparationPrepare,
   type TranslationPreparationSet, type TranslationPreparationQuery, type TranslationPreparationRead,
+  type TranslationPreparationCorrectionReview, type PreparationCorrectionReviewFacts,
 } from '../shared/translation-preparation.js'
 import { sourceCodePointLength, type TranslationSourceRange } from '../shared/translation-source-read.js'
 import type { TranslationSourceScope } from '../shared/translation-sources.js'
@@ -58,7 +60,7 @@ function materialScope(envelope: Extract<TranslationMaterialEnvelope, { kind: 'm
   return { ownerId: envelope.ownerId, mainSessionId: envelope.mainSessionId, topicId: envelope.material.topicId, translationSessionId: envelope.material.translationSessionId }
 }
 function matchesTarget(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>, target: TranslationPreparationQuery['target']): boolean {
-  return envelope.mainSessionId === target.mainSessionId && envelope.requestId === target.requestId && envelope.material.materialId === target.materialId && envelope.material.sourceVersion === target.sourceVersion
+  return target.kind === 'material' && envelope.mainSessionId === target.mainSessionId && envelope.requestId === target.requestId && envelope.material.materialId === target.materialId && envelope.material.sourceVersion === target.sourceVersion
 }
 function binding(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>, hash: string): string {
   const { sourceText: _text, ...material } = envelope.material
@@ -111,6 +113,9 @@ function fixedBinding(snapshot: TopicTermSnapshot, targetLanguage: string): Read
 function analysisBusinessFacts(analysis: PreparationAnalysisFacts): unknown {
   const { notification: _notification, updatedAt: _updatedAt, ...run } = analysis.run
   return { ...analysis, run }
+}
+function ready(snapshot: PreparationSnapshot): boolean {
+  return snapshot.preparationReady && (snapshot.correctionReview?.complete ?? snapshot.mechanicalCoverage.complete) && snapshot.modelReview.complete && !snapshot.conflicts.length && !snapshot.questions.some(question => question.decision === null)
 }
 /** Exact pairs only. Description alternatives and original spellings remain observable. */
 export function mergePreparationCandidates(candidates: readonly AnalysisCandidate[]): readonly PreparationCandidate[] {
@@ -179,7 +184,7 @@ export class PreparationStore {
     return { preparationId: snapshot.id, version: snapshot.version, target: snapshot.target, scope: snapshot.scope,
       sourceVersion: snapshot.sourceVersion, route: snapshot.route, totalCodePoints: snapshot.totalCodePoints,
       preparationReady: snapshot.preparationReady, executionReady: false, executionGate: 'plan_and_budget_pending',
-      issueCount: snapshot.conflicts.length + Number(!snapshot.mechanicalCoverage.complete) + Number(!snapshot.modelReview.complete),
+      issueCount: snapshot.conflicts.length + Number(!(snapshot.correctionReview?.complete ?? snapshot.mechanicalCoverage.complete)) + Number(!snapshot.modelReview.complete),
       termCount: snapshot.terms.length, candidateCount: seat.audit.candidateCount, storage: snapshot.storage, storageError: snapshot.storageError,
       editable, restartExecutable: false, createdAt: snapshot.createdAt, updatedAt: snapshot.updatedAt }
   }
@@ -304,7 +309,7 @@ export class PreparationStore {
     const next = this.commit(storageKey, bound, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
     return ok(this.receipt(next, next.audit.versions.at(-1)!, true))
   }
-  private conflicts(candidates: readonly PreparationCandidate[], topic: TopicTermSnapshot, terms: readonly PreparationFrozenTerm[], required: readonly TranslationSourceRange[], request: TranslationPreparationSet, targetLanguage: string): readonly PreparationConflict[] {
+  private conflicts(candidates: readonly PreparationCandidate[], topic: TopicTermSnapshot, terms: readonly PreparationFrozenTerm[], required: readonly TranslationSourceRange[], request: Pick<TranslationPreparationSet, 'questions'>, targetLanguage: string): readonly PreparationConflict[] {
     const conflicts: PreparationConflict[] = [], forms = new Map<string, PreparationCandidate[]>()
     for (const candidate of candidates) { const old = forms.get(candidate.original); if (old) old.push(candidate); else forms.set(candidate.original, [candidate]) }
     for (const [original, options] of forms) {
@@ -331,24 +336,115 @@ export class PreparationStore {
     for (const question of request.questions ?? []) if (question.decision === null) conflicts.push({ code: 'question_unresolved', original: '', refs: [], ranges: question.ranges, message: question.question })
     return conflicts
   }
+  async reviewCorrection(args: unknown, rawFacts: PreparationCorrectionReviewFacts, measurePage?: (page: PreparationPage) => number): Promise<AnalysisResult<PreparationReceipt>> {
+    try {
+      const request = parseTranslationPreparationCorrectionReview(args), facts = parsePreparationCorrectionReviewFacts(rawFacts), signature = await textHash(JSON.stringify(request))
+      return await this.locked(() => this.reviewCorrectionLocked(request, facts, signature, measurePage))
+    } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '纠错准备复核参数或准确源事实无效。', 'review_correction_preparation') }
+  }
+  private reviewCorrectionLocked(request: TranslationPreparationCorrectionReview, facts: PreparationCorrectionReviewFacts, signature: string, measurePage?: (page: PreparationPage) => number): AnalysisResult<PreparationReceipt> {
+    const storageKey = key(request.target.mainSessionId, request.preparationId), seat = this.fresh(storageKey), latest = seat?.audit.versions.at(-1)
+    if (!seat || !latest) return bad('preparation_not_found', '原准备包不存在。')
+    if (!this.current(facts.scope) || !same(latest.scope, facts.scope) || request.target.unitId !== facts.unitId || request.target.translationSessionId !== facts.scope.translationSessionId || request.target.mainSessionId !== facts.scope.mainSessionId || request.target.sourceVersion !== facts.sourceVersion) return bad('source_mismatch', '复核不属于此确切单元和当前纠错原稿。')
+    if (!this.currentTerms(facts.topicTerms)) return bad('stale_terms', '复核期间主题术语已变化，请重新读取。')
+    const repeated = seat.audit.operations[request.operationId]
+    if (repeated) return repeated.signature === signature ? ok(this.receipt(seat, seat.audit.versions[repeated.version - 1]!, true)) : bad('idempotency_conflict', '此复核标识已绑定不同内容。')
+    if ([...this.seats.values()].some(other => other !== seat && other.audit.versions[0]?.scope.ownerId === facts.scope.ownerId && Object.hasOwn(other.audit.operations, request.operationId))) return bad('idempotency_conflict', '此操作标识已绑定另一准备包。')
+    if (request.expectedVersion !== latest.version) return bad('stale_preparation', '准备版本已变化，请先读取准确版本。')
+    if (facts.sourceVersion < latest.sourceVersion || facts.sourceVersion === latest.sourceVersion && (!latest.correctionReview || !same(latest.target, request.target) || latest.sourceSha256 !== facts.sourceSha256)) return bad('source_mismatch', '此操作必须复核新纠错原稿或调整该源已有的纠错准备。')
+    if (latest.target.kind === 'unit' && latest.target.unitId !== facts.unitId) return bad('scope_mismatch', '纠错准备已绑定另一单元。')
+    const excluded = request.excludedRanges ?? [], required = requiredRanges(excluded, facts.totalCodePoints)
+    if (!validRanges(excluded, facts.totalCodePoints) || !validRanges(request.reviewedRanges, facts.totalCodePoints) || !validRanges(request.backgroundRanges ?? [], facts.totalCodePoints) || request.questions?.some(item => !validRanges(item.ranges, facts.totalCodePoints))) return bad('invalid_range', '新原稿的排除、复核、背景或问题范围无效。')
+    const terms: PreparationFrozenTerm[] = []
+    for (const selected of request.termSelections) {
+      if (!validRanges(selected.ranges, facts.totalCodePoints) || !applicableRanges(selected.ranges, required)) return bad('invalid_range', '新术语范围必须位于本次需译范围。')
+      if (!facts.termMatches.some(match => same(match.ref, selected.ref) && match.matched)) return bad('term_source_mismatch', '所选旧术语或固定原词未在新原稿的适用范围中命中。')
+      if (selected.ref.kind === 'candidate') {
+        const previous = latest.terms.find(term => term.ref.kind === 'candidate' && (term.ref.id === selected.ref.id || term.candidateRefs.some(ref => ref.id === selected.ref.id)))
+        if (!previous) return bad('candidate_not_found', '纠错复核只采用真实旧准备中的候选；新增术语需先登记主题条目。')
+        if (selected.descriptionRef) return bad('description_mismatch', '纠错复核保留原候选说明，调整说明请给出明确任务内容。')
+        if (selected.content && selected.content.original !== previous.sourceForms[0]) return bad('candidate_spelling_mismatch', '不能把旧分析引用改为另一原词的分析依据。')
+        terms.push({ ...previous, preferred: selected.content?.preferred ?? previous.preferred, description: selected.content?.description ?? previous.description,
+          origin: selected.content ? 'main_model_adjusted' : previous.origin, ranges: selected.ranges })
+      } else {
+        const ref = selected.ref, entry = facts.topicTerms.entries.find(term => term.id === ref.id && term.version === ref.entryVersion)
+        if (!entry || entry.status !== 'active' || entry.targetLanguage !== latest.targetLanguage) return bad('stale_terms', '复核所选主题术语已变化或不再适用。')
+        if (selected.content || selected.descriptionRef) return bad('description_mismatch', '主题术语使用当前真实条目，任务复核不能改写固定规则。')
+        terms.push({ ref, sourceForms: entry.sourceForms, aliases: entry.aliases, preferred: entry.preferred, description: entry.sense,
+          sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sense: entry.sense, forbidden: entry.forbidden,
+          userFixed: fixed(entry), confirmation: entry.confirmation, origin: entry.origin, evidence: entry.evidence, candidateRefs: [], ranges: selected.ranges })
+      }
+    }
+    if (new Set(terms.map(term => JSON.stringify(term.ref))).size !== terms.length) return bad('duplicate_candidate', '同一个合并候选只能采用一次。')
+    const conflicts = this.conflicts([], facts.topicTerms, terms, required, request, latest.targetLanguage)
+    const fixedEntries = facts.topicTerms.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === latest.targetLanguage && fixed(entry) && facts.relevantFixedIds.includes(entry.id))
+    const missingFixed = fixedEntries.filter(entry => !terms.some(term => term.userFixed && term.ref.kind === 'topic_term' && term.ref.id === entry.id))
+    if (missingFixed.length) return bad('preparation_incomplete', `新原稿命中的用户固定条目尚未按准确版本复核：${missingFixed.map(entry => entry.id).join(', ').slice(0, 700)}`)
+    if (conflicts.some(item => item.code === 'fixed_conflict')) return bad('fixed_conflict', '纠错准备与用户固定规则冲突。')
+    const complete = covers(request.reviewedRanges, required) && conflicts.length === 0
+    const original = seat.audit.versions[0]!, analysisBasis = latest.correctionReview?.analysisBasis ?? { sourceVersion: original.sourceVersion, sourceSha256: original.sourceSha256, totalCodePoints: original.totalCodePoints,
+      actualCalls: seat.catalog?.analysis.run.actualCalls ?? facts.analysisActualCalls }
+    const snapshot: PreparationSnapshot = { ...latest, version: latest.version + 1, target: request.target, sourceVersion: facts.sourceVersion, sourceSha256: facts.sourceSha256, totalCodePoints: facts.totalCodePoints,
+      organizedRequirements: request.organizedRequirements, modelReview: { meaning: 'main_model_declared_review', reviewedRanges: request.reviewedRanges, complete: covers(request.reviewedRanges, required) },
+      correctionReview: { meaning: 'main_model_correction_review', previousPreparationRef: { id: latest.id, version: latest.version }, correctionOperationId: facts.correctionOperationId, basis: request.basis,
+        analysisBasis, requiredRanges: required, excludedRanges: excluded, fixedTermVersions: fixedBinding(facts.topicTerms, latest.targetLanguage),
+        termMappings: latest.terms.map(previous => ({ previous: previous.ref, current: terms.find(term => term.ref.kind === previous.ref.kind && term.ref.id === previous.ref.id)?.ref ?? null })), complete },
+      terms, backgroundRanges: request.backgroundRanges ?? [], referenceRefs: [], questions: request.questions ?? [], conflicts,
+      preparationReady: complete, storage: 'runtime_only', storageError: null, updatedAt: now(), operationId: request.operationId }
+    parsePreparationSnapshot(snapshot)
+    this.readable(seat, snapshot, measurePage)
+    const next = this.commit(storageKey, seat, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
+    return ok(this.receipt(next, next.audit.versions.at(-1)!, true))
+  }
   status(args: unknown, envelope?: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): AnalysisResult<PreparationReceipt> {
     try {
       const query = parseTranslationPreparationQuery(args), { seat, snapshot } = this.lookup(query)
-      return ok(this.receipt(seat, snapshot, !!seat.catalog && !!envelope && matchesTarget(envelope, query.target)))
+      return ok(this.receipt(seat, snapshot, !!snapshot.correctionReview || !!seat.catalog && !!envelope && matchesTarget(envelope, query.target)))
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '准备查询参数或保存记录无效。', 'read_preparation') }
   }
   /** Saved immutable preparation for explicit task recovery; never restores analysis authority. */
   documentAnalysisActualCalls(scope: TranslationSourceScope, reference: { readonly id: string; readonly version: number }): number | null {
     const seat = this.fresh(key(scope.ownerId, reference.id)), snapshot = seat?.audit.versions.find(item => item.version === reference.version)
-    return snapshot && same(snapshot.scope, scope) && seat?.catalog ? seat.catalog.analysis.run.actualCalls : null
+    return snapshot && same(snapshot.scope, scope) ? seat?.catalog?.analysis.run.actualCalls ?? snapshot.correctionReview?.analysisBasis.actualCalls ?? null : null
+  }
+  /** The caller proves the unit's exact preparation reference and source version. */
+  documentUnitPreparation(scope: TranslationSourceScope, reference: { readonly id: string; readonly version: number }, sourceSha256: string, requireReady = false): AnalysisResult<PreparationSnapshot> {
+    try {
+      const seat = this.fresh(key(scope.ownerId, reference.id)), snapshot = seat?.audit.versions.find(item => item.version === reference.version)
+      if (!snapshot || !this.current(scope) || !same(snapshot.scope, scope) || snapshot.sourceSha256 !== sourceSha256) return bad('preparation_unavailable', '确切准备与此单元原稿不一致。', 'capture_preparation')
+      if (requireReady && !ready(snapshot)) return bad('preparation_not_ready', '此原稿的准备尚未完整复核。', 'capture_preparation')
+      return ok(snapshot)
+    } catch { return bad('preparation_unavailable', '准备记录不可读取。', 'capture_preparation') }
   }
   savedDocumentPreparation(scope: TranslationSourceScope, reference: { readonly id: string; readonly version: number }, sourceSha256: string): AnalysisResult<PreparationSnapshot> {
     try {
       const seat = this.fresh(key(scope.ownerId, reference.id)), snapshot = seat?.audit.versions.find(item => item.version === reference.version)
       if (!snapshot || snapshot.storage !== 'saved' || !same(snapshot.scope, scope) || snapshot.sourceSha256 !== sourceSha256) return bad('preparation_unavailable', '确切准备正文未保存或与此原稿范围不符。', 'restore_document')
-      if (!snapshot.preparationReady || !snapshot.mechanicalCoverage.complete || !snapshot.modelReview.complete || snapshot.conflicts.length || snapshot.questions.some(question => question.decision === null)) return bad('preparation_not_ready', '已保存准备尚未完整解决关键问题。', 'restore_document')
+      if (!ready(snapshot)) return bad('preparation_not_ready', '已保存准备尚未完整解决关键问题。', 'restore_document')
       return ok(structuredClone(snapshot))
     } catch { return bad('preparation_unavailable', '已保存准备记录不可读取。', 'restore_document') }
+  }
+  async captureUnit(args: unknown, sourceSha256: string, topicTerms: TopicTermSnapshot, relevantFixedIds: readonly string[], measureReply: (snapshot: PreparationSnapshot) => number): Promise<AnalysisResult<PreparationSnapshot>> {
+    try {
+      const query = parseTranslationPreparationQuery(args)
+      if (query.target.kind !== 'unit') return bad('invalid_input', '纠错准备捕获需要准确单元。', 'capture_preparation')
+      return await this.locked(() => {
+        const { seat, snapshot } = this.lookup(query)
+        if (snapshot.sourceSha256 !== sourceSha256 || !this.currentTerms(topicTerms) || topicTerms.ownerId !== snapshot.scope.ownerId || topicTerms.topicId !== snapshot.scope.topicId) return bad('source_mismatch', '纠错准备、当前原稿或主题术语已变化。', 'capture_preparation')
+        if (!ready(snapshot)) return bad('preparation_not_ready', '纠错后需完整的主模型复核准备。', 'capture_preparation')
+        const baseline = snapshot.correctionReview?.fixedTermVersions ?? seat.planningBindings?.[snapshot.version]
+        if (!baseline) return bad('preparation_unavailable', '准备缺少准确固定规则基线。', 'capture_preparation')
+        const currentFixed = topicTerms.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === snapshot.targetLanguage && fixed(entry))
+        const adopted = snapshot.terms.filter(term => term.userFixed)
+        if (adopted.some(term => term.ref.kind !== 'topic_term' || !currentFixed.some(entry => entry.id === term.ref.id && entry.version === (term.ref as Extract<PreparationTermRef, { kind: 'topic_term' }>).entryVersion && same(entry.confirmation, term.confirmation) && entry.preferred === term.preferred && same(entry.forbidden, term.forbidden) && same(entry.sourceForms, term.sourceForms) && same(entry.aliases, term.aliases) && entry.sourceLanguage === term.sourceLanguage && entry.sense === term.sense && entry.origin === term.origin && same(entry.evidence, term.evidence)))) return bad('stale_fixed_terms', '采用的用户固定规则已更新或删除，请形成新复核准备。', 'capture_preparation')
+        for (const entry of currentFixed.filter(entry => relevantFixedIds.includes(entry.id))) {
+          if (baseline[entry.id] !== entry.version) return bad('stale_fixed_terms', '新原稿相关固定规则已变化，请重新复核。', 'capture_preparation')
+          if (!adopted.some(term => term.ref.kind === 'topic_term' && term.ref.id === entry.id)) return bad('preparation_incomplete', '新原稿命中未采用的用户固定规则，请重新复核。', 'capture_preparation')
+        }
+        if (measureReply(snapshot) > MAX_PREPARATION_PACKET_BYTES) return bad('preparation_too_large', '完整准备回包超过传输预算。', 'capture_preparation')
+        return ok(snapshot)
+      })
+    } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '单元准备捕获事实无效。', 'capture_preparation') }
   }
   /** Private planning capture: saved audits alone never recreate runtime preparation authority. */
   async documentPreparation(args: unknown, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): Promise<AnalysisResult<PreparationSnapshot>> {
@@ -427,7 +523,8 @@ export class PreparationStore {
       case 'summary': return [{ userRequirements: snapshot.userRequirements, organizedRequirements: snapshot.organizedRequirements, route: snapshot.route, sourceSha256: snapshot.sourceSha256,
         targetLanguage: snapshot.targetLanguage, mechanicalCoverageComplete: snapshot.mechanicalCoverage.complete, mainModelReviewComplete: snapshot.modelReview.complete,
         preparationReady: snapshot.preparationReady, executionReady: false, executionGate: 'plan_and_budget_pending',
-        coverageMeaning: snapshot.mechanicalCoverage.meaning, reviewMeaning: snapshot.modelReview.meaning }]
+        coverageMeaning: snapshot.mechanicalCoverage.meaning, reviewMeaning: snapshot.modelReview.meaning,
+        ...(snapshot.correctionReview ? { analysisSourceVersion: snapshot.correctionReview.analysisBasis.sourceVersion, correctionReviewComplete: snapshot.correctionReview.complete } : {}) }]
       case 'candidates': return seat.catalog!.candidates.flatMap(candidate => [
         { kind: 'candidate', id: candidate.id, version: candidate.version, original: candidate.original, preferred: candidate.preferred,
           memberCount: candidate.members.length, descriptionCount: candidate.descriptions.length, occurrences: candidate.occurrences.slice(0, 8),
@@ -437,11 +534,12 @@ export class PreparationStore {
       ])
       case 'terms': return snapshot.terms
       case 'coverage': return [
-        ...snapshot.mechanicalCoverage.requiredRanges.map(range => ({ kind: 'required', range })),
-        ...snapshot.mechanicalCoverage.excludedRanges.map(range => ({ kind: 'excluded', range })),
-        ...snapshot.mechanicalCoverage.coverage.map(item => ({ kind: 'mechanical_scan', analysisId: snapshot.mechanicalCoverage.analysisId, analysisVersion: 1, ...item })),
-        ...snapshot.modelReview.reviewedRanges.map(range => ({ kind: 'main_model_declared_review', range })),
+        ...(snapshot.correctionReview?.requiredRanges ?? snapshot.mechanicalCoverage.requiredRanges).map(range => ({ kind: 'required', range, ...(snapshot.correctionReview ? { sourceVersion: snapshot.sourceVersion } : {}) })),
+        ...(snapshot.correctionReview?.excludedRanges ?? snapshot.mechanicalCoverage.excludedRanges).map(range => ({ kind: 'excluded', range, ...(snapshot.correctionReview ? { sourceVersion: snapshot.sourceVersion } : {}) })),
+        ...snapshot.mechanicalCoverage.coverage.map(item => ({ kind: 'mechanical_scan', analysisId: snapshot.mechanicalCoverage.analysisId, analysisVersion: 1, ...item, ...(snapshot.correctionReview ? { sourceVersion: snapshot.correctionReview.analysisBasis.sourceVersion } : {}) })),
+        ...snapshot.modelReview.reviewedRanges.map(range => ({ kind: 'main_model_declared_review', range, ...(snapshot.correctionReview ? { sourceVersion: snapshot.sourceVersion } : {}) })),
       ]
+      case 'correction_review': return snapshot.correctionReview ? [snapshot.correctionReview] : []
       case 'background': return snapshot.backgroundRanges.map(range => ({ target: snapshot.target, sourceVersion: snapshot.sourceVersion, range, role: 'source_background' }))
       case 'references': return snapshot.referenceRefs
       case 'questions': return snapshot.questions
@@ -449,7 +547,7 @@ export class PreparationStore {
     }
   }
   private readable(seat: Seat, snapshot: PreparationSnapshot, measurePage: (page: PreparationPage) => number = page => preparationPacketBytes({ requestId: 'preflight', ok: true, value: { kind: 'preparation_page', page } })): void {
-    for (const section of ['summary', 'candidates', 'terms', 'coverage', 'background', 'references', 'questions', 'conflicts'] as const) {
+    for (const section of ['summary', 'terms', 'coverage', 'background', 'references', 'questions', 'conflicts', 'correction_review', ...(seat.catalog ? ['candidates' as const] : [])] as const) {
       const items = this.section(seat, snapshot, section)
       for (const [offset, item] of items.entries()) {
         const page: PreparationPage = { target: snapshot.target, preparationId: snapshot.id, version: snapshot.version, section, items: [item],
@@ -465,8 +563,12 @@ export class PreparationStore {
     if (!audit || audit.schemaVersion !== 1 || typeof audit.cursorToken !== 'string' || !/^[0-9a-f-]{36}$/u.test(audit.cursorToken) || typeof audit.prepareSignature !== 'string' || !Number.isSafeInteger(audit.candidateCount) || audit.candidateCount < 0 || !Array.isArray(audit.versions) || !audit.versions.length || !audit.operations || typeof audit.operations !== 'object' || Array.isArray(audit.operations)) throw new TypeError('Invalid preparation audit')
     const first = audit.versions[0]!
     for (const [index, snapshot] of audit.versions.entries()) {
-      if (snapshot.version !== index + 1 || snapshot.id !== first.id || !same(snapshot.target, first.target) || !same(snapshot.scope, first.scope) || snapshot.sourceSha256 !== first.sourceSha256 || !same(snapshot.route, first.route) || snapshot.targetLanguage !== first.targetLanguage || snapshot.userRequirements !== first.userRequirements || !same(snapshot.mechanicalCoverage, first.mechanicalCoverage) || snapshot.storage !== 'saved') throw new TypeError('Invalid preparation audit version')
-      const calculated = snapshot.mechanicalCoverage.complete && snapshot.modelReview.complete && snapshot.conflicts.length === 0
+      if (snapshot.version !== index + 1 || snapshot.id !== first.id || !same(snapshot.scope, first.scope) || !same(snapshot.route, first.route) || snapshot.targetLanguage !== first.targetLanguage || snapshot.userRequirements !== first.userRequirements || !same(snapshot.mechanicalCoverage, first.mechanicalCoverage) || snapshot.storage !== 'saved') throw new TypeError('Invalid preparation audit version')
+      if (snapshot.correctionReview) {
+        const previous = audit.versions[index - 1], basis = snapshot.correctionReview.analysisBasis
+        if (!previous || snapshot.sourceVersion < previous.sourceVersion || snapshot.sourceVersion === previous.sourceVersion && (!previous.correctionReview || !same(snapshot.target, previous.target) || snapshot.sourceSha256 !== previous.sourceSha256) || basis.sourceVersion !== first.sourceVersion || basis.sourceSha256 !== first.sourceSha256 || basis.totalCodePoints !== first.totalCodePoints || previous.target.kind === 'unit' && snapshot.target.kind === 'unit' && previous.target.unitId !== snapshot.target.unitId) throw new TypeError('Invalid correction preparation lineage')
+      } else if (!same(snapshot.target, first.target) || snapshot.sourceSha256 !== first.sourceSha256) throw new TypeError('Invalid original preparation source')
+      const calculated = snapshot.correctionReview?.complete ?? (snapshot.mechanicalCoverage.complete && snapshot.modelReview.complete && snapshot.conflicts.length === 0)
       if (snapshot.version > 1 && snapshot.preparationReady !== calculated) throw new TypeError('Invalid preparation eligibility')
       if (!Array.isArray(snapshot.terms) || !Array.isArray(snapshot.questions) || !Array.isArray(snapshot.conflicts) || !Array.isArray(snapshot.backgroundRanges) || snapshot.referenceRefs.length) throw new TypeError('Invalid preparation audit content')
     }

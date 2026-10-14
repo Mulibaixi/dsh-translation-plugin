@@ -3,6 +3,7 @@ import { parseTranslationSourceReference, parseTranslationSourceStorageRequest,
   type TranslationSourceReference } from './translation-source-storage.js'
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
 import type { TranslationMaterialRoute } from './translation-material.js'
+import { parseDocumentCorrectionFact, parseDocumentReuseApproval, type DocumentCorrectionFact, type DocumentReuseApproval } from './document-correction.js'
 
 export interface VersionReference { readonly id: string; readonly version: number }
 export type SourceBody = { readonly kind: 'inline'; readonly text: string }
@@ -142,7 +143,7 @@ export interface ManifestEntry {
   readonly chunkId: string
   readonly outputRange: TranslationSourceRange
   readonly revisionId: string
-  readonly reuseRef?: { readonly sourceVersion: number; readonly planVersion: number; readonly revisionId: string }
+  readonly reuseRef?: { readonly sourceVersion: number; readonly planVersion: number; readonly revisionId: string; readonly approvalId?: string }
 }
 export interface DocumentReview {
   readonly status: 'pending' | 'passed' | 'failed'
@@ -181,6 +182,8 @@ export interface DocumentUnit {
   readonly chunkRevisions: readonly ChunkRevision[]
   readonly revisions: readonly DocumentRevision[]
   readonly final: DocumentFinalPointer | null
+  readonly corrections?: readonly DocumentCorrectionFact[]
+  readonly reuseApprovals?: readonly DocumentReuseApproval[]
 }
 
 type Data = Record<string, unknown>
@@ -409,8 +412,10 @@ export function parseDocumentRevision(value: unknown, sourceLength: number): Doc
     exact(raw, ['chunkId', 'outputRange', 'revisionId'], ['reuseRef']); string(raw.chunkId); string(raw.revisionId)
     const entry: ManifestEntry = { chunkId: raw.chunkId, outputRange: range(raw.outputRange, sourceLength), revisionId: raw.revisionId }
     if (!Object.hasOwn(raw, 'reuseRef')) return entry
-    exact(raw.reuseRef, ['sourceVersion', 'planVersion', 'revisionId']); integer(raw.reuseRef.sourceVersion); integer(raw.reuseRef.planVersion); string(raw.reuseRef.revisionId)
-    return { ...entry, reuseRef: { sourceVersion: raw.reuseRef.sourceVersion, planVersion: raw.reuseRef.planVersion, revisionId: raw.reuseRef.revisionId } }
+    exact(raw.reuseRef, ['sourceVersion', 'planVersion', 'revisionId'], ['approvalId']); integer(raw.reuseRef.sourceVersion); integer(raw.reuseRef.planVersion); string(raw.reuseRef.revisionId)
+    if (raw.reuseRef.approvalId !== undefined) string(raw.reuseRef.approvalId)
+    return { ...entry, reuseRef: { sourceVersion: raw.reuseRef.sourceVersion, planVersion: raw.reuseRef.planVersion, revisionId: raw.reuseRef.revisionId,
+      ...(raw.reuseRef.approvalId === undefined ? {} : { approvalId: raw.reuseRef.approvalId }) } }
   })
   exact(value.review, ['status', 'checkedAt', 'issues']); array(value.review.issues, 50)
   if (!['pending', 'passed', 'failed'].includes(value.review.status as string)) throw new TypeError('Invalid document review')
@@ -430,7 +435,7 @@ export function parseDocumentRevision(value: unknown, sourceLength: number): Doc
 
 /** Validates structural facts only; document-task validates their cross references and eligibility. */
 export function parseDocumentUnitShape(value: unknown): DocumentUnit {
-  exact(value, ['kind', 'id', 'order', 'targetLanguage', 'instruction', 'sourceVersion', 'sourceVersions', 'createdAt', 'preparations', 'plans', 'tasks', 'chunkRevisions', 'revisions', 'final'])
+  exact(value, ['kind', 'id', 'order', 'targetLanguage', 'instruction', 'sourceVersion', 'sourceVersions', 'createdAt', 'preparations', 'plans', 'tasks', 'chunkRevisions', 'revisions', 'final'], ['corrections', 'reuseApprovals'])
   if (value.kind !== 'document') throw new TypeError('Invalid document unit kind')
   string(value.id); integer(value.order); string(value.targetLanguage, 80); string(value.instruction, 4000, false); integer(value.sourceVersion); time(value.createdAt)
   array(value.sourceVersions); array(value.preparations); array(value.plans); array(value.tasks); array(value.chunkRevisions); array(value.revisions)
@@ -450,7 +455,10 @@ export function parseDocumentUnitShape(value: unknown): DocumentUnit {
   const plans = value.plans.map(raw => { exact(raw, ['id', 'version', 'sourceVersion', 'preparationRef', 'items', 'createdAt', 'operationId'], ['protectedRanges']); return parseDocumentChunkPlan(raw, sourceLength(raw.sourceVersion)) })
   const chunkRevisions = value.chunkRevisions.map(raw => { exact(raw, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt']); return parseChunkRevision(raw, sourceLength(raw.sourceVersion)) })
   const revisions = value.revisions.map(raw => { exact(raw, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility']); return parseDocumentRevision(raw, sourceLength(raw.sourceVersion)) })
+  const corrections = value.corrections === undefined ? undefined : (() => { array(value.corrections); return value.corrections.map(parseDocumentCorrectionFact) })()
+  const reuseApprovals = value.reuseApprovals === undefined ? undefined : (() => { array(value.reuseApprovals); return value.reuseApprovals.map(parseDocumentReuseApproval) })()
   return { kind: 'document', id: value.id, order: value.order, targetLanguage: value.targetLanguage, instruction: value.instruction, sourceVersion: value.sourceVersion,
     sourceVersions, createdAt: value.createdAt, preparations: value.preparations.map(parseDocumentPreparationReference), plans,
-    tasks: value.tasks.map(parseDocumentTaskRecord), chunkRevisions, revisions, final }
+    tasks: value.tasks.map(parseDocumentTaskRecord), chunkRevisions, revisions, final,
+    ...(corrections === undefined ? {} : { corrections }), ...(reuseApprovals === undefined ? {} : { reuseApprovals }) }
 }

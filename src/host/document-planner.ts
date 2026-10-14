@@ -119,6 +119,13 @@ export class DocumentPlanner {
   private check(input: DocumentPlanningInput, target: TranslationPlanQuery['target'], preparationRef: VersionReference): PreparationSnapshot {
     if (!input.isCurrent()) throw reject('scope_mismatch', '规划所属实际主 Agent 或固定材料已失效。', 'authorize_plan')
     const preparation = parsePreparationSnapshot(input.preparation), envelope = input.envelope
+    if (target.kind === 'unit') {
+      if (!input.restoredSource || input.restoredSource.version !== target.sourceVersion || !same(preparation.target, target) ||
+        preparation.id !== preparationRef.id || preparation.version !== preparationRef.version || !preparation.preparationReady ||
+        preparation.scope.translationSessionId !== target.translationSessionId || preparation.scope.mainSessionId !== target.mainSessionId ||
+        !Number.isSafeInteger(input.analysis.actualCalls) || input.analysis.actualCalls < preparation.mechanicalCoverage.coverage.length || input.analysis.actualCalls > 512) throw reject('source_mismatch', '纠错原稿、复核准备和实际分析基线不一致。')
+      return preparation
+    }
     if (!envelope) throw reject('material_missing', '新规划需要确切已交付材料。')
     const material = envelope.material
     if (!same(preparation.target, target) || envelope.ownerId !== target.mainSessionId || envelope.mainSessionId !== target.mainSessionId ||
@@ -184,7 +191,8 @@ export class DocumentPlanner {
       contextWindow: capacity.contextWindow, maxOutputTokens: capacity.maxOutputTokens, contextRef: actualRef }, prompt }
   }
   private validatePlan(preparation: PreparationSnapshot, plan: DocumentChunkPlan, protectedRanges: readonly TranslationSourceRange[]): void {
-    const required = preparation.mechanicalCoverage.requiredRanges, coverage = preparation.mechanicalCoverage.coverage.map(item => item.range)
+    const required = preparation.correctionReview?.requiredRanges ?? preparation.mechanicalCoverage.requiredRanges,
+      coverage = preparation.correctionReview ? preparation.correctionReview.complete ? required : [] : preparation.mechanicalCoverage.coverage.map(item => item.range)
     for (const item of plan.items) {
       if (item.mode !== 'translate') continue
       if (!covers(required, item.outputRange) || !covers(coverage, item.outputRange) || !covers(preparation.modelReview.reviewedRanges, item.outputRange)) {
@@ -230,8 +238,8 @@ export class DocumentPlanner {
         if (!record || record.signature !== signature) return bad('invalid_cursor', '建议游标的固定材料或分析事实已失效。', 'read_plan_suggestion')
       } else {
         const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
-        const excluded = preparation.mechanicalCoverage.excludedRanges
-        const partitions = [...preparation.mechanicalCoverage.requiredRanges.map(range => ({ range, mode: 'translate' as const })),
+        const excluded = preparation.correctionReview?.excludedRanges ?? preparation.mechanicalCoverage.excludedRanges
+        const partitions = [...(preparation.correctionReview?.requiredRanges ?? preparation.mechanicalCoverage.requiredRanges).map(range => ({ range, mode: 'translate' as const })),
           ...excluded.map(range => ({ range, mode: 'copy' as const }))].sort((a, b) => a.range.start - b.range.start)
         const items: DocumentPlanSuggestion[] = []
         for (const part of partitions) {
@@ -373,7 +381,7 @@ export class DocumentPlanner {
     const preparedId = `document-restore:${crypto.randomUUID()}`
     try {
       const preparation = parsePreparationSnapshot(input.preparation)
-      if (!input.isCurrent() || !preparation.preparationReady || !preparation.mechanicalCoverage.complete || !preparation.modelReview.complete ||
+      if (!input.isCurrent() || !preparation.preparationReady || !(preparation.correctionReview?.complete ?? preparation.mechanicalCoverage.complete) || !preparation.modelReview.complete ||
         preparation.conflicts.length || preparation.questions.some(question => question.decision === null)) throw reject('preparation_not_ready', '已保存准备缺少完整扫描、审阅或关键问题决策。', 'restore_document')
       if (input.restoredSource?.version !== preparation.sourceVersion || input.analysis.actualCalls !== baseline.analysisActualCalls ||
         !Number.isSafeInteger(baseline.analysisActualCalls)) throw reject('execution_baseline_missing', '已保存原稿、准备与实际分析事实不一致。', 'restore_document')

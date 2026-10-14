@@ -1,5 +1,6 @@
 import type { TermEvidenceRef } from '../memory/topic-terms.js'
-import { documentSourceLength, sameVersionReference, type ChunkPlanItem, type ChunkRevision, type DocumentChunkPlan, type DocumentRevision, type DocumentSourceVersion } from '../shared/translation-batch.js'
+import { isDocumentManifestReuse } from '../memory/document-correction.js'
+import { documentSourceLength, sameVersionReference, type ChunkPlanItem, type ChunkRevision, type DocumentChunkPlan, type DocumentRevision, type DocumentSourceVersion, type ManifestEntry } from '../shared/translation-batch.js'
 import type { EvidenceReadRequest, EvidenceReadResult, EvidenceReadyResult, EvidenceUnavailableResult } from '../shared/translation-evidence.js'
 import type { TranslationSourceIntegrityPort } from '../shared/translation-source-integrity.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength,
@@ -22,6 +23,7 @@ export interface DocumentReadTarget {
   readonly sourceVersion?: number; readonly manifestRevisionId?: string | null
 }
 export interface DocumentReadBlock extends ChunkPlanItem {
+  readonly reuseRef?: ManifestEntry['reuseRef']
   readonly revisionId: string | null
   readonly revision: ChunkRevision | null
 }
@@ -144,10 +146,13 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       : task ? unit.plans.find(plan => sameVersionReference(plan, task.planRef)) ?? null : null
     const blocks: DocumentReadBlock[] = (plan?.items ?? []).map(item => {
       const entry = manifest?.entries.find(entry => entry.chunkId === item.chunkId)
-      const revision = entry ? unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId) ?? null : !manifest && task && plan
+      const approval = !manifest && task && plan ? unit.reuseApprovals?.find(approval => approval.operationId === task.operationId && approval.chunkId === item.chunkId) : undefined
+      const approvedEntry = approval ? { chunkId: item.chunkId, outputRange: item.outputRange, revisionId: approval.reuseRef.revisionId, reuseRef: { ...approval.reuseRef, approvalId: approval.id } } : undefined
+      const reusable = approvedEntry && task && isDocumentManifestReuse(unit, task, approvedEntry)
+      const revision = entry ? unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId) ?? null : reusable ? unit.chunkRevisions.find(chunk => chunk.id === approvedEntry.revisionId) ?? null : !manifest && task && plan
         ? [...unit.chunkRevisions].reverse().find(chunk => chunk.chunkId === item.chunkId && chunk.taskId === task.taskId && chunk.sourceVersion === sourceVersion &&
           unit.plans.some(actual => sameVersionReference(actual, chunk.planRef) && actual.items.some(original => original.chunkId === item.chunkId && same(original.outputRange, item.outputRange) && original.mode === item.mode))) ?? null : null
-      return { ...item, revisionId: revision?.id ?? null, revision }
+      return { ...item, revisionId: revision?.id ?? null, revision, ...((entry?.reuseRef ?? (reusable ? approvedEntry.reuseRef : undefined)) ? { reuseRef: entry?.reuseRef ?? approvedEntry!.reuseRef } : {}) }
     })
     const scope: TranslationSourceScope = { ownerId: target.ownerId, mainSessionId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId }
     const check = (): EvidenceUnavailableResult | null => {
@@ -189,14 +194,16 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       let loaded: LoadedText
       try {
         if (!chunk) loaded = await this.sourceText(fixed, reading, range)
-        else if (chunk.sourceVersion !== sourceVersion || chunk.content.kind !== 'text' && chunk.status !== 'completed') return unavailable(fixed, 'missing', 'chunk_not_completed', length)
+        else if (chunk.sourceVersion !== sourceVersion && !blocks.some(block => block.revisionId === chunk.id && block.reuseRef && (manifest ?? task) && isDocumentManifestReuse(unit, (manifest ?? task)!, { chunkId: block.chunkId, outputRange: block.outputRange, revisionId: chunk.id, reuseRef: block.reuseRef })) || chunk.content.kind !== 'text' && chunk.status !== 'completed') return unavailable(fixed, 'missing', 'chunk_not_completed', length)
         else if (chunk.content.kind === 'text') loaded = { text: slicePoints(chunk.content.text, range) }
         else {
-          const prepared = await this.prepareAsset(fixed, reading)
+          const copy = this.copySource(fixed, reading, chunk)
+          if ('status' in copy) return copy
+          const prepared = await this.prepareAsset(copy.request, copy.snapshot)
           if ('status' in prepared) return prepared
-          const verified = await this.verifyCopy(fixed, reading, chunk, prepared)
+          const verified = await this.verifyCopy(copy.request, copy.snapshot, chunk, prepared)
           if (verified) return verified
-          loaded = await this.sourceText(fixed, reading, { start: chunk.content.range.start + range.start, end: chunk.content.range.start + range.end }, prepared)
+          loaded = await this.sourceText(copy.request, copy.snapshot, { start: chunk.content.range.start + range.start, end: chunk.content.range.start + range.end }, prepared)
         }
       } catch { return unavailable(fixed, 'unloaded', 'transport_unavailable') }
       const after = reading.checkFixed()
@@ -227,6 +234,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
         const block = blocks.find(block => block.revisionId === revisionId), chunk = block?.revision
         const entry = manifest?.entries.find(entry => entry.revisionId === revisionId)
         const binding = manifest ?? task
+        if (chunk && block && binding && block.reuseRef && isDocumentManifestReuse(unit, binding, { chunkId: block.chunkId, outputRange: block.outputRange, revisionId: chunk.id, reuseRef: block.reuseRef })) return read(range, chunk)
         if (!chunk || !block || !binding || !plan || manifest && (!entry || entry.reuseRef || !same(entry.outputRange, block.outputRange)) || chunk.chunkId !== block.chunkId ||
           chunk.taskId !== binding.taskId || !unit.plans.some(actual => sameVersionReference(actual, chunk.planRef) && sameVersionReference(actual.preparationRef, chunk.preparationRef) && actual.items.some(original => original.chunkId === block.chunkId && same(original.outputRange, block.outputRange) && original.mode === block.mode)) ||
           (block.mode === 'copy' ? chunk.kind !== 'copy' || chunk.content.kind !== 'source_copy' : chunk.kind === 'copy') ||
@@ -273,8 +281,10 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     let totalCodePoints = 0
     for (const entry of final.entries) {
       const chunk = document.chunkRevisions.find(chunk => chunk.id === entry.revisionId)
-      if (!chunk || chunk.status !== 'completed' || chunk.chunkId !== entry.chunkId || chunk.sourceVersion !== request.sourceVersion || entry.reuseRef) return unavailable(request, 'corrupt', 'manifest_invalid')
-      if (chunk.content.kind === 'source_copy' && (chunk.content.sourceVersion !== request.sourceVersion || !validRange(chunk.content.range) || chunk.content.range.end > documentSourceLength(source as DocumentSourceVersion))) return unavailable(request, 'corrupt', 'copy_range_invalid')
+      const reused = Boolean(entry.reuseRef && isDocumentManifestReuse(document, final, entry))
+      if (!chunk || chunk.status !== 'completed' || !reused && (chunk.chunkId !== entry.chunkId || chunk.sourceVersion !== request.sourceVersion || entry.reuseRef)) return unavailable(request, 'corrupt', 'manifest_invalid')
+      const copySource = reused ? document.sourceVersions.find(source => source.version === chunk.sourceVersion) : source
+      if (chunk.content.kind === 'source_copy' && (!copySource || chunk.content.sourceVersion !== chunk.sourceVersion || !validRange(chunk.content.range) || chunk.content.range.end > documentSourceLength(copySource as DocumentSourceVersion))) return unavailable(request, 'corrupt', 'copy_range_invalid')
       totalCodePoints += chunk.content.kind === 'text' ? sourceCodePointLength(chunk.content.text) : chunk.content.range.end - chunk.content.range.start
       if (!Number.isSafeInteger(totalCodePoints)) return unavailable(request, 'corrupt', 'manifest_invalid')
       chunks.push(chunk)
@@ -334,6 +344,12 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
   }
   private async validateCachedAsset(request: EvidenceReadRequest, snapshot: Snapshot,
     range: TranslationSourceRange): Promise<EvidenceUnavailableResult | null> {
+    if (request.side === 'final') for (const chunk of snapshot.chunks.filter(chunk => chunk.content.kind === 'source_copy' && chunk.sourceVersion !== request.sourceVersion)) {
+      const copy = this.copySource(request, snapshot, chunk)
+      if ('status' in copy) return copy
+      const prepared = await this.prepareAsset(copy.request, copy.snapshot)
+      if ('status' in prepared) return prepared
+    }
     const source = snapshot.source
     if (!('body' in source) || source.body.kind !== 'asset') return null
     if (request.side === 'final') {
@@ -452,23 +468,29 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     if (changed) return changed
     return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('') === chunk.content.sha256 ? remember() : unavailable(request, 'corrupt', 'copy_hash_mismatch')
   }
+  private copySource(request: EvidenceReadRequest, snapshot: Snapshot, chunk: ChunkRevision): { request: EvidenceReadRequest; snapshot: Snapshot } | EvidenceUnavailableResult {
+    if (chunk.sourceVersion === request.sourceVersion) return { request, snapshot }
+    if (!isDocumentUnit(snapshot.unit)) return unavailable(request, 'corrupt', 'copy_range_invalid')
+    const source = snapshot.unit.sourceVersions.find(source => source.version === chunk.sourceVersion)
+    if (!source) return unavailable(request, 'missing', 'source_version_missing')
+    return { request: { ...request, sourceVersion: source.version }, snapshot: { ...snapshot, source, checkFixed: () => this.after(request, snapshot) } }
+  }
   private async finalText(request: EvidenceReadRequest, snapshot: Snapshot, range: TranslationSourceRange): Promise<LoadedText> {
     if (snapshot.final && 'text' in snapshot.final) return { text: slicePoints(snapshot.final.text, range) }
-    let offset = 0, text = '', prepared: { readonly saved: boolean } | undefined
+    let offset = 0, text = ''
     for (const chunk of snapshot.chunks) {
       const length = chunk.content.kind === 'text' ? sourceCodePointLength(chunk.content.text) : chunk.content.range.end - chunk.content.range.start
       const start = Math.max(range.start, offset), end = Math.min(range.end, offset + length)
       if (start < end) {
         if (chunk.content.kind === 'text') text += slicePoints(chunk.content.text, { start: start - offset, end: end - offset })
         else {
-          if (!prepared) {
-            const preparation = await this.prepareAsset(request, snapshot)
-            if ('status' in preparation) return preparation
-            prepared = preparation
-          }
-          const verified = await this.verifyCopy(request, snapshot, chunk, prepared)
+          const copy = this.copySource(request, snapshot, chunk)
+          if ('status' in copy) return copy
+          const prepared = await this.prepareAsset(copy.request, copy.snapshot)
+          if ('status' in prepared) return prepared
+          const verified = await this.verifyCopy(copy.request, copy.snapshot, chunk, prepared)
           if (verified) return verified
-          const loaded = await this.sourceText(request, snapshot, { start: chunk.content.range.start + start - offset, end: chunk.content.range.start + end - offset }, prepared)
+          const loaded = await this.sourceText(copy.request, copy.snapshot, { start: chunk.content.range.start + start - offset, end: chunk.content.range.start + end - offset }, prepared)
           if ('status' in loaded) return loaded
           text += loaded.text
         }

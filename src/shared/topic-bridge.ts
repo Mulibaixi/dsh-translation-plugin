@@ -15,6 +15,11 @@ import {
   type PreparationAnalysisFacts, type PreparationReceipt, type PreparationPage, type PreparationSnapshot,
 } from './translation-preparation.js'
 
+import { parseDocumentUnitCaptureRequest, parseDocumentUnitCapture, parseDocumentCorrectionQuery, type DocumentCorrectionQuery, type DocumentUnitCaptureRequest, type DocumentUnitCapture } from './document-unit-capture.js'
+import { parseDocumentCorrectionCommit, parseDocumentCorrectionReceipt, type DocumentCorrectionCommit, type DocumentCorrectionReceipt } from './document-correction.js'
+import { parseDocumentUnitAcceptRequest, type DocumentUnitAcceptRequest } from './document-execution.js'
+import { parseTranslationPreparationCorrectionReview, parsePreparationCorrectionReviewFacts, type TranslationPreparationCorrectionReview, type PreparationCorrectionReviewFacts } from './translation-preparation.js'
+
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
 export interface TopicBridgeOpen { readonly ownerId: string; readonly mainSessionId: string }
@@ -57,6 +62,11 @@ export interface TopicUnitFact {
   readonly final: { readonly revisionId: string; readonly selection: 'automatic' | 'user_fixed'; readonly selectionEventId: string } | null
 }
 export type TopicBridgeCommand =
+  | { readonly kind: 'document_correct_observe'; readonly request: DocumentCorrectionQuery }
+  | { readonly kind: 'preparation_review_correction'; readonly request: TranslationPreparationCorrectionReview; readonly facts: PreparationCorrectionReviewFacts }
+  | { readonly kind: 'document_accept_unit'; readonly request: DocumentUnitAcceptRequest }
+  | { readonly kind: 'document_capture'; readonly request: DocumentUnitCaptureRequest }
+  | { readonly kind: 'document_correct'; readonly request: DocumentCorrectionCommit }
   | { readonly kind: 'document_accept'; readonly request: DocumentAcceptRequest }
   | { readonly kind: 'document_register'; readonly request: DocumentBlockRegistration }
   | { readonly kind: 'document_event'; readonly event: DocumentTaskEvent }
@@ -93,6 +103,9 @@ export type TopicBridgeCommand =
   | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
+  | { readonly kind: 'document_correct_observed'; readonly receipt: DocumentCorrectionReceipt | null }
+  | { readonly kind: 'document_captured'; readonly capture: DocumentUnitCapture }
+  | { readonly kind: 'document_corrected'; readonly receipt: DocumentCorrectionReceipt }
   | { readonly kind: 'document_accepted' | 'document_updated'; readonly receipt: DocumentTaskReceipt }
   | { readonly kind: 'document_registered'; readonly registration: DocumentBlockReceipt }
   | { readonly kind: 'document_observed'; readonly receipt: DocumentTaskReceipt | null }
@@ -159,8 +172,13 @@ export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
 }
 export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 = 1): TopicBridgeCommand {
   object(value)
-  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe', 'document_control', 'document_restore'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
+  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe', 'document_control', 'document_restore', 'document_capture', 'document_correct', 'document_accept_unit', 'preparation_review_correction', 'document_correct_observe'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
   switch (value.kind) {
+      case 'document_correct_observe': exact(value, ['kind', 'request']); return { kind: 'document_correct_observe', request: parseDocumentCorrectionQuery(value.request) }
+      case 'preparation_review_correction': exact(value, ['kind', 'request', 'facts']); return { kind: 'preparation_review_correction', request: parseTranslationPreparationCorrectionReview(value.request), facts: parsePreparationCorrectionReviewFacts(value.facts) }
+      case 'document_accept_unit': exact(value, ['kind', 'request']); return { kind: 'document_accept_unit', request: parseDocumentUnitAcceptRequest(value.request) }
+      case 'document_capture': exact(value, ['kind', 'request']); return { kind: 'document_capture', request: parseDocumentUnitCaptureRequest(value.request) }
+      case 'document_correct': exact(value, ['kind', 'request']); return { kind: 'document_correct', request: parseDocumentCorrectionCommit(value.request) }
       case 'document_accept': exact(value, ['kind', 'request']); return { kind: 'document_accept', request: parseDocumentAcceptRequest(value.request) }
       case 'document_register': exact(value, ['kind', 'request']); return { kind: 'document_register', request: parseDocumentBlockRegistration(value.request) }
       case 'document_event': exact(value, ['kind', 'event']); return { kind: 'document_event', event: parseDocumentTaskEvent(value.event) }
@@ -311,8 +329,11 @@ function sessionSummary(value: unknown): void {
 }
 function parseValue(value: unknown, protocol: 1 | 2): TopicBridgeValue {
   object(value)
-  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
+  if (protocol === 1 && ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string)) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
+    case 'document_correct_observed': exact(value, ['kind', 'receipt']); return { kind: 'document_correct_observed', receipt: value.receipt === null ? null : parseDocumentCorrectionReceipt(value.receipt) }
+    case 'document_captured': exact(value, ['kind', 'capture']); return { kind: 'document_captured', capture: parseDocumentUnitCapture(value.capture) }
+    case 'document_corrected': exact(value, ['kind', 'receipt']); return { kind: 'document_corrected', receipt: parseDocumentCorrectionReceipt(value.receipt) }
     case 'document_accepted': case 'document_updated': exact(value, ['kind', 'receipt']); return { kind: value.kind, receipt: parseDocumentTaskReceipt(value.receipt) }
     case 'document_registered': exact(value, ['kind', 'registration']); return { kind: 'document_registered', registration: parseDocumentBlockReceipt(value.registration) }
     case 'document_observed': exact(value, ['kind', 'receipt']); return { kind: 'document_observed', receipt: value.receipt === null ? null : parseDocumentTaskReceipt(value.receipt) }

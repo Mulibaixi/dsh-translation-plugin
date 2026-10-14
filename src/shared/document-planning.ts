@@ -1,4 +1,4 @@
-import { parseNormalTranslationTarget, type NormalTranslationMaterialTarget } from './normal-translation.js'
+import { parseNormalTranslationTarget, type NormalTranslationTarget } from './normal-translation.js'
 import { parseDocumentChunkPlan, type ChunkPlanItem, type DocumentCallContextReference, type VersionReference } from './translation-batch.js'
 import type { TranslationMaterialRoute } from './translation-material.js'
 import type { PreparationSnapshot } from './translation-preparation.js'
@@ -13,13 +13,13 @@ export const MAX_DOCUMENT_PLAN_PAGE_ITEMS = 50
 export const DOCUMENT_TRANSLATION_PROMPT_VERSION = 'document-text-v1' as const
 
 export interface TranslationPlanSuggest {
-  readonly target: NormalTranslationMaterialTarget
+  readonly target: NormalTranslationTarget
   readonly preparationRef: VersionReference
   readonly cursor?: string
   readonly limit?: number
 }
 export interface TranslationPlanSet {
-  readonly target: NormalTranslationMaterialTarget
+  readonly target: NormalTranslationTarget
   readonly planId: string
   /** Zero creates the first plan; later revisions use the current immutable version. */
   readonly expectedVersion: number
@@ -30,7 +30,7 @@ export interface TranslationPlanSet {
   readonly protectedRanges?: readonly TranslationSourceRange[]
 }
 export interface TranslationPlanQuery {
-  readonly target: NormalTranslationMaterialTarget
+  readonly target: NormalTranslationTarget
   readonly planId: string
   readonly version: number
 }
@@ -122,9 +122,8 @@ function text(value: unknown, maximum = 2048): asserts value is string {
 }
 export function documentPlanningBytes(value: unknown): number { return new TextEncoder().encode(JSON.stringify(value)).byteLength }
 function packet(value: unknown): void { if (documentPlanningBytes(value) > MAX_DOCUMENT_PLAN_PACKET_BYTES) throw new TypeError('Planning packet exceeds transport budget') }
-function target(value: unknown): NormalTranslationMaterialTarget {
+function target(value: unknown): NormalTranslationTarget {
   const result = parseNormalTranslationTarget(value)
-  if (result.kind !== 'material') throw new TypeError('Planning requires fixed delivered material')
   return result
 }
 function reference(value: unknown): VersionReference { exact(value, ['id', 'version']); text(value.id); integer(value.version); return { id: value.id, version: value.version } }

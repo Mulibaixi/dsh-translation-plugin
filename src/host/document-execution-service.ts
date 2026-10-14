@@ -4,6 +4,8 @@ import { parseTranslationBatchExecute, parseTranslationBatchStatus, parseTransla
   type DocumentTaskScope } from '../shared/document-execution.js'
 import type { AnalysisResult } from '../shared/translation-preparation.js'
 import type { DocumentTaskStatus, DocumentExecutionBaseline, DocumentSourceVersion, DocumentSupplementFact } from '../shared/translation-batch.js'
+import { verifyDocumentReuse } from '../memory/document-correction.js'
+import type { DocumentCorrectionService } from './document-correction-service.js'
 import { documentPlanningBytes, MAX_DOCUMENT_PLAN_CALLS, MAX_DOCUMENT_PLAN_PAGE_BYTES } from '../shared/document-planning.js'
 import { DshTextExecutionAdapter, type DocumentExecutionPacket } from './dsh-text-adapter.js'
 import type { DocumentExecutionFreeze, DocumentPlanningInput } from './document-planner.js'
@@ -18,6 +20,7 @@ import type { TranslationExchangeService, ExecutorOperationRef, NeedsContextRefe
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 interface ProgressFact { readonly taskSequence: number; readonly kind: string; readonly chunkId: string | null; readonly childOperationId: string | null; readonly sequence: number | null; readonly at: string }
 interface Job extends DocumentTaskScope {
+  superseded?: boolean
   /** The Cordis invocation context that authorized the job and owns its E exchange registration. */
   readonly exchangeOwner: TopicHostContext
   request: TranslationBatchExecute
@@ -106,7 +109,7 @@ export class DocumentExecutionService {
       inspectBatchTaskPhase: event => {
         const fixed = this.phaseFacts.get(event.eventId), job = this.jobs.get(event.result.taskId)
         return !this.disposed && this.exchangeRegistrations.get(owner)?.exchange.hostGeneration === exchange.hostGeneration && job?.exchangeOwner === owner &&
-          fixed && same(fixed, event) && job.taskVersion === event.result.version && job.taskSequence === event.result.taskSequence ? fixed : null
+          fixed && !job?.superseded && same(fixed, event) && job.taskVersion === event.result.version && job.taskSequence === event.result.taskSequence ? fixed : null
       },
     })
     this.exchangeRegistrations.set(owner, { exchange, unregister, unregisterPhase })
@@ -150,9 +153,10 @@ export class DocumentExecutionService {
     try { request = parseTranslationBatchExecute(args) } catch { return failure('invalid_input', '整篇执行参数无效。', 'execute_document') }
     if (this.disposed || !this.topics?.ownsAgent(request.target.mainSessionId, exec.agent)) return failure('scope_mismatch', '整篇执行不属于已连接的实际主 Agent。', 'authorize_document')
     if (this.topics.protocolFor(request.target.mainSessionId) !== 2) return failure('execution_unavailable', '整篇执行需要唯一主题桥的 v2 连接。', 'authorize_document')
-    if (request.target.kind !== 'material') return failure('unit_preparation_unavailable', '已保存单元尚无已授权的整篇准备与规划读取路径；请使用本次已交付材料。', 'authorize_document')
     const operationKey = key(request.target.mainSessionId, request.operationId), old = this.operations.get(operationKey)
     if (old) return same(old.request, request) ? old.acceptance : failure('idempotency_conflict', '同一整篇操作标识不能更换材料、计划或准备版本。', 'execute_document')
+    if (request.target.kind === 'unit') return this.executeUnit(request, exec, exchangeOwner)
+    if (request.reuseApprovals?.length) return failure('invalid_reuse', '首份材料没有可复用旧文档块。', 'execute_document')
     exec.signal.throwIfAborted()
     // Source authorization gives the original translation Session, independent from current UI selection.
     const material = (this.ctx.get?.('translationMaterials') as import('./translation-materials.js').TranslationMaterialsService)?.deliveredForAgent(request.target, exec.agent!)
@@ -169,6 +173,71 @@ export class DocumentExecutionService {
     this.jobs.set(taskId, job); this.operations.set(operationKey, job)
     job.acceptance = this.accept(job, exec)
     return job.acceptance
+  }
+  private async executeUnit(request: TranslationBatchExecute, exec: ToolExecution, exchangeOwner: TopicHostContext): Promise<AnalysisResult<DocumentTaskReceipt>> {
+    if (request.target.kind !== 'unit') return failure('invalid_input', '文档新版本必须使用准确单元目标。', 'execute_document')
+    const correction = this.ctx.get?.('translationCorrection') as DocumentCorrectionService, captured = await correction.captureUnit(request.target, request.preparationRef, exec, { requireReady: true, metadataOnly: true })
+    if (!captured.ok) return captured
+    const scope = captured.value.capture.scope, taskId = `document-task:${crypto.randomUUID()}`
+    if (captured.value.capture.currentSourceVersion !== request.target.sourceVersion) return failure('stale_source_version', '此原稿已经被新版本取代。', 'accept_document')
+    if (!this.normal.claimDocumentSession(scope.ownerId, scope.translationSessionId, taskId)) return failure('busy', '此翻译会话仍有未结算任务。', 'accept_document')
+    const job: Job = { request, scope, taskId, unitId: request.target.unitId, agent: exec.agent!, exchangeOwner, controller: new AbortController(), delivery: new AbortController(), facts: [],
+      createdAt: new Date().toISOString(), acceptance: undefined!, input: null, snapshot: null, receipt: null, status: 'running', taskSequence: 0, actualCalls: 0, outputBytes: 0, completedChunks: 0,
+      writing: Promise.resolve(), error: null, uncertain: false, acceptRequested: false, finishing: false, cleanupRequested: false, taskVersion: 1, pauseRequested: false, cancelRequested: false, running: null,
+      completed: new Set(), source: captured.value.capture.source, automaticSupplementCalls: 0, supplemented: new Set(), supplements: new Map(), reviewIssues: [], help: null, resumeEntry: null, phaseNotification: 'unavailable', controlling: false, controlOwner: null, controllingKind: null }
+    this.jobs.set(taskId, job); this.operations.set(key(scope.mainSessionId, request.operationId), job)
+    job.acceptance = this.acceptUnit(job, exec)
+    return job.acceptance
+  }
+  private async acceptUnit(job: Job, exec: ToolExecution): Promise<AnalysisResult<DocumentTaskReceipt>> {
+    try {
+      const request = job.request
+      if (request.target.kind !== 'unit') throw rejected('invalid_input', '新版本目标无效。', 'accept_document')
+      const captured = await this.planning.captureExecution(request.target, request.planRef, request.preparationRef, this.execution(job))
+      if (!captured.ok) throw rejected(captured.error.code, captured.error.message, captured.error.stage)
+      job.input = captured.value.input; job.snapshot = captured.value.snapshot; job.actualCalls = job.snapshot.callBudget.analysisActualCalls
+      const correction = this.ctx.get?.('translationCorrection') as DocumentCorrectionService, current = await correction.captureUnit(request.target, request.preparationRef, this.execution(job), { requireReady: true })
+      if (!current.ok) throw rejected(current.error.code, current.error.message, current.error.stage)
+      const approvals = [], sourcePreparations = new Map<string, import('./document-correction-service.js').CapturedDocumentSource>()
+      for (const reuse of request.reuseApprovals ?? []) {
+        const previous = await correction.captureUnit({ ...request.target, sourceVersion: reuse.sourceVersion }, undefined, this.execution(job), { revisionIds: [reuse.revisionId], metadataOnly: true })
+        if (!previous.ok) throw rejected(previous.error.code, previous.error.message, previous.error.stage)
+        const chunk = previous.value.capture.chunks.find(chunk => chunk.id === reuse.revisionId)!
+        const cacheKey = JSON.stringify([reuse.sourceVersion, chunk.preparationRef])
+        let prepared = sourcePreparations.get(cacheKey)
+        if (!prepared) { const found = await correction.captureUnit({ ...request.target, sourceVersion: reuse.sourceVersion }, chunk.preparationRef, this.execution(job))
+          if (!found.ok) throw rejected(found.error.code, found.error.message, found.error.stage)
+          prepared = found.value; sourcePreparations.set(cacheKey, prepared)
+        }
+        if (!prepared.capture.preparation) throw rejected('reuse_preparation_missing', '旧块的准确实际准备正文缺失。', 'verify_document_reuse')
+        const approval = await verifyDocumentReuse({ unit: { id: job.unitId, sourceVersion: request.target.sourceVersion, sourceVersions: [prepared.capture.source, current.value.capture.source],
+          plans: previous.value.capture.plans, chunkRevisions: previous.value.capture.chunks, corrections: current.value.capture.corrections }, request: reuse, id: `document-reuse:${crypto.randomUUID()}`, operationId: request.operationId, createdAt: job.createdAt,
+          oldSourceText: prepared.text, newSourceText: current.value.text, oldPreparation: prepared.capture.preparation, newPreparation: job.snapshot.preparation, plan: job.snapshot.plan,
+          contextRef: job.snapshot.budgets.find(budget => budget.chunkId === reuse.chunkId)!.contextRef })
+        const outputBytes = chunk.outputBytes ?? new TextEncoder().encode(Array.from(prepared.text).slice(approval.evidence.previous.outputRange.start, approval.evidence.previous.outputRange.end).join('')).byteLength
+        if (job.outputBytes + outputBytes > MAX_OUTPUT_BYTES) throw rejected('output_budget_exceeded', '复用旧块后的整篇正文超过 16 MiB。', 'verify_document_reuse')
+        job.outputBytes += outputBytes; approvals.push(approval); job.completed.add(reuse.chunkId)
+      }
+      job.completedChunks = job.completed.size
+      if (!await this.adapter.ready()) throw rejected('execution_unavailable', '文档模型运行服务尚未就绪。', 'prepare_document')
+      exec.signal.throwIfAborted()
+      job.acceptRequested = true
+      const reply = await this.topics.requestOwned(job.scope.mainSessionId, { kind: 'document_accept_unit', request: { target: request.target, operationId: request.operationId, taskId: job.taskId,
+        plan: job.snapshot.plan, preparationRef: request.preparationRef, createdAt: job.createdAt, executionBaseline: this.baseline(job), reuseApprovals: approvals, reusedOutputBytes: job.outputBytes } }, this.execution(job))
+      if (reply.kind !== 'document_accepted') throw rejected('invalid_reply', '新版本文档受理回执未知。', 'accept_document')
+      this.assertReceipt(job, reply.receipt, 0); job.receipt = reply.receipt
+      queueMicrotask(() => this.start(job)); return { ok: true, value: reply.receipt }
+    } catch (error) {
+      const known = error as { code?: string; message?: string; stage?: string }; job.uncertain = job.acceptRequested && ['outcome_unknown', 'invalid_reply'].includes(known.code ?? '')
+      job.status = job.uncertain ? 'unknown' : 'failed'; job.error = { code: known.code ?? 'prepare_failed', message: known.message ?? '新版本文档受理失败，未派发模型。', stage: known.stage ?? 'accept_document' }
+      if (!job.uncertain) this.release(job)
+      return failure(job.error.code, `${job.error.message}${job.uncertain ? ` taskId=${job.taskId}` : ''}`, job.error.stage)
+    }
+  }
+  supersedeSource(scope: DocumentTaskScope['scope'], unitId: string, previousVersion: number): void {
+    for (const job of this.jobs.values()) if (same(job.scope, scope) && job.unitId === unitId && job.request.target.sourceVersion === previousVersion && !job.running && !job.uncertain) {
+      job.pauseRequested = true; job.superseded = true; job.controller.abort(); this.release(job)
+    }
   }
   private async accept(job: Job, exec: ToolExecution): Promise<AnalysisResult<DocumentTaskReceipt>> {
     try {
@@ -273,7 +342,8 @@ export class DocumentExecutionService {
     const snapshot = job.snapshot!, input = job.input!
     // Freeze the route/preparation, while checking the original Agent/bridge/source at each read.
     const target = job.request.target
-    if (target.kind !== 'material') throw rejected('source_mismatch', '文档缺少固定源目标。', 'read_document_source')
+    if (target.kind === 'unit') return { ...input, isCurrent: () => !this.disposed && !job.controller.signal.aborted && this.topics.ownsAgent(job.scope.mainSessionId, job.agent),
+      readSource: range => { job.controller.signal.throwIfAborted(); return input.readSource(range) } }
     const materials = this.ctx.get?.('translationMaterials') as import('./translation-materials.js').TranslationMaterialsService
     const isCurrent = () => !this.disposed && !job.controller.signal.aborted && this.topics.ownsAgent(job.scope.mainSessionId, job.agent) && (job.source !== null || materials.deliveredForAgent(target, job.agent).ok)
     return { ...input, isCurrent, readSource: range => {
@@ -430,7 +500,7 @@ export class DocumentExecutionService {
   authorizePeer(mainSessionId: string, peerId: string): boolean { return this.topics.ownsConnection(mainSessionId, peerId) }
   private child(ref: ExecutorOperationRef): Job | undefined {
     const job = this.children.get(ref.operationId), help = job?.help
-    if (!job || !help || this.disposed || !this.topics.ownsAgent(ref.mainSessionId, job.agent) || this.attachExchange(job.exchangeOwner)?.hostGeneration !== help.exchange.hostGeneration ||
+    if (!job || job.superseded || !help || this.disposed || !this.topics.ownsAgent(ref.mainSessionId, job.agent) || this.attachExchange(job.exchangeOwner)?.hostGeneration !== help.exchange.hostGeneration ||
       ref.hostGeneration !== help.exchange.hostGeneration || !same({ mainSessionId: ref.mainSessionId, topicId: ref.topicId, translationSessionId: ref.translationSessionId,
         unitId: ref.unitId, sourceVersion: ref.sourceVersion, operationId: ref.operationId }, this.helpReference(job).scope) ||
       ref.callId !== help.registration.callId || ref.contextVersion !== help.contextVersion || ref.exchangeId !== undefined && ref.exchangeId !== help.exchangeId) return undefined
@@ -568,7 +638,7 @@ export class DocumentExecutionService {
         } }
       const restored = await this.planning.planner.restoreExecution(input, capture.plan, baseline, exec.signal)
       if (!restored.ok) return restored
-      const completed = new Set(capture.chunks.filter(chunk => chunk.status === 'completed').map(chunk => chunk.chunkId))
+      const completed = new Set([...capture.chunks.filter(chunk => chunk.status === 'completed').map(chunk => chunk.chunkId), ...(capture.reuseApprovals ?? []).map(approval => approval.chunkId)])
       const job: Job = { scope: request.scope, taskId: request.taskId, unitId: receipt.unitId, request: { target: capture.preparation.target,
         operationId: receipt.operationId, planRef: receipt.planRef, preparationRef: receipt.preparationRef }, agent: exec.agent!, exchangeOwner, controller: new AbortController(), delivery: new AbortController(),
         facts: [], createdAt: capture.source.createdAt, acceptance: Promise.resolve({ ok: true, value: receipt }), input, snapshot: restored.value, receipt,
@@ -627,7 +697,6 @@ export class DocumentExecutionService {
         job.pauseRequested = true; await job.running
         if (job.uncertain) throw rejected('outcome_unknown', '在途块结果未知，不能更新依赖。', 'control_document')
         const update = request as TranslationBatchUpdate
-        if (job.request.target.kind !== 'material') throw rejected('preparation_unavailable', '此任务缺少准确材料准备目标。', 'update_document')
         const captured = await this.planning.captureExecution(job.request.target, update.planRef, update.preparationRef, authorized)
         if (!captured.ok) throw rejected(captured.error.code, captured.error.message, captured.error.stage)
         let next = captured.value.snapshot
@@ -657,6 +726,7 @@ export class DocumentExecutionService {
         return { ok: true, value: receipt }
       }
       if (!['paused', 'failed', 'cancelled', 'interrupted', 'waiting_user'].includes(job.status) || job.running) return failure('invalid_state', '只有已停止且结果已确认的任务可明确继续。', 'resume_document')
+      if (job.superseded) return failure('stale_source_version', '旧任务原稿已被纠错版本取代，不能继续旧源派发。', 'resume_document')
       if (job.help) return failure('context_resolution_required', '本块仍有实际求助问题，请通过当前 Composer 交换明确答复。', 'resume_document')
       if (!job.input || !job.snapshot) return failure('execution_baseline_missing', '原稿、准备或计划事实缺失，不能恢复。', 'resume_document')
       if (!this.normal.claimDocumentSession(job.scope.ownerId, job.scope.translationSessionId, job.taskId)) return failure('busy', '此翻译会话已被另一操作占用。', 'resume_document')
@@ -691,7 +761,7 @@ export class DocumentExecutionService {
         const view = { scope: receipt.scope, taskId: receipt.taskId, unitId: receipt.unitId, operationId: receipt.operationId, sourceVersion: receipt.sourceVersion,
           planRef: receipt.planRef, preparationRef: receipt.preparationRef, status: receipt.status, receipt, taskSequence: facts.taskSequence, taskVersion: facts.taskVersion,
           hostGeneration: receipt.hostGeneration!, pauseRequested: receipt.status === 'paused', cancelRequested: receipt.status === 'cancelled',
-          completedChunks: new Set(capture.chunks.filter(chunk => chunk.status === 'completed').map(chunk => chunk.chunkId)).size, chunkCount: capture.plan.items.length,
+          completedChunks: new Set([...capture.chunks.filter(chunk => chunk.status === 'completed').map(chunk => chunk.chunkId), ...(capture.reuseApprovals ?? []).map(approval => approval.chunkId)]).size, chunkCount: capture.plan.items.length,
           actualCalls: facts.actualCalls, outputBytes: facts.outputBytes, maximumCalls: MAX_DOCUMENT_PLAN_CALLS, maximumOutputBytes: MAX_OUTPUT_BYTES,
           error: null, events, afterTaskSequence: after, nextCursor: events.length < available.length ? events.at(-1)?.taskSequence ?? after : null,
           restartExecutable: receipt.restartExecutable, automaticSupplementCalls: facts.automaticSupplementCalls, reviewIssues: facts.reviewIssues,

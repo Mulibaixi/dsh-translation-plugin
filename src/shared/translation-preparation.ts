@@ -1,4 +1,4 @@
-import { parseNormalTranslationTarget, type NormalTranslationMaterialTarget } from './normal-translation.js'
+import { parseNormalTranslationTarget, type NormalTranslationMaterialTarget, type NormalTranslationUnitTarget, type NormalTranslationTarget } from './normal-translation.js'
 import { parseTranslationSourceScope, type TranslationSourceScope } from './translation-sources.js'
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
 import type { TranslationMaterialRoute } from './translation-material.js'
@@ -229,11 +229,51 @@ export interface TranslationPreparationSet {
   readonly questions?: readonly PreparationQuestion[]
 }
 export interface TranslationPreparationQuery {
-  readonly target: NormalTranslationMaterialTarget
+  readonly target: NormalTranslationTarget
   readonly preparationId: string
   readonly version: number
 }
-export type PreparationSection = 'summary' | 'candidates' | 'terms' | 'coverage' | 'background' | 'references' | 'questions' | 'conflicts'
+/** Explicit main-model review of a corrected source; it does not claim a new analysis run. */
+export interface TranslationPreparationCorrectionReview {
+  readonly target: NormalTranslationUnitTarget
+  readonly preparationId: string
+  readonly expectedVersion: number
+  readonly operationId: string
+  readonly basis: string
+  readonly organizedRequirements: string
+  readonly termSelections: readonly PreparationTermSelection[]
+  readonly reviewedRanges: readonly TranslationSourceRange[]
+  readonly excludedRanges?: readonly TranslationSourceRange[]
+  readonly backgroundRanges?: readonly TranslationSourceRange[]
+  readonly questions?: readonly PreparationQuestion[]
+}
+/** Source matching is read by Host; scope, current source and terms are checked by Client. */
+export interface PreparationCorrectionReviewFacts {
+  readonly scope: TranslationSourceScope
+  readonly unitId: string
+  readonly sourceVersion: number
+  readonly sourceSha256: string
+  readonly totalCodePoints: number
+  readonly correctionOperationId: string
+  readonly analysisActualCalls: number | null
+  readonly topicTerms: TopicTermSnapshot
+  readonly termMatches: readonly { readonly ref: PreparationTermRef; readonly matched: boolean }[]
+  readonly relevantFixedIds: readonly string[]
+}
+export interface PreparationCorrectionReview {
+  readonly meaning: 'main_model_correction_review'
+  readonly previousPreparationRef: { readonly id: string; readonly version: number }
+  readonly correctionOperationId: string
+  readonly basis: string
+  /** Exact original analysis source. Its mechanical coverage remains in those coordinates. */
+  readonly analysisBasis: { readonly sourceVersion: number; readonly sourceSha256: string; readonly totalCodePoints: number; readonly actualCalls: number | null }
+  readonly requiredRanges: readonly TranslationSourceRange[]
+  readonly excludedRanges: readonly TranslationSourceRange[]
+  readonly fixedTermVersions: Readonly<Record<string, number>>
+  readonly termMappings: readonly { readonly previous: PreparationTermRef; readonly current: PreparationTermRef | null }[]
+  readonly complete: boolean
+}
+export type PreparationSection = 'summary' | 'candidates' | 'terms' | 'coverage' | 'background' | 'references' | 'questions' | 'conflicts' | 'correction_review'
 export interface TranslationPreparationRead extends TranslationPreparationQuery {
   readonly section: PreparationSection
   readonly cursor?: string
@@ -307,7 +347,7 @@ export interface PreparationSnapshot {
   readonly schemaVersion: 1
   readonly id: string
   readonly version: number
-  readonly target: NormalTranslationMaterialTarget
+  readonly target: NormalTranslationTarget
   readonly scope: TranslationSourceScope
   readonly sourceVersion: number
   readonly sourceSha256: string
@@ -318,6 +358,7 @@ export interface PreparationSnapshot {
   readonly organizedRequirements: string
   readonly mechanicalCoverage: PreparationMechanicalCoverage
   readonly modelReview: PreparationModelReview
+  readonly correctionReview?: PreparationCorrectionReview
   readonly terms: readonly PreparationFrozenTerm[]
   readonly backgroundRanges: readonly TranslationSourceRange[]
   readonly referenceRefs: readonly PreparationReferenceRef[]
@@ -335,7 +376,7 @@ export interface PreparationSnapshot {
 export interface PreparationReceipt {
   readonly preparationId: string
   readonly version: number
-  readonly target: NormalTranslationMaterialTarget
+  readonly target: NormalTranslationTarget
   readonly scope: TranslationSourceScope
   readonly sourceVersion: number
   readonly route: TranslationMaterialRoute
@@ -402,11 +443,9 @@ export function parseTranslationPreparationPrepare(value: unknown): TranslationP
   if (value.analysisVersion !== 1) throw new TypeError('Invalid preparation analysis version')
   return { target: target(value.target), preparationId: value.preparationId, operationId: value.operationId, analysisId: value.analysisId, analysisVersion: 1 }
 }
-export function parseTranslationPreparationSet(value: unknown): TranslationPreparationSet {
-  preparationPacket(value); exact(value, ['target', 'preparationId', 'expectedVersion', 'operationId', 'organizedRequirements', 'termSelections', 'reviewedRanges'], ['backgroundRanges', 'referenceRefs', 'questions'])
-  text(value.preparationId, 2048); text(value.operationId, 2048); text(value.organizedRequirements, 4000, true); preparationInteger(value.expectedVersion)
-  preparationList(value.termSelections, 100)
-  const termSelections = value.termSelections.map(item => {
+function preparationSelections(value: unknown): readonly PreparationTermSelection[] {
+  preparationList(value, 100)
+  const termSelections = value.map(item => {
     exact(item, ['ref', 'ranges'], ['descriptionRef', 'content']); const selectedRanges = ranges(item.ranges)
     if (!selectedRanges.length) throw new TypeError('Selected term requires an applicability range')
     let content: PreparationTermSelection['content']
@@ -419,6 +458,12 @@ export function parseTranslationPreparationSet(value: unknown): TranslationPrepa
       ...(item.descriptionRef === undefined ? {} : { descriptionRef: preparationDescriptionRef(item.descriptionRef) }), ...(content === undefined ? {} : { content }) }
   })
   if (new Set(termSelections.map(item => JSON.stringify(item.ref))).size !== termSelections.length) throw new TypeError('Duplicate preparation term ref')
+  return termSelections
+}
+export function parseTranslationPreparationSet(value: unknown): TranslationPreparationSet {
+  preparationPacket(value); exact(value, ['target', 'preparationId', 'expectedVersion', 'operationId', 'organizedRequirements', 'termSelections', 'reviewedRanges'], ['backgroundRanges', 'referenceRefs', 'questions'])
+  text(value.preparationId, 2048); text(value.operationId, 2048); text(value.organizedRequirements, 4000, true); preparationInteger(value.expectedVersion)
+  const termSelections = preparationSelections(value.termSelections)
   return { target: target(value.target), preparationId: value.preparationId, expectedVersion: value.expectedVersion, operationId: value.operationId,
     organizedRequirements: value.organizedRequirements, termSelections, reviewedRanges: ranges(value.reviewedRanges),
     ...(value.backgroundRanges === undefined ? {} : { backgroundRanges: ranges(value.backgroundRanges) }),
@@ -427,12 +472,34 @@ export function parseTranslationPreparationSet(value: unknown): TranslationPrepa
 }
 export function parseTranslationPreparationQuery(value: unknown): TranslationPreparationQuery {
   exact(value, ['target', 'preparationId', 'version']); text(value.preparationId, 2048); preparationInteger(value.version)
-  return { target: target(value.target), preparationId: value.preparationId, version: value.version }
+  return { target: parseNormalTranslationTarget(value.target), preparationId: value.preparationId, version: value.version }
+}
+export function parseTranslationPreparationCorrectionReview(value: unknown): TranslationPreparationCorrectionReview {
+  preparationPacket(value); exact(value, ['target', 'preparationId', 'expectedVersion', 'operationId', 'basis', 'organizedRequirements', 'termSelections', 'reviewedRanges'], ['excludedRanges', 'backgroundRanges', 'questions'])
+  const sourceTarget = parseNormalTranslationTarget(value.target)
+  if (sourceTarget.kind !== 'unit') throw new TypeError('Correction review requires a real document unit')
+  text(value.basis, 2000); text(value.preparationId, 2048); text(value.operationId, 2048); text(value.organizedRequirements, 4000, true); preparationInteger(value.expectedVersion)
+  return { target: sourceTarget, preparationId: value.preparationId, expectedVersion: value.expectedVersion, operationId: value.operationId, organizedRequirements: value.organizedRequirements,
+    termSelections: preparationSelections(value.termSelections), reviewedRanges: ranges(value.reviewedRanges), basis: value.basis,
+    ...(value.excludedRanges === undefined ? {} : { excludedRanges: ranges(value.excludedRanges) }), ...(value.backgroundRanges === undefined ? {} : { backgroundRanges: ranges(value.backgroundRanges) }), ...(value.questions === undefined ? {} : { questions: preparationQuestions(value.questions) }) }
+}
+export function parsePreparationCorrectionReviewFacts(value: unknown): PreparationCorrectionReviewFacts {
+  preparationPacket(value); exact(value, ['scope', 'unitId', 'sourceVersion', 'sourceSha256', 'totalCodePoints', 'correctionOperationId', 'analysisActualCalls', 'topicTerms', 'termMatches', 'relevantFixedIds'])
+  const scope = parseTranslationSourceScope(value.scope), topicTerms = decodeTopicTermSnapshot(value.topicTerms)
+  text(value.unitId, 2048); text(value.correctionOperationId, 2048); preparationInteger(value.sourceVersion); preparationInteger(value.totalCodePoints)
+  if (typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || !topicTerms || topicTerms.ownerId !== scope.ownerId || topicTerms.topicId !== scope.topicId) throw new TypeError('Invalid correction review source or terms')
+  if (value.analysisActualCalls !== null) preparationInteger(value.analysisActualCalls, 0, MAX_ANALYSIS_CALLS)
+  preparationList(value.termMatches, 100)
+  const termMatches = value.termMatches.map(item => { exact(item, ['ref', 'matched']); if (typeof item.matched !== 'boolean') throw new TypeError('Invalid source term match'); return { ref: preparationRef(item.ref), matched: item.matched } })
+  const relevantFixedIds = preparationStrings(value.relevantFixedIds, 2048)
+  if (new Set(termMatches.map(item => JSON.stringify(item.ref))).size !== termMatches.length) throw new TypeError('Duplicate correction review match')
+  return { scope, unitId: value.unitId, sourceVersion: value.sourceVersion, sourceSha256: value.sourceSha256, totalCodePoints: value.totalCodePoints, correctionOperationId: value.correctionOperationId,
+    analysisActualCalls: value.analysisActualCalls as number | null, topicTerms, termMatches, relevantFixedIds }
 }
 export function parseTranslationPreparationRead(value: unknown): TranslationPreparationRead {
   exact(value, ['target', 'preparationId', 'version', 'section'], ['cursor', 'limit'])
   const query = parseTranslationPreparationQuery({ target: value.target, preparationId: value.preparationId, version: value.version })
-  if (!['summary', 'candidates', 'terms', 'coverage', 'background', 'references', 'questions', 'conflicts'].includes(String(value.section))) throw new TypeError('Invalid preparation section')
+  if (!['summary', 'candidates', 'terms', 'coverage', 'background', 'references', 'questions', 'conflicts', 'correction_review'].includes(String(value.section))) throw new TypeError('Invalid preparation section')
   if (value.cursor !== undefined) text(value.cursor, 300)
   if (value.limit !== undefined) preparationInteger(value.limit, 1, MAX_PREPARATION_PAGE_ITEMS)
   return { ...query, section: value.section as PreparationSection, ...(value.cursor === undefined ? {} : { cursor: value.cursor }), ...(value.limit === undefined ? {} : { limit: value.limit as number }) }
@@ -477,7 +544,7 @@ export function parsePreparationReceipt(value: unknown): PreparationReceipt {
   if (typeof value.preparationReady !== 'boolean' || typeof value.editable !== 'boolean' || value.executionReady !== false || value.executionGate !== 'plan_and_budget_pending' || value.restartExecutable !== false || !['saved', 'runtime_only'].includes(String(value.storage))) throw new TypeError('Invalid preparation receipt')
   if (value.storageError !== null) text(value.storageError, 4000)
   preparationTime(value.createdAt); preparationTime(value.updatedAt)
-  const result = { ...(structuredClone(value) as unknown as PreparationReceipt), target: target(value.target), scope: parseTranslationSourceScope(value.scope), route: preparationRoute(value.route) }
+  const result = { ...(structuredClone(value) as unknown as PreparationReceipt), target: parseNormalTranslationTarget(value.target), scope: parseTranslationSourceScope(value.scope), route: preparationRoute(value.route) }
   if (result.target.mainSessionId !== result.scope.mainSessionId || result.target.sourceVersion !== result.sourceVersion) throw new TypeError('Preparation receipt source mismatch')
   return result
 }
@@ -527,32 +594,36 @@ function parsePreparationConflict(value: unknown): PreparationConflict {
 }
 function parsePreparationPageItem(section: PreparationSection, value: unknown): unknown {
   switch (section) {
+    case 'correction_review': return parsePreparationCorrectionReview(value)
     case 'terms': return parseFrozenPreparationTerm(value)
     case 'conflicts': return parsePreparationConflict(value)
     case 'questions': return preparationQuestions([value])[0]!
     case 'references': return preparationReferences([value])[0]!
     case 'summary': {
-      exact(value, ['userRequirements', 'organizedRequirements', 'route', 'sourceSha256', 'targetLanguage', 'mechanicalCoverageComplete', 'mainModelReviewComplete', 'preparationReady', 'executionReady', 'executionGate', 'coverageMeaning', 'reviewMeaning'])
+      exact(value, ['userRequirements', 'organizedRequirements', 'route', 'sourceSha256', 'targetLanguage', 'mechanicalCoverageComplete', 'mainModelReviewComplete', 'preparationReady', 'executionReady', 'executionGate', 'coverageMeaning', 'reviewMeaning'], ['analysisSourceVersion', 'correctionReviewComplete'])
       text(value.userRequirements, 4000, true); text(value.organizedRequirements, 4000, true); text(value.targetLanguage, 80)
       if (typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || [value.mechanicalCoverageComplete, value.mainModelReviewComplete, value.preparationReady].some(item => typeof item !== 'boolean') || value.executionReady !== false || value.executionGate !== 'plan_and_budget_pending' || value.coverageMeaning !== 'mechanical_source_scan' || value.reviewMeaning !== 'main_model_declared_review') throw new TypeError('Invalid preparation summary')
+      if (value.analysisSourceVersion !== undefined) preparationInteger(value.analysisSourceVersion)
+      if (value.correctionReviewComplete !== undefined && typeof value.correctionReviewComplete !== 'boolean') throw new TypeError('Invalid correction review summary')
       return { ...structuredClone(value), route: preparationRoute(value.route) }
     }
     case 'background': {
-      exact(value, ['target', 'sourceVersion', 'range', 'role']); const source = target(value.target); preparationInteger(value.sourceVersion)
+      exact(value, ['target', 'sourceVersion', 'range', 'role']); const source = parseNormalTranslationTarget(value.target); preparationInteger(value.sourceVersion)
       if (value.sourceVersion !== source.sourceVersion || value.role !== 'source_background') throw new TypeError('Background is not an external reference')
       return { target: source, sourceVersion: value.sourceVersion, range: range(value.range), role: 'source_background' }
     }
     case 'coverage': {
-      exact(value, ['kind', 'range'], ['analysisId', 'analysisVersion', 'callId', 'candidateCount'])
+      exact(value, ['kind', 'range'], ['analysisId', 'analysisVersion', 'callId', 'candidateCount', 'sourceVersion'])
       const scannedRange = range(value.range)
+      if (value.sourceVersion !== undefined) preparationInteger(value.sourceVersion)
       if (value.kind === 'mechanical_scan') {
-        exact(value, ['kind', 'range', 'analysisId', 'analysisVersion', 'callId', 'candidateCount']); text(value.analysisId, 2048); text(value.callId, 2048); preparationInteger(value.candidateCount, 0)
+        exact(value, ['kind', 'range', 'analysisId', 'analysisVersion', 'callId', 'candidateCount'], ['sourceVersion']); text(value.analysisId, 2048); text(value.callId, 2048); preparationInteger(value.candidateCount, 0)
         if (value.analysisVersion !== 1) throw new TypeError('Invalid mechanical analysis ref')
         return { ...structuredClone(value), range: scannedRange }
       }
-      exact(value, ['kind', 'range'])
+      exact(value, ['kind', 'range'], ['sourceVersion'])
       if (!['required', 'excluded', 'main_model_declared_review'].includes(String(value.kind))) throw new TypeError('Invalid preparation coverage meaning')
-      return { kind: value.kind, range: scannedRange }
+      return { kind: value.kind, range: scannedRange, ...(value.sourceVersion === undefined ? {} : { sourceVersion: value.sourceVersion }) }
     }
     case 'candidates': {
       exact(value, ['kind'], ['id', 'version', 'original', 'preferred', 'memberCount', 'descriptionCount', 'occurrences', 'occurrenceCount', 'occurrenceSamples', 'origin', 'candidateId', 'description', 'descriptionRef', 'callId'])
@@ -571,16 +642,33 @@ function parsePreparationPageItem(section: PreparationSection, value: unknown): 
     }
   }
 }
+function parsePreparationCorrectionReview(value: unknown): PreparationCorrectionReview {
+  exact(value, ['meaning', 'previousPreparationRef', 'correctionOperationId', 'basis', 'analysisBasis', 'requiredRanges', 'excludedRanges', 'fixedTermVersions', 'termMappings', 'complete'])
+  if (value.meaning !== 'main_model_correction_review' || typeof value.complete !== 'boolean') throw new TypeError('Invalid correction review meaning')
+  exact(value.previousPreparationRef, ['id', 'version']); text(value.previousPreparationRef.id, 2048); preparationInteger(value.previousPreparationRef.version)
+  text(value.correctionOperationId, 2048); text(value.basis, 2000)
+  const analysis = value.analysisBasis
+  exact(analysis, ['sourceVersion', 'sourceSha256', 'totalCodePoints', 'actualCalls']); preparationInteger(analysis.sourceVersion); preparationInteger(analysis.totalCodePoints)
+  if (typeof analysis.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(analysis.sourceSha256)) throw new TypeError('Invalid original analysis identity')
+  if (analysis.actualCalls !== null) preparationInteger(analysis.actualCalls, 0, MAX_ANALYSIS_CALLS)
+  if (!value.fixedTermVersions || typeof value.fixedTermVersions !== 'object' || Array.isArray(value.fixedTermVersions)) throw new TypeError('Invalid fixed rule baseline')
+  for (const [id, version] of Object.entries(value.fixedTermVersions)) { text(id, 2048); preparationInteger(version) }
+  preparationList(value.termMappings, 100)
+  const termMappings = value.termMappings.map(item => { exact(item, ['previous', 'current']); return { previous: preparationRef(item.previous), current: item.current === null ? null : preparationRef(item.current) } })
+  preparationList(value.requiredRanges, MAX_ANALYSIS_RANGES + 1)
+  return { ...(structuredClone(value) as unknown as PreparationCorrectionReview), requiredRanges: value.requiredRanges.map(range), excludedRanges: ranges(value.excludedRanges), termMappings }
+}
 function preparationCovers(actual: readonly TranslationSourceRange[], required: readonly TranslationSourceRange[]): boolean {
   const sorted = [...actual].sort((a, b) => a.start - b.start)
   return required.every(item => { let end = item.start; for (const part of sorted) { if (part.end <= end) continue; if (part.start > end) break; end = part.end; if (end >= item.end) return true } return false })
 }
 export function parsePreparationSnapshot(value: unknown): PreparationSnapshot {
   preparationPacket(value)
-  exact(value, ['schemaVersion', 'id', 'version', 'target', 'scope', 'sourceVersion', 'sourceSha256', 'totalCodePoints', 'route', 'targetLanguage', 'userRequirements', 'organizedRequirements', 'mechanicalCoverage', 'modelReview', 'terms', 'backgroundRanges', 'referenceRefs', 'questions', 'conflicts', 'preparationReady', 'executionReady', 'executionGate', 'storage', 'storageError', 'createdAt', 'updatedAt', 'operationId'])
+  exact(value, ['schemaVersion', 'id', 'version', 'target', 'scope', 'sourceVersion', 'sourceSha256', 'totalCodePoints', 'route', 'targetLanguage', 'userRequirements', 'organizedRequirements', 'mechanicalCoverage', 'modelReview', 'terms', 'backgroundRanges', 'referenceRefs', 'questions', 'conflicts', 'preparationReady', 'executionReady', 'executionGate', 'storage', 'storageError', 'createdAt', 'updatedAt', 'operationId'], ['correctionReview'])
   text(value.id, 2048); preparationInteger(value.version); preparationInteger(value.sourceVersion); preparationInteger(value.totalCodePoints); text(value.operationId, 2048)
   text(value.targetLanguage, 80); text(value.userRequirements, 4000, true); text(value.organizedRequirements, 4000, true); preparationTime(value.createdAt); preparationTime(value.updatedAt)
-  const sourceTarget = target(value.target), scope = parseTranslationSourceScope(value.scope)
+  const sourceTarget = parseNormalTranslationTarget(value.target), scope = parseTranslationSourceScope(value.scope), correction = value.correctionReview === undefined ? undefined : parsePreparationCorrectionReview(value.correctionReview)
+  if (sourceTarget.kind === 'unit' && (!correction || sourceTarget.translationSessionId !== scope.translationSessionId) || correction && (sourceTarget.kind !== 'unit' || correction.previousPreparationRef.id !== value.id || correction.previousPreparationRef.version !== value.version - 1 || correction.analysisBasis.sourceVersion >= value.sourceVersion)) throw new TypeError('Invalid corrected preparation identity')
   if (value.schemaVersion !== 1 || value.sourceVersion !== sourceTarget.sourceVersion || sourceTarget.mainSessionId !== scope.mainSessionId || typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || value.executionReady !== false || value.executionGate !== 'plan_and_budget_pending' || !['saved', 'runtime_only'].includes(String(value.storage)) || typeof value.preparationReady !== 'boolean') throw new TypeError('Invalid preparation snapshot identity')
   if (value.storageError !== null) text(value.storageError, 4000)
   const mechanical = value.mechanicalCoverage, review = value.modelReview
@@ -591,20 +679,29 @@ export function parsePreparationSnapshot(value: unknown): PreparationSnapshot {
   preparationList(mechanical.requiredRanges, 257); const required = mechanical.requiredRanges.map(range)
   const expectedRequired: TranslationSourceRange[] = []; let start = 0
   for (const item of excluded) { if (start < item.start) expectedRequired.push({ start, end: item.start }); start = item.end }
-  if (start < value.totalCodePoints) expectedRequired.push({ start, end: value.totalCodePoints })
+  const analysisTotal = correction?.analysisBasis.totalCodePoints ?? value.totalCodePoints
+  if (start < analysisTotal) expectedRequired.push({ start, end: analysisTotal })
   if (JSON.stringify(required) !== JSON.stringify(expectedRequired) || requested.some(item => excluded.some(skip => item.start < skip.end && skip.start < item.end))) throw new TypeError('Invalid source partition')
   preparationList(mechanical.coverage, MAX_ANALYSIS_CALLS)
   const coverage = mechanical.coverage.map(item => { exact(item, ['callId', 'range', 'candidateCount']); text(item.callId, 2048); preparationInteger(item.candidateCount, 0); return { callId: item.callId, range: range(item.range), candidateCount: item.candidateCount } })
   if (new Set(coverage.map(item => item.callId)).size !== coverage.length || coverage.some(item => !preparationCovers(requested, [item.range])) || mechanical.complete !== preparationCovers(coverage.map(item => item.range), required)) throw new TypeError('Invalid mechanical coverage completion')
   exact(review, ['meaning', 'reviewedRanges', 'complete']); const reviewed = ranges(review.reviewedRanges)
-  if (review.meaning !== 'main_model_declared_review' || review.complete !== preparationCovers(reviewed, required)) throw new TypeError('Invalid declared review completion')
+  const currentRequired = correction?.requiredRanges ?? required
+  if (review.meaning !== 'main_model_declared_review' || review.complete !== preparationCovers(reviewed, currentRequired)) throw new TypeError('Invalid declared review completion')
   preparationList(value.terms, 100); const terms = value.terms.map(parseFrozenPreparationTerm), background = ranges(value.backgroundRanges), references = preparationReferences(value.referenceRefs), questions = preparationQuestions(value.questions)
   preparationList(value.conflicts, 1024); const conflicts = value.conflicts.map(parsePreparationConflict)
-  if (references.length || terms.some(item => item.targetLanguage !== value.targetLanguage || !preparationCovers(required, item.ranges))) throw new TypeError('Invalid adopted scope or unsupported reference')
-  const allRanges = [...requested, ...excluded, ...required, ...coverage.map(item => item.range), ...reviewed, ...background, ...terms.flatMap(item => item.ranges), ...questions.flatMap(item => item.ranges), ...conflicts.flatMap(item => item.ranges)]
+  if (references.length || terms.some(item => item.targetLanguage !== value.targetLanguage || !preparationCovers(currentRequired, item.ranges))) throw new TypeError('Invalid adopted scope or unsupported reference')
+  if ([...requested, ...excluded, ...required, ...coverage.map(item => item.range)].some(item => item.end > analysisTotal)) throw new TypeError('Analysis range exceeds original source')
+  if (correction) {
+    const expected: TranslationSourceRange[] = []; let position = 0
+    for (const skip of correction.excludedRanges) { if (position < skip.start) expected.push({ start: position, end: skip.start }); position = skip.end }
+    if (position < value.totalCodePoints) expected.push({ start: position, end: value.totalCodePoints })
+    if (JSON.stringify(expected) !== JSON.stringify(currentRequired) || correction.complete !== (review.complete && conflicts.length === 0)) throw new TypeError('Invalid corrected source coverage')
+  }
+  const allRanges = [...currentRequired, ...(correction?.excludedRanges ?? []), ...reviewed, ...background, ...terms.flatMap(item => item.ranges), ...questions.flatMap(item => item.ranges), ...conflicts.flatMap(item => item.ranges)]
   const total = value.totalCodePoints
   if (allRanges.some(item => item.end > total)) throw new TypeError('Preparation range exceeds source')
-  if (value.preparationReady !== (value.version > 1 && mechanical.complete && review.complete && conflicts.length === 0)) throw new TypeError('Invalid preparation eligibility')
+  if (value.preparationReady !== (value.version > 1 && (correction?.complete ?? (mechanical.complete && review.complete && conflicts.length === 0)))) throw new TypeError('Invalid preparation eligibility')
   return { ...(structuredClone(value) as unknown as PreparationSnapshot), target: sourceTarget, scope, route: preparationRoute(value.route), terms, backgroundRanges: background, referenceRefs: references, questions, conflicts,
     mechanicalCoverage: { meaning: 'mechanical_source_scan', analysisId: mechanical.analysisId, analysisVersion: 1, requestedRanges: requested, excludedRanges: excluded, requiredRanges: required, coverage, complete: mechanical.complete },
     modelReview: { meaning: 'main_model_declared_review', reviewedRanges: reviewed, complete: review.complete as boolean } }

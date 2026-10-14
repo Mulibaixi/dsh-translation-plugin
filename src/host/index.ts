@@ -10,6 +10,7 @@ import { TerminologyAnalysisService } from './terminology-analysis.js'
 import { installTranslationPreparation } from './translation-preparation.js'
 import { installDocumentPlanning } from './document-planning-service.js'
 import { installDocumentExecution } from './document-execution-service.js'
+import { installDocumentCorrection } from './document-correction-service.js'
 import type { AnalysisNotification, AnalysisRun } from '../shared/translation-preparation.js'
 import type { TaskPhaseEvent, TranslationExchangeService } from 'dsh-composer-extension/contracts'
 
@@ -37,7 +38,7 @@ export type * from '../shared/translation-source-storage.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection'] as const
 
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
@@ -107,6 +108,7 @@ export function apply(ctx: QuickHostContext): void {
   installTranslationPreparation(ctx as TopicHostContext)
   installDocumentPlanning(ctx as TopicHostContext)
   installDocumentExecution(ctx as TopicHostContext)
+  installDocumentCorrection(ctx as TopicHostContext)
   const quick = installQuickTranslation(ctx, undefined, false)
   const register = (scope: QuickHostContext): void => {
     const registry = scope.get ? scope.get('typert') as QuickHostContext['typert'] : scope.typert

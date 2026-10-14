@@ -90,6 +90,17 @@ export class TranslationSourcesService {
     const found = this.referenceRecord(fixedScope, reference, peerId)
     return found.ok ? ok(found.value.source) : found
   }
+  /** Private correction writer: immutable assets are created only from Host-verified text. */
+  async createCorrectedForAgent(scope: TranslationSourceScope, text: string, name: string, peerId: string, agent: Agent): Promise<TranslationSourceResult<TranslationSourceAsset>> {
+    if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', '纠错原稿不属于实际主 Agent。', 'correct_document_source')
+    const bytes = new TextEncoder().encode(text), totalCodePoints = sourceCodePointLength(text)
+    if (!totalCodePoints || bytes.byteLength > MAX_TRANSLATION_SOURCE_BYTES || /[\uD800-\uDFFF]/u.test(text)) return bad('invalid_input', '纠错后的原稿为空、编码无效或超过 2 MiB。', 'correct_document_source')
+    const source: TranslationSourceAsset = { sourceId: `source-${crypto.randomUUID()}`, version: 1, name, bytes: bytes.byteLength,
+      totalCodePoints, encoding: 'utf-8', bom: bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf, sha256: await sourceSha256(bytes), persistence: 'runtime_only' }
+    if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', '纠错原稿生成时所属连接已失效。', 'correct_document_source')
+    this.sources.set(source.sourceId, { scope, peerId, agent, source, text, bytes, codePointOffsets: indexText(text) })
+    return ok(source)
+  }
   /** Called only after Materials confirms this exact material was delivered to the actual main Agent. */
   readForAgent(scope: TranslationSourceScope, source: TranslationSourceAsset, range: TranslationSourceRange, peerId: string,
     agent: Pick<Agent, 'id' | 'session'>): TranslationSourceResult<{ readonly totalCodePoints: number; readonly text: string }> {

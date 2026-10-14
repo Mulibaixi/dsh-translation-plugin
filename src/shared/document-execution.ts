@@ -8,6 +8,7 @@ import { parseDocumentChunkPlan, parseDocumentCallContextReference, parseDocumen
   type VersionReference, type DocumentExecutionBaseline, type DocumentExecutionFacts, type DocumentSourceVersion, type ChunkRevision, type DocumentSupplementFact } from './translation-batch.js'
 import { parsePreparationSnapshot, type PreparationSnapshot } from './translation-preparation.js'
 import { parseTranslationSourceStorageRequest, type TranslationSourceStoredRead } from './translation-source-storage.js'
+import { parseDocumentReuseRequests, parseDocumentReuseApproval, type DocumentReuseRequest, type DocumentReuseApproval } from './document-correction.js'
 
 export const MAX_DOCUMENT_OUTPUT_BYTES = 16 * 1024 * 1024
 export const MAX_DOCUMENT_EXECUTION_PACKET_BYTES = 196608
@@ -16,6 +17,18 @@ export interface TranslationBatchExecute {
   readonly operationId: string
   readonly planRef: VersionReference
   readonly preparationRef: VersionReference
+  readonly reuseApprovals?: readonly DocumentReuseRequest[]
+}
+export interface DocumentUnitAcceptRequest {
+  readonly target: Extract<NormalTranslationTarget, { kind: 'unit' }>
+  readonly operationId: string
+  readonly taskId: string
+  readonly plan: DocumentChunkPlan
+  readonly preparationRef: VersionReference
+  readonly createdAt: string
+  readonly executionBaseline: DocumentExecutionBaseline
+  readonly reuseApprovals: readonly DocumentReuseApproval[]
+  readonly reusedOutputBytes: number
 }
 export interface TranslationBatchStatus {
   readonly scope: TranslationSourceScope
@@ -123,6 +136,7 @@ export interface DocumentTaskControl extends DocumentTaskScope {
 }
 export interface DocumentRestoreRequest { readonly scope: TranslationSourceScope; readonly taskId: string; readonly unitId?: string; readonly hostGeneration: string }
 export interface DocumentRestoreCapture {
+  readonly reuseApprovals?: readonly DocumentReuseApproval[]
   readonly receipt: DocumentTaskReceipt
   readonly source: DocumentSourceVersion
   readonly plan: DocumentChunkPlan
@@ -184,9 +198,21 @@ function packet(value: unknown): void {
 }
 function nullableIdentity(value: unknown): asserts value is string | null { if (value !== null) text(value) }
 export function parseTranslationBatchExecute(value: unknown): TranslationBatchExecute {
-  packet(value); exact(value, ['target', 'operationId', 'planRef', 'preparationRef']); text(value.operationId)
+  packet(value); exact(value, ['target', 'operationId', 'planRef', 'preparationRef'], ['reuseApprovals']); text(value.operationId)
   return { target: parseNormalTranslationTarget(value.target), operationId: value.operationId,
-    planRef: reference(value.planRef), preparationRef: reference(value.preparationRef) }
+    planRef: reference(value.planRef), preparationRef: reference(value.preparationRef), ...(value.reuseApprovals === undefined ? {} : { reuseApprovals: parseDocumentReuseRequests(value.reuseApprovals) }) }
+}
+export function parseDocumentUnitAcceptRequest(value: unknown): DocumentUnitAcceptRequest {
+  packet(value); exact(value, ['target', 'operationId', 'taskId', 'plan', 'preparationRef', 'createdAt', 'executionBaseline', 'reuseApprovals', 'reusedOutputBytes'])
+  const target = parseNormalTranslationTarget(value.target)
+  if (target.kind !== 'unit') throw new TypeError('Unit admission requires an exact unit target')
+  text(value.operationId); text(value.taskId); time(value.createdAt)
+  const raw = value.plan as DocumentChunkPlan, plan = parseDocumentChunkPlan(raw, raw.items.at(-1)?.outputRange.end ?? 0), preparationRef = reference(value.preparationRef), executionBaseline = parseDocumentExecutionBaseline(value.executionBaseline)
+  if (plan.sourceVersion !== target.sourceVersion || !sameVersionReference(plan.preparationRef, preparationRef) || executionBaseline.contextBindings.length !== plan.items.length || executionBaseline.contextBindings.some((binding, index) => binding.chunkId !== plan.items[index]!.chunkId || !sameVersionReference(binding.contextRef.preparationRef, preparationRef))) throw new TypeError('Unit admission dependencies changed')
+  if (!Array.isArray(value.reuseApprovals) || value.reuseApprovals.length > 256) throw new TypeError('Invalid unit reuse approvals')
+  integer(value.reusedOutputBytes, 0, MAX_DOCUMENT_OUTPUT_BYTES)
+  return { target, operationId: value.operationId, taskId: value.taskId, plan, preparationRef, createdAt: value.createdAt, executionBaseline,
+    reuseApprovals: value.reuseApprovals.map(parseDocumentReuseApproval), reusedOutputBytes: value.reusedOutputBytes }
 }
 export function parseTranslationBatchStatus(value: unknown): TranslationBatchStatus {
   packet(value); exact(value, ['scope', 'taskId'], ['afterTaskSequence', 'limit']); text(value.taskId)
@@ -313,7 +339,7 @@ export function parseDocumentRestoreRequest(value: unknown): DocumentRestoreRequ
   return { scope: parseTranslationSourceScope(value.scope), taskId: value.taskId, hostGeneration: value.hostGeneration, ...(value.unitId === undefined ? {} : { unitId: value.unitId }) }
 }
 export function parseDocumentRestoreCapture(value: unknown): DocumentRestoreCapture {
-  packet(value); exact(value, ['receipt', 'source', 'plan', 'preparation', 'executionFacts', 'chunks'], ['sourceRestore'])
+  packet(value); exact(value, ['receipt', 'source', 'plan', 'preparation', 'executionFacts', 'chunks'], ['sourceRestore', 'reuseApprovals'])
   const receipt = parseDocumentTaskReceipt(value.receipt), source = parseDocumentSourceVersion(value.source), plan = parseDocumentChunkPlan(value.plan, documentSourceLength(source)), preparation = parsePreparationSnapshot(value.preparation), executionFacts = parseDocumentExecutionFacts(value.executionFacts)
   if (!Array.isArray(value.chunks) || value.chunks.length > 512) throw new TypeError('Invalid restored chunk metadata')
   const chunks = value.chunks.map(raw => {
@@ -323,7 +349,9 @@ export function parseDocumentRestoreCapture(value: unknown): DocumentRestoreCapt
     return { ...raw, planRef: reference(raw.planRef), preparationRef: reference(raw.preparationRef) } as unknown as DocumentRestoreCapture['chunks'][number]
   })
   if (receipt.sourceVersion !== source.version || plan.sourceVersion !== source.version || !sameVersionReference(plan, receipt.planRef) || !sameVersionReference(preparation, receipt.preparationRef) || !sameVersionReference(plan.preparationRef, preparation)) throw new TypeError('Restored task references changed')
+  if (value.reuseApprovals !== undefined && (!Array.isArray(value.reuseApprovals) || value.reuseApprovals.length > 256)) throw new TypeError('Invalid restored reuse approvals')
   return { receipt, source, plan, preparation, executionFacts, chunks,
+    ...(value.reuseApprovals === undefined ? {} : { reuseApprovals: (value.reuseApprovals as unknown[]).map(parseDocumentReuseApproval) }),
     ...(value.sourceRestore === undefined ? {} : { sourceRestore: parseTranslationSourceStorageRequest('restore', value.sourceRestore) as TranslationSourceStoredRead }) }
 }
 export function parseDocumentBatchStatusView(value: unknown): DocumentBatchStatusView {
