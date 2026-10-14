@@ -14,6 +14,7 @@ import { DEFAULT_SESSION_SETTINGS, validateSessionSettings, type LocalSession, t
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
 import { type TopicTermsViewPort } from './topic-terms-view.js'
 import { downloadExport } from './browser-download.js'
+import { useExportDownloadFeedback } from './export-download-feedback.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import type { NormalTranslationClient } from './normal-translation.js'
@@ -441,6 +442,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const [remark, setRemark] = react.useState('')
   const [exportRequest, setExportRequest] = react.useState<(FrozenTranslationExport & { readonly result: TranslationExport }) | undefined>(undefined)
   const [exportNotice, setExportNotice] = react.useState<{ readonly message: string; readonly failure: boolean } | undefined>(undefined)
+  const exportFeedback = useExportDownloadFeedback()
   const [exporting, setExporting] = react.useState(false)
   const [exportLabel, setExportLabel] = react.useState('')
   const exportLifetime = react.useRef({ mounted: true, generation: 0, busy: false })
@@ -500,7 +502,11 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       const current = store.getSession(session.id)
       return !current || store.isSessionDeleted(session.id) || current.ownerId !== request.topic.ownerId || current.topicId !== request.topic.topicId
     })) { setExportNotice({ message: '导出范围已不可用，请重新导出。', failure: true }); return }
-    try { downloadExport(allowPartialTranslationExport(result)); setExportNotice({ message: `已向浏览器发起${request.scope === 'topic' ? `主题「${request.topic.topicName}」` : `会话「${request.entries[0]!.session.remark || request.entries[0]!.session.name}」`}的下载。`, failure: false }); setExportRequest(undefined) }
+    try {
+      const download = allowPartialTranslationExport(result)
+      downloadExport(download); exportFeedback.downloadStarted(download.fileName)
+      setExportNotice(undefined); setExportRequest(undefined)
+    }
     catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
   }
   async function exportSession(id: string, format: 'txt' | 'json', scope: 'session' | 'topic'): Promise<void> {
@@ -508,7 +514,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     const generation = ++exportLifetime.current.generation
     const active = (): boolean => exportLifetime.current.mounted && exportLifetime.current.generation === generation && Boolean(store.getSession(id)?.ownerId === ownerId && !store.isSessionDeleted(id))
     exportLifetime.current.busy = true; setExporting(true)
-    closeSessionMenus(); setExportNotice(undefined); setExportRequest(undefined)
+    closeSessionMenus(); exportFeedback.clear(); setExportNotice(undefined); setExportRequest(undefined)
     try {
       const target = store.getSession(id)
       if (!target || target.ownerId !== ownerId) throw new Error('Session no longer available')
@@ -541,6 +547,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     }, sessionLabel(session))
   }
   return h('div', { className: 'dsh-tp-workspace' },
+    exportFeedback.toast,
     h('aside', { className: 'dsh-tp-session-sidebar', hidden: !sidebar, 'aria-label': '翻译会话侧栏' },
       h('div', { className: 'dsh-tp-session-list', 'aria-label': '使用中的翻译会话', 'data-session-sort-list': true },
         ...sessions.map(sessionItem),

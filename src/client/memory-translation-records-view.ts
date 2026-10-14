@@ -1,5 +1,6 @@
 import { h, react } from './react.js'
 import { downloadExport } from './browser-download.js'
+import { useExportDownloadFeedback } from './export-download-feedback.js'
 import type { SessionStore } from './session-store.js'
 import type { QuickTranslationClient } from './quick-translation.js'
 import { currentFinalRevision, isTextUnit, type TextRevision } from './translation-history.js'
@@ -34,6 +35,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   const [expanded, setExpanded] = react.useState(() => new Set<string>())
   const [drafts, setDrafts] = react.useState(() => new Map<string, EditDraft>())
   const [message, setMessage] = react.useState<string | undefined>(undefined)
+  const exportFeedback = useExportDownloadFeedback(visible)
   const [exportRequest, setExportRequest] = react.useState<PendingRecordsExport | undefined>(undefined)
   const [exporting, setExporting] = react.useState(false)
   const [exportLabel, setExportLabel] = react.useState('')
@@ -71,7 +73,11 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
       const current = store.getSession(session.id)
       return !current || store.isSessionDeleted(session.id) || current.ownerId !== request.topic.ownerId || current.topicId !== request.topic.topicId
     })) { setMessage('导出范围已不可用，请重新导出。'); return }
-    try { downloadExport(allowPartialTranslationExport(result)); setMessage(`已向浏览器发起${request.scope === 'topic' ? `主题「${request.topic.topicName}」` : `会话「${request.entries[0]!.session.remark || request.entries[0]!.session.name}」`}的下载。`); setExportRequest(undefined) }
+    try {
+      const download = allowPartialTranslationExport(result)
+      downloadExport(download); exportFeedback.downloadStarted(download.fileName)
+      setMessage(undefined); setExportRequest(undefined)
+    }
     catch { setMessage('无法启动下载，请重试。') }
   }
   async function exportRecords(format: 'txt' | 'json'): Promise<void> {
@@ -79,7 +85,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     const exportId = ++lifetime.current.exportId
     const active = (): boolean => lifetime.current.mounted && lifetime.current.exportId === exportId && store.getTopics(ownerId).some(topic => topic.id === topicId)
     lifetime.current.busy = true; setExporting(true)
-    setMessage(undefined); setExportRequest(undefined)
+    exportFeedback.clear(); setMessage(undefined); setExportRequest(undefined)
     try {
       const topic = store.getTopics(ownerId).find(candidate => candidate.id === topicId)
       if (!topic) throw new Error('Topic no longer available')
@@ -104,6 +110,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   }
   const note = '原文只读；人工修改保存为新版本，再明确设为最终。'
   return h('section', { className: 'dsh-tp-terms dsh-tp-records', 'aria-label': '译文记录', 'data-records-scope': scope, 'data-records-session-id': sessionId },
+    exportFeedback.toast,
     h('div', { className: 'dsh-tp-asset-toolbar' },
       h('div', { className: 'dsh-tp-unit-header' },
         h('div', { className: 'dsh-tp-asset-heading' }, h('h3', null, '译文记录'), h('small', { className: 'dsh-tp-muted dsh-tp-asset-note', title: note }, note)),

@@ -4,5 +4,5 @@ export const {
   Menu, MenuGroup, MenuItemButton,
   IconChevronDownOutlineRegular, IconChevronRightOutlineRegular,
   IconPanelLeftOutlineRegular, IconSendOutlineMedium,
-  MarkdownText,
+  MarkdownText, Toast,
 } = require('@deepseek-ai/dsh-client-ui-primitives') as Record<string, unknown>

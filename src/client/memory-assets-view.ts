@@ -1,6 +1,7 @@
 import { h, react } from './react.js'
 import { styles } from './view-styles.js'
 import { downloadExport } from './browser-download.js'
+import { useExportDownloadFeedback } from './export-download-feedback.js'
 import { TopicTermsView, type TopicTermsViewPort } from './topic-terms-view.js'
 import { MemoryTranslationRecordsView } from './memory-translation-records-view.js'
 import type { SessionStore } from './session-store.js'
@@ -80,8 +81,10 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
   const [category, setCategory] = react.useState<'terms' | 'translations'>('terms')
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
+  const exportFeedback = useExportDownloadFeedback(active && category === 'terms')
   const evidenceContextKey = JSON.stringify([ownerId, topicId, associatedSessionId, navigationRevision])
   function exportArchive(format: 'json' | 'markdown'): void {
+    exportFeedback.clear(); setExportNotice(undefined)
     try {
       const frozen = structuredClone({ terms: terms.getSnapshot(ownerId, topicId), archive: archive.getSnapshot(ownerId, topicId) })
       function availability(snapshot: { readonly ownerId: string; readonly topicId: string; readonly entries: readonly { readonly id: string; readonly evidence: readonly TermEvidenceRef[] }[] }) {
@@ -98,11 +101,12 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
         exportedAt: new Date().toISOString(), rememberHistory: store.getSettings().rememberHistory,
         termsStorageStatus: terms.getStatus(ownerId, topicId), archiveStorageStatus: archive.getStatus(ownerId, topicId),
         termEvidenceAvailability: availability(frozen.terms), archiveEvidenceAvailability: availability(frozen.archive) }
-      downloadExport(format === 'json' ? buildTopicArchiveJsonExport(input) : buildTopicArchiveMarkdownExport(input))
-      setExportNotice({ message: '已向浏览器发起下载。', failure: false })
+      const download = format === 'json' ? buildTopicArchiveJsonExport(input) : buildTopicArchiveMarkdownExport(input)
+      downloadExport(download); exportFeedback.downloadStarted(download.fileName)
     } catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
   }
   return h('div', { className: 'dsh-tp-assets-body' },
+      exportFeedback.toast,
       h('nav', { className: 'dsh-tp-assets-nav', 'aria-label': '资产分类' },
         h('button', { type: 'button', 'aria-current': category === 'translations', onClick: () => setCategory('translations') }, '译文记录'),
         h('button', { type: 'button', 'aria-current': category === 'terms', onClick: () => setCategory('terms') }, '结构化档案'),
