@@ -1,3 +1,4 @@
+import type { FrozenReferenceContext } from '../shared/reference-memory.js'
 import type { ModelSelection } from '../shared/contracts.js'
 import type { TextCapabilityEvidence, TextExecutionAdapter, TextExecutionEvent, TextExecutionPacket } from '../shared/domain-contracts.js'
 import { NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION,
@@ -52,6 +53,8 @@ export interface NormalExecutionPacket {
   readonly targetLanguage: string
   readonly instruction: string
   readonly context: NormalTranslationContext
+  readonly referenceContext?: FrozenReferenceContext
+  readonly referenceContextCurrent?: () => boolean
   readonly exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>
   readonly exchangeContextVersion?: number
 }
@@ -282,10 +285,11 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     try {
       const bound = this.prepared.get(packet.operationId)
       if (!bound || key(bound.route) !== key(packet.model)) throw Object.assign(new Error('Normal preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
+      if(packet.context.referenceContextRef && (!packet.referenceContext || JSON.stringify(packet.context.referenceContextRef)!==JSON.stringify(packet.referenceContext.manifestRef)) || packet.referenceContextCurrent?.()===false)throw Object.assign(new Error('Reference context unavailable or changed'),{code:'REFERENCE_CONTEXT_CHANGED'})
       const requestContext = requestContextAvailable && bound.call.toolUpdate !== undefined
       const context = requestContext
-        ? reconstructNormalExchangeTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, bound.exchangeResume)
-        : reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context)
+        ? reconstructNormalExchangeTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, bound.exchangeResume, packet.referenceContext)
+        : reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, packet.referenceContext)
       const bytes = new TextEncoder().encode(context.systemPrompt + context.userMessage).byteLength
       // This is a conservative UTF-8 based estimate, not a tokenizer measurement.
       if (bytes > 196_608) throw Object.assign(new Error('Normal execution package exceeds short-text budget'), { code: 'INPUT_LIMIT' })
@@ -335,10 +339,11 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   async *executeNormal(packet: NormalExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncGenerator<NormalExecutionEvent> {
     const bound = this.prepared.get(packet.operationId)
     this.prepared.delete(packet.operationId)
+    if(packet.referenceContextCurrent?.()===false)throw Object.assign(new Error('Reference context changed before dispatch'),{code:'REFERENCE_CONTEXT_CHANGED'})
     if (!bound || key(bound.route) !== key(packet.model) || !bound.normalContext || JSON.stringify(bound.normalContext) !== JSON.stringify(packet.context)) throw new Error('Normal execution preparation does not match')
     yield* this.executePrepared(packet.operationId, packet.callId, bound.call, 'normal',
-      (bound.requestContext ? reconstructNormalExchangeTranslationContext : reconstructNormalTranslationContext)(
-        { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, bound.exchangeResume),
+      bound.requestContext ? reconstructNormalExchangeTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, bound.exchangeResume, packet.referenceContext)
+        : reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, packet.referenceContext),
       signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion)
   }
   private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal' | 'analysis' | 'document',

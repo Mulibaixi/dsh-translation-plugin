@@ -115,7 +115,7 @@ export interface TranslationExchangeRecord {
 }
 /** One browser snapshot; events and final pointers reference the sole revision body. */
 export interface TranslationHistory {
-  readonly schemaVersion: 8
+  readonly schemaVersion: 9
   readonly units: readonly TranslationUnit[]
   readonly events: readonly TranslationEvent[]
   readonly exchanges: readonly TranslationExchangeRecord[]
@@ -124,7 +124,7 @@ export type NewTextUnit = Pick<TextUnit, 'id' | 'source' | 'targetLanguage' | 'i
 export type NewTextRevision = Omit<TextRevision, 'order' | 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion' | 'deletion'> & Partial<Pick<TextRevision, 'kind' | 'baseRevisionId' | 'callRecord' | 'sourceVersion'>>
 export type TextRevisionPatch = Partial<Pick<TextRevision, 'status' | 'text' | 'message' | 'updatedAt' | 'callRecord'>>
 
-export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 8, units: [], events: [], exchanges: [] } }
+export function emptyTranslationHistory(): TranslationHistory { return { schemaVersion: 9, units: [], events: [], exchanges: [] } }
 
 type Data = Record<string, unknown>
 const statuses: readonly TextRevisionStatus[] = ['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted', 'context_requested', 'deleted']
@@ -253,7 +253,7 @@ function decodeExchange(value: unknown, units: readonly TranslationUnit[]): Tran
 
 /** Validation does not turn live requests into restored requests. Unknown fields are rejected. */
 export function decodeTranslationHistory(value: unknown): TranslationHistory | undefined {
-  if (!record(value) || !exact(value, (value.schemaVersion as number) >= 6 ? ['schemaVersion', 'units', 'events', 'exchanges'] : ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5, 6, 7, 8].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events) ||
+  if (!record(value) || !exact(value, (value.schemaVersion as number) >= 6 ? ['schemaVersion', 'units', 'events', 'exchanges'] : ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5, 6, 7, 8, 9].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events) ||
     ((value.schemaVersion as number) >= 6 && !Array.isArray(value.exchanges))) return undefined
   const units: TranslationUnit[] = [], revisionIds = new Set<string>(), callIds = new Set<string>(), operationUnits = new Map<string, string>(), unitIds = new Set<string>()
   for (const item of value.units) {
@@ -372,7 +372,7 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
   }
   for (const unit of units.filter(isTextUnit)) for (const revision of unit.revisions) if (revision.deletion &&
     events.filter(event => event.type === 'revision.deleted' && event.revisionId === revision.id && event.id === revision.deletion!.eventId).length !== 1) return undefined
-  return { schemaVersion: 8, units, events, exchanges: exchanges as TranslationExchangeRecord[] }
+  return { schemaVersion: 9, units, events, exchanges: exchanges as TranslationExchangeRecord[] }
 }
 
 /** Version records own source bodies; storage and full-record exports omit the compatibility projection. */

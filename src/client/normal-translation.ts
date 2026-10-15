@@ -413,7 +413,7 @@ export class NormalTranslationClient {
     const terms = item.termSnapshot.entries.map(entry => ({ id: entry.id, entryVersion: entry.version, sourceForms: entry.sourceForms,
       aliases: entry.aliases, sense: entry.sense, preferred: entry.preferred, forbidden: entry.forbidden, userFixed: entry.origin === 'user_explicit' }))
     return metadata.model.provider === model.provider && metadata.model.model === model.model && (model.reasoningEffort === undefined || metadata.model.reasoningEffort === model.reasoningEffort) &&
-      JSON.stringify(metadata.context) === JSON.stringify({ organizedRequirements: request.organizedRequirements, terms })
+      JSON.stringify(metadata.context) === JSON.stringify({ organizedRequirements: request.organizedRequirements, ...(request.referenceContextRef ? {referenceContextRef:request.referenceContextRef} : {}), terms })
   }
 
   private locate(ownerId: string, operationId: string): AcceptedOperation | undefined {

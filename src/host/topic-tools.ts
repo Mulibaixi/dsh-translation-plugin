@@ -1,3 +1,4 @@
+import { registerReferenceTools, type ReferenceFilesService } from './reference-files.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
 import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection } from '../shared/normal-translation.js'
@@ -47,12 +48,12 @@ const sessionStartParameter = { required: true, oneOf: [
   { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['parent_session'], required: true }, translationSessionId: sessionParameter } },
   { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['existing_topic'], required: true }, topicId: topicParameter } },
 ] }
-const termFields = {
+const rawTermFields = {
   id: { type: 'string', required: true }, expectedEntryVersion: { oneOf: [{ type: 'integer' }, { type: 'null' }], required: true },
   sourceLanguage: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true }, targetLanguage: { type: 'string', required: true },
   sourceForms: { type: 'array', items: { type: 'string' }, required: true }, aliases: { type: 'array', items: { type: 'string' }, required: true },
   sense: { type: 'string', required: true }, preferred: { type: 'string', required: true }, forbidden: { type: 'array', items: { type: 'string' }, required: true },
-  origin: { type: 'string', enum: ['inferred', 'source_checked'], required: true }, status: { type: 'string', enum: ['proposal', 'active'], required: true },
+  origin: { type: 'string', enum: ['inferred', 'source_checked', 'reference_derived'], required: true }, status: { type: 'string', enum: ['proposal', 'active'], required: true },
   evidence: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
     kind: { type: 'string', enum: ['source', 'final'], required: true }, sessionId: { type: 'string', required: true }, unitId: { type: 'string', required: true },
     revisionId: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
@@ -62,6 +63,12 @@ const termFields = {
     role: { type: 'string', enum: ['basis', 'example'], required: true },
   } }, required: true },
 }
+const referenceEvidenceParameter = { type: 'object', additionalProperties: false, properties: {
+  kind: { type: 'string', enum: ['reference'], required: true }, referenceId: { type: 'string', required: true }, referenceVersion: { type: 'integer', enum: [1], required: true },
+  segmentId: { type: 'string', required: true }, segmentVersion: { type: 'integer', enum: [1], required: true }, role: {type: 'string', enum: ['basis','example'], required: true},
+  range: { oneOf: [{type:'null'}, {type:'object', additionalProperties:false, properties:{start:{type:'integer',required:true},end:{type:'integer',required:true}}}], required:true },
+} }
+const termFields = { ...rawTermFields, evidence: { ...rawTermFields.evidence, items: { oneOf: [rawTermFields.evidence.items, referenceEvidenceParameter] } } }
 const archiveKinds = ['entity', 'fact', 'relation'] as const
 const archiveFields = {
   id: termFields.id, expectedEntryVersion: termFields.expectedEntryVersion, origin: termFields.origin,
@@ -101,7 +108,7 @@ class ManagementConnection {
   private wake: (() => void) | undefined
   readonly stopped: Promise<void>
   private stop!: () => void
-  constructor(readonly identity: TopicBridgeOpen, readonly peerId: string, readonly timeoutMs: number, readonly protocol: 1 | 2) {
+  constructor(readonly identity: TopicBridgeOpen, readonly peerId: string, readonly timeoutMs: number, readonly protocol: 1 | 2 | 3) {
     this.stopped = new Promise(resolve => { this.stop = resolve })
   }
   async request(command: TopicBridgeCommand, exec: ToolExecution, peerRead = false): Promise<TopicBridgeValue> {
@@ -130,7 +137,7 @@ class ManagementConnection {
     const pending = this.pending
     if (!pending || reply.requestId !== pending.frame.requestId) throw bridgeError('invalid_reply', '主题管理回执与请求不一致。')
     if (reply.ok) {
-      const expected = { list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
+      const expected = { reference_assets: 'reference_assets', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         document_review_page: 'document_review_page', document_review_read: 'document_review_text', document_review_begin: 'document_review_receipt', document_review_submit: 'document_review_receipt', document_review_manual: 'document_review_receipt', document_review_observe: 'document_review_observed',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
@@ -163,7 +170,13 @@ export class TopicToolsService {
     return ready ? { ready: true } : { ready: false, reason: '宿主主题管理接口尚未就绪。' }
   }
   capabilitiesV2(): TopicBridgeCapability & { readonly normalProtocol: 2 } { return { ...this.capabilities(), normalProtocol: 2 } }
-  protocolFor(ownerId: string): 1 | 2 | undefined {
+  capabilitiesV3(): TopicBridgeCapability & { readonly normalProtocol: 2; readonly referenceProtocol: 1 } {
+    const base = this.capabilities()
+    return { ...(base.ready && !(this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined)?.available()
+      ? {ready:false,reason:'宿主真实消息附件读取接口尚未就绪。'} : base), normalProtocol: 2, referenceProtocol: 1 }
+  }
+  async *connectV3(request: TopicBridgeOpen, signal: AbortSignal): AsyncGenerator<TopicBridgeDown> { yield* this.connectProtocol(request, signal, 3) }
+  protocolFor(ownerId: string): 1 | 2 | 3 | undefined {
     const connection = this.connections.get(ownerId)
     return connection?.ready && !connection.closed ? connection.protocol : undefined
   }
@@ -220,7 +233,7 @@ export class TopicToolsService {
   async *connectV2(request: TopicBridgeOpen, signal: AbortSignal): AsyncGenerator<TopicBridgeDown> {
     yield* this.connectProtocol(request, signal, 2)
   }
-  private async *connectProtocol(request: TopicBridgeOpen, signal: AbortSignal, protocol: 1 | 2): AsyncGenerator<TopicBridgeDown> {
+  private async *connectProtocol(request: TopicBridgeOpen, signal: AbortSignal, protocol: 1 | 2 | 3): AsyncGenerator<TopicBridgeDown> {
     request = parseTopicBridgeOpen(request)
     signal.throwIfAborted()
     const peerId = this.ctx.invocation?.peer.id
@@ -283,13 +296,13 @@ export class TopicToolsService {
       { name: 'translation_read_unit', kind: 'read_unit', parameters: { translationSessionId: sessionParameter, unitId: { type: 'string', required: true } }, description: 'Read one historical text unit explicitly exposed by the user. Unpublished history and current drafts are inaccessible.' },
       { name: 'translation_list_terms', kind: 'list_terms', parameters: { translationSessionId: { type: 'string', description: sessionParameter.description }, topicId: { type: 'string', description: topicParameter.description } }, description: 'Read owned topic terminology, status, versions and evidence references. Supply exactly one translationSessionId or topicId; a topic id also works after its last Session was deleted. Source bodies are not included.' },
       { name: 'translation_query_terms', kind: 'query_terms', parameters: { translationSessionId: sessionParameter, sourceLanguage: termFields.sourceLanguage, targetLanguage: termFields.targetLanguage, forms: { type: 'array', items: { type: 'string' }, required: true } }, description: 'Select active topic terms by exact source language, target language and explicit forms or aliases. Invalid or outdated basis is excluded.' },
-      { name: 'translation_upsert_term', kind: 'upsert_term', parameters: { translationSessionId: sessionParameter, expectedVersion: { type: 'integer', required: true }, entry: { type: 'object', additionalProperties: false, properties: termFields, required: true } }, description: 'Propose or source-check one topic term against the observed topic/entry versions. Source evidence must have been explicitly published. Cannot create user confirmation or rewrite a user-adopted rule.' },
+      { name: 'translation_upsert_term', kind: 'upsert_term', parameters: { translationSessionId: sessionParameter, expectedVersion: { type: 'integer', required: true }, entry: { type: 'object', additionalProperties: false, properties: termFields, required: true } }, description: 'Propose or source-check one topic term against the observed topic/entry versions. Source evidence must have been explicitly published. Reference-derived active entries require published reviewed reference segments without unresolved uncertainty and must retain reference evidence; they do not constitute user confirmation. Cannot create user confirmation or rewrite a user-adopted rule.' },
       { name: 'translation_list_topic_archive', kind: 'list_topic_archive', parameters: { topicId: topicParameter }, description: 'Read entity, fact and relation entries, statuses, versions and evidence references for one owned topic, including a retained topic without translation Sessions. Does not include source bodies or drafts.' },
       { name: 'translation_query_archive', kind: 'query_archive', parameters: { translationSessionId: sessionParameter,
         kinds: { type: 'array', items: { type: 'string', enum: archiveKinds }, required: true }, forms: { type: 'array', items: { type: 'string' }, required: true } },
         description: 'Select active topic archive entries by explicit exact names, aliases, titles or relation forms. The translation Session fixes owner, topic and actual mode; Quick returns no entries. Outdated basis and unavailable entity references are excluded.' },
       { name: 'translation_upsert_archive', kind: 'upsert_archive', parameters: { topicId: topicParameter, expectedVersion: { type: 'integer', required: true }, entry: archiveEntryParameter },
-        description: 'Propose or source-check one entity, fact or relation in an owned topic against observed topic and entry versions. Evidence must be explicitly published by the user; inferred entries stay proposals. Cannot create user confirmation, overwrite user-adopted entries, edit translation text or invoke translation. Retained topics without Sessions also accept proposals.' },
+        description: 'Propose or source-check one entity, fact or relation in an owned topic against observed topic and entry versions. Evidence must be explicitly published; inferred entries stay proposals. Reference-derived entries require published reviewed reference segments, preserve model-interpretation provenance and never become user-fixed automatically. Cannot create user confirmation, overwrite user-adopted entries, edit translation text or invoke translation. Retained topics without Sessions also accept proposals.' },
     ]
     const disposers: (() => void)[] = []
     try {
@@ -300,9 +313,9 @@ export class TopicToolsService {
           if (definition.kind === 'list_terms') {
             const session = args.translationSessionId !== undefined, topic = args.topicId !== undefined
             if (session === topic) throw bridgeError('invalid_target', '术语读取必须恰好指定翻译会话或主题 ID。')
-            return connection.request(parseTopicBridgeCommand(topic ? { kind: 'list_topic_terms', topicId: args.topicId } : { kind: 'list_terms', translationSessionId: args.translationSessionId }), exec)
+            return connection.request(parseTopicBridgeCommand(topic ? { kind: 'list_topic_terms', topicId: args.topicId } : { kind: 'list_terms', translationSessionId: args.translationSessionId }, connection.protocol), exec)
           }
-          return connection.request(parseTopicBridgeCommand({ ...args, kind: definition.kind }), exec)
+          return connection.request(parseTopicBridgeCommand({ ...args, kind: definition.kind }, connection.protocol), exec)
         },
       })))
       const materials = this.ctx.get?.('translationMaterials') as TranslationMaterialsService | undefined
@@ -365,7 +378,7 @@ export class TopicToolsService {
         })))
       }
       const preparation = this.ctx.get?.('translationPreparation') as TranslationPreparationService | undefined
-      if (preparation && connection.protocol === 2) {
+      if (preparation && connection.protocol >= 2) {
         const range = { type: 'object', additionalProperties: false, properties: { start: { type: 'integer', required: true }, end: { type: 'integer', required: true } } }
         const reference = { oneOf: [
           { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['candidate'], required: true }, id: { type: 'string', required: true }, version: { type: 'integer', enum: [1], required: true } } },
@@ -382,7 +395,7 @@ export class TopicToolsService {
               descriptionRef: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, version: { type: 'integer', enum: [1], required: true } } },
               content: { type: 'object', additionalProperties: false, properties: { original: { type: 'string', required: true }, preferred: { type: 'string', required: true }, description: { type: 'string' } } },
             } } },
-            reviewedRanges: { type: 'array', items: range, required: true }, backgroundRanges: { type: 'array', items: range },
+            reviewedRanges: { type: 'array', items: range, required: true }, referenceContextRef:{type:'object',additionalProperties:false,properties:{id:{type:'string',required:true},version:{type:'integer',enum:[1],required:true}}}, backgroundRanges: { type: 'array', items: range },
             referenceRefs: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, version: { type: 'integer', required: true }, range: { ...range, required: true } } } },
             questions: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, question: { type: 'string', required: true }, ranges: { type: 'array', items: range, required: true }, decision: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true } } } } },
             description: 'Append an immutable task preparation version using exact candidate or topic-term references and source ranges. Query candidates/conflicts first; preserve homonymous meanings by assigning nonoverlapping contexts. Client freezes actual selected translations and descriptions and enforces current user-fixed rules. Candidate content can adjust task wording only while retaining the exact original candidate spelling. organizedRequirements supplements frozen userRequirements from the delivered material and cannot replace them. Adoption is task-local and does not edit permanent topic terminology. reviewedRanges records the main model review independently from mechanical scan coverage. backgroundRanges references only fixed source context. External referenceRefs must be empty until an authorized reference registry is implemented. preparationReady means preparation gates passed; executionReady remains false because plan and call budget are pending.' },
@@ -404,7 +417,7 @@ export class TopicToolsService {
         })))
       }
       const planning = this.ctx.get?.('translationPlanning') as DocumentPlanningService | undefined
-      if (planning && connection.protocol === 2) {
+      if (planning && connection.protocol >= 2) {
         const range = { type: 'object', additionalProperties: false, properties: { start: { type: 'integer', required: true }, end: { type: 'integer', required: true } } }
         const common = { target: { required: true, oneOf: [materialTargetParameter, unitTargetParameter] } }
         const preparationRef = { type: 'object', additionalProperties: false, required: true, properties: { id: { type: 'string', required: true }, version: { type: 'integer', required: true } } }
@@ -431,8 +444,8 @@ export class TopicToolsService {
       }
       const batch = this.ctx.get?.('translationBatch') as DocumentExecutionService | undefined
       const review = this.ctx.get?.('translationReview') as DocumentReviewService | undefined
-      if (review && connection.protocol === 2) disposers.push(...registerDocumentReviewTools(review, this, agent, options => helpers.defineTool(options)))
-      if (batch && connection.protocol === 2) {
+      if (review && connection.protocol >= 2) disposers.push(...registerDocumentReviewTools(review, this, agent, options => helpers.defineTool(options)))
+      if (batch && connection.protocol >= 2) {
         const reference = { type: 'object', additionalProperties: false, required: true, properties: { id: { type: 'string', required: true }, version: { type: 'integer', required: true } } }
         const scope = { type: 'object', additionalProperties: false, required: true, properties: {
           ownerId: { type: 'string', required: true }, mainSessionId: { type: 'string', required: true }, topicId: { type: 'string', required: true }, translationSessionId: { type: 'string', required: true },
@@ -469,7 +482,7 @@ export class TopicToolsService {
         parameters: {
           target: { required: true, oneOf: [materialTargetParameter, unitTargetParameter] },
           operationId: { type: 'string', required: true }, organizedRequirements: { type: 'string', required: true },
-          termReferences: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
+          referenceContextRef: {type:'object',additionalProperties:false,properties:{id:{type:'string',required:true},version:{type:'integer',enum:[1],required:true}}}, termReferences: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: {
             id: { type: 'string', required: true }, entryVersion: { type: 'integer', required: true },
           } } },
         },
@@ -489,6 +502,8 @@ export class TopicToolsService {
           return normal.correctSource(parseNormalTranslationSourceCorrection(args), exec)
         },
       })))
+      const references = this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined
+      if (references && connection.protocol === 3) disposers.push(...registerReferenceTools(references, this, agent, options => helpers.defineTool(options)))
       return disposers
     } catch (error) { disposers.forEach(dispose => dispose()); throw error }
   }

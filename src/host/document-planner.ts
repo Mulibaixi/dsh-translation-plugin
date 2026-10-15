@@ -1,3 +1,4 @@
+import type { FrozenReferenceContext } from '../shared/reference-memory.js'
 import type { ModelSelection } from '../shared/contracts.js'
 import { parseDocumentChunkPlan, type ChunkPlanItem, type DocumentChunkPlan, type VersionReference, type DocumentSourceVersion, type DocumentExecutionBaseline } from '../shared/translation-batch.js'
 import {
@@ -18,6 +19,7 @@ export interface DocumentPlanningInput {
   readonly restoredSource?: DocumentSourceVersion
   readonly maxInputChars?: number
   readonly preparation: PreparationSnapshot
+  readonly referenceContext?: FrozenReferenceContext
   readonly analysis: { readonly analysisId: string; readonly version: number; readonly actualCalls: number }
   readonly readSource: (range: TranslationSourceRange) => string | Promise<string>
   readonly isCurrent: () => boolean
@@ -166,7 +168,8 @@ export class DocumentPlanner {
     return { points: Array.from(text), bytes: bytes.byteLength }
   }
   private budget(preparation: PreparationSnapshot, item: ChunkPlanItem, points: readonly string[], capacity: DocumentPreparedCapacity,
-    maximum: number, protectedRanges: readonly TranslationSourceRange[] = []): { readonly budget: DocumentChunkBudget; readonly prompt: DocumentTranslationPrompt | null } {
+    maximum: number, protectedRanges: readonly TranslationSourceRange[] = [], references?: FrozenReferenceContext): { readonly budget: DocumentChunkBudget; readonly prompt: DocumentTranslationPrompt | null } {
+    if(preparation.referenceContextRef && (!references || !same(references.manifestRef,preparation.referenceContextRef) || references.scope.topicId!==preparation.scope.topicId || references.scope.ownerId!==preparation.scope.ownerId))throw reject('reference_context_unavailable','准确的参考上下文不可用，不能省略后执行。')
     const contextRef = { preparationRef: { id: preparation.id, version: preparation.version }, termRefs: [], referenceRefs: [], contextRanges: [], supplementRefs: [] }
     if (item.mode === 'copy') return { budget: { chunkId: item.chunkId, mode: 'copy', outputCodePoints: item.outputRange.end - item.outputRange.start,
       inputTokens: 0, countKind: 'estimated', outputReservationTokens: 0, contextWindow: capacity.contextWindow, maxOutputTokens: capacity.maxOutputTokens, contextRef }, prompt: null }
@@ -178,7 +181,7 @@ export class DocumentPlanner {
     const actualRef = { ...contextRef, termRefs, contextRanges: contexts, referenceRefs: preparation.referenceRefs }
     const outputText = points.slice(item.outputRange.start, item.outputRange.end).join('')
     const prompt = reconstructDocumentTranslationPrompt(preparation, item, outputText,
-      contexts.map(range => ({ range, text: points.slice(range.start, range.end).join('') })), actualRef, protectedRanges)
+      contexts.map(range => ({ range, text: points.slice(range.start, range.end).join('') })), actualRef, protectedRanges, references)
     const bytes = new TextEncoder().encode(prompt.systemPrompt + prompt.userMessage).byteLength
     if (bytes > MAX_DOCUMENT_PLAN_PACKET_BYTES) throw reject('input_package_limit', `块 ${item.chunkId} 的完整提示、用词与背景超过 196608 字节；请细分或调整背景。`)
     const inputTokens = bytes + 16, outputEstimate = Math.max(1, new TextEncoder().encode(outputText).byteLength)
@@ -245,7 +248,7 @@ export class DocumentPlanner {
         for (const part of partitions) {
           if (part.mode === 'copy') {
             const item: ChunkPlanItem = { chunkId: `suggested-${items.length + 1}`, outputRange: part.range, mode: 'copy', contextRanges: [] }
-            items.push({ item, boundary: 'excluded_copy', budget: this.budget(preparation, item, source.points, capacity, inputLimit(input)).budget })
+            items.push({ item, boundary: 'excluded_copy', budget: this.budget(preparation, item, source.points, capacity, inputLimit(input), [], input.referenceContext).budget })
             continue
           }
           let start = part.range.start
@@ -257,7 +260,7 @@ export class DocumentPlanner {
             let item: ChunkPlanItem, budget: DocumentChunkBudget
             for (;;) {
               item = { chunkId: `suggested-${items.length + 1}`, outputRange: { start, end }, mode: 'translate', contextRanges: [] }
-              try { budget = this.budget(preparation, item, source.points, capacity, inputLimit(input)).budget; break }
+              try { budget = this.budget(preparation, item, source.points, capacity, inputLimit(input), [], input.referenceContext).budget; break }
               catch (error) {
                 if (end - start <= 1 || !['context_capacity', 'output_capacity', 'input_package_limit', 'term_range_budget'].includes((error as { code?: string }).code ?? '')) throw error
                 const reduced = start + Math.max(1, Math.floor((end - start) * 0.75))
@@ -317,7 +320,7 @@ export class DocumentPlanner {
       this.validatePlan(preparation, plan, protectedRanges)
       const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
       const budgets = plan.items.map(item => {
-        try { return this.budget(preparation, item, source.points, capacity, inputLimit(input), protectedRanges).budget }
+        try { return this.budget(preparation, item, source.points, capacity, inputLimit(input), protectedRanges, input.referenceContext).budget }
         catch (error) {
           const protection = item.mode === 'translate' ? protectedRanges.find(range => overlap(range, item.outputRange)) : undefined
           if (protection && ['single_input_limit', 'context_capacity', 'output_capacity', 'input_package_limit'].includes((error as { code?: string }).code ?? '')) {
@@ -363,7 +366,7 @@ export class DocumentPlanner {
       const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
       if (!same(capacity.route, record.receipt.capacity.route)) throw reject('model_mismatch', '实际默认推理等级或路由已变化，请重新准备并规划。', 'freeze_document')
       const budgets = record.plan.items.map(item => this.budget(preparation, item, source.points, capacity,
-        inputLimit(input), record.protectedRanges).budget)
+        inputLimit(input), record.protectedRanges, input.referenceContext).budget)
       return ok(frozen({ target: record.target, sourceSha256: record.sourceSha256,
         plan: { ...record.plan, protectedRanges: record.protectedRanges },
         preparation: frozen(structuredClone(preparation)), protectedRanges: record.protectedRanges, budgets, capacity,
@@ -391,7 +394,7 @@ export class DocumentPlanner {
       const source = await this.source(input, preparation, signal)
       const capacity = await this.adapter.prepareDocumentCapacity(preparedId, model(baseline.route), signal)
       if (!same(capacity.route, baseline.route)) throw reject('model_mismatch', '实际模型路由与已保存默认推理等级不一致，请明确更新准备与规划。', 'restore_document')
-      const budgets = plan.items.map(item => this.budget(preparation, item, source.points, capacity, inputLimit(input), protectedRanges).budget)
+      const budgets = plan.items.map(item => this.budget(preparation, item, source.points, capacity, inputLimit(input), protectedRanges, input.referenceContext).budget)
       if (!same(budgets.map(item => ({ chunkId: item.chunkId, contextRef: item.contextRef })), baseline.contextBindings)) throw reject('context_mismatch', '已保存调用上下文无法按确切准备和计划重建。', 'restore_document')
       return ok(frozen({ target: preparation.target, sourceSha256: preparation.sourceSha256, plan, preparation, protectedRanges, budgets, capacity,
         callBudget: callBudget(baseline.analysisActualCalls, plan.items) }))
@@ -406,7 +409,7 @@ export class DocumentPlanner {
       const source = await this.source(input, snapshot.preparation, signal)
       const capacity = await this.adapter.prepareDocumentCapacity(preparedId, model(route), signal)
       if (capacity.route.provider !== route.provider || capacity.route.model !== route.model || route.reasoningEffort !== undefined && route.reasoningEffort !== capacity.route.reasoningEffort) throw reject('model_mismatch', '明确新模型与实际准备路由不一致。', 'update_document')
-      const budgets = snapshot.plan.items.map(item => this.budget(snapshot.preparation, item, source.points, capacity, inputLimit(input), snapshot.protectedRanges).budget)
+      const budgets = snapshot.plan.items.map(item => this.budget(snapshot.preparation, item, source.points, capacity, inputLimit(input), snapshot.protectedRanges, input.referenceContext).budget)
       return ok(frozen({ ...snapshot, capacity, budgets }))
     } catch (error) { return errorResult(error) }
     finally { this.adapter.discard(preparedId) }
@@ -420,7 +423,7 @@ export class DocumentPlanner {
       signal.throwIfAborted()
       if (!input.isCurrent()) throw reject('scope_mismatch', '整篇原会话或源授权已失效。', 'prepare_document')
       const points = frozenSource ?? (await this.source(input, snapshot.preparation, signal)).points
-      const assembled = this.budget(snapshot.preparation, item, points, capacity, inputLimit(input), snapshot.protectedRanges)
+      const assembled = this.budget(snapshot.preparation, item, points, capacity, inputLimit(input), snapshot.protectedRanges, input.referenceContext)
       const expected = snapshot.budgets.find(item => item.chunkId === chunkId)
       if (!expected || !same(assembled.budget.contextRef, expected.contextRef)) throw reject('context_mismatch', '实际上下文引用与受理时冻结集合不一致。', 'prepare_document')
       return ok(assembled.prompt!)
@@ -445,7 +448,7 @@ export class DocumentPlanner {
       if (!item) return bad('not_found', '未找到计划块。')
       if (item.mode === 'copy') return bad('copy_has_no_call', 'copy 块只引用原稿范围，不存在模型提示或调用记录。')
       const source = await this.source(input, preparation, signal)
-      const assembled = this.budget(preparation, item, source.points, record.receipt.capacity, inputLimit(input), record.protectedRanges)
+      const assembled = this.budget(preparation, item, source.points, record.receipt.capacity, inputLimit(input), record.protectedRanges, input.referenceContext)
       return ok(assembled.prompt!)
     } catch (error) { return errorResult(error) }
   }

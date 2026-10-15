@@ -1,3 +1,5 @@
+import type { ReferenceStore } from './reference-store.js'
+import { ReferenceFilesView } from './reference-view.js'
 import { h, react } from './react.js'
 import { styles } from './view-styles.js'
 import { downloadExport } from './browser-download.js'
@@ -22,6 +24,7 @@ import { useThemeMemoryClearing } from './theme-memory-clearing-view.js'
 
 interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
+  readonly references?: ReferenceStore | undefined
   readonly archive: TopicArchiveStore
   readonly memoryClearing?: ThemeMemoryClearing | undefined
   readonly topics?: TopicBridgeClient | undefined; readonly ownerId: string; readonly topicId: string
@@ -29,7 +32,7 @@ interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps {
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, references, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly onSelectTopic?: ((topicId: string) => void) | undefined
 }): unknown {
@@ -65,6 +68,7 @@ export function MemoryAssetsView({ store, terms, archive, quick, topics, objects
         type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice', key: topic.id, 'data-topic-id': topic.id, 'aria-current': topic.id === selectedTopicId,
         onClick: () => { onSelectTopic(topic.id); setPickerOpen(false); setQuery('') },
       }, topic.name))))) : null,
+    references && topic ? h(ReferenceFilesView,{references,ownerId,topicId:selectedTopicId}) : null,
     store.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null,
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
@@ -93,6 +97,7 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
       const frozen = structuredClone({ terms: terms.getSnapshot(ownerId, topicId), archive: archive.getSnapshot(ownerId, topicId) })
       function availability(snapshot: { readonly ownerId: string; readonly topicId: string; readonly entries: readonly { readonly id: string; readonly evidence: readonly TermEvidenceRef[] }[] }) {
         return snapshot.entries.flatMap(entry => entry.evidence.map((ref, evidenceIndex) => {
+          if (ref.kind === 'reference') return {entryId: entry.id, evidenceIndex, sessionName: null, unitOrder: null, revisionOrder: null, readable: false, sourceLabel:'参考资料：'+ref.referenceId+' / '+ref.segmentId, readability:'not_loaded' as const}
           const candidate = store.getSession(ref.sessionId)
           const session = candidate?.ownerId === ownerId && candidate.topicId === topicId && !store.isSessionDeleted(candidate.id) ? candidate : undefined
           const unit = session ? store.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined

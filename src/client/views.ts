@@ -1,3 +1,4 @@
+import { LocalDataClearView, type LocalDataClient } from './local-data.js'
 import { styles } from './view-styles.js'
 import { h, react } from './react.js'
 import { ModelPicker } from './model-picker.js'
@@ -775,43 +776,7 @@ function DeleteDialog({ request, onCancel, onConfirm, onTermsChange, sessionDele
     h('div', { className: 'dsh-tp-actions' }, button(pending ? '正在删除…' : sessionDeletion ? '确认删除会话' : '确认删除历史', onConfirm, pending), button('取消', onCancel, pending)),
   )
 }
-function HistorySection({ store, terms }: StoreProps & { readonly terms?: TopicMemoryStore | undefined }): unknown {
-  useStore(store)
-  const [selected, setSelected] = react.useState<readonly string[]>([])
-  const [request, setRequest] = react.useState<DeleteRequest | undefined>(undefined)
-  const action = useAsyncAction()
-  const history = store.getHistory()
-  const selectedIds = selected.filter(id => history.some(session => session.id === id))
-  function choose(title: string, ids: readonly string[], all = false): void {
-    setRequest(captureDeleteRequest(store, terms, title, ids, all ? store.getUnreadableHistory() : []))
-  }
-  return h('div', null,
-    h('div', { className: 'dsh-tp-actions' },
-      button('清除历史快译', () => choose('清除历史快译', history.filter(session => session.mode === 'quick').map(session => session.id)), action.pending || !history.some(session => session.mode === 'quick')),
-      button('清除所有会话历史', () => choose('清除所有会话历史', history.map(session => session.id), true), action.pending),
-    ),
-    h('div', { className: 'dsh-tp-history-list', 'aria-label': '已保存会话历史' },
-      history.length === 0 ? h('p', { className: 'dsh-tp-muted' }, '尚无已保存的会话历史。') : null,
-      ...history.map(session => h('label', { key: session.id, className: 'dsh-tp-history-row', title: sessionTitle(session) },
-        h('input', { type: 'checkbox', checked: selectedIds.includes(session.id), disabled: action.pending, 'aria-label': `选择会话 ${session.name}`, onChange: (event: CheckEvent) => {
-          const checked = event.currentTarget.checked
-          setSelected(current => checked ? [...new Set([...current, session.id])] : current.filter(id => id !== session.id))
-        } }),
-      h('span', null, session.name,
-        session.remark ? h('div', { className: 'dsh-tp-muted' }, session.remark) : null,
-        h('div', { className: 'dsh-tp-muted' }, `${session.mode === 'quick' ? '快译' : '普通'} · ${session.targetLanguage} · ${session.updatedAt.slice(0, 10)}${session.archivedAt ? ' · 已归档' : ''}`)),
-      )),
-    ),
-    button(`删除所选历史（${selectedIds.length}）`, () => choose('删除所选历史', selectedIds), action.pending || selectedIds.length === 0),
-    request ? h(DeleteDialog, { request, pending: action.pending, onCancel: () => setRequest(undefined), onConfirm: () => {
-        void action.run(() => deleteConfirmed(store, terms, request), () => { setSelected([]); setRequest(currentRequest => currentRequest === request ? undefined : currentRequest) })
-      }, onTermsChange: (checked: boolean) => setRequest(currentRequest => currentRequest === request ? { ...request, includeTerms: checked } : currentRequest) }) : null,
-    action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
-    terms?.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, terms.getNotice()) : null,
-  )
-}
-
-export function SettingsView({ store, onClose, terms }: StoreProps & { readonly onClose?: (() => void) | undefined; readonly terms?: TopicMemoryStore | undefined }): unknown {
+export function SettingsView({ store, onClose, terms, localData }: StoreProps & { readonly onClose?: (() => void) | undefined; readonly terms?: TopicMemoryStore | undefined; readonly localData?: LocalDataClient | undefined }): unknown {
   useStore(store)
   const [pending, setPending] = react.useState<Partial<Omit<SessionSettings, 'schemaVersion'>>>({})
   const [errors, setErrors] = react.useState<readonly string[]>([])
@@ -873,9 +838,10 @@ export function SettingsView({ store, onClose, terms }: StoreProps & { readonly 
       h('p', { className: 'dsh-tp-muted' }, '模型与推理等级选择独立保存在此设备，不受此开关影响。开启后自动保存主题名称、会话配置和当前原文草稿，以及已受理的原文、各版译文与定稿选择，数据以明文保存在此设备。已保存的历史保留；关闭后的后续内容仅保留在本次运行。'),
       h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
       store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
-      h(HistorySection, { store, terms }),
+
     ),
-    h(StorageUsageView, { store }),
+    localData ? h(LocalDataClearView, {data:localData}) : null,
+    h(StorageUsageView, { store, localData }),
     errors.length ? h('div', { role: 'alert', className: 'dsh-tp-message' }, ...errors.map(error => h('p', { key: error }, error))) : null,
     storeNotice(store),
     Object.keys(pending).length && !errors.length && !saving ? button('重试保存失败的修改', () => change({})) : null,

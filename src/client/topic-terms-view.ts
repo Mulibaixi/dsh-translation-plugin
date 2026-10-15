@@ -1,5 +1,6 @@
+import { ReferenceEvidenceView } from './reference-view.js'
 import { h, react } from './react.js'
-import { resolveTermEvidence, type TopicTermSnapshot, type TopicTerm, type TopicTermUserInput, type TermMutationResult, type TermEvidenceRef, type TermEvidenceFact } from '../memory/topic-terms.js'
+import { resolveTermEvidence, type TopicTermSnapshot, type TopicTerm, type TopicTermUserInput, type TermMutationResult, type TermEvidenceRef, type UnitEvidenceRef, type TermEvidenceFact } from '../memory/topic-terms.js'
 import type { SessionStore, HistoryStatus } from './session-store.js'
 import { isTextUnit } from './translation-history.js'
 import { isDocumentEvidenceUnloaded } from './document-evidence.js'
@@ -10,6 +11,7 @@ import type { EvidenceReadResult } from '../shared/translation-evidence.js'
 export interface TopicTermsViewPort {
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot
   subscribe(listener: () => void): () => void
+  readReferenceAsync?(ownerId:string,topicId:string,ref:import('../shared/reference-memory.js').ReferenceEvidenceRef):Promise<import('../shared/reference-memory.js').ReferenceText|undefined>
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined
   readEvidenceAsync?(ownerId: string, topicId: string, reference: TermEvidenceRef): Promise<EvidenceReadResult>
   getNotice(): string | undefined
@@ -20,15 +22,15 @@ export interface TopicTermsViewPort {
     command: { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }): Promise<TermMutationResult>
 }
 const labels = { proposal: '待确认', active: '生效', conflict: '有冲突', review_required: '待复核', disabled: '已停用' } as const
-const origins = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
+const origins = { inferred: '模型提案', source_checked: '原文依据', reference_derived: '参考资料（主模型解读）', user_explicit: '用户采用' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突', error: '保存失败' } as const
 function evidenceBody(terms: TopicTermsViewPort, snapshot: TopicTermSnapshot, ref: TermEvidenceRef): string | undefined {
   return resolveTermEvidence(snapshot, ref, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
 }
 /** The same precise reference viewer is shared by terminology and structured archives. */
-export function TopicEvidenceView({ sessions, terms, snapshot, reference, active = true, contextKey = '' }: {
+function UnitEvidenceView({ sessions, terms, snapshot, reference, active = true, contextKey = '' }: {
   readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly snapshot: { readonly ownerId: string; readonly topicId: string }
-  readonly reference: TermEvidenceRef; readonly active?: boolean; readonly contextKey?: string
+  readonly reference: UnitEvidenceRef; readonly active?: boolean; readonly contextKey?: string
 }): unknown {
   const [open, setOpen] = react.useState(false)
   const [loaded, setLoaded] = react.useState<{ readonly key: string; readonly result: EvidenceReadResult } | undefined>(undefined)
@@ -184,6 +186,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
         topicName: sessions.getTopics(ownerId).find(topic => topic.id === topicId)?.name ?? topicName,
         snapshot: frozen, exportedAt: new Date().toISOString(), rememberHistory: sessions.getSettings().rememberHistory, storageStatus: terms.getStatus(ownerId, topicId),
         evidenceAvailability: frozen.entries.flatMap(entry => entry.evidence.map((ref, evidenceIndex) => {
+          if (ref.kind === 'reference') return {entryId: entry.id, evidenceIndex, sessionName: null, unitOrder: null, revisionOrder: null, readable: false, sourceLabel:'参考资料：'+ref.referenceId+' / '+ref.segmentId, readability:'not_loaded' as const}
           const candidate = sessions.getSession(ref.sessionId)
           const session = candidate?.ownerId === ownerId && candidate.topicId === topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
           const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined
@@ -265,4 +268,8 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
       }) } }, pending ? '正在删除…' : '确认删除术语'), h('button', { type: 'button', disabled: pending, onClick: () => setDeletion(undefined) }, '取消')),
     ) : null,
   )
+}
+
+export function TopicEvidenceView(props: { readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly snapshot: {readonly ownerId: string; readonly topicId: string}; readonly reference: TermEvidenceRef; readonly active?: boolean; readonly contextKey?: string }): unknown {
+  return props.reference.kind === 'reference' ? h(ReferenceEvidenceView, {reference:props.reference,active:props.active,read:props.terms.readReferenceAsync ? ()=>props.terms.readReferenceAsync!(props.snapshot.ownerId,props.snapshot.topicId,props.reference as import('../shared/reference-memory.js').ReferenceEvidenceRef) : undefined}) : h(UnitEvidenceView, props)
 }

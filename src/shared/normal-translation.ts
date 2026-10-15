@@ -1,5 +1,6 @@
+import { parseReferenceContextRef, type ReferenceContextRef } from './reference-memory.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
-import { parseTranslationCallMetadata, type TranslationCallMetadata } from './translation-call.js'
+import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type TranslationCallMetadata } from './translation-call.js'
 
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
 export interface NormalTranslationMaterialTarget {
@@ -41,12 +42,14 @@ export interface NormalTranslationExecute {
   readonly operationId: string
   readonly organizedRequirements: string
   readonly termReferences: readonly NormalTranslationTermReference[]
+  readonly referenceContextRef?: ReferenceContextRef
 }
 export interface NormalTranslationAcceptance {
   readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>
   readonly operationId: string
   readonly organizedRequirements: string
   readonly termReferences: readonly NormalTranslationTermReference[]
+  readonly referenceContextRef?: ReferenceContextRef
 }
 export interface NormalTranslationOperation {
   readonly operationId: string
@@ -145,17 +148,17 @@ function references(value: unknown): asserts value is readonly NormalTranslation
   }
 }
 export function parseNormalTranslationExecute(value: unknown): NormalTranslationExecute {
-  object(value); exact(value, ['target', 'operationId', 'organizedRequirements', 'termReferences'])
+  object(value); exact(value, ['target', 'operationId', 'organizedRequirements', 'termReferences', ...(Object.hasOwn(value,'referenceContextRef') ? ['referenceContextRef'] : [])])
   const target = parseNormalTranslationTarget(value.target)
   text(value.operationId); text(value.organizedRequirements, 4000, true); references(value.termReferences)
-  return { target, operationId: value.operationId, organizedRequirements: value.organizedRequirements, termReferences: structuredClone(value.termReferences) }
+  return { target, operationId: value.operationId, organizedRequirements: value.organizedRequirements, termReferences: structuredClone(value.termReferences), ...(value.referenceContextRef === undefined ? {} : {referenceContextRef: parseReferenceContextRef(value.referenceContextRef)}) }
 }
 export function parseNormalTranslationAcceptance(value: unknown): NormalTranslationAcceptance {
-  object(value); exact(value, ['envelope', 'operationId', 'organizedRequirements', 'termReferences'])
+  object(value); exact(value, ['envelope', 'operationId', 'organizedRequirements', 'termReferences', ...(Object.hasOwn(value,'referenceContextRef') ? ['referenceContextRef'] : [])])
   const envelope = parseTranslationMaterialEnvelope(value.envelope)
   if (envelope.kind !== 'material') throw new TypeError('Normal translation requires material')
   text(value.operationId); text(value.organizedRequirements, 4000, true); references(value.termReferences)
-  return { envelope, operationId: value.operationId, organizedRequirements: value.organizedRequirements, termReferences: structuredClone(value.termReferences) }
+  return { envelope, operationId: value.operationId, organizedRequirements: value.organizedRequirements, termReferences: structuredClone(value.termReferences), ...(value.referenceContextRef === undefined ? {} : {referenceContextRef: parseReferenceContextRef(value.referenceContextRef)}) }
 }
 export function parseNormalTranslationOperation(value: unknown): NormalTranslationOperation {
   object(value); exact(value, ['operationId', 'mainSessionId', 'topicId', 'translationSessionId', 'materialId', 'unitId', 'sourceVersion', 'draftVersion', 'status', 'persistence'])
@@ -182,7 +185,7 @@ export function parseNormalTranslationUpdate(value: unknown): NormalTranslationU
   if (!['running', 'completed', 'failed', 'cancelled', 'unknown'].includes(value.status as string)) throw new TypeError('Invalid normal translation update state')
   const metadata = value.metadata === null ? null : parseTranslationCallMetadata(value.metadata)
   if (value.callId === null && (value.status === 'running' || value.status === 'completed' || value.textDelta !== '' || metadata !== null)) throw new TypeError('Unstarted operation cannot contain a model revision')
-  if (metadata && metadata.promptVersion !== 'normal-text-v1') throw new TypeError('Normal translation requires its own prompt')
+  if (metadata && !isNormalTranslationPromptVersion(metadata.promptVersion)) throw new TypeError('Normal translation requires its own prompt')
   const error = value.error === null ? null : parseError(value.error)
   return { ...structuredClone(value), metadata, error } as unknown as NormalTranslationUpdate
 }

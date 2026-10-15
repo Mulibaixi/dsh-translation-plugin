@@ -31,7 +31,7 @@ export interface PreparationStoreOptions {
 }
 interface Operation { readonly signature: string; readonly version: number }
 interface StoredPreparation {
-  readonly schemaVersion: 1
+  readonly schemaVersion: 1 | 2
   readonly cursorToken: string
   readonly prepareSignature: string
   readonly candidateCount: number
@@ -192,7 +192,7 @@ export class PreparationStore {
   private commit(storageKey: string, seat: Seat, snapshot: PreparationSnapshot, signature: string, prepareSignature: string, candidateCount: number): Seat {
     const operationKey = snapshot.operationId, operations = { ...seat.audit.operations, [operationKey]: { signature, version: snapshot.version } }
     const versions = [...seat.audit.versions, snapshot]
-    let audit: StoredPreparation = { schemaVersion: 1, cursorToken: seat.audit.cursorToken, prepareSignature, candidateCount, versions, operations }, stored = seat.stored
+    let audit: StoredPreparation = { schemaVersion: 2, cursorToken: seat.audit.cursorToken, prepareSignature, candidateCount, versions, operations }, stored = seat.stored
     const enabled = this.options.isEnabled?.() ?? true
     if (enabled && this.options.storage && this.options.withLock) {
       try {
@@ -299,7 +299,7 @@ export class PreparationStore {
     // An adopted conflicting spelling never replaces a user-fixed rule, even in an incomplete draft.
     if (conflicts.some(item => item.code === 'fixed_conflict')) return bad('fixed_conflict', '任务采用与用户固定译法或禁用译法冲突；请分配不重叠语义范围并保留固定条目。')
     const reviewedComplete = covers(request.reviewedRanges, required), at = now()
-    const snapshot: PreparationSnapshot = { ...latest, version: latest.version + 1, organizedRequirements: request.organizedRequirements,
+    const snapshot: PreparationSnapshot = { ...latest, schemaVersion: 2, ...(request.referenceContextRef ? {referenceContextRef:request.referenceContextRef} : {}), version: latest.version + 1, organizedRequirements: request.organizedRequirements,
       modelReview: { meaning: 'main_model_declared_review', reviewedRanges: request.reviewedRanges, complete: reviewedComplete },
       terms, backgroundRanges: request.backgroundRanges ?? [], referenceRefs: [], questions: request.questions ?? [], conflicts,
       preparationReady: latest.mechanicalCoverage.complete && reviewedComplete && conflicts.length === 0,
@@ -385,7 +385,7 @@ export class PreparationStore {
     const complete = covers(request.reviewedRanges, required) && conflicts.length === 0
     const original = seat.audit.versions[0]!, analysisBasis = latest.correctionReview?.analysisBasis ?? { sourceVersion: original.sourceVersion, sourceSha256: original.sourceSha256, totalCodePoints: original.totalCodePoints,
       actualCalls: seat.catalog?.analysis.run.actualCalls ?? facts.analysisActualCalls }
-    const snapshot: PreparationSnapshot = { ...latest, version: latest.version + 1, target: request.target, sourceVersion: facts.sourceVersion, sourceSha256: facts.sourceSha256, totalCodePoints: facts.totalCodePoints,
+    const snapshot: PreparationSnapshot = { ...latest, schemaVersion: 2, ...(request.referenceContextRef ? {referenceContextRef:request.referenceContextRef} : {}), version: latest.version + 1, target: request.target, sourceVersion: facts.sourceVersion, sourceSha256: facts.sourceSha256, totalCodePoints: facts.totalCodePoints,
       organizedRequirements: request.organizedRequirements, modelReview: { meaning: 'main_model_declared_review', reviewedRanges: request.reviewedRanges, complete: covers(request.reviewedRanges, required) },
       correctionReview: { meaning: 'main_model_correction_review', previousPreparationRef: { id: latest.id, version: latest.version }, correctionOperationId: facts.correctionOperationId, basis: request.basis,
         analysisBasis, requiredRanges: required, excludedRanges: excluded, fixedTermVersions: fixedBinding(facts.topicTerms, latest.targetLanguage),
@@ -529,6 +529,7 @@ export class PreparationStore {
         targetLanguage: snapshot.targetLanguage, mechanicalCoverageComplete: snapshot.mechanicalCoverage.complete, mainModelReviewComplete: snapshot.modelReview.complete,
         preparationReady: snapshot.preparationReady, executionReady: false, executionGate: 'plan_and_budget_pending',
         coverageMeaning: snapshot.mechanicalCoverage.meaning, reviewMeaning: snapshot.modelReview.meaning,
+        ...(snapshot.referenceContextRef ? {referenceContextRef:snapshot.referenceContextRef} : {}),
         ...(snapshot.correctionReview ? { analysisSourceVersion: snapshot.correctionReview.analysisBasis.sourceVersion, correctionReviewComplete: snapshot.correctionReview.complete } : {}) }]
       case 'candidates': return seat.catalog!.candidates.flatMap(candidate => [
         { kind: 'candidate', id: candidate.id, version: candidate.version, original: candidate.original, preferred: candidate.preferred,
@@ -565,7 +566,8 @@ export class PreparationStore {
     const input = JSON.parse(raw) as StoredPreparation
     if (!input || typeof input !== 'object' || Object.keys(input).length !== 6 || !['schemaVersion', 'cursorToken', 'prepareSignature', 'candidateCount', 'versions', 'operations'].every(field => Object.hasOwn(input, field))) throw new TypeError('Unexpected preparation audit fields')
     const audit = { ...input, versions: input.versions.map(parsePreparationSnapshot) }
-    if (!audit || audit.schemaVersion !== 1 || typeof audit.cursorToken !== 'string' || !/^[0-9a-f-]{36}$/u.test(audit.cursorToken) || typeof audit.prepareSignature !== 'string' || !Number.isSafeInteger(audit.candidateCount) || audit.candidateCount < 0 || !Array.isArray(audit.versions) || !audit.versions.length || !audit.operations || typeof audit.operations !== 'object' || Array.isArray(audit.operations)) throw new TypeError('Invalid preparation audit')
+    if (!audit || ![1, 2].includes(audit.schemaVersion) || typeof audit.cursorToken !== 'string' || !/^[0-9a-f-]{36}$/u.test(audit.cursorToken) || typeof audit.prepareSignature !== 'string' || !Number.isSafeInteger(audit.candidateCount) || audit.candidateCount < 0 || !Array.isArray(audit.versions) || !audit.versions.length || !audit.operations || typeof audit.operations !== 'object' || Array.isArray(audit.operations)) throw new TypeError('Invalid preparation audit')
+    if (audit.schemaVersion === 1 && audit.versions.some(version => version.referenceContextRef)) throw new TypeError('Reference context requires preparation audit version 2')
     const first = audit.versions[0]!
     for (const [index, snapshot] of audit.versions.entries()) {
       if (snapshot.version !== index + 1 || snapshot.id !== first.id || !same(snapshot.scope, first.scope) || !same(snapshot.route, first.route) || snapshot.targetLanguage !== first.targetLanguage || snapshot.userRequirements !== first.userRequirements || !same(snapshot.mechanicalCoverage, first.mechanicalCoverage) || snapshot.storage !== 'saved') throw new TypeError('Invalid preparation audit version')

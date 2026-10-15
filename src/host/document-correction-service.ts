@@ -21,7 +21,7 @@ export class DocumentCorrectionService {
   private get sources(): TranslationSourcesService { return this.ctx.get?.('translationSources') as TranslationSourcesService }
   async captureUnit(target: NormalTranslationUnitTarget, preparationRef: VersionReference | undefined, exec: ToolExecution,
     options: { readonly requireReady?: boolean; readonly revisionIds?: readonly string[]; readonly metadataOnly?: boolean } = {}): Promise<AnalysisResult<CapturedDocumentSource>> {
-    if (!this.topics?.ownsAgent(target.mainSessionId, exec.agent) || this.topics.protocolFor(target.mainSessionId) !== 2) return failure('scope_mismatch', '文档读取需要实际主 Agent 和唯一 v2 主题桥。', 'capture_document')
+    if (!this.topics?.ownsAgent(target.mainSessionId, exec.agent) || (this.topics.protocolFor(target.mainSessionId) ?? 0) < 2) return failure('scope_mismatch', '文档读取需要实际主 Agent 和唯一 v2 或更新主题桥。', 'capture_document')
     try {
       const { metadataOnly, ...captureOptions } = options
       const reply = await this.topics.requestOwned(target.mainSessionId, { kind: 'document_capture', request: { target, ...(preparationRef ? { preparationRef } : {}), ...captureOptions } }, exec)

@@ -1,3 +1,4 @@
+import type { ReferenceFilesService } from './reference-files.js'
 import { parseTranslationBatchExecute, parseTranslationBatchStatus, parseTranslationBatchControl, parseTranslationBatchUpdate, parseDocumentRestoreCapture,
   type TranslationBatchControl, type TranslationBatchUpdate, type DocumentTaskControl, type TranslationBatchExecute,
   type TranslationBatchStatus, type DocumentTaskReceipt, type DocumentTaskEvent, type DocumentBlockRegistration,
@@ -174,7 +175,7 @@ export class DocumentExecutionService {
     let request: TranslationBatchExecute
     try { request = parseTranslationBatchExecute(args) } catch { return failure('invalid_input', '整篇执行参数无效。', 'execute_document') }
     if (this.disposed || !this.topics?.ownsAgent(request.target.mainSessionId, exec.agent)) return failure('scope_mismatch', '整篇执行不属于已连接的实际主 Agent。', 'authorize_document')
-    if (this.topics.protocolFor(request.target.mainSessionId) !== 2) return failure('execution_unavailable', '整篇执行需要唯一主题桥的 v2 连接。', 'authorize_document')
+    if ((this.topics.protocolFor(request.target.mainSessionId) ?? 0) < 2) return failure('execution_unavailable', '整篇执行需要唯一主题桥的 v2 连接。', 'authorize_document')
     const operationKey = key(request.target.mainSessionId, request.operationId), old = this.operations.get(operationKey)
     if (old) return same(old.request, request) ? old.acceptance : failure('idempotency_conflict', '同一整篇操作标识不能更换材料、计划或准备版本。', 'execute_document')
     if (request.target.kind === 'unit') return this.executeUnit(request, exec, exchangeOwner)
@@ -367,10 +368,11 @@ export class DocumentExecutionService {
     const snapshot = job.snapshot!, input = job.input!
     // Freeze the route/preparation, while checking the original Agent/bridge/source at each read.
     const target = job.request.target
-    if (target.kind === 'unit') return { ...input, isCurrent: () => !this.disposed && !job.controller.signal.aborted && this.topics.ownsAgent(job.scope.mainSessionId, job.agent),
+    const referenceCurrent = () => !input.referenceContext || (this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined)?.contextCurrent(input.referenceContext) === true
+    if (target.kind === 'unit') return { ...input, isCurrent: () => referenceCurrent() && !this.disposed && !job.controller.signal.aborted && this.topics.ownsAgent(job.scope.mainSessionId, job.agent),
       readSource: range => { job.controller.signal.throwIfAborted(); return input.readSource(range) } }
     const materials = this.ctx.get?.('translationMaterials') as import('./translation-materials.js').TranslationMaterialsService
-    const isCurrent = () => !this.disposed && !job.controller.signal.aborted && this.topics.ownsAgent(job.scope.mainSessionId, job.agent) && (job.source !== null || materials.deliveredForAgent(target, job.agent).ok)
+    const isCurrent = () => referenceCurrent() && !this.disposed && !job.controller.signal.aborted && this.topics.ownsAgent(job.scope.mainSessionId, job.agent) && (job.source !== null || materials.deliveredForAgent(target, job.agent).ok)
     return { ...input, isCurrent, readSource: range => {
       job.controller.signal.throwIfAborted()
       if (!isCurrent()) throw rejected('scope_mismatch', '整篇原稿授权已失效。', 'read_document_source')
@@ -388,12 +390,22 @@ export class DocumentExecutionService {
   private async run(job: Job): Promise<void> {
     const snapshot = job.snapshot!, input = job.input!
     const workerInput = this.workerInput(job)
+    const checkReferences = async (): Promise<void> => {
+      if (!input.referenceContext) return
+      try {
+        const references = this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined
+        if (!references) throw new Error('参考资料服务不可用。')
+        await references.validateContext(input.referenceContext, this.execution(job))
+      } catch (error) { throw rejected('reference_context_changed', (error as Error).message, 'check_document_reference') }
+    }
     try {
+      await checkReferences()
       const points = await this.planning.planner.readExecutionSource(workerInput, snapshot, job.controller.signal)
       for (const item of snapshot.plan.items) {
         if (job.completed.has(item.chunkId)) continue
         if (job.pauseRequested) { job.status = 'paused'; return }
         job.controller.signal.throwIfAborted()
+        await checkReferences()
         const resume = job.resumeEntry?.registration?.chunkId === item.chunkId ? job.resumeEntry : null
         let internalId = resume?.packet?.operationId ?? `document-worker:${crypto.randomUUID()}`, registration: DocumentBlockRegistration = resume?.registration ?? {
           scope: job.scope, taskId: job.taskId, unitId: job.unitId, chunkId: item.chunkId,
@@ -506,6 +518,15 @@ export class DocumentExecutionService {
       await this.finish(job, 'completed')
     } catch (error) {
       const known = error as { code?: string; message?: string; stage?: string }
+      if (known.code === 'reference_context_changed' && !job.uncertain && !this.disposed) {
+        job.pauseRequested = true
+        job.error = {code:known.code,message:known.message ?? '参考依据已变化，请重新确认上下文后继续。',stage:known.stage ?? 'check_document_reference'}
+        try {
+          await job.writing
+          await this.writeControl(job, {scope:job.scope,taskId:job.taskId,expectedTaskVersion:job.taskVersion,operationId:`reference-pause:${crypto.randomUUID()}`}, 'pause', 'paused')
+          return
+        } catch { job.uncertain = true }
+      }
       job.uncertain ||= ['outcome_unknown', 'invalid_reply', 'scope_mismatch'].includes(known.code ?? '')
       job.status = this.disposed ? 'interrupted' : job.uncertain ? 'unknown' : job.cancelRequested ? 'cancelled' : 'failed'
       job.error = { code: known.code ?? 'document_execution_failed', message: known.message ?? '整篇执行已停止，已完成块及残稿保留。', stage: known.stage ?? 'execute_document' }
@@ -661,12 +682,13 @@ export class DocumentExecutionService {
           if (!read.ok) throw rejected(read.error.code, read.error.message, read.error.stage)
           return read.value.text
         } }
-      const restored = await this.planning.planner.restoreExecution(input, capture.plan, baseline, exec.signal)
+      const referenceInput = await this.planning.attachReferences(input, exec)
+      const restored = await this.planning.planner.restoreExecution(referenceInput, capture.plan, baseline, exec.signal)
       if (!restored.ok) return restored
       const completed = new Set([...capture.chunks.filter(chunk => chunk.status === 'completed').map(chunk => chunk.chunkId), ...(capture.reuseApprovals ?? []).map(approval => approval.chunkId)])
       const job: Job = { scope: request.scope, taskId: request.taskId, unitId: receipt.unitId, request: { target: capture.preparation.target,
         operationId: receipt.operationId, planRef: receipt.planRef, preparationRef: receipt.preparationRef }, agent: exec.agent!, exchangeOwner, controller: new AbortController(), delivery: new AbortController(),
-        facts: [], createdAt: capture.source.createdAt, acceptance: Promise.resolve({ ok: true, value: receipt }), input, snapshot: restored.value, receipt,
+        facts: [], createdAt: capture.source.createdAt, acceptance: Promise.resolve({ ok: true, value: receipt }), input: referenceInput, snapshot: restored.value, receipt,
         status: receipt.status, taskSequence: facts.taskSequence, actualCalls: facts.actualCalls, outputBytes: facts.outputBytes, completedChunks: completed.size, writing: Promise.resolve(),
         error: null, uncertain: false, acceptRequested: true, finishing: false, cleanupRequested: false, taskVersion: facts.taskVersion,
         pauseRequested: true, cancelRequested: false, running: null, completed, source, automaticSupplementCalls: facts.automaticSupplementCalls,
@@ -834,6 +856,7 @@ export class DocumentExecutionService {
     if (available.length && !events.length || documentPlanningBytes({ ok: true, value: view() }) > MAX_DOCUMENT_PLAN_PAGE_BYTES) return failure('reply_too_large', '完整整篇状态单项超过 32768 字节。', 'status_document')
     return { ok: true, value: structuredClone(view()) }
   }
+  hasActiveJobs(): boolean { return [...this.jobs.values()].some(job => !!job.running || job.uncertain || ['running', 'waiting_context', 'waiting_user', 'unknown'].includes(job.status)) }
   dispose(): void {
     this.disposed = true
     for (const registration of this.exchangeRegistrations.values()) { registration.unregister(); registration.unregisterPhase() }

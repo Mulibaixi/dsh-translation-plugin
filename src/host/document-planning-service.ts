@@ -1,3 +1,4 @@
+import type { ReferenceFilesService } from './reference-files.js'
 import {
   parseTranslationPlanSuggest, parseTranslationPlanSet, parseTranslationPlanQuery, parseTranslationPlanRead,
   documentPlanningBytes, MAX_DOCUMENT_PLAN_PAGE_BYTES, type TranslationPlanSuggest, type TranslationPlanSet,
@@ -28,11 +29,11 @@ export class DocumentPlanningService {
   private get materials(): TranslationMaterialsService | undefined { return this.ctx.get?.('translationMaterials') as TranslationMaterialsService | undefined }
   private material(target: NormalTranslationMaterialTarget, exec: ToolExecution): AnalysisResult<Envelope> {
     if (this.disposed || !this.topics?.ownsAgent(target.mainSessionId, exec.agent)) return failure('scope_mismatch', '规划不属于已连接的实际主 Agent。', 'authorize_plan')
-    if (this.topics.protocolFor(target.mainSessionId) !== 2) return failure('planning_unavailable', '规划需要当前唯一主题桥的 v2 连接。', 'authorize_plan')
+    if ((this.topics.protocolFor(target.mainSessionId) ?? 0) < 2) return failure('planning_unavailable', '规划需要当前唯一主题桥的 v2 连接。', 'authorize_plan')
     exec.signal.throwIfAborted()
     return this.materials?.deliveredForAgent(target, exec.agent!) ?? failure('unavailable', '固定材料服务尚未就绪。', 'authorize_plan')
   }
-  private async input(request: Pick<TranslationPlanSuggest, 'target' | 'preparationRef'>, exec: ToolExecution): Promise<AnalysisResult<DocumentPlanningInput>> {
+  private async baseInput(request: Pick<TranslationPlanSuggest, 'target' | 'preparationRef'>, exec: ToolExecution): Promise<AnalysisResult<DocumentPlanningInput>> {
     if (request.target.kind === 'unit') {
       const correction = this.ctx.get?.('translationCorrection') as DocumentCorrectionService
       const captured = await correction.captureUnit(request.target, request.preparationRef, exec, { requireReady: true })
@@ -112,6 +113,20 @@ export class DocumentPlanningService {
       },
     } }
   }
+  async attachReferences(input: DocumentPlanningInput, exec: ToolExecution): Promise<DocumentPlanningInput> {
+    const ref=input.preparation.referenceContextRef
+    if(!ref)return input
+    const service=this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined
+    if(!service)throw rejection('reference_unavailable','参考资料服务不可用，不能省略参考继续执行。','prepare_reference')
+    const context=await service.resolveContext(input.preparation.scope.ownerId,input.preparation.scope.topicId,ref,exec)
+    return {...input,referenceContext:context,isCurrent:()=>input.isCurrent()&&service.contextCurrent(context)}
+  }
+  private async input(request: Pick<TranslationPlanSuggest,'target'|'preparationRef'>, exec: ToolExecution): Promise<AnalysisResult<DocumentPlanningInput>> {
+    const input=await this.baseInput(request,exec)
+    if(!input.ok)return input
+    try{return {ok:true,value:await this.attachReferences(input.value,exec)}}
+    catch(error){return failure(String((error as {code?:string}).code??'reference_unavailable'),(error as Error).message,'prepare_reference')}
+  }
   private bounded<T>(result: AnalysisResult<T>): AnalysisResult<T> {
     return documentPlanningBytes(result) > MAX_DOCUMENT_PLAN_PAGE_BYTES ? failure('reply_too_large', '完整规划回执超过 32768 字节；未截字段。', 'plan_budget') : result
   }
@@ -141,7 +156,7 @@ export class DocumentPlanningService {
   }
   /** Private authorized capture; never registered as a model tool or Remote method. */
   private unitAuthorized(target: NormalTranslationTarget, exec: ToolExecution): AnalysisResult<true> {
-    return !this.disposed && this.topics?.ownsAgent(target.mainSessionId, exec.agent) && this.topics.protocolFor(target.mainSessionId) === 2
+    return !this.disposed && this.topics?.ownsAgent(target.mainSessionId, exec.agent) && (this.topics.protocolFor(target.mainSessionId) ?? 0) >= 2
       ? { ok: true, value: true } : failure('scope_mismatch', '规划不属于当前实际主 Agent。', 'authorize_plan')
   }
   async captureExecution(target: NormalTranslationTarget, planRef: VersionReference, preparationRef: VersionReference,

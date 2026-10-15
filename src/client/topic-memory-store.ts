@@ -1,3 +1,5 @@
+import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
+import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import {
   emptyTopicTerms, decodeTopicTermSnapshot, decodeTopicTermPut, decodeTopicTermUserInput, putTopicTerm, putUserTopicTerm, adoptTopicTerm, disableTopicTerm, reconcileTopicTerms, queryTopicTerms, resolveTermEvidence, topicTermContentsConflict,
   type TopicTermSnapshot, type TopicTermPut, type TopicTermUserInput, type TopicTermUserPut, type TermMutationResult, type TermEvidenceFact, type TopicTermQuery, type TermEvidenceRef,
@@ -6,7 +8,7 @@ import { SessionStore, type LocalStoragePort, type StructureLockPort, type Histo
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
 import { currentFinalRevision, isTextUnit } from './translation-history.js'
-import { isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
+import { cachedTopicEvidence, isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
 import { TranslationSourceReader, type TranslationEvidenceReader } from './source-reader.js'
 import type { EvidenceReadResult } from '../shared/translation-evidence.js'
 import { storageSaveFailureMessage } from './storage-errors.js'
@@ -29,7 +31,7 @@ export type TopicTermCommand = { readonly kind: 'put'; readonly input: TopicTerm
   | { readonly kind: 'user_put'; readonly input: TopicTermUserPut }
   | { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }
 interface Seat { snapshot: TopicTermSnapshot; stored: string | null; dirty: boolean; status: HistoryStatus }
-function browserStorage(): LocalStoragePort | undefined { try { return typeof window === 'undefined' ? undefined : window.localStorage } catch { return undefined } }
+const browserStorage = browserPluginStorage
 function browserLocks(): StructureLockPort | undefined {
   if (typeof navigator === 'undefined' || !navigator.locks) return undefined
   return { request: async <T>(name: string, action: () => T | Promise<T>): Promise<T> => await navigator.locks.request(name, async () => await action()) }
@@ -46,6 +48,8 @@ export class TopicMemoryStore {
   private enabled: boolean
   private notice: string | undefined
   private disposed = false
+  private referenceEvidence: ReferenceEvidencePort | undefined
+  setReferenceEvidence(port: ReferenceEvidencePort): void { this.referenceEvidence = port }
   private evidenceReader: TranslationEvidenceReader | undefined
 
   constructor(private readonly sessions: SessionStore, private readonly storage: LocalStoragePort | undefined = browserStorage(),
@@ -55,7 +59,7 @@ export class TopicMemoryStore {
     this.stopSession = sessions.subscribe(() => this.sessionChanged())
     if (listen) this.stopStorage = listen(key => this.externalChange(key))
     else if (typeof window !== 'undefined' && storage) {
-      const onChange = (event: StorageEvent): void => { if (event.storageArea === storage) this.externalChange(event.key) }
+      const onChange = (event: StorageEvent): void => { if (isPluginStorageEvent(event, storage)) this.externalChange(event.key) }
       window.addEventListener('storage', onChange); this.stopStorage = () => window.removeEventListener('storage', onChange)
     }
   }
@@ -115,6 +119,7 @@ export class TopicMemoryStore {
     try { return await reader.read(captured) }
     catch { return { status: 'unloaded', request: captured, reason: 'transport_unavailable' } }
   }
+  readReferenceAsync(ownerId:string,topicId:string,ref:import('../shared/reference-memory.js').ReferenceEvidenceRef){return this.referenceEvidence?.view?.({ownerId,topicId},ref) ?? Promise.resolve(undefined)}
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     if (!session || !history || this.sessions.isSessionDeleted(sessionId) || this.sessions.getStatus(sessionId) === 'conflict') return undefined
@@ -128,7 +133,7 @@ export class TopicMemoryStore {
   query(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): TopicTermSnapshot {
     const snapshot = this.getSnapshot(ownerId, topicId)
     return { ...snapshot, entries: this.getStatus(ownerId, topicId) === 'conflict' ? [] :
-      queryTopicTerms(snapshot, { ...query, ownerId, topicId }, (sessionId, unitId) => this.readEvidence(sessionId, unitId)) }
+      queryTopicTerms(snapshot, { ...query, ownerId, topicId }, cachedTopicEvidence((sessionId, unitId) => this.readEvidence(sessionId, unitId), this.referenceEvidence)) }
   }
   async queryAsync(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): Promise<TopicTermSnapshot> {
     const fixed = structuredClone(query), seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
@@ -137,7 +142,7 @@ export class TopicMemoryStore {
       entry.sourceLanguage === fixed.sourceLanguage && entry.targetLanguage === fixed.targetLanguage &&
       [...entry.sourceForms, ...entry.aliases].some(form => fixed.forms.includes(form)))
     const prepared = await prepareTopicEvidence(this.sessions, snapshot, entries.flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')),
-      (sessionId, unitId) => this.readEvidence(sessionId, unitId), reader)
+      (sessionId, unitId) => this.readEvidence(sessionId, unitId), reader, this.referenceEvidence)
     if (this.disposed || reader !== this.evidenceReader || !prepared.isCurrent() || seat.snapshot !== snapshot || this.getStatus(ownerId, topicId) === 'conflict' || !this.currentRaw(seat) ||
       !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return { ...seat.snapshot, entries: [] }
     return { ...snapshot, entries: queryTopicTerms(snapshot, { ...fixed, ownerId, topicId }, prepared.resolver) }
@@ -146,7 +151,7 @@ export class TopicMemoryStore {
     const seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
     const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry =>
       entry.origin !== 'user_explicit' && entry.status !== 'disabled' && entry.status !== 'review_required').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')),
-      (sessionId, unitId) => this.readEvidence(sessionId, unitId), reader)
+      (sessionId, unitId) => this.readEvidence(sessionId, unitId), reader, this.referenceEvidence)
     return this.locked(seat.snapshot, () => {
       if (reader !== this.evidenceReader || seat.snapshot !== snapshot || !prepared.isCurrent() || !this.currentRaw(seat) ||
         !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return seat.snapshot
@@ -222,7 +227,7 @@ export class TopicMemoryStore {
     const refs = fixed.kind === 'put' ? [...fixed.input.evidence, ...seat.snapshot.entries.filter(entry =>
       fixed.input.status === 'active' && entry.id !== fixed.input.id && entry.status === 'active' && entry.origin !== 'user_explicit' &&
       topicTermContentsConflict(entry, fixed.input)).flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))] : []
-    const prepared = await prepareTopicEvidence(this.sessions, seat.snapshot, refs, (sessionId, unitId) => this.readEvidence(sessionId, unitId), reader)
+    const prepared = await prepareTopicEvidence(this.sessions, seat.snapshot, refs, (sessionId, unitId) => this.readEvidence(sessionId, unitId), reader, this.referenceEvidence)
     return this.locked(failure, () => {
       if (reader !== this.evidenceReader || !prepared.isCurrent() || !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId) || !this.currentRaw(seat) || seat.snapshot.version !== expectedVersion) {
         this.emit(); return { status: 'stale', snapshot: seat.snapshot, entry: null }

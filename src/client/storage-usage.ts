@@ -6,6 +6,7 @@ export const STORAGE_USAGE_CATEGORIES = [
   { id: 'terms', label: '术语' },
   { id: 'archive', label: '结构化档案' },
   { id: 'preparation', label: '准备记录' },
+  { id: 'references', label: '参考资料索引' },
   { id: 'objects', label: '对象关联' },
   { id: 'preferences', label: '模型及排序偏好' },
   { id: 'settings', label: '设置' },
@@ -36,6 +37,7 @@ function category(key: string): StorageUsageCategory {
   if (name.startsWith('topic-terms:')) return 'terms'
   if (name.startsWith('topic-archive:')) return 'archive'
   if (name.startsWith('preparation:')) return 'preparation'
+  if (name.startsWith('references:') || name.startsWith('reference-binding:')) return 'references'
   if (name.startsWith('record-objects:')) return 'objects'
   if (name.startsWith('session-model:') || name.startsWith('owner-model:') || name.startsWith('session-order:')) return 'preferences'
   if (name.startsWith('settings:')) return 'settings'

@@ -126,6 +126,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     return JSON.stringify(this.options.sessions.getTranslationHistory(request.sessionId)?.events.filter(event => event.unitId === request.unitId && event.type === 'revision.deleted').map(event => event.id) ?? [])
   }
   capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult {
+    if (ref.kind === 'reference') return unavailable(null, 'unloaded', 'reference_registry_required')
     const unit = this.options.sessions.getTranslationHistory(ref.sessionId)?.units.find(unit => unit.id === ref.unitId)
     const request: EvidenceReadRequest = { ownerId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
       sourceVersion: ref.kind === 'source' ? ref.sourceVersion ?? 1 : unit?.sourceVersion ?? 1,

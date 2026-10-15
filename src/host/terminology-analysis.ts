@@ -352,6 +352,7 @@ export class TerminologyAnalysisService {
       !['completed', 'failed', 'unknown'].includes(job.run.status)) return null
     return structuredClone(job.run)
   }
+  hasActiveJobs(): boolean { return [...this.jobs.values()].some(job => ['running', 'unknown'].includes(job.run.status)) }
   dispose(): void {
     this.disposed = true
     for (const job of this.jobs.values()) job.controller.abort()

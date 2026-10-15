@@ -1,8 +1,9 @@
+import { parseReferenceEvidence } from '../shared/reference-memory.js'
 import { resolveTermEvidence, type TermEvidenceRef, type TermEvidenceResolver, type TermUserAdoption } from './topic-terms.js'
 
 export type TopicArchiveKind = 'entity' | 'fact' | 'relation'
 export type TopicArchiveStatus = 'proposal' | 'active' | 'review_required' | 'disabled'
-export type TopicArchiveOrigin = 'inferred' | 'source_checked' | 'user_explicit'
+export type TopicArchiveOrigin = 'inferred' | 'source_checked' | 'reference_derived' | 'user_explicit'
 export interface TopicEntityContent { readonly kind: 'entity'; readonly name: string; readonly aliases: readonly string[]; readonly description: string }
 export interface TopicFactContent { readonly kind: 'fact'; readonly title: string; readonly body: string; readonly entityIds: readonly string[] }
 export interface TopicRelationContent { readonly kind: 'relation'; readonly sourceEntityId: string; readonly relation: string; readonly targetEntityId: string; readonly description: string }
@@ -13,11 +14,11 @@ export type TopicArchiveEntry = TopicArchiveContent & {
   readonly confirmation: TermUserAdoption | null; readonly createdAt: string; readonly updatedAt: string
 }
 export interface TopicArchiveSnapshot {
-  readonly schemaVersion: 1; readonly ownerId: string; readonly topicId: string; readonly version: number
+  readonly schemaVersion: 1 | 2; readonly ownerId: string; readonly topicId: string; readonly version: number
   readonly activeVersion: number; readonly updatedAt: string; readonly entries: readonly TopicArchiveEntry[]
 }
 export type TopicArchivePut = TopicArchiveContent & {
-  readonly id: string; readonly expectedEntryVersion: number | null; readonly origin: 'inferred' | 'source_checked'; readonly status: 'proposal' | 'active'
+  readonly id: string; readonly expectedEntryVersion: number | null; readonly origin: 'inferred' | 'source_checked' | 'reference_derived'; readonly status: 'proposal' | 'active'
 }
 export type TopicArchiveUserInput = TopicArchiveSemantic & { readonly id: string | null; readonly expectedEntryVersion: number | null }
 export type TopicArchiveUserPut = TopicArchiveSemantic & { readonly id: string; readonly expectedEntryVersion: number | null }
@@ -41,6 +42,7 @@ function strings(value: unknown, maximum: number): value is readonly string[] {
   return Array.isArray(value) && value.length <= 100 && value.every(item => text(item, maximum)) && new Set(value).size === value.length
 }
 function evidence(value: unknown): value is TermEvidenceRef {
+  if (value && typeof value === 'object' && 'kind' in value && value.kind === 'reference') { try { parseReferenceEvidence(value); return true } catch { return false } }
   if (!record(value) || !(exact(value, ['kind', 'sessionId', 'unitId', 'revisionId', 'selectionEventId', 'range', 'role']) ||
       (value.kind === 'source' && exact(value, ['kind', 'sessionId', 'unitId', 'sourceVersion', 'revisionId', 'selectionEventId', 'range', 'role']))) ||
     !text(value.sessionId, 2048) || !text(value.unitId, 2048) || !['basis', 'example'].includes(value.role as string)) return false
@@ -67,7 +69,11 @@ function copySemantic(value: TopicArchiveSemantic): TopicArchiveSemantic {
       { kind: value.kind, sourceEntityId: value.sourceEntityId, relation: value.relation, targetEntityId: value.targetEntityId, description: value.description }
 }
 function copyContent(value: TopicArchiveContent): TopicArchiveContent { return { ...copySemantic(value), evidence: value.evidence.map(ref => ({ ...ref, range: ref.range ? { ...ref.range } : null })) } }
-function sourceBasis(value: TopicArchiveContent): boolean { return value.evidence.some(ref => ref.kind === 'source' && ref.role === 'basis') }
+function sourceBasis(value: TopicArchiveContent): boolean { return value.evidence.some(ref => (ref.kind === 'source' || ref.kind === 'reference') && ref.role === 'basis') }
+function referenceOriginValid(value: { readonly origin: unknown; readonly evidence: readonly TermEvidenceRef[] }): boolean {
+  const references = value.evidence.filter(ref => ref.kind === 'reference')
+  return value.origin === 'reference_derived' ? references.some(ref => ref.role === 'basis') : value.origin !== 'source_checked' || references.length === 0
+}
 function adoption(value: unknown): value is TermUserAdoption {
   return record(value) && exact(value, ['eventId', 'at', 'adoptedEntryVersion']) && text(value.eventId, 2048) && time(value.at) && integer(value.adoptedEntryVersion, 1)
 }
@@ -76,8 +82,9 @@ function adoption(value: unknown): value is TermUserAdoption {
 export function decodeTopicArchivePut(value: unknown): TopicArchivePut | undefined {
   if (!record(value) || !exact(value, [...semanticKeys(value.kind), 'evidence', 'id', 'expectedEntryVersion', 'origin', 'status']) || !content(value) ||
     !text(value.id, 2048) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
-    !['inferred', 'source_checked'].includes(value.origin as string) || !['proposal', 'active'].includes(value.status as string) ||
-    (value.status === 'active' && (value.origin !== 'source_checked' || !sourceBasis(value)))) return undefined
+    !['inferred', 'source_checked', 'reference_derived'].includes(value.origin as string) || !['proposal', 'active'].includes(value.status as string) ||
+    (value.status === 'active' && (!['source_checked', 'reference_derived'].includes(String(value.origin)) || !sourceBasis(value)))) return undefined
+  if (!referenceOriginValid(value as unknown as TopicArchiveEntry)) return undefined
   return { ...copyContent(value), id: value.id, expectedEntryVersion: value.expectedEntryVersion, origin: value.origin as TopicArchivePut['origin'], status: value.status as TopicArchivePut['status'] }
 }
 export function decodeTopicArchiveUserInput(value: unknown): TopicArchiveUserInput | undefined {
@@ -87,20 +94,22 @@ export function decodeTopicArchiveUserInput(value: unknown): TopicArchiveUserInp
   return { ...copySemantic(value), id: value.id, expectedEntryVersion: value.expectedEntryVersion }
 }
 function decodeSnapshot(value: unknown, projection: boolean): TopicArchiveSnapshot | undefined {
-  if (!record(value) || !exact(value, ['schemaVersion', 'ownerId', 'topicId', 'version', 'activeVersion', 'updatedAt', 'entries']) || value.schemaVersion !== 1 ||
+  if (!record(value) || !exact(value, ['schemaVersion', 'ownerId', 'topicId', 'version', 'activeVersion', 'updatedAt', 'entries']) || ![1, 2].includes(value.schemaVersion as number) ||
     !text(value.ownerId, 2048) || !text(value.topicId, 2048) || !integer(value.version) || !integer(value.activeVersion) || value.activeVersion > value.version || !time(value.updatedAt) || !Array.isArray(value.entries)) return undefined
   const entries: TopicArchiveEntry[] = [], ids = new Set<string>()
   for (const raw of value.entries) {
     if (!record(raw) || !exact(raw, [...semanticKeys(raw.kind), 'evidence', 'id', 'version', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt']) ||
       !content(raw) || !text(raw.id, 2048) || ids.has(raw.id) || !integer(raw.version, 1) || raw.version > value.version || !time(raw.createdAt) || !time(raw.updatedAt) ||
-      !statuses.includes(raw.status as TopicArchiveStatus) || !['inferred', 'source_checked', 'user_explicit'].includes(raw.origin as string)) return undefined
+      !statuses.includes(raw.status as TopicArchiveStatus) || !['inferred', 'source_checked', 'reference_derived', 'user_explicit'].includes(raw.origin as string)) return undefined
     if (raw.origin === 'user_explicit' ? (!adoption(raw.confirmation) || raw.confirmation.adoptedEntryVersion >= raw.version || raw.evidence.some(ref => ref.role === 'basis')) : raw.confirmation !== null) return undefined
-    if (raw.status === 'active' && (raw.origin === 'inferred' || (raw.origin === 'source_checked' && !sourceBasis(raw)))) return undefined
+    if (raw.status === 'active' && (raw.origin === 'inferred' || (['source_checked', 'reference_derived'].includes(String(raw.origin)) && !sourceBasis(raw)))) return undefined
+    if (!referenceOriginValid(raw as unknown as TopicArchiveEntry)) return undefined
     ids.add(raw.id); entries.push(structuredClone(raw) as unknown as TopicArchiveEntry)
   }
   // Deleted references remain visible only as explicitly unavailable review/disabled entries.
   if (projection ? entries.some(entry => entry.status !== 'active') : entries.some(entry => entry.status !== 'review_required' && entry.status !== 'disabled' && referencedEntityIds(entry).some(id => !entries.some(candidate => candidate.id === id && candidate.kind === 'entity')))) return undefined
-  return { schemaVersion: 1, ownerId: value.ownerId, topicId: value.topicId, version: value.version, activeVersion: value.activeVersion, updatedAt: value.updatedAt, entries }
+  if (value.schemaVersion === 1 && entries.some(entry => entry.origin === 'reference_derived' || entry.evidence.some(ref => ref.kind === 'reference'))) return undefined
+  return { schemaVersion: value.schemaVersion as 1 | 2, ownerId: value.ownerId, topicId: value.topicId, version: value.version, activeVersion: value.activeVersion, updatedAt: value.updatedAt, entries }
 }
 export function decodeTopicArchiveSnapshot(value: unknown): TopicArchiveSnapshot | undefined { return decodeSnapshot(value, false) }
 /** Query entries are active projections; entity IDs may refer to omitted matching context. */
@@ -116,7 +125,7 @@ function validBasis(snapshot: TopicArchiveSnapshot, entry: TopicArchiveContent, 
   return sourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined || isUnloaded(ref))
 }
 function effectiveOwn(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
-  return entry.status === 'active' && (entry.origin === 'user_explicit' || (entry.origin === 'source_checked' && validBasis(snapshot, entry, resolver, isUnloaded)))
+  return entry.status === 'active' && (entry.origin === 'user_explicit' || (['source_checked', 'reference_derived'].includes(entry.origin) && validBasis(snapshot, entry, resolver, isUnloaded)))
 }
 function validReferences(snapshot: TopicArchiveSnapshot, value: TopicArchiveSemantic, resolver: TermEvidenceResolver, active: boolean, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
   return referencedEntityIds(value).every(id => {
@@ -130,7 +139,7 @@ function activeProjection(entry: TopicArchiveEntry | undefined): unknown {
 }
 function replace(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, at: string): TopicArchiveSnapshot {
   const old = snapshot.entries.find(item => item.id === entry.id), activeChanged = JSON.stringify(activeProjection(old)) !== JSON.stringify(activeProjection(entry))
-  return { ...snapshot, version: snapshot.version + 1, activeVersion: snapshot.activeVersion + (activeChanged ? 1 : 0), updatedAt: at,
+  return { ...snapshot, schemaVersion: 2 as const, version: snapshot.version + 1, activeVersion: snapshot.activeVersion + (activeChanged ? 1 : 0), updatedAt: at,
     entries: old ? snapshot.entries.map(item => item.id === entry.id ? entry : item) : [...snapshot.entries, entry] }
 }
 function reviewDependents(snapshot: TopicArchiveSnapshot, entityId: string, at: string): TopicArchiveSnapshot {
@@ -151,7 +160,7 @@ export function putTopicArchive(snapshot: TopicArchiveSnapshot, input: TopicArch
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
   if (old?.origin === 'user_explicit') return result(snapshot, 'requires_user_action', old)
-  if (!text(input.id, 2048) || !time(at) || !content(input) || (old && old.kind !== input.kind) || !['inferred', 'source_checked'].includes(input.origin) ||
+  if (!referenceOriginValid(input) || !text(input.id, 2048) || !time(at) || !content(input) || (old && old.kind !== input.kind) || !['inferred', 'source_checked', 'reference_derived'].includes(input.origin) ||
     !['proposal', 'active'].includes(input.status) || (input.status === 'active' && (input.origin !== 'source_checked' || !validBasis(snapshot, input, resolver))) ||
     !validReferences(snapshot, input, resolver, input.status === 'active')) return result(snapshot, 'invalid', old)
   const entry: TopicArchiveEntry = { ...copyContent(input), id: input.id, version: (old?.version ?? 0) + 1, status: input.status, origin: input.origin,

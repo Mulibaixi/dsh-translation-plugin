@@ -221,6 +221,7 @@ export class QuickTranslationService {
     const job = context.jobs.get(context.active)
     if (!job || !['running', 'unknown'].includes(this.view(context, job).status)) context.active = undefined
   }
+  hasActiveJobs(): boolean { return [...this.contexts.values()].some(context => [...context.jobs.values()].some(job => job.preparation === 'preparing' || ['running', 'unknown'].includes(this.view(context, job).status))) }
   dispose(): void {
     this.disposed = true
     for (const context of this.contexts.values()) for (const job of context.jobs.values()) {

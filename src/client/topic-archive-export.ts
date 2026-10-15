@@ -10,7 +10,7 @@ export interface TopicArchiveExportSnapshot {
   readonly termEvidenceAvailability: readonly TopicEvidenceAvailability[]; readonly archiveEvidenceAvailability: readonly TopicEvidenceAvailability[]
 }
 const statusLabels = { proposal: '待确认', active: '生效', review_required: '待复核', disabled: '已停用' } as const
-const originLabels = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
+const originLabels = { inferred: '模型提案', source_checked: '原文依据', reference_derived: '参考资料（主模型解读）', user_explicit: '用户采用' } as const
 const kindLabels = { entity: '实体', fact: '事实', relation: '关系' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突，当前快照可能与已保存副本不同', error: '保存失败，当前快照不代表已可靠落盘' } as const
 function scope(input: TopicArchiveExportSnapshot): void {
@@ -47,6 +47,7 @@ function semanticLines(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry)
       [`- 源实体：${entityLabel(snapshot, entry.sourceEntityId)}`, `- 关系：${md(entry.relation)}`, `- 目标实体：${entityLabel(snapshot, entry.targetEntityId)}`, `- 描述：${md(entry.description) || '未提供'}`]
 }
 function referenceLines(ref: TermEvidenceRef): readonly string[] {
+  if (ref.kind === 'reference') return ['- 参考资料：' + md(ref.referenceId), '- 片段：' + md(ref.segmentId) + '；来源为主模型解读；不等于用户确认']
   return [`- 类型：${ref.kind === 'source' ? '原文' : '最终译文'}；用途：${ref.role === 'basis' ? '依据' : '示例'}`,
     `- 会话 ID：${md(ref.sessionId)}；单元 ID：${md(ref.unitId)}`,
     `- 版本 ID：${ref.revisionId === null ? '无' : md(ref.revisionId)}；最终选择事件 ID：${ref.selectionEventId === null ? '无' : md(ref.selectionEventId)}`,
@@ -73,9 +74,9 @@ export function buildTopicArchiveMarkdownExport(input: TopicArchiveExportSnapsho
     if (!entry.evidence.length) lines.push('无证据引用。', '')
     entry.evidence.forEach((ref, index) => {
       const availability = input.archiveEvidenceAvailability.find(item => item.entryId === entry.id && item.evidenceIndex === index)
-      const label = availability ? `${availability.sessionName ?? '会话不可用'} · ${availability.unitOrder === null ? '单元不可用' : `文本 ${availability.unitOrder}`}${availability.revisionOrder === null ? '' : ` · 版本 ${availability.revisionOrder}`}` : '来源标签未提供'
+      const label = availability?.sourceLabel ?? (availability ? `${availability.sessionName ?? '会话不可用'} · ${availability.unitOrder === null ? '单元不可用' : `文本 ${availability.unitOrder}`}${availability.revisionOrder === null ? '' : ` · 版本 ${availability.revisionOrder}`}` : '来源标签未提供')
       lines.push(`##### 引用 ${index + 1}`, '', `- 来源：${md(label)}`,
-        `- 冻结时可读性：${availability ? availability.readable ? '可读（正文未导出）' : '依据已变化或不可用（正文未导出）' : '未提供，无法确认来源是否可读'}`,
+        `- 冻结时可读性：${availability?.readability === 'not_loaded' ? '本次未读取参考片段，未确认可读性（正文未导出）' : availability ? availability.readable ? '可读（正文未导出）' : '依据已变化或不可用（正文未导出）' : '未提供，无法确认来源是否可读'}`,
         ...referenceLines(ref), '')
     })
   }

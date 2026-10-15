@@ -1,3 +1,5 @@
+import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
+import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import {
   emptyTopicArchive, decodeTopicArchiveSnapshot, decodeTopicArchivePut, decodeTopicArchiveUserInput, putTopicArchive, putUserTopicArchive, adoptTopicArchive,
   disableTopicArchive, deleteTopicArchiveEntry, reconcileTopicArchive, queryTopicArchive, referencedEntityIds,
@@ -7,7 +9,7 @@ import type { TermEvidenceResolver } from '../memory/topic-terms.js'
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
-import { isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
+import { cachedTopicEvidence, isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
 import type { TranslationEvidenceReader } from './source-reader.js'
 import { storageSaveFailureMessage } from './storage-errors.js'
 
@@ -27,7 +29,7 @@ export type TopicArchiveCommand = { readonly kind: 'put'; readonly input: TopicA
   | { readonly kind: 'user_put'; readonly input: TopicArchiveUserPut }
   | { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }
 interface Seat { snapshot: TopicArchiveSnapshot; stored: string | null; dirty: boolean; status: HistoryStatus }
-function browserStorage(): LocalStoragePort | undefined { try { return typeof window === 'undefined' ? undefined : window.localStorage } catch { return undefined } }
+const browserStorage = browserPluginStorage
 function browserLocks(): StructureLockPort | undefined {
   if (typeof navigator === 'undefined' || !navigator.locks) return undefined
   return { request: async <T>(name: string, action: () => T | Promise<T>): Promise<T> => await navigator.locks.request(name, async () => await action()) }
@@ -45,6 +47,8 @@ export class TopicArchiveStore {
   private enabled: boolean
   private notice: string | undefined
   private disposed = false
+  private referenceEvidence: ReferenceEvidencePort | undefined
+  setReferenceEvidence(port: ReferenceEvidencePort): void { this.referenceEvidence = port }
   private evidenceReader: TranslationEvidenceReader | undefined
 
   constructor(private readonly sessions: SessionStore, private readonly resolver: TermEvidenceResolver, private readonly storage: LocalStoragePort | undefined = browserStorage(),
@@ -54,7 +58,7 @@ export class TopicArchiveStore {
     this.stopSession = sessions.subscribe(() => this.sessionChanged())
     if (listen) this.stopStorage = listen(key => this.externalChange(key))
     else if (typeof window !== 'undefined' && storage) {
-      const onChange = (event: StorageEvent): void => { if (event.storageArea === storage) this.externalChange(event.key) }
+      const onChange = (event: StorageEvent): void => { if (isPluginStorageEvent(event, storage)) this.externalChange(event.key) }
       window.addEventListener('storage', onChange); this.stopStorage = () => window.removeEventListener('storage', onChange)
     }
   }
@@ -98,7 +102,7 @@ export class TopicArchiveStore {
   }
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot {
     const seat = this.seat(ownerId, topicId)
-    return { ...seat.snapshot, entries: seat.status === 'conflict' ? [] : queryTopicArchive(seat.snapshot, { ...query, ownerId, topicId }, this.resolver) }
+    return { ...seat.snapshot, entries: seat.status === 'conflict' ? [] : queryTopicArchive(seat.snapshot, { ...query, ownerId, topicId }, cachedTopicEvidence(this.resolver, this.referenceEvidence)) }
   }
   async queryAsync(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot> {
     const fixed = structuredClone(query), seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
@@ -114,7 +118,7 @@ export class TopicArchiveStore {
     })
     const dependencyIds = new Set(candidates.flatMap(referencedEntityIds))
     const needed = [...candidates, ...snapshot.entries.filter(entry => dependencyIds.has(entry.id))]
-    const prepared = await prepareTopicEvidence(this.sessions, snapshot, needed.filter(entry => entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader)
+    const prepared = await prepareTopicEvidence(this.sessions, snapshot, needed.filter(entry => entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader, this.referenceEvidence)
     if (this.disposed || reader !== this.evidenceReader || !prepared.isCurrent() || seat.snapshot !== snapshot || this.getStatus(ownerId, topicId) === 'conflict' || !this.currentRaw(seat) ||
       !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return { ...seat.snapshot, entries: [] }
     return { ...snapshot, entries: queryTopicArchive(snapshot, { ...fixed, ownerId, topicId }, prepared.resolver) }
@@ -122,7 +126,7 @@ export class TopicArchiveStore {
   async reconcileAsync(ownerId: string, topicId: string): Promise<TopicArchiveSnapshot> {
     const seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
     const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry => entry.origin !== 'user_explicit' &&
-      entry.status !== 'disabled' && entry.status !== 'review_required').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader)
+      entry.status !== 'disabled' && entry.status !== 'review_required').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader, this.referenceEvidence)
     return this.locked(seat.snapshot, () => {
       if (reader !== this.evidenceReader || seat.snapshot !== snapshot || !prepared.isCurrent() || !this.currentRaw(seat) ||
         !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return seat.snapshot
@@ -197,7 +201,7 @@ export class TopicArchiveStore {
     const dependencyIds = new Set(content ? referencedEntityIds(content) : [])
     const refs = fixed.kind === 'disable' ? [] : [...(fixed.kind === 'put' ? fixed.input.evidence : []),
       ...seat.snapshot.entries.filter(entry => dependencyIds.has(entry.id) && entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))]
-    const prepared = await prepareTopicEvidence(this.sessions, seat.snapshot, refs, this.resolver, reader)
+    const prepared = await prepareTopicEvidence(this.sessions, seat.snapshot, refs, this.resolver, reader, this.referenceEvidence)
     return this.locked(failure, () => {
       if (reader !== this.evidenceReader || !prepared.isCurrent() || !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId) ||
         !this.currentRaw(seat) || seat.snapshot.version !== expectedVersion) { this.emit(); return { status: 'stale', snapshot: seat.snapshot, entry: null } }

@@ -1,3 +1,4 @@
+import type { LocalDataService } from './local-data.js'
 import { parseSourceIdentity, parseTranslationSourceScope, type SourceIdentity, type TranslationSourceScope } from '../shared/translation-sources.js'
 import { parseTranslationSourceReference, type TranslationSourceReference } from '../shared/translation-source-storage.js'
 import type { QuickHostContext } from './quick-translation.js'
@@ -84,6 +85,7 @@ export async function loadTranslationSourceStorage(ctx: QuickHostContext): Promi
     return path.join(root, 'references', `${await sourceSha256(new TextEncoder().encode(JSON.stringify([scope, referenceKey])))}.json`)
   }
   const absent = (error: unknown): boolean => !!error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
+  const write = (ctx.get?.('translationLocalData') as LocalDataService | undefined)?.storageWriter() ?? (async <T>(action: () => Promise<T>): Promise<T> => action())
   return {
     async readReference(scope, referenceKey) {
       let text: string
@@ -94,7 +96,8 @@ export async function loadTranslationSourceStorage(ctx: QuickHostContext): Promi
     },
     async writeReference(input) {
       const record = parseStoredSourceReference(input)
-      await atomic.writeFileAtomic(await mappingPath(record.reference.scope, record.reference.referenceKey), JSON.stringify(record), { mode: 0o600, dirMode: 0o700 })
+      const destination = await mappingPath(record.reference.scope, record.reference.referenceKey)
+      await write(() => atomic.writeFileAtomic(destination, JSON.stringify(record), { mode: 0o600, dirMode: 0o700 }))
     },
     async readContent(source) {
       try { return new Uint8Array(await fs.readFile(contentPath(source))) } catch (error) { if (absent(error)) return undefined; throw error }
@@ -107,7 +110,7 @@ export async function loadTranslationSourceStorage(ctx: QuickHostContext): Promi
         if (prior.byteLength !== source.bytes || await sourceSha256(prior) !== source.sha256) throw new TypeError('Saved source content corrupt')
         return
       }
-      await atomic.writeFileAtomic(contentPath(source), bytes, { mode: 0o600, dirMode: 0o700 })
+      await write(() => atomic.writeFileAtomic(contentPath(source), bytes, { mode: 0o600, dirMode: 0o700 }))
     },
     originalPath: contentPath,
   }

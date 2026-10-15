@@ -1,3 +1,4 @@
+import { parseReferenceContextRef, type ReferenceContextRef } from './reference-memory.js'
 import { parseNormalTranslationTarget, type NormalTranslationMaterialTarget, type NormalTranslationUnitTarget, type NormalTranslationTarget } from './normal-translation.js'
 import { parseTranslationSourceScope, type TranslationSourceScope } from './translation-sources.js'
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
@@ -225,6 +226,7 @@ export interface TranslationPreparationSet {
   /** Main model declaration, independently recorded from mechanical scanning. */
   readonly reviewedRanges: readonly TranslationSourceRange[]
   readonly backgroundRanges?: readonly TranslationSourceRange[]
+  readonly referenceContextRef?: ReferenceContextRef
   readonly referenceRefs?: readonly PreparationReferenceRef[]
   readonly questions?: readonly PreparationQuestion[]
 }
@@ -245,6 +247,7 @@ export interface TranslationPreparationCorrectionReview {
   readonly reviewedRanges: readonly TranslationSourceRange[]
   readonly excludedRanges?: readonly TranslationSourceRange[]
   readonly backgroundRanges?: readonly TranslationSourceRange[]
+  readonly referenceContextRef?: ReferenceContextRef
   readonly questions?: readonly PreparationQuestion[]
 }
 /** Source matching is read by Host; scope, current source and terms are checked by Client. */
@@ -314,7 +317,7 @@ export interface PreparationFrozenTerm {
   readonly forbidden: readonly string[]
   readonly userFixed: boolean
   readonly confirmation: TermUserAdoption | null
-  readonly origin: 'model_inferred' | 'main_model_adjusted' | 'inferred' | 'source_checked' | 'user_explicit'
+  readonly origin: 'model_inferred' | 'main_model_adjusted' | 'inferred' | 'source_checked' | 'reference_derived' | 'user_explicit'
   /** Topic evidence remains its real reference; analysis never invents a unit. */
   readonly evidence: readonly TermEvidenceRef[]
   readonly candidateRefs: readonly { readonly id: string; readonly version: 1; readonly callId: string }[]
@@ -344,7 +347,7 @@ export interface PreparationModelReview {
 }
 /** Immutable audit baseline. Source and external-reference bodies are never copied here. */
 export interface PreparationSnapshot {
-  readonly schemaVersion: 1
+  readonly schemaVersion: 1 | 2
   readonly id: string
   readonly version: number
   readonly target: NormalTranslationTarget
@@ -361,6 +364,7 @@ export interface PreparationSnapshot {
   readonly correctionReview?: PreparationCorrectionReview
   readonly terms: readonly PreparationFrozenTerm[]
   readonly backgroundRanges: readonly TranslationSourceRange[]
+  readonly referenceContextRef?: ReferenceContextRef
   readonly referenceRefs: readonly PreparationReferenceRef[]
   readonly questions: readonly PreparationQuestion[]
   readonly conflicts: readonly PreparationConflict[]
@@ -461,12 +465,12 @@ function preparationSelections(value: unknown): readonly PreparationTermSelectio
   return termSelections
 }
 export function parseTranslationPreparationSet(value: unknown): TranslationPreparationSet {
-  preparationPacket(value); exact(value, ['target', 'preparationId', 'expectedVersion', 'operationId', 'organizedRequirements', 'termSelections', 'reviewedRanges'], ['backgroundRanges', 'referenceRefs', 'questions'])
+  preparationPacket(value); exact(value, ['target', 'preparationId', 'expectedVersion', 'operationId', 'organizedRequirements', 'termSelections', 'reviewedRanges'], ['backgroundRanges', 'referenceRefs', 'questions', 'referenceContextRef'])
   text(value.preparationId, 2048); text(value.operationId, 2048); text(value.organizedRequirements, 4000, true); preparationInteger(value.expectedVersion)
   const termSelections = preparationSelections(value.termSelections)
   return { target: target(value.target), preparationId: value.preparationId, expectedVersion: value.expectedVersion, operationId: value.operationId,
     organizedRequirements: value.organizedRequirements, termSelections, reviewedRanges: ranges(value.reviewedRanges),
-    ...(value.backgroundRanges === undefined ? {} : { backgroundRanges: ranges(value.backgroundRanges) }),
+    ...(value.referenceContextRef === undefined ? {} : {referenceContextRef:parseReferenceContextRef(value.referenceContextRef)}), ...(value.backgroundRanges === undefined ? {} : { backgroundRanges: ranges(value.backgroundRanges) }),
     ...(value.referenceRefs === undefined ? {} : { referenceRefs: preparationReferences(value.referenceRefs) }),
     ...(value.questions === undefined ? {} : { questions: preparationQuestions(value.questions) }) }
 }
@@ -475,13 +479,14 @@ export function parseTranslationPreparationQuery(value: unknown): TranslationPre
   return { target: parseNormalTranslationTarget(value.target), preparationId: value.preparationId, version: value.version }
 }
 export function parseTranslationPreparationCorrectionReview(value: unknown): TranslationPreparationCorrectionReview {
-  preparationPacket(value); exact(value, ['target', 'preparationId', 'expectedVersion', 'operationId', 'basis', 'organizedRequirements', 'termSelections', 'reviewedRanges'], ['excludedRanges', 'backgroundRanges', 'questions'])
+  preparationPacket(value); exact(value, ['target', 'preparationId', 'expectedVersion', 'operationId', 'basis', 'organizedRequirements', 'termSelections', 'reviewedRanges'], ['excludedRanges', 'backgroundRanges', 'questions', 'referenceContextRef'])
+  if (value.referenceContextRef !== undefined) parseReferenceContextRef(value.referenceContextRef)
   const sourceTarget = parseNormalTranslationTarget(value.target)
   if (sourceTarget.kind !== 'unit') throw new TypeError('Correction review requires a real document unit')
   text(value.basis, 2000); text(value.preparationId, 2048); text(value.operationId, 2048); text(value.organizedRequirements, 4000, true); preparationInteger(value.expectedVersion)
   return { target: sourceTarget, preparationId: value.preparationId, expectedVersion: value.expectedVersion, operationId: value.operationId, organizedRequirements: value.organizedRequirements,
     termSelections: preparationSelections(value.termSelections), reviewedRanges: ranges(value.reviewedRanges), basis: value.basis,
-    ...(value.excludedRanges === undefined ? {} : { excludedRanges: ranges(value.excludedRanges) }), ...(value.backgroundRanges === undefined ? {} : { backgroundRanges: ranges(value.backgroundRanges) }), ...(value.questions === undefined ? {} : { questions: preparationQuestions(value.questions) }) }
+    ...(value.excludedRanges === undefined ? {} : { excludedRanges: ranges(value.excludedRanges) }), ...(value.referenceContextRef === undefined ? {} : {referenceContextRef:parseReferenceContextRef(value.referenceContextRef)}), ...(value.backgroundRanges === undefined ? {} : { backgroundRanges: ranges(value.backgroundRanges) }), ...(value.questions === undefined ? {} : { questions: preparationQuestions(value.questions) }) }
 }
 export function parsePreparationCorrectionReviewFacts(value: unknown): PreparationCorrectionReviewFacts {
   preparationPacket(value); exact(value, ['scope', 'unitId', 'sourceVersion', 'sourceSha256', 'totalCodePoints', 'correctionOperationId', 'analysisActualCalls', 'topicTerms', 'termMatches', 'relevantFixedIds'])
@@ -579,7 +584,7 @@ function parseFrozenPreparationTerm(value: unknown): PreparationFrozenTerm {
   if (ref.kind === 'candidate') {
     if (!['model_inferred', 'main_model_adjusted'].includes(String(value.origin)) || value.userFixed || value.confirmation !== null || value.evidence.length || !candidateRefs.length || sourceForms.length !== 1 || aliases.length || value.sourceLanguage !== null || value.sense !== '' || forbidden.length) throw new TypeError('Candidate cannot fabricate topic or fixed evidence')
   } else {
-    const auditTime = '2000-01-01T00:00:00.000Z', decoded = decodeTopicTermSnapshot({ schemaVersion: 1, ownerId: 'audit', topicId: 'audit', version: ref.entryVersion,
+    const auditTime = '2000-01-01T00:00:00.000Z', decoded = decodeTopicTermSnapshot({ schemaVersion: value.origin === 'reference_derived' ? 2 : 1, ownerId: 'audit', topicId: 'audit', version: ref.entryVersion,
       activeVersion: ref.entryVersion, updatedAt: auditTime, entries: [{ id: ref.id, version: ref.entryVersion, sourceLanguage: value.sourceLanguage, targetLanguage: value.targetLanguage,
         sourceForms, aliases, sense: value.sense, preferred: value.preferred, forbidden, evidence: value.evidence, status: 'active', origin: value.origin, confirmation: value.confirmation, createdAt: auditTime, updatedAt: auditTime }] })
     if (!decoded || candidateRefs.length || value.description !== value.sense || value.userFixed !== (decoded.entries[0]!.confirmation !== null)) throw new TypeError('Invalid fixed topic term facts')
@@ -600,7 +605,8 @@ function parsePreparationPageItem(section: PreparationSection, value: unknown): 
     case 'questions': return preparationQuestions([value])[0]!
     case 'references': return preparationReferences([value])[0]!
     case 'summary': {
-      exact(value, ['userRequirements', 'organizedRequirements', 'route', 'sourceSha256', 'targetLanguage', 'mechanicalCoverageComplete', 'mainModelReviewComplete', 'preparationReady', 'executionReady', 'executionGate', 'coverageMeaning', 'reviewMeaning'], ['analysisSourceVersion', 'correctionReviewComplete'])
+      exact(value, ['userRequirements', 'organizedRequirements', 'route', 'sourceSha256', 'targetLanguage', 'mechanicalCoverageComplete', 'mainModelReviewComplete', 'preparationReady', 'executionReady', 'executionGate', 'coverageMeaning', 'reviewMeaning'], ['analysisSourceVersion', 'correctionReviewComplete', 'referenceContextRef'])
+      if (value.referenceContextRef !== undefined) parseReferenceContextRef(value.referenceContextRef)
       text(value.userRequirements, 4000, true); text(value.organizedRequirements, 4000, true); text(value.targetLanguage, 80)
       if (typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || [value.mechanicalCoverageComplete, value.mainModelReviewComplete, value.preparationReady].some(item => typeof item !== 'boolean') || value.executionReady !== false || value.executionGate !== 'plan_and_budget_pending' || value.coverageMeaning !== 'mechanical_source_scan' || value.reviewMeaning !== 'main_model_declared_review') throw new TypeError('Invalid preparation summary')
       if (value.analysisSourceVersion !== undefined) preparationInteger(value.analysisSourceVersion)
@@ -664,12 +670,13 @@ function preparationCovers(actual: readonly TranslationSourceRange[], required: 
 }
 export function parsePreparationSnapshot(value: unknown): PreparationSnapshot {
   preparationPacket(value)
-  exact(value, ['schemaVersion', 'id', 'version', 'target', 'scope', 'sourceVersion', 'sourceSha256', 'totalCodePoints', 'route', 'targetLanguage', 'userRequirements', 'organizedRequirements', 'mechanicalCoverage', 'modelReview', 'terms', 'backgroundRanges', 'referenceRefs', 'questions', 'conflicts', 'preparationReady', 'executionReady', 'executionGate', 'storage', 'storageError', 'createdAt', 'updatedAt', 'operationId'], ['correctionReview'])
+  exact(value, ['schemaVersion', 'id', 'version', 'target', 'scope', 'sourceVersion', 'sourceSha256', 'totalCodePoints', 'route', 'targetLanguage', 'userRequirements', 'organizedRequirements', 'mechanicalCoverage', 'modelReview', 'terms', 'backgroundRanges', 'referenceRefs', 'questions', 'conflicts', 'preparationReady', 'executionReady', 'executionGate', 'storage', 'storageError', 'createdAt', 'updatedAt', 'operationId'], ['correctionReview', 'referenceContextRef'])
   text(value.id, 2048); preparationInteger(value.version); preparationInteger(value.sourceVersion); preparationInteger(value.totalCodePoints); text(value.operationId, 2048)
+  if (value.referenceContextRef !== undefined) parseReferenceContextRef(value.referenceContextRef)
   text(value.targetLanguage, 80); text(value.userRequirements, 4000, true); text(value.organizedRequirements, 4000, true); preparationTime(value.createdAt); preparationTime(value.updatedAt)
   const sourceTarget = parseNormalTranslationTarget(value.target), scope = parseTranslationSourceScope(value.scope), correction = value.correctionReview === undefined ? undefined : parsePreparationCorrectionReview(value.correctionReview)
   if (sourceTarget.kind === 'unit' && (!correction || sourceTarget.translationSessionId !== scope.translationSessionId) || correction && (sourceTarget.kind !== 'unit' || correction.previousPreparationRef.id !== value.id || correction.previousPreparationRef.version !== value.version - 1 || correction.analysisBasis.sourceVersion >= value.sourceVersion)) throw new TypeError('Invalid corrected preparation identity')
-  if (value.schemaVersion !== 1 || value.sourceVersion !== sourceTarget.sourceVersion || sourceTarget.mainSessionId !== scope.mainSessionId || typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || value.executionReady !== false || value.executionGate !== 'plan_and_budget_pending' || !['saved', 'runtime_only'].includes(String(value.storage)) || typeof value.preparationReady !== 'boolean') throw new TypeError('Invalid preparation snapshot identity')
+  if (![1,2].includes(value.schemaVersion as number) || value.schemaVersion === 1 && value.referenceContextRef !== undefined || value.sourceVersion !== sourceTarget.sourceVersion || sourceTarget.mainSessionId !== scope.mainSessionId || typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || value.executionReady !== false || value.executionGate !== 'plan_and_budget_pending' || !['saved', 'runtime_only'].includes(String(value.storage)) || typeof value.preparationReady !== 'boolean') throw new TypeError('Invalid preparation snapshot identity')
   if (value.storageError !== null) text(value.storageError, 4000)
   const mechanical = value.mechanicalCoverage, review = value.modelReview
   exact(mechanical, ['meaning', 'analysisId', 'analysisVersion', 'requestedRanges', 'excludedRanges', 'requiredRanges', 'coverage', 'complete'])

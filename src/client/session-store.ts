@@ -1,3 +1,4 @@
+import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
 import {
   DEFAULT_SESSION_SETTINGS, HISTORY_PREFIX, LEGACY_DRAFT_PREFIX, LEGACY_SETTINGS_KEY, SETTINGS_KEY,
   decodeSession, historyKey, legacySession, newSession, parseSettings, sessionName, validateSessionSettings,
@@ -64,8 +65,8 @@ interface SessionSnapshot { readonly session: LocalSession; readonly translation
 function readSnapshot(raw: string): SessionSnapshot | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
-    const hasTranslations = [4, 5, 6, 7, 8, 9, 10, 11].includes(value.schemaVersion as number)
+    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    const hasTranslations = [4, 5, 6, 7, 8, 9, 10, 11, 12].includes(value.schemaVersion as number)
     const fields = hasTranslations ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
     if (Object.keys(value).length !== fields.length || fields.some(key => !Object.hasOwn(value, key))) return undefined
     if (hasTranslations && (value.translationHistory as { schemaVersion?: unknown } | null)?.schemaVersion !== (value.schemaVersion as number) - 3) return undefined
@@ -101,6 +102,12 @@ export class SessionStore {
     this.stop = listen?.(key => this.externalChange(key))
   }
 
+  getAllSessions(): readonly LocalSession[] { return [...this.seats.values()].map(seat => seat.session) }
+  hasUnsettledWork(): boolean {
+    return this.executionLeases.size > 0 || [...this.seats.values()].some(seat => seat.translationHistory.exchanges.some(exchange => ['open','waiting_user','resuming','unknown'].includes(exchange.status)) || seat.translationHistory.units.some(unit => isDocumentUnit(unit)
+      ? unit.tasks.some(task => ['running','unknown','waiting_context','waiting_user'].includes(task.status))
+      : unit.revisions.some(revision => ['submitting','running','unknown','context_requested'].includes(revision.status))))
+  }
   getSettings(): SessionSettings { return this.settings }
   getStorageUsage(): PluginStorageUsage { return readPluginStorageUsage(this.storage) }
   getNotice(): string | undefined {
@@ -727,7 +734,7 @@ export class SessionStore {
     return { ok: true, sessions: [seat.session], persistence: this.settings.rememberHistory ? 'saved' : 'runtime_only' }
   }
 
-  async createManagedSessionAsync(ownerId: string, start: TopicSessionStart): Promise<SessionManagementResult> {
+  async createManagedSessionAsync(ownerId: string, start: TopicSessionStart, initialMode?: 'normal'): Promise<SessionManagementResult> {
     return this.manageSessions(() => {
       if (!ownerId.trim()) return this.managementFailure('out_of_scope', '主会话身份无效。')
       const parentId = start.kind === 'parent_session' ? start.translationSessionId : undefined
@@ -739,6 +746,10 @@ export class SessionStore {
       const session = this.createSessionLocked(ownerId, parentId, topicId, false)
       if (!session) return this.managementFailure('operation_failed', this.notice ?? '新会话未创建，请核对当前记录。')
       const seat = this.seats.get(session.id)!
+      if (initialMode && seat.session.mode !== initialMode) {
+        seat.session = {...seat.session, mode:initialMode}; seat.status = 'memory'
+        if (this.settings.rememberHistory) this.persistLocked(session.id)
+      }
       if (this.settings.rememberHistory && seat.status !== 'saved') return this.managementFailure('storage_error', '新会话未保存，内存可能已创建，请查询当前会话列表；未自动重试。')
       return { ok: true, sessions: [seat.session], persistence: this.settings.rememberHistory ? 'saved' : 'runtime_only' }
     })
@@ -890,7 +901,7 @@ export class SessionStore {
       if (!this.storage || !seat.savedSession) return stopped('failed', '保存副本不可用，本次未删除正文。')
       const saved: SessionSnapshot = { session: { ...seat.savedSession, updatedAt: at },
         translationHistory: deleteTextRevision(seat.savedTranslationHistory, fixed.unitId, fixed.revisionId, input) }
-      const serialized = JSON.stringify({ schemaVersion: 11, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
+      const serialized = JSON.stringify({ schemaVersion: 12, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
       const pending: PendingRevisionDeletion = { plan: fixed, at, saved, serialized, release }
       this.revisionDeletions.set(fixed.eventId, pending)
       try { this.storage.setItem(historyKey(fixed.sessionId), serialized) } catch { /* Read the original operation below; a thrown write is not proof of failure. */ }
@@ -1086,7 +1097,7 @@ export class SessionStore {
         }
       }
       const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
-      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 11 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
+      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 12 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
         ...(hasTranslations ? { translationHistory: persistedTranslationHistory(seat.translationHistory) } : {}) })
       this.storage.setItem(historyKey(id), serialized)
       if (this.storage.getItem(historyKey(id)) !== serialized) throw new Error('history read-back failed')
@@ -1303,10 +1314,9 @@ export class SessionStore {
 }
 
 export function createSessionStore(): SessionStore {
-  let storage: LocalStoragePort | undefined
-  try { storage = window.localStorage } catch { /* 存储被禁用时保留内存编辑。 */ }
+  const storage = browserPluginStorage()
   return new SessionStore(storage, onChange => {
-    const listener = (event: StorageEvent): void => { if (event.storageArea === storage) onChange(event.key) }
+    const listener = (event: StorageEvent): void => { if (isPluginStorageEvent(event, storage)) onChange(event.key) }
     window.addEventListener('storage', listener)
     return () => window.removeEventListener('storage', listener)
   })

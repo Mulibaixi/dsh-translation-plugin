@@ -1,3 +1,4 @@
+import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
 import {
   appendRecordObjectReference, decodeRecordObjectReferenceInput, decodeRecordObjectSnapshot, emptyRecordObjects, recordObjectTargetMatches,
   type RecordObjectMutationResult, type RecordObjectReference, type RecordObjectReferenceInput, type RecordObjectSnapshot, type RecordObjectTarget,
@@ -13,7 +14,7 @@ export type RecordObjectAvailability = 'available' | 'record_unavailable' | 'pos
 interface Seat { snapshot: RecordObjectSnapshot; stored: string | null; dirty: boolean; status: HistoryStatus }
 const now = (): string => new Date().toISOString()
 function refId(): string { return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? `record-object-ref:${crypto.randomUUID()}` : `record-object-ref:${Date.now()}:${Math.random()}` }
-function browserStorage(): LocalStoragePort | undefined { try { return typeof window === 'undefined' ? undefined : window.localStorage } catch { return undefined } }
+const browserStorage = browserPluginStorage
 function browserLocks(): StructureLockPort | undefined {
   if (typeof navigator === 'undefined' || !navigator.locks) return undefined
   return { request: async <T>(name: string, action: () => T | Promise<T>): Promise<T> => await navigator.locks.request(name, async () => await action()) }
@@ -43,7 +44,7 @@ export class RecordObjectStore {
     })
     if (listen) this.stopStorage = listen(key => this.externalChange(key))
     else if (typeof window !== 'undefined' && storage) {
-      const onChange = (event: StorageEvent): void => { if (event.storageArea === storage) this.externalChange(event.key) }
+      const onChange = (event: StorageEvent): void => { if (isPluginStorageEvent(event, storage)) this.externalChange(event.key) }
       window.addEventListener('storage', onChange); this.stopStorage = () => window.removeEventListener('storage', onChange)
     }
   }

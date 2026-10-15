@@ -1,3 +1,4 @@
+import type { ReferenceFilesService } from './reference-files.js'
 import { NORMAL_TRANSLATION_REMOTE, parseNormalTranslationExecute, parseNormalTranslationQuery, type NormalTranslationExecute,
   type NormalTranslationOperation, type NormalTranslationQuery, type NormalTranslationJob, type NormalTranslationResult,
   type NormalTranslationUpdate, type NormalTranslationError, type NormalTranslationCapability,
@@ -154,6 +155,7 @@ export class NormalTranslationService {
     }
     let clientResolution: NormalTranslationResolution
     if (resolution.kind === 'answer') {
+      if (job.packet.referenceContext) await (this.ctx.get?.('translationReferences') as ReferenceFilesService).validateContext(job.packet.referenceContext, {agent:job.agent,callId:job.request.operationId,signal:job.controller.signal})
       const termIds = new Set(job.packet.context.terms.map(term => JSON.stringify([term.id, term.entryVersion])))
       if (resolution.references.some(reference => !termIds.has(JSON.stringify([reference.id, reference.version])))) throw rejected('stale_reference', '答复引用不属于该翻译操作冻结的术语或依据版本。', 'resolve')
       clientResolution = { ...resolution, resolutionId, observedVersion }
@@ -321,24 +323,25 @@ export class NormalTranslationService {
     try {
       if (!await this.adapter.ready()) throw rejected('execution_unavailable', '普通翻译模型运行服务尚未就绪；材料保留。', 'prepare')
       const terms = await this.topics.requestOwned(request.target.mainSessionId, { kind: 'normal_prepare', envelope,
-        operationId: request.operationId, organizedRequirements: request.organizedRequirements, termReferences: request.termReferences }, exec)
+        operationId: request.operationId, organizedRequirements: request.organizedRequirements, termReferences: request.termReferences, ...(request.referenceContextRef ? {referenceContextRef: request.referenceContextRef} : {}) }, exec)
       if (terms.kind !== 'normal_prepared') throw rejected('invalid_reply', '未取得普通翻译准备回执。', 'prepare')
       this.validateTerms(request, envelope, terms.termSnapshot)
       const route = envelope.material.model!, model = { providerId: route.provider, modelId: route.model, configVersion: 0,
         ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) }
       await this.adapter.prepareOperation(job.internalId, model, job.controller.signal)
-      const context: NormalTranslationContext = { organizedRequirements: request.organizedRequirements, terms: terms.termSnapshot.entries.map(entry => ({
+      const referenceContext = request.referenceContextRef ? await (this.ctx.get?.('translationReferences') as ReferenceFilesService).resolveContext(envelope.ownerId, envelope.material.topicId, request.referenceContextRef, exec) : undefined
+      const context: NormalTranslationContext = { organizedRequirements: request.organizedRequirements, ...(request.referenceContextRef ? {referenceContextRef: request.referenceContextRef} : {}), terms: terms.termSnapshot.entries.map(entry => ({
         id: entry.id, entryVersion: entry.version, sourceForms: entry.sourceForms, aliases: entry.aliases, sense: entry.sense,
         preferred: entry.preferred, forbidden: entry.forbidden, userFixed: entry.origin === 'user_explicit',
       })) }
       job.packet = { operationId: job.internalId, callId: `normal-call:${crypto.randomUUID()}`, model, sourceText: envelope.material.sourceText,
-        targetLanguage: envelope.material.targetLanguage, instruction: envelope.material.instruction, context }
+        targetLanguage: envelope.material.targetLanguage, instruction: envelope.material.instruction, context, ...(referenceContext ? {referenceContext,referenceContextCurrent:()=> (this.ctx.get?.('translationReferences') as ReferenceFilesService).contextCurrent(referenceContext)} : {}) }
       const exchangeOwner = this.ctx
       const exchange = this.attachExchange(exchangeOwner)
       if (exchange) { job.exchange = exchange; job.exchangeOwner = exchangeOwner }
       else { delete job.exchange; delete job.exchangeOwner }
       const exchangeCapabilities = await exchange?.capabilities()
-      const requestContextAvailable = this.topics.protocolFor(request.target.mainSessionId) === 2 && exchangeCapabilities?.ok === true &&
+      const requestContextAvailable = (this.topics.protocolFor(request.target.mainSessionId) ?? 0) >= 2 && exchangeCapabilities?.ok === true &&
         exchangeCapabilities.value.capabilities.exchange.state === 'available' && exchangeCapabilities.value.capabilities.modelControl.state === 'available'
       job.metadata = this.adapter.preflightNormal(job.packet, requestContextAvailable)
       job.controller.signal.throwIfAborted()
@@ -376,7 +379,7 @@ export class NormalTranslationService {
     this.activeSessions.add(sessionId)
     const result = Promise.resolve().then(async (): Promise<Accepted> => {
       const value = await this.topics.requestOwned(request.target.mainSessionId, { kind: 'normal_accept', envelope,
-        operationId: request.operationId, organizedRequirements: request.organizedRequirements, termReferences: request.termReferences }, exec)
+        operationId: request.operationId, organizedRequirements: request.organizedRequirements, termReferences: request.termReferences, ...(request.referenceContextRef ? {referenceContextRef: request.referenceContextRef} : {}) }, exec)
       if (value.kind !== 'normal_operation' || value.operation.operationId !== request.operationId || value.operation.mainSessionId !== request.target.mainSessionId ||
         value.operation.materialId !== envelope.material.materialId || value.operation.sourceVersion !== request.target.sourceVersion ||
         (request.target.kind === 'unit' && value.operation.unitId !== request.target.unitId) ||
@@ -483,6 +486,7 @@ export class NormalTranslationService {
     try {
       if (job.error?.code === 'HOST_GENERATION_LOST') return
       if (job.controller.signal.aborted || this.disposed) { this.emit(job, 'cancelled', '', null, { code: 'CANCELLED_BEFORE_DISPATCH', message: '已在模型调用前取消。', stage: 'cancel' }); return }
+      if (job.packet.referenceContext) await (this.ctx.get?.('translationReferences') as ReferenceFilesService).validateContext(job.packet.referenceContext, {agent:job.agent,callId:job.request.operationId,signal:job.controller.signal})
       for await (const event of this.adapter.executeNormal(job.packet, job.controller.signal, () => {
         if (job.error?.code === 'HOST_GENERATION_LOST') throw job.error
         job.callId = job.packet!.callId
@@ -725,6 +729,7 @@ export class NormalTranslationService {
     if (['preparing', 'accepted', 'running', 'unknown'].includes(job.status)) job.controller.abort()
     return this.view(job, request.afterSequence)
   }
+  hasActiveJobs(): boolean { return this.activeSessions.size > 0 || this.documentSessions.size > 0 || [...this.jobs.values()].some(job => ['accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status)) }
   dispose(): void {
     this.disposed = true
     this.unregisterExchange?.(); this.unregisterExchange = undefined; this.exchange = undefined

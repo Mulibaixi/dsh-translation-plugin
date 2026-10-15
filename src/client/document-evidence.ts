@@ -5,6 +5,7 @@ import { TranslationSourceReader } from './source-reader.js'
 
 /** Metadata can establish a stale reference without pretending its body has been loaded. */
 export function isDocumentEvidenceUnloaded(sessions: SessionStore, scope: { readonly ownerId: string; readonly topicId: string }, ref: TermEvidenceRef): boolean {
+  if (ref.kind === 'reference') return true
   const history = sessions.getTranslationHistory(ref.sessionId)
   const unit = history?.units.find(unit => unit.id === ref.unitId)
   if (!unit || !isDocumentUnit(unit)) return false

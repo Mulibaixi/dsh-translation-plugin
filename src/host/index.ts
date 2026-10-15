@@ -1,3 +1,5 @@
+import { LocalDataService } from './local-data.js'
+import { ReferenceFilesService } from './reference-files.js'
 import { createTranslationFramework } from './framework.js'
 import { installQuickTranslation, type QuickHostContext } from './quick-translation.js'
 import { installTopicTools, type TopicHostContext } from './topic-tools.js'
@@ -40,7 +42,7 @@ export type * from '../shared/translation-source-storage.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationLocalData'] as const
 
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
@@ -101,7 +103,11 @@ export function installTerminologyAnalysis(ctx: TopicHostContext): TerminologyAn
 }
 
 export function apply(ctx: QuickHostContext): void {
+  ctx.provide('translationLocalData', new LocalDataService(ctx as TopicHostContext))
   installTopicTools(ctx as TopicHostContext, undefined, false)
+  const references = new ReferenceFilesService(ctx as TopicHostContext)
+  ctx.provide('translationReferences', references)
+  ctx.effect?.(() => () => references.dispose(), 'reference files lifetime')
   installObjectAssets(ctx, {}, false)
   installTranslationMaterials(ctx as TranslationMaterialHostContext, undefined, false)
   installNormalTranslation(ctx as TopicHostContext, undefined, false)

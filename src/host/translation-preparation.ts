@@ -10,6 +10,7 @@ import type { TopicHostContext, TopicToolsService, ToolExecution } from './topic
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TerminologyAnalysisService } from './terminology-analysis.js'
 import type { DocumentCorrectionService } from './document-correction-service.js'
+import type { ReferenceFilesService } from './reference-files.js'
 
 type Envelope = Extract<TranslationMaterialEnvelope, { kind: 'material' }>
 function failure(code: string, message: string, stage: string): AnalysisResult<never> { return { ok: false, error: { code, message, stage } } }
@@ -21,7 +22,7 @@ export class TranslationPreparationService {
   private get topics(): TopicToolsService | undefined { return this.ctx.get?.('translationTopics') as TopicToolsService | undefined }
   private authorized(ownerId: string, exec: ToolExecution): AnalysisResult<true> {
     if (this.disposed || !this.topics?.ownsAgent(ownerId, exec.agent)) return failure('scope_mismatch', '准备操作不属于已连接的实际主 Agent。', 'authorize_preparation')
-    if (this.topics.protocolFor(ownerId) !== 2) return failure('preparation_unavailable', '准备记录需要当前唯一主题桥的 v2 连接。', 'authorize_preparation')
+    if ((this.topics.protocolFor(ownerId) ?? 0) < 2) return failure('preparation_unavailable', '准备记录需要当前唯一主题桥的 v2 或更新连接。', 'authorize_preparation')
     exec.signal.throwIfAborted()
     return { ok: true, value: true }
   }
@@ -66,6 +67,13 @@ export class TranslationPreparationService {
     try { request = parseTranslationPreparationSet(args) } catch { return failure('invalid_input', '准备采用参数无效。', 'set_preparation') }
     const material = this.material(request, exec)
     if (!material.ok) return material
+    if (request.referenceContextRef) {
+      try {
+        const references = this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined
+        if (!references) return failure('reference_unavailable', '参考资料服务尚未就绪。', 'set_preparation')
+        await references.resolveContext(material.value.ownerId, material.value.material.topicId, request.referenceContextRef, exec)
+      } catch(error) { return failure((error as {code?:string}).code ?? 'reference_unavailable', (error as Error).message, 'set_preparation') }
+    }
     return this.request(request.target.mainSessionId, { kind: 'preparation_set', request, envelope: material.value }, 'preparation_receipt', exec)
   }
   async status(args: unknown, exec: ToolExecution): Promise<AnalysisResult<unknown>> {
@@ -87,6 +95,12 @@ export class TranslationPreparationService {
     const { capture, text: sourceText } = captured.value, previous = capture.preparation
     if (capture.currentSourceVersion !== request.target.sourceVersion || !previous || capture.source.operationId === null || !capture.corrections.some(fact => fact.operationId === capture.source.operationId && fact.toSourceVersion === capture.source.version)) return failure('source_mismatch', '复核需要当前纠错源及其真实准备和纠错事实。', 'review_correction_preparation')
     try {
+      const reference = request.referenceContextRef ?? previous.referenceContextRef
+      if (reference) {
+        const references = this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined
+        if (!references) return failure('reference_unavailable', '参考资料服务尚未就绪。', 'review_correction_preparation')
+        await references.resolveContext(capture.scope.ownerId, capture.scope.topicId, reference, exec)
+      }
       const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sourceText).buffer)), hash = [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('')
       const total = Array.from(sourceText).length
       if (capture.source.body.kind === 'asset' && (capture.source.body.reference.sha256 !== hash || capture.source.body.reference.totalCodePoints !== total)) return failure('source_mismatch', '实际读到的纠错原稿与固定身份不一致。', 'review_correction_preparation')

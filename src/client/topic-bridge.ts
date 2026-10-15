@@ -1,3 +1,4 @@
+import { ReferenceStore } from './reference-store.js'
 import {
   MAX_TOPIC_BRIDGE_REPLY_BYTES, parseTopicBridgeCapability, parseTopicBridgeV2Capability, parseTopicBridgeDown, parseTopicBridgeReply,
   type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact, type TopicSessionSummary,
@@ -21,6 +22,8 @@ import type { DocumentReviewClient } from './document-review-client.js'
 export interface TopicBridgeRemotePort {
   capabilities(): Promise<unknown>
   capabilitiesV2?(): Promise<unknown>
+  capabilitiesV3?(): Promise<unknown>
+  connectV3?: TopicBridgeRemotePort['connect']
   connectV2?: TopicBridgeRemotePort['connect']
   connect(request: TopicBridgeOpen, signal?: AbortSignal): AsyncIterable<unknown> & {
     send(item: TopicBridgeReply): void
@@ -66,6 +69,8 @@ function error(requestId: string, code: string, message: string): TopicBridgeRep
 
 /** Browser facts remain authoritative for material, history and terminology. */
 export class TopicBridgeClient {
+  private references: ReferenceStore | undefined
+  setReferences(references: ReferenceStore): void { this.references = references }
   private readonly connections = new Map<string, Connection>()
   private readonly publications = new Map<string, Publication>()
   private readonly documentPublications = new Map<string, { readonly sessionId: string; readonly topicId: string; readonly unitId: string; readonly sourceVersion: number }>()
@@ -128,15 +133,19 @@ export class TopicBridgeClient {
       if (response?.ok !== true) throw new Error('无法取得主题管理服务回执。')
       const capability = parseTopicBridgeCapability(response.value)
       if (!capability.ready) throw new Error(capability.reason ?? '主题管理服务尚未就绪。')
-      let protocol: 1 | 2 = 1
+      let protocol: 1 | 2 | 3 = 1
       if (remote.capabilitiesV2 && remote.connectV2) {
         try {
           const response = await remote.capabilitiesV2() as { readonly ok?: boolean; readonly value?: unknown }
           if (response?.ok === true && parseTopicBridgeV2Capability(response.value).ready) protocol = 2
         } catch { /* Older Host: keep the single v1 connection and text-only execution. */ }
       }
+      if (remote.capabilitiesV3 && remote.connectV3) {
+        const response = await remote.capabilitiesV3() as { ok?: boolean; value?: { ready?: boolean; referenceProtocol?: number } }
+        if (response.ok === true && response.value?.ready && response.value.referenceProtocol === 1) protocol = 3
+      }
       if (!current()) return
-      const handle = protocol === 2 ? remote.connectV2!({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
+      const handle = protocol === 3 ? remote.connectV3!({ ownerId, mainSessionId: ownerId }, connection.controller.signal) : protocol === 2 ? remote.connectV2!({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
         : remote.connect({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
       connection.handle = handle
       let opened = false
@@ -181,6 +190,7 @@ export class TopicBridgeClient {
     catch { console.error('[dsh-translation-plugin] Topic bridge stream cleanup failed.') }
   }
   private publishedEvidence(ownerId: string, topicId: string, ref: TermEvidenceRef): boolean {
+    if (ref.kind === 'reference') return this.references?.isPublished(ownerId, topicId, ref) === true
     const documented = this.documentPublications.get(this.key(ownerId, ref.sessionId, ref.unitId))
     if (documented && documented.topicId === topicId) {
       const session = this.sessions.getSession(ref.sessionId), history = this.sessions.getTranslationHistory(ref.sessionId), unit = history?.units.find(unit => unit.id === ref.unitId)
@@ -349,6 +359,7 @@ export class TopicBridgeClient {
     if (command.kind === 'normal_accept' || command.kind === 'normal_prepare' || command.kind === 'normal_update') {
       const { kind, ...payload } = command
       if (kind !== 'normal_update' && 'envelope' in payload && payload.envelope.material.unitReference && !this.isPublished(ownerId, payload.envelope.material.translationSessionId, payload.envelope.material.unitReference.unitId)) return error(request.requestId, 'reference_not_published', '此单元参考已撤回。')
+      if (kind !== 'normal_update' && 'envelope' in payload) await this.terms.reconcileAsync?.(ownerId, payload.envelope.material.topicId)
       const result = kind === 'normal_update' ? this.normal?.update(ownerId, payload as NormalTranslationUpdate)
         : kind === 'normal_prepare' ? this.normal?.prepare(ownerId, payload as NormalTranslationAcceptance)
         : this.normal?.accept(ownerId, payload as NormalTranslationAcceptance)
@@ -364,6 +375,29 @@ export class TopicBridgeClient {
     if (command.kind === 'normal_exchange_resolve') {
       const result = this.normal?.resolveExchange(ownerId, command)
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译 exchange 通道尚未就绪。')
+    }
+    if (command.kind === 'reference_assets') {
+      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId,'scope_mismatch','参考资产不属于当前主题。')
+      const archive = await (this.archive.reconcileAsync?.(ownerId, command.topicId) ?? this.archive.getSnapshot(ownerId, command.topicId))
+      const assets = await Promise.all(command.selections.map(async selection => {
+        const entry = archive.entries.find(entry => entry.id === selection.id && entry.version === selection.version && entry.kind === selection.kind && entry.status === 'active')
+        if (!entry) throw Object.assign(new Error('所选背景资产已变化或未生效。'),{code:'stale_reference_asset'})
+        const label = entry.kind === 'entity' ? entry.name : entry.kind === 'fact' ? entry.title : entry.relation
+        const effective = await this.archive.queryAsync?.(ownerId, command.topicId, {mode:'normal',kinds:[entry.kind],forms:[label]})
+        if (!effective?.entries.some(candidate => candidate.id === entry.id && candidate.version === entry.version)) throw Object.assign(new Error('所选背景资产的依据尚不可用。'), {code:'stale_reference_asset'})
+        const {id:_id, version:_version, createdAt:_created, updatedAt:_updated, confirmation:_confirmation, evidence:_evidence, status:_status, origin, ...content} = entry
+        return {...selection, content: JSON.stringify({origin,...content})}
+      }))
+      return success({kind:'reference_assets',assets})
+    }
+    if (command.kind === 'reference_bind' || command.kind === 'reference_scope' || command.kind === 'reference_sync') {
+      if (!this.references) return error(request.requestId, 'reference_unavailable', '参考资料服务尚未就绪。')
+      try {
+        const facts = command.kind === 'reference_bind' ? await this.references.bind(ownerId, command.operationId, command.start)
+          : command.kind === 'reference_scope' ? this.references.facts(ownerId, command.topicId)
+          : this.references.sync(ownerId, command.index, command.expectedVersion)
+        return success({ kind: 'reference_facts', facts })
+      } catch (cause) { return error(request.requestId, String((cause as {code?: string}).code ?? 'reference_unavailable'), (cause as Error).message) }
     }
     if (command.kind === 'list_sessions') return success({ kind: 'sessions', sessions: this.sessions.getAvailableSessions(ownerId).filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => this.sessionSummary(session)) })
     if (command.kind === 'list_topics') return success({ kind: 'topics', topics: this.sessions.getTopics(ownerId).map(topic => ({ ...topic,

@@ -6,7 +6,7 @@ import { TopicEvidenceView, type TopicTermsViewPort } from './topic-terms-view.j
 
 const kinds = { entity: '实体', fact: '事实', relation: '关系' } as const
 const statuses = { proposal: '待确认', active: '生效', review_required: '待复核', disabled: '已停用' } as const
-const origins = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
+const origins = { inferred: '模型提案', source_checked: '原文依据', reference_derived: '参考资料（主模型解读）', user_explicit: '用户采用' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突', error: '保存失败' } as const
 type TextEvent = { readonly currentTarget: { readonly value: string } }
 interface ArchiveForm {
