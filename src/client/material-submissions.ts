@@ -88,10 +88,12 @@ function pastedTextSize(text: string): { readonly bytes: number; readonly totalC
   if (bytes > MAX_TRANSLATION_SOURCE_BYTES) throw new Error('待译原文超过 2 MiB UTF-8 上限；正文保持完整。')
   return { bytes, totalCodePoints }
 }
-function composerReasonLabel(reason?: string): string { return reason === 'composer_protocol_undeclared'
-  ? `当前 DSH 的同步提交接口未声明协议版本（${reason}）。`
-  : reason?.startsWith('composer_protocol_unsupported:') ? `当前 DSH 的同步提交协议版本不受支持（${reason}）。`
-    : reason ?? SEAM_MISSING
+function composerReasonLabel(reason?: string): string {
+  if (reason === 'composer_submissions_unavailable') return '普通模式暂不可用：Composer 扩展已加载，但当前 DSH 缺少同步发送材料接口；请安装匹配的宿主补丁并重启 DSH。'
+  if (reason === 'composer_extension_disposed' || reason === 'composer_extension_unavailable') return '普通模式暂不可用：Composer 扩展尚未就绪。'
+  if (reason === 'composer_protocol_undeclared') return `当前 DSH 的同步提交接口未声明协议版本（${reason}）。`
+  if (reason?.startsWith('composer_protocol_unsupported')) return `当前 DSH 的同步提交协议版本不受支持（${reason}）。`
+  return reason ?? SEAM_MISSING
 }
 
 /** One root lifetime owns capture, bridge retention and immutable submission receipts. */
@@ -105,7 +107,9 @@ export class MaterialSubmissionsClient {
   private readonly listeners = new Set<() => void>()
   private readonly stopStore: () => void
   private readonly stopTopics: () => void
-  private readonly unregister: (() => void) | undefined
+  private unregister: (() => void) | undefined
+  private registry: MaterialSubmissionRegistry | undefined
+  private composerReason: string | undefined
   private capability: TranslationMaterialCapability | undefined
   private sourceCapability: TranslationSourceCapability | undefined
   private sourceReason: string | undefined
@@ -116,12 +120,22 @@ export class MaterialSubmissionsClient {
   constructor(private readonly options: Options) {
     this.stopStore = options.store.subscribe(() => { this.reconcile(); this.emit() })
     this.stopTopics = options.topics.subscribe(() => this.emit())
-    this.unregister = options.registry?.register(options.owner, {
+    this.setComposerBridge(options.registry, options.composerReason)
+    this.reconcile()
+    void this.load()
+  }
+  setComposerBridge(registry?: MaterialSubmissionRegistry, reason?: string): void {
+    if (this.disposed || (this.registry === registry && this.composerReason === reason)) return
+    this.unregister?.()
+    this.unregister = undefined
+    this.registry = undefined
+    this.composerReason = reason
+    this.unregister = registry?.register(this.options.owner, {
       key: 'dsh-translation-plugin.material-submissions',
       freeze: gesture => this.freeze(gesture),
     })
-    this.reconcile()
-    void this.load()
+    this.registry = registry
+    this.emit()
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
@@ -166,7 +180,7 @@ export class MaterialSubmissionsClient {
   getAttachment(ownerId: string): { readonly label: string; readonly omitted: boolean; readonly available: boolean } | undefined {
     const session = this.options.store.getActiveSession(ownerId)
     if (!session || session.mode !== 'normal' || !this.live(session) || (!session.input.trim() && !this.files.has(session.id))) return undefined
-    return { label: this.unregister ? `附带待译稿：${session.remark || session.name}` : composerReasonLabel(this.options.composerReason),
+    return { label: this.unregister ? `附带待译稿：${session.remark || session.name}` : composerReasonLabel(this.composerReason),
       omitted: this.omitted.get(ownerId)?.selected ?? false, available: !!this.unregister }
   }
   private async port(): Promise<TranslationMaterialsRemotePort> {
@@ -213,7 +227,7 @@ export class MaterialSubmissionsClient {
     return undefined
   }
   private readiness(ownerId: string, file = false): string | undefined {
-    if (!this.unregister) return composerReasonLabel(this.options.composerReason)
+    if (!this.unregister) return composerReasonLabel(this.composerReason)
     if (!this.capability?.ready || !this.capability.directSubmit) return this.serviceReason ?? '正在检查材料提交服务…'
     const topic = this.options.topics.getStatus(ownerId)
     if (!topic.ready) return topic.reason ?? '正在连接此主会话的材料通道…'

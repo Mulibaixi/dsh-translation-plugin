@@ -100,8 +100,10 @@ const CLIENT_ID = 'dsh-translation-plugin'
 export const name = 'dsh-translation-client'
 export const inject = ['sidebarRightTabs', 'sidebarRight', 'slots', 'remote', 'remote.session', 'fileUpload', 'conversation'] as const
 
-function materialSubmissionBridge(ctx: ClientPluginContext): { registry?: MaterialSubmissionRegistry; composerReason?: string } {
-  const extension = ctx.get ? ctx.get('composerExtension') : ctx.composerExtension
+function materialSubmissionBridge(
+  ctx: ClientPluginContext,
+  extension: ComposerExtensionService | null | undefined = ctx.get ? ctx.get('composerExtension') : ctx.composerExtension,
+): { registry?: MaterialSubmissionRegistry; composerReason?: string } {
   const capability: Capability | undefined = extension?.capabilities()
   if (extension) return capability?.state === 'available'
     ? { registry: extension }
@@ -187,6 +189,17 @@ export function apply(ctx: ClientPluginContext): void {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationMaterials')
       } : ctx.remote.translationMaterials,
+    })
+    // Cordis re-runs this scope when the optional service is loaded or replaced.
+    // Keep drafts and submission receipts in the root client across those changes.
+    ctx.inject(['composerExtension'], scope => {
+      const bridge = materialSubmissionBridge(ctx, scope.get('composerExtension'))
+      materials.setComposerBridge(bridge.registry, bridge.composerReason)
+      scope.effect(() => () => {
+        // The service may still be visible while its dependency scope is stopping.
+        const fallback = materialSubmissionBridge(ctx, null)
+        materials.setComposerBridge(fallback.registry, fallback.composerReason)
+      })
     })
     const preparations = new PreparationStore({ ...store.createPreparationStoreOptions(), isTopicTermsCurrent: snapshot => terms.isSnapshotCurrent(snapshot) })
     topics.setPreparation(preparations, envelope => materials.resolveSubmittedMaterial(envelope), target => materials.resolveSubmittedTarget(target))
