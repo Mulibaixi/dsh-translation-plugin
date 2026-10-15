@@ -12,6 +12,39 @@ import type { DocumentReviewClient } from './document-review-client.js'
 import { documentReviewVersion, documentManifestFinalEligibility } from '../memory/document-review.js'
 import type { DocumentReviewTarget } from '../shared/document-review.js'
 import { readDocumentText } from './document-export.js'
+import { downloadExport } from './browser-download.js'
+
+function TranslatedDocumentFile({ unit, session, documents, objects }: RecordObjectsProps & DocumentViewProps & {
+  readonly unit: DocumentUnit; readonly session: LocalSession
+}): unknown {
+  const final = currentDocumentFinalRevision(unit)
+  const [file, setFile] = react.useState<{ readonly identity: string; readonly content: string; readonly fileName: string; readonly mimeType: string } | undefined>(undefined)
+  const [failure, setFailure] = react.useState(false), [retry, setRetry] = react.useState(0)
+  const identity = JSON.stringify([session.id, unit.id, unit.sourceVersion, final?.id])
+  react.useEffect(() => {
+    let active = true
+    setFile(undefined); setFailure(false)
+    if (!final) return
+    if (!documents) { setFailure(true); return }
+    const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision' as const, revisionId: final.id }
+    const references = structuredClone(objects?.getReferences(target) ?? [])
+    void (async () => {
+      const handle = documents.captureDocument({ ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id,
+        unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: final.id })
+      if ('status' in handle) throw new Error('Final file unavailable')
+      const result = await projectDocumentResult(handle)
+      if (!result.complete || result.text === null) throw new Error('Final file incomplete')
+      if (active) setFile({ identity, content: recordObjectPlainText(result.text, target, references), fileName: result.fileName, mimeType: result.mimeType })
+    })().catch(() => { if (active) setFailure(true) })
+    return () => { active = false }
+  }, [identity, unit, documents, objects, retry])
+  if (!final) return null
+  return h('div', { className: 'dsh-tp-attachment', role: 'status' },
+    file?.identity === identity ? h('button', { type: 'button', className: 'dsh-tp-object-link', onClick: () => {
+      try { downloadExport(file) } catch { setFailure(true) }
+    } }, `已翻译文件：${file.fileName}`) : h('span', null, failure ? '译文文件暂不可用。' : '正在生成译文文件…'),
+    failure ? h('button', { type: 'button', onClick: () => setRetry(value => value + 1) }, '重试') : null)
+}
 
 export interface DocumentViewProps { readonly documents?: TranslationDocumentReader | undefined; readonly documentTasks?: DocumentTasksClient | undefined; readonly documentReviews?: DocumentReviewClient | undefined }
 type Failure = Pick<EvidenceUnavailableResult, 'status' | 'reason'>
@@ -232,6 +265,8 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, docu
   }
   let targetOffset: number | null = 0
   return h('article', { className: 'dsh-tp-record-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'data-source-version': unit.sourceVersion, 'data-manifest-id': manifest?.id, 'aria-label': `文档 ${unit.order}` },
+    h('p', { role: 'status' }, `待处理文件：${name}`),
+    h(TranslatedDocumentFile, { unit, session, documents, objects }),
     h('div', { className: 'dsh-tp-record-unit-heading' }, h('h3', null, `文档 ${unit.order} · ${name} · ${status}`), h('small', { className: 'dsh-tp-muted' }, `原文版本 ${unit.sourceVersion} · 目标语言：${unit.targetLanguage}`),
       h('span', { className: 'dsh-tp-actions dsh-tp-record-open-links' }, h(RecordOpenLink, { identity, visible, navigationRevision, action: originalAction }), h(RecordOpenLink, { identity, visible, navigationRevision, action: resultAction }))),
     manifests.length ? h('div', { className: 'dsh-tp-actions' },

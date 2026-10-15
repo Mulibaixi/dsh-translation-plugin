@@ -641,6 +641,9 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
         void action.run(() => deleteConfirmed(store, terms, deletion), () => setDeletion(currentRequest => currentRequest === deletion ? undefined : currentRequest))
       }, onTermsChange: (checked: boolean) => setDeletion(currentRequest => currentRequest === deletion ? { ...deletion, includeTerms: checked } : currentRequest) }) : null,
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, 'aria-label': '翻译会话内容' },
+        ...(current ? materials?.getSentFiles(current.id) ?? [] : []).filter(file => !units.some(unit => !isTextUnit(unit) && unit.sourceVersions.some(source => source.body.kind === 'asset' && source.body.reference.sourceId === file.sourceId))).map(file =>
+          h('article', { key: file.materialId, className: 'dsh-tp-record-unit', 'aria-label': '已发送文件' },
+            h('p', { role: 'status' }, `待处理文件：${file.name}`), h('small', { className: 'dsh-tp-muted' }, '已发送 · 原稿已冻结'))),
         historyNote && (units.length || records.length) ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
         ...units.map(unit => isTextUnit(unit) ? h(TranslationUnit, { key: unit.id, store, unit, quick, normal, materials, session: current!, editor, objects, objectAssets, topics: current?.mode === 'normal' ? topics : undefined }) : h(DocumentUnitView, { key: unit.id, unit, session: current!, store, documents, documentTasks, documentReviews, objects, objectAssets })),

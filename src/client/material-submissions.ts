@@ -54,6 +54,7 @@ interface Submission {
   started: boolean
   settling: boolean
   consumed?: boolean
+  sent?: boolean
   preparation?: Promise<void>
   controller?: AbortController
   hostStarted: boolean
@@ -170,6 +171,22 @@ export class MaterialSubmissionsClient {
     this.reconcile(); this.emit()
   }
   getSelectedFile(sessionId: string): File | undefined { return this.files.get(sessionId)?.file }
+  /** Sent files are immutable records, separate from the next editable draft. */
+  getSentFiles(sessionId: string): readonly { readonly materialId: string; readonly name: string; readonly sourceId: string | undefined }[] {
+    return [...this.submissions.values()].filter(item => item.sessionId === sessionId && item.sent && item.draft?.carrier?.kind === 'selected_file')
+      .map(item => ({ materialId: item.draft!.materialId,
+        name: item.draft!.carrier!.kind === 'selected_file' ? item.draft!.carrier!.selected.file.name : item.draft!.carrier!.name,
+        sourceId: item.envelope?.kind === 'material' ? item.envelope.material.sourceRef?.sourceId : undefined }))
+  }
+  private confirmSent(item: Submission): void {
+    if (item.sent || !item.draft) return
+    item.sent = true
+    const carrier = item.draft.carrier, sessionId = item.draft.session.id
+    if (carrier?.kind === 'selected_file' && this.files.get(sessionId)?.version === carrier.selected.version) {
+      this.files.delete(sessionId)
+      this.fileVersions.set(sessionId, (this.fileVersions.get(sessionId) ?? 0) + 1)
+    }
+  }
   clearSelectedFiles(ownerId: string): void {
     for (const sessionId of [...this.files.keys()]) if (this.options.store.getSession(sessionId)?.ownerId === ownerId) this.setFileSelected(sessionId, undefined)
   }
@@ -222,7 +239,8 @@ export class MaterialSubmissionsClient {
       if (file.size > MAX_TRANSLATION_SOURCE_BYTES) return 'TXT 原稿超过 2 MiB 上限；所选文件保留。'
       return undefined
     }
-    if (!session.input.trim()) return '请输入待译材料。'
+    if (!session.input.trim()) return this.getSentFiles(session.id).length
+      ? '文件已发送；可在主会话继续说明处理要求，或添加新的待译材料。' : '请输入待译材料。'
     try { pastedTextSize(session.input) } catch (error) { return detail(error) }
     return undefined
   }
@@ -259,7 +277,9 @@ export class MaterialSubmissionsClient {
     if (busy) blocked = '正在提交材料…'
     if (unknown) blocked = '提交结果尚不确定，请先检查提交状态。'
     let message = latest?.reason
-    if (latest?.consumed) message = '翻译业务已受理；原提交材料已记录。'
+    if (this.getSentFiles(sessionId).length && !session?.input.trim() && !this.files.has(sessionId)) message = '文件已发送并冻结；待处理文件见会话记录。'
+    else if (latest?.consumed) message = session && latest.draft && this.draftVersion(session) !== latest.draft.draftVersion
+      ? '翻译业务已受理；当前草稿的后续修改保留。' : '翻译业务已受理；原提交材料已记录。'
     else if (latest?.draft && ['submitted', 'attached'].includes(latest.stage)) {
       const sent = latest.draft.draftVersion, current = session ? this.draftVersion(session) : sent
       message = current === sent ? `已向主会话提交草稿版本 ${sent}；待译草稿保留。`
@@ -310,6 +330,7 @@ export class MaterialSubmissionsClient {
   private checkReceipt(item: Submission, receipt: TranslationMaterialReceipt): void {
     if (!sameScope(item.identity, receipt) || item.kind !== receipt.kind) throw new Error('材料服务回执身份不匹配；提交结果尚不确定。')
     item.stage = receipt.stage
+    if (receipt.stage === 'submitted' || receipt.stage === 'attached') this.confirmSent(item)
   }
   /** The bridge may only admit the exact browser snapshot that was prepared for this main submission. */
   resolveSubmittedMaterial(envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }): TranslationMaterialEnvelope & { readonly kind: 'material' } | undefined {
@@ -376,7 +397,7 @@ export class MaterialSubmissionsClient {
         const envelope = await this.materialEnvelope(item, controller.signal)
         const receipt = await this.call<TranslationMaterialReceipt>(method, envelope, () => { this.active(item, controller.signal); item.hostStarted = true })
         this.active(item, controller.signal)
-        if (!sameScope(item.identity, receipt) || item.kind !== receipt.kind || receipt.stage !== (method === 'prepare' ? 'prepared' : 'submitted')) throw new Error('材料准备回执身份或阶段无效。')
+        if (!sameScope(item.identity, receipt) || item.kind !== receipt.kind || !(method === 'prepare' ? receipt.stage === 'prepared' : ['submitted', 'attached'].includes(receipt.stage))) throw new Error('材料准备回执身份或阶段无效。')
         this.checkReceipt(item, receipt)
       } catch (error) {
         item.reason = detail(error)
@@ -395,7 +416,11 @@ export class MaterialSubmissionsClient {
     if (!item) {
       try {
         const kind = omit ? 'omit' : session?.mode === 'normal' && (session.input.trim() || this.files.has(session.id)) ? 'material' : 'none'
-        if (kind === 'material' && session) { const reason = this.inputReason(session); if (reason) throw new Error(reason) }
+        if (kind === 'material' && session) {
+          const status = this.getStatus(session.id)
+          if (status.busy || status.unknown) throw new Error(status.blocked ?? '材料提交尚未结算。')
+          const reason = this.inputReason(session); if (reason) throw new Error(reason)
+        }
         item = this.record(session, gesture.sessionId, gesture.requestId, kind, false)
         if (omit) this.omitted.set(gesture.sessionId, { revision: omit, selected: false })
       } catch (error) { failure = detail(error) }
@@ -415,6 +440,7 @@ export class MaterialSubmissionsClient {
         const result = outcome === 'accepted' ? 'submitted' : outcome === 'handled' || outcome === 'cancelled' ? 'no_prompt' : outcome
         if (!frozen.started) { frozen.stage = result === 'unknown' ? 'unknown' : 'released'; this.reconcile(); this.emit(); return }
         frozen.stage = result === 'submitted' ? 'submitted' : result === 'unknown' ? 'unknown' : 'released'
+        if (result === 'submitted') this.confirmSent(frozen)
         frozen.settling = true
         // A disposal can finish while prepare is in flight. Cleanup must follow its ACK.
         void Promise.resolve(frozen.preparation).catch(() => {}).then(() => frozen.hostStarted
