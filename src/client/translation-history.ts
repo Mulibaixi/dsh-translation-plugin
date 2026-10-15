@@ -1,5 +1,5 @@
 import { decodeRoute, type ModelRoute } from './sessions.js'
-import { parseTranslationCallMetadata, parseTranslationCallFacts, translationCallFacts, type TranslationCallMetadata, type TranslationCallFacts } from '../shared/translation-call.js'
+import { isNormalExchangePromptVersion, parseTranslationCallMetadata, parseTranslationCallFacts, translationCallFacts, type TranslationCallMetadata, type TranslationCallFacts } from '../shared/translation-call.js'
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
 import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
@@ -230,7 +230,7 @@ function decodeExchange(value: unknown, units: readonly TranslationUnit[]): Tran
   const unit = units.filter(isTextUnit).find(item => item.id === value.unitId), source = unit?.sourceVersions.find(item => item.version === value.sourceVersion)
   const revision = unit?.revisions.find(item => item.id === value.callId)
   if (!unit || !source || !revision || revision.operationId !== value.operationId || revision.sourceVersion !== value.sourceVersion ||
-    (revision.callRecord ?? revision.deletion?.callFacts)?.promptVersion !== 'normal-text-exchange-v1') return undefined
+    !isNormalExchangePromptVersion((revision.callRecord ?? revision.deletion?.callFacts)?.promptVersion)) return undefined
   let questions: RequestContextInput
   try { questions = parseRequestContextInput(value.questions, Array.from(source.text).length) } catch { return undefined }
   const resolutions = value.resolutions.map(decodeExchangeResolution)

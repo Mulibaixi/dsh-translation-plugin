@@ -3,7 +3,7 @@ import { parseNormalTranslationAcceptance, parseNormalTranslationUpdate, parseNo
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import type { TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
-import type { TranslationCallMetadata } from '../shared/translation-call.js'
+import { isNormalExchangePromptVersion, isNormalTranslationPromptVersion, type TranslationCallMetadata } from '../shared/translation-call.js'
 import { parseRequestContextInput } from '../shared/request-context.js'
 import { parseNormalTranslationV2Event, parseNormalTranslationV2Job, type NormalTranslationResolution, type NormalTranslationV2Event, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
 import { appendAdmittedTextUnit, appendTextRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation,
@@ -325,7 +325,7 @@ export class NormalTranslationClient {
 
   private matchesResume(item: AcceptedOperation, metadata: TranslationCallMetadata, history: TranslationHistory, exchangeId: string | null): boolean {
     const refs = metadata.exchangeContext?.resolutionRefs
-    if (metadata.promptVersion !== 'normal-text-exchange-v1' || metadata.exchangeContext?.contextVersion !== item.v2Attempts.size + 1 || refs?.length !== 1) return false
+    if (!isNormalExchangePromptVersion(metadata.promptVersion) || metadata.exchangeContext?.contextVersion !== item.v2Attempts.size + 1 || refs?.length !== 1) return false
     const exchange = history.exchanges.find(exchange => exchange.operationId === item.operation.operationId && exchange.resolutions.some(resolution => resolution.resolutionId === refs[0]!.resolutionId))
     if (!exchange || exchange.exchangeId !== exchangeId || exchange.status !== 'resuming' || exchange.sourceVersion !== item.operation.sourceVersion) return false
     const resolution = exchange.resolutions.find(item => item.resolutionId === refs[0]!.resolutionId)
@@ -405,8 +405,8 @@ export class NormalTranslationClient {
   }
 
   private matchesCall(item: AcceptedOperation, metadata: TranslationCallMetadata, previous: TranslationCallMetadata | null): boolean {
-    if (!['normal-text-v1', 'normal-text-exchange-v1'].includes(metadata.promptVersion) || !metadata.context) return false
-    if (metadata.promptVersion === 'normal-text-exchange-v1' && (metadata.exchangeContext?.contextVersion !== 1 || metadata.exchangeContext.resolutionRefs.length !== 0)) return false
+    if (!isNormalTranslationPromptVersion(metadata.promptVersion) || !metadata.context) return false
+    if (isNormalExchangePromptVersion(metadata.promptVersion) && (metadata.exchangeContext?.contextVersion !== 1 || metadata.exchangeContext.resolutionRefs.length !== 0)) return false
     if (previous) return JSON.stringify({ ...metadata, usage: null }) === JSON.stringify({ ...previous, usage: null })
     if (!item.signature) return true // A restored history already owns its saved call context.
     const request = JSON.parse(item.signature) as NormalTranslationAcceptance, model = request.envelope.material.model!
@@ -428,7 +428,7 @@ export class NormalTranslationClient {
       const accepted = history?.events.find(event => event.operationId === operationId && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null)
       if (!unit || event?.type === 'source.corrected' || (material && material.mainSessionId !== ownerId) || this.store.isSessionDeleted(session.id)) continue
       const revision = [...unit.revisions].reverse().find(revision => revision.operationId === operationId)
-      if (!accepted && !['normal-text-v1', 'normal-text-exchange-v1'].includes((revision?.callRecord ?? revision?.deletion?.callFacts)?.promptVersion ?? '')) continue
+      if (!accepted && !isNormalTranslationPromptVersion((revision?.callRecord ?? revision?.deletion?.callFacts)?.promptVersion)) continue
       const receipt = [...history!.events].reverse().find(event => event.operationId === operationId && event.normalSequence !== undefined)
       const state = revision?.deletion?.originalStatus ?? revision?.status ?? event?.status
       const restoredV2Status: NormalTranslationV2Status = ['completed', 'failed', 'cancelled'].includes(state ?? '')
@@ -442,7 +442,7 @@ export class NormalTranslationClient {
         v2Sequence: history?.events.filter(event => event.operationId === operationId && event.normalV2Sequence !== undefined).at(-1)?.normalV2Sequence ?? 0,
         v2Status: restoredV2Status,
         v2Updates: new Map(), v2Attempts: new Map(unit.revisions.filter(revision => revision.operationId === operationId &&
-          revision.callRecord?.promptVersion === 'normal-text-exchange-v1').map(revision => [revision.id, {
+          isNormalExchangePromptVersion(revision.callRecord?.promptVersion)).map(revision => [revision.id, {
           contextVersion: revision.callRecord!.exchangeContext!.contextVersion, metadata: revision.callRecord!, text: revision.text,
           status: ['completed', 'failed', 'cancelled', 'context_requested'].includes(revision.status) ? revision.status : 'running',
           needsContext: history!.exchanges.some(exchange => exchange.operationId === operationId && exchange.callId === revision.id),
@@ -524,7 +524,7 @@ export class NormalTranslationClient {
       const v2 = typeof this.options.remoteV2 === 'function' ? await this.options.remoteV2() : this.options.remoteV2
       const unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
       const exchangeMode = item.v2Sequence > 0 || unit && isTextUnit(unit) && unit.revisions.some(
-        revision => revision.operationId === status.operationId && revision.callRecord?.promptVersion === 'normal-text-exchange-v1')
+        revision => revision.operationId === status.operationId && isNormalExchangePromptVersion(revision.callRecord?.promptVersion))
       if (v2 && exchangeMode) {
         usedV2 = true
         let more = true, action = method

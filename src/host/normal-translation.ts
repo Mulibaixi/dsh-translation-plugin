@@ -6,7 +6,7 @@ import { NORMAL_TRANSLATION_REMOTE, parseNormalTranslationExecute, parseNormalTr
 import { NORMAL_TRANSLATION_V2_REMOTE, NormalTranslationAttemptJournal, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { TranslationMaterialEnvelope, TranslationMaterialSnapshot } from '../shared/translation-material.js'
-import type { NormalTranslationContext, TranslationCallMetadata } from '../shared/translation-call.js'
+import { isNormalExchangePromptVersion, type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
 import type { RequestContextInput } from '../shared/request-context.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
 import { DshTextExecutionAdapter, hostLlmLoader, type LlmModuleLoader, type NormalExecutionPacket } from './dsh-text-adapter.js'
@@ -443,7 +443,7 @@ export class NormalTranslationService {
       unitId: operation.unitId, operationId: operation.operationId, sourceVersion: operation.sourceVersion, callId: job.callId,
       sequence: job.updates.length + 1, status, textDelta, metadata, error }
     job.updates.push(structuredClone(update)); job.status = status; job.operation = { ...operation, status }
-    const v2Attempt = job.attempts.snapshot().attempts.length > 0 && job.metadata?.promptVersion === 'normal-text-exchange-v1'
+    const v2Attempt = job.attempts.snapshot().attempts.length > 0 && isNormalExchangePromptVersion(job.metadata?.promptVersion)
     if (v2Attempt) return
     job.writing = job.writing.then(async () => {
       if (job.deliveryFailed || this.disposed) return
@@ -489,7 +489,7 @@ export class NormalTranslationService {
         const contextVersion = job.metadata!.exchangeContext?.contextVersion ?? 1
         job.attempts.start(job.callId, contextVersion, job.metadata!, job.exchangeId)
         job.v2Status = 'running'
-        if (job.metadata!.promptVersion === 'normal-text-exchange-v1') {
+        if (isNormalExchangePromptVersion(job.metadata!.promptVersion)) {
           const resolutionId = job.metadata!.exchangeContext?.resolutionRefs[0]?.resolutionId
           this.deliverV2(job)
           if (resolutionId && job.exchange) {
@@ -514,7 +514,7 @@ export class NormalTranslationService {
             const delta = points.slice(offset, offset + 8192).join('')
             if (delta) {
               job.attempts.partial(job.callId!, delta)
-              if (job.metadata?.promptVersion === 'normal-text-exchange-v1') this.deliverV2(job)
+              if (isNormalExchangePromptVersion(job.metadata?.promptVersion)) this.deliverV2(job)
             }
             this.emit(job, 'running', delta)
           }
@@ -539,7 +539,7 @@ export class NormalTranslationService {
           let controlStatus: 'waiting_context' | 'waiting_user' = 'waiting_context'
           let registered = false
           let ref: NeedsContextReference | undefined
-          if (job.exchange && job.operation && job.metadata?.promptVersion === 'normal-text-exchange-v1') {
+          if (job.exchange && job.operation && isNormalExchangePromptVersion(job.metadata?.promptVersion)) {
             ref = { scope, callId: job.callId!, contextVersion: job.attempts.snapshot().attempts.at(-1)!.contextVersion,
               hostGeneration: job.exchange.hostGeneration, lastSequence: job.attempts.snapshot().events.length }
             const accepted = await job.exchange.acceptNeedsContext(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['acceptNeedsContext']>[0], ref, event.input)
@@ -550,14 +550,14 @@ export class NormalTranslationService {
             }
           }
           job.v2Status = controlStatus
-          if (job.metadata?.promptVersion === 'normal-text-exchange-v1' && !registered) {
+          if (isNormalExchangePromptVersion(job.metadata?.promptVersion) && !registered) {
             job.attempts.control(job.callId!, 'unknown', null, null)
             job.v2Status = 'unknown'
             job.error = { code: 'EXCHANGE_UNAVAILABLE', message: '求助控制事实未能登记，操作状态未知；不会自动续作。', stage: 'register_resume' }
           } else if (registered) {
             job.attempts.control(job.callId!, controlStatus, null, job.exchangeId)
           }
-          if (job.metadata?.promptVersion === 'normal-text-exchange-v1') {
+          if (isNormalExchangePromptVersion(job.metadata?.promptVersion)) {
             this.deliverV2(job)
             await job.writing
             if (job.deliveryFailed) {
@@ -578,7 +578,7 @@ export class NormalTranslationService {
             message: status === 'cancelled' ? '普通翻译已取消，已有输出保留。' : job.requestContext ? '当前执行尚未连接补充协调器，部分译文已保留。' : '普通译文未完整完成，已有输出保留。',
             stage: status === 'cancelled' ? 'cancel' : job.requestContext ? 'resolve' : 'stream',
           }, job.metadata ?? undefined, job.exchangeId)
-          if (job.metadata?.promptVersion === 'normal-text-exchange-v1') this.deliverV2(job)
+          if (isNormalExchangePromptVersion(job.metadata?.promptVersion)) this.deliverV2(job)
           if (!job.requestContext) job.v2Status = status
           const error = status === 'completed' ? null : status === 'cancelled'
             ? { code: 'CANCELLED', message: '普通翻译已取消，已有输出保留。', stage: 'cancel' }
@@ -594,7 +594,7 @@ export class NormalTranslationService {
       const status = error.stage === 'protocol' ? 'failed' : 'unknown'
       if (job.callId && job.attempts.snapshot().attempts.at(-1)?.endSequence === null) {
         job.attempts.end(job.callId, status, error, job.metadata ?? undefined, job.exchangeId)
-        if (job.metadata?.promptVersion === 'normal-text-exchange-v1') this.deliverV2(job)
+        if (isNormalExchangePromptVersion(job.metadata?.promptVersion)) this.deliverV2(job)
       }
       if (job.v2Status !== 'waiting_context') job.v2Status = status
       this.emit(job, status, '', job.callId ? job.metadata : null, error)
@@ -606,7 +606,7 @@ export class NormalTranslationService {
         if (job.operation) job.operation = { ...job.operation, status: 'unknown' }
       }
       const attempt = job.attempts.snapshot().attempts.at(-1)
-      if (job.exchange && job.operation && job.exchangeId && job.callId && job.metadata?.promptVersion === 'normal-text-exchange-v1' && attempt) {
+      if (job.exchange && job.operation && job.exchangeId && job.callId && isNormalExchangePromptVersion(job.metadata?.promptVersion) && attempt) {
         const result = job.v2Status === 'waiting_context' || job.v2Status === 'waiting_user' ? 'needs_context'
           : job.v2Status === 'completed' ? 'completed' : job.v2Status === 'cancelled' ? 'cancelled' : 'unknown'
         await job.exchange.finishOperation(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['finishOperation']>[0], {
