@@ -431,7 +431,7 @@ export class PreparationStore {
       if (query.target.kind !== 'unit') return bad('invalid_input', '纠错准备捕获需要准确单元。', 'capture_preparation')
       return await this.locked(() => {
         const { seat, snapshot } = this.lookup(query)
-        if (snapshot.sourceSha256 !== sourceSha256 || !this.currentTerms(topicTerms) || topicTerms.ownerId !== snapshot.scope.ownerId || topicTerms.topicId !== snapshot.scope.topicId) return bad('source_mismatch', '纠错准备、当前原稿或主题术语已变化。', 'capture_preparation')
+        if (snapshot.sourceSha256 !== sourceSha256 || !this.currentTerms(topicTerms) || topicTerms.topicId !== snapshot.scope.topicId) return bad('source_mismatch', '纠错准备、当前原稿或主题术语已变化。', 'capture_preparation')
         if (!ready(snapshot)) return bad('preparation_not_ready', '纠错后需完整的主模型复核准备。', 'capture_preparation')
         const baseline = snapshot.correctionReview?.fixedTermVersions ?? seat.planningBindings?.[snapshot.version]
         if (!baseline) return bad('preparation_unavailable', '准备缺少准确固定规则基线。', 'capture_preparation')

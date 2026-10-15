@@ -53,7 +53,7 @@ export interface PreparedTopicEvidence {
 export function isTopicEvidenceUnloaded(sessions: SessionStore, scope: Scope, ref: TermEvidenceRef): boolean {
   if (ref.kind === 'reference') return true
   const session = sessions.getSession(ref.sessionId)
-  return !!session && (session.ownerId !== scope.ownerId || session.topicId !== scope.topicId ||
+  return !!session && (session.topicId !== scope.topicId ||
     sessions.getStatus(session.id) === 'conflict') || isDocumentEvidenceUnloaded(sessions, scope, ref)
 }
 

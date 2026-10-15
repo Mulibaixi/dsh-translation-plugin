@@ -256,9 +256,16 @@ export class SessionStore {
   }
   getStatus(id: string): HistoryStatus { return this.seats.get(id)?.status ?? 'memory' }
   getStructureCapability(): 'web-locks' | 'runtime-only' { return this.storage && this.locks ? 'web-locks' : 'runtime-only' }
-  getTopics(ownerId?: string): readonly { readonly id: string; readonly name: string; readonly nextSequence: number }[] {
-    return [...this.topics.values()].filter(topic => ownerId === undefined || topic.identity.ownerId === ownerId)
+  /** Topics belong to this local asset library; ownerId remains a legacy caller argument. */
+  getTopics(_ownerId?: string): readonly { readonly id: string; readonly name: string; readonly nextSequence: number }[] {
+    return [...this.topics.values()]
       .map(topic => ({ id: topic.identity.id, name: topic.name, nextSequence: topic.identity.nextSequence }))
+  }
+  /** Stable storage anchor retained for existing topic assets; never an execution owner. */
+  getTopicAssetOwner(topicId: string): string | undefined { return this.topics.get(topicId)?.identity.ownerId }
+  getTopicSessions(topicId: string): readonly LocalSession[] {
+    return this.getAllSessions().filter(session => session.topicId === topicId && !this.isSessionDeleted(session.id))
+      .sort((a, b) => a.sequence - b.sequence)
   }
   subscribe(listener: Disposer): Disposer { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const fn of this.listeners) fn() }
@@ -490,7 +497,7 @@ export class SessionStore {
       }
       this.topics.set(session.topicId, topic)
     }
-    if (topic.identity.ownerId !== session.ownerId || topic.identity.sequenceNamespaceId !== session.sequenceNamespaceId) {
+    if (topic.identity.sequenceNamespaceId !== session.sequenceNamespaceId) {
       this.corruptTopics.add(topicIdentityKey(session.topicId)); seat.status = 'conflict'; return
     }
     const allocation = topic.identity.allocations.find(entry => entry.sessionId === session.id)
@@ -633,7 +640,7 @@ export class SessionStore {
       this.notice = '原会话已变化或删除，新建未执行。'; this.emit(); return undefined
     }
     let topic = topicId ? this.topics.get(topicId) : currentParent ? this.topics.get(currentParent.topicId) : undefined
-    if (topicId && (!topic || topic.identity.ownerId !== ownerId)) return undefined
+    if (topicId && !topic) return undefined
     const id = this.freshId()
     if (!topic) {
       topic = {
@@ -663,7 +670,7 @@ export class SessionStore {
   async createSessionForTopicAsync(ownerId: string, topicId: string, activate = true): Promise<LocalSession | undefined> {
     this.loadHistory()
     const topic = this.topics.get(topicId)
-    if (!topic || topic.identity.ownerId !== ownerId) return undefined
+    if (!ownerId.trim() || !topic) return undefined
     const parent = this.getAvailableSessions(ownerId).find(session => session.topicId === topicId)
     if (parent) return this.createSessionAsync(ownerId, parent.id, activate)
     if (!this.readSettings()) return undefined
@@ -742,7 +749,7 @@ export class SessionStore {
       const parent = parentId ? this.seats.get(parentId) : undefined
       if (parentId && (!parent || parent.session.ownerId !== ownerId || this.isDeleted(parentId))) return this.managementFailure('out_of_scope', '起点会话不属于当前主会话或已删除。')
       if (parent && !this.managedSessionCurrent(parent)) return this.managementFailure('conflict', '起点会话在其他窗口变化，请先核对当前记录。')
-      if (topicId && this.topics.get(topicId)?.identity.ownerId !== ownerId) return this.managementFailure('out_of_scope', '主题不属于当前主会话或不存在。')
+      if (topicId && !this.topics.has(topicId)) return this.managementFailure('out_of_scope', '主题不存在或已删除。')
       const session = this.createSessionLocked(ownerId, parentId, topicId, false)
       if (!session) return this.managementFailure('operation_failed', this.notice ?? '新会话未创建，请核对当前记录。')
       const seat = this.seats.get(session.id)!
@@ -758,7 +765,7 @@ export class SessionStore {
   async renameTopicAsync(ownerId: string, topicId: string, expectedName: string, name: string): Promise<SessionManagementResult> {
     return this.manageSessions(() => {
       const topic = this.topics.get(topicId)
-      if (!topic || topic.identity.ownerId !== ownerId) return this.managementFailure('out_of_scope', '主题不属于当前主会话或不存在。')
+      if (!ownerId.trim() || !topic) return this.managementFailure('out_of_scope', '主题不存在或已删除。')
       if (!this.validTopicName(name)) return this.managementFailure('invalid_input', this.notice!)
       const raw = this.storage?.getItem(topicNameKey(topicId)) ?? null
       const saved = raw === null ? undefined : decodeTopicName(raw, topic.identity)
@@ -1119,7 +1126,7 @@ export class SessionStore {
     const raw = this.storage?.getItem(key) ?? null
     if (raw === null && topic?.stored !== null) return false
     const identity = raw === null ? topic?.identity : decodeTopicIdentity(raw)
-    return !!identity && identity.id === session.topicId && identity.ownerId === session.ownerId &&
+    return !!identity && identity.id === session.topicId &&
       identity.sequenceNamespaceId === session.sequenceNamespaceId &&
       identity.allocations.some(allocation => allocation.sessionId === session.id && allocation.sequence === session.sequence)
   }

@@ -1,3 +1,4 @@
+import { parseLibrarySourceRequest, type LibrarySourceRequest, type LibrarySourceValue } from '../shared/library-sources.js'
 import { MAX_TRANSLATION_SOURCE_BYTES, TRANSLATION_SOURCES_REMOTE, parseTranslationSourceAsset, parseTranslationSourceRequest, parseTranslationSourceScope, toSourceIdentity,
   translationSourceResultBytes, type TranslationSourceAsset, type TranslationSourceAssetPage, type TranslationSourceAssetRead,
   type TranslationSourceCapability, type TranslationSourceErrorCode, type TranslationSourceImport, type TranslationSourceResult,
@@ -332,18 +333,50 @@ export class TranslationSourcesService {
     if (prior.reference.historyToken !== request.historyToken) return storageBad('token_mismatch', '已保存原稿与历史提交标识不一致。', 'authorize_saved_source')
     return ok(prior.reference)
   }
-  private async verifiedContent(storage: TranslationSourceStorage, request: TranslationSourceStoredRead, peerId: string, agent: Agent): Promise<TranslationSourceStorageResult<{ bytes: Uint8Array; text: string }>> {
+  private async verifiedContent(storage: TranslationSourceStorage, request: TranslationSourceStoredRead, peerId: string, agent: Agent | undefined, current = () => this.owns(request.scope, peerId, agent)): Promise<TranslationSourceStorageResult<{ bytes: Uint8Array; text: string }>> {
     const bytes = await storage.readContent(request.source)
-    if (!this.owns(request.scope, peerId, agent)) return storageBad('scope_mismatch', '读取已保存原稿时所属连接或 Agent 已失效。', 'verify_saved_source')
+    if (!current()) return storageBad('scope_mismatch', '读取已保存原稿时所属连接或 Agent 已失效。', 'verify_saved_source')
     if (!bytes) return storageBad('source_missing', '已保存原稿内容不存在。', 'verify_saved_source')
     if (bytes.byteLength !== request.source.bytes) return storageBad('source_corrupt', '已保存原稿字节大小不一致。', 'verify_saved_source')
     const digest = await sourceSha256(bytes)
-    if (!this.owns(request.scope, peerId, agent)) return storageBad('scope_mismatch', '校验已保存原稿时所属连接或 Agent 已失效。', 'verify_saved_source')
+    if (!current()) return storageBad('scope_mismatch', '校验已保存原稿时所属连接或 Agent 已失效。', 'verify_saved_source')
     let text: string
     try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { return storageBad('source_corrupt', '已保存原稿不是有效 UTF-8。', 'verify_saved_source') }
     if (digest !== request.source.sha256 || (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) !== request.source.bom ||
       sourceCodePointLength(text) !== request.source.totalCodePoints) return storageBad('source_corrupt', '已保存原稿内容与固定身份不一致。', 'verify_saved_source')
     return { ok: true, value: { bytes, text } }
+  }
+  /** Read-only access proved by an exact saved history commit, independent of the old main Agent. */
+  async readLibrarySource(input: LibrarySourceRequest, signal?: AbortSignal): Promise<TranslationSourceStorageResult<LibrarySourceValue>> {
+    let request: LibrarySourceRequest
+    try { request = parseLibrarySourceRequest(input) } catch { return storageBad('invalid_input', '共享原稿读取凭据或范围无效。', 'read_library_source') }
+    const peerId = this.ctx.invocation?.peer.id
+    const topics = this.ctx.get?.('translationTopics') as { ownsAssetConnection(scope: { namespaceId: string; ownerId: string }, peerId: string): boolean } | undefined
+    const current = (): boolean => !this.disposed && !signal?.aborted && !!peerId && !!topics?.ownsAssetConnection({ namespaceId: request.namespaceId, ownerId: request.stored.scope.ownerId }, peerId)
+    if (!current()) return storageBad('scope_mismatch', '共享原稿读取不属于已连接的本地资产库。', 'read_library_source')
+    try {
+      const storage = await this.storagePort(), prior = await storage.readReference(request.stored.scope, request.stored.referenceKey)
+      if (!current()) return storageBad('scope_mismatch', '共享原稿连接已失效。', 'read_library_source')
+      const confirmed = this.confirmed(prior, request.stored)
+      if (!confirmed.ok) return confirmed
+      if (confirmed.value.prepareToken !== request.prepareToken) return storageBad('token_mismatch', '共享原稿准备凭据不一致。', 'read_library_source')
+      const content = await this.verifiedContent(storage, request.stored, peerId!, undefined, current)
+      if (!content.ok) return content
+      const latest = await storage.readReference(request.stored.scope, request.stored.referenceKey)
+      if (!current() || JSON.stringify(latest?.reference) !== JSON.stringify(prior?.reference)) return storageBad('scope_mismatch', '共享原稿引用或连接已变化。', 'read_library_source')
+      if (request.action === 'open') {
+        const controller = this.ctx.get?.('sessionController') as Controller | undefined
+        if (!controller?.canOpenWorkspacePath?.()) return storageBad('unavailable', '宿主不支持在系统应用中打开原稿。', 'read_library_source')
+        await controller.openWorkspacePath({ path: storage.originalPath(request.stored.source) }, signal ?? new AbortController().signal)
+        return current() ? ok({ kind: 'opened' }) : storageBad('scope_mismatch', '共享原稿连接已失效。', 'read_library_source')
+      }
+      const offsets = indexText(content.value.text), range = request.range!
+      const text = content.value.text.slice(offsets[range.start]!, offsets[range.end]!)
+      if (request.action === 'page') return ok({ kind: 'page', text })
+      const digest = await sourceSha256(new TextEncoder().encode(text))
+      if (!current()) return storageBad('scope_mismatch', '共享原稿连接已失效。', 'read_library_source')
+      return digest === request.sha256 ? ok({ kind: 'verified' }) : storageBad('source_corrupt', '共享原稿复制范围的哈希不一致。', 'read_library_source')
+    } catch { return storageBad('storage_failed', '共享原稿读取或打开未完成。', 'read_library_source') }
   }
   async restore(input: TranslationSourceStoredRead): Promise<TranslationSourceStorageResult<TranslationSourceRestored>> {
     let request: TranslationSourceStoredRead

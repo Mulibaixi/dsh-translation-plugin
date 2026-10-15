@@ -31,8 +31,8 @@ export class ThemeMemoryClearing {
   }
 
   getBlockedReason(ownerId: string, topicId: string): string | undefined {
-    if (!this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return '此主题不属于当前主会话或已不可用。'
-    for (const session of this.sessions.getAvailableSessions(ownerId).filter(session => session.topicId === topicId && !this.sessions.isSessionDeleted(session.id))) {
+    if (!this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return '此主题不存在或已不可用。'
+    for (const session of this.sessions.getTopicSessions(topicId)) {
       const history = this.sessions.getTranslationHistory(session.id)
       if (this.sessions.hasDocumentLease(session.id) || this.options.isSessionBusy?.(session.id) || history?.units.some(unit => isDocumentUnit(unit)
         ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status))
@@ -59,7 +59,7 @@ export class ThemeMemoryClearing {
     try {
       return await this.terms.withTopicLock(() => {
         const topic = this.sessions.getTopics(fixed.ownerId).find(topic => topic.id === fixed.topicId)
-        if (!topic || topic.name !== fixed.topicName || [fixed.terms, fixed.archive].some(version => version.ownerId !== fixed.ownerId || version.topicId !== fixed.topicId) ||
+        if (!topic || topic.name !== fixed.topicName || [fixed.terms, fixed.archive].some(version => version.ownerId !== this.sessions.getTopicAssetOwner(fixed.topicId) || version.topicId !== fixed.topicId) ||
           chosen.terms && !this.terms.isClearVersionCurrent(fixed.terms) || chosen.archive && !this.archive.isClearVersionCurrent(fixed.archive)) {
           return stopped('stale', '主题或所选记忆已变化，请重新打开清空确认；本次尚未清空任何范围。')
         }

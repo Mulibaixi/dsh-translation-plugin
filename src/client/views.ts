@@ -200,13 +200,14 @@ function LanguagePicker({ session, store }: StoreProps & { readonly session: Loc
   }))))
 }
 
-function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onTopicAssets, sorting }: StoreProps & {
+function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, contextOpen, onDismissContext, onContext, onContextKeys, creating, onCreate, onUseTopic, onTopicAssets, sorting }: StoreProps & {
   readonly ownerId: string; readonly current: LocalSession | undefined
   readonly open: boolean; readonly onOpenChange: (open: boolean) => void
   readonly contextOpen: boolean; readonly onDismissContext: () => void
   readonly onContext: (session: LocalSession, event: ContextEvent) => void
   readonly onContextKeys: (session: LocalSession, event: KeyboardEvent & { currentTarget: HTMLElement }) => void
   readonly creating: boolean; readonly onCreate: () => void
+  readonly onUseTopic: (topicId: string) => void
   readonly sorting: SessionSorting
   readonly onTopicAssets?: ((topic: { readonly id: string; readonly name: string }) => void) | undefined
 }): unknown {
@@ -250,6 +251,10 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
         'aria-label': `打开记忆资产：${assetTopic.name}`, 'data-topic-id': assetTopic.id,
         onClick: () => onTopicAssets(assetTopic),
       }, '记忆资产'), h('div', { role: 'separator', className: 'dsh-tp-session-divider' })) : null,
+    topics.length ? h(MenuGroup, { label: '使用已有主题' }, ...topics.map(topic => h('button', {
+      type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice', key: topic.id, disabled: creating,
+      'aria-label': `使用主题：${topic.name}`, onClick: () => onUseTopic(topic.id),
+    }, topic.name))) : null,
     h('div', { 'data-session-sort-list': true }, ...sessions.map(session => row(session))),
     archived.length ? h(MenuGroup, { label: '已归档（点击恢复）' }, h('div', { 'data-session-sort-list': true }, ...archived.map(session => row(session, true)))) : null,
     h('div', { role: 'separator', className: 'dsh-tp-session-divider' }),
@@ -513,7 +518,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const selectedFile = current ? materials?.getSelectedFile(current.id) : undefined
   const longDraft = current?.mode === 'normal' ? materials?.getLongDraft(current.id) : undefined
   const target = context ? store.getSession(context.id) : undefined
-  const targetTopicSessions = target ? store.getAvailableSessions(ownerId).filter(session => session.topicId === target.topicId) : []
+  const targetTopicSessions = target ? store.getTopicSessions(target.topicId) : []
   const targetTopicHasRecords = targetTopicSessions.some(session => store.getTranslationHistory(session.id)?.units.length)
   const dialogSession = dialog ? store.getSession(dialog.id) : undefined
   const status = current ? store.getStatus(current.id) : 'memory'
@@ -554,7 +559,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     closeSessionMenus()
     if (request.entries.some(({ session, history }) => {
       const current = store.getSession(session.id)
-      return !current || store.isSessionDeleted(session.id) || current.ownerId !== request.topic.ownerId || current.topicId !== request.topic.topicId || revisionDeletionChanged(history, store.getTranslationHistory(session.id))
+      return !current || store.isSessionDeleted(session.id) || current.ownerId !== session.ownerId || current.topicId !== request.topic.topicId || revisionDeletionChanged(history, store.getTranslationHistory(session.id))
     })) { setExportNotice({ message: '导出范围已不可用，请重新导出。', failure: true }); return }
     try {
       const download = allowPartialTranslationExport(result)
@@ -572,15 +577,15 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     try {
       const target = store.getSession(id)
       if (!target || target.ownerId !== ownerId) throw new Error('Session no longer available')
-      const selected = scope === 'topic' ? store.getAvailableSessions(ownerId).filter(session => session.topicId === target.topicId) : [target]
+      const selected = scope === 'topic' ? store.getTopicSessions(target.topicId) : [target]
       for (const session of selected) if (!quick.finalizeForExport(session.id)) throw new Error('Cannot finalize export')
       const entries = selected.map(session => {
         const history = store.getTranslationHistory(session.id)
         if (!history) throw new Error('Session no longer available')
         return { session, history }
       })
-      const references = entries.flatMap(({ session }) => objects?.getSnapshot(ownerId, target.topicId, session.id).references ?? [])
-      const snapshot: FrozenTranslationExport = { ...structuredClone({ topic: { ownerId, topicId: target.topicId, topicName: target.topicName }, references, scope, format, at: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
+      const references = entries.flatMap(({ session }) => objects?.getSnapshot(session.ownerId, target.topicId, session.id).references ?? [])
+      const snapshot: FrozenTranslationExport = { ...structuredClone({ topic: { ownerId: store.getTopicAssetOwner(target.topicId) ?? ownerId, topicId: target.topicId, topicName: target.topicName }, references, scope, format, at: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
       setExportLabel(scope === 'topic' ? `主题「${target.topicName}」` : `会话「${target.remark || target.name}」`)
       const result = await projectTranslationExport(snapshot, documents)
       if (!active()) return
@@ -622,7 +627,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     h('div', { className: 'dsh-tp-main' },
       h('header', { className: 'dsh-tp-workspace-header' },
         h('button', { type: 'button', title: sidebar ? '收起会话侧栏' : '展开会话侧栏', 'aria-label': '切换会话侧栏', 'aria-expanded': sidebar, onClick: () => setSidebar(value => !value) }, h(IconPanelLeftOutlineRegular, { size: 16 })),
-        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onTopicAssets: onOpenAssets ? openTopicAssets : undefined, sorting }),
+        h(SessionPicker, { store, ownerId, current, open: sessionPickerOpen, onOpenChange: setSessionPickerOpen, contextOpen: Boolean(context && target), onDismissContext: () => setContext(undefined), onContext: contextMenu, onContextKeys: contextKeys, creating: action.pending, onCreate: () => create(), onUseTopic: (topicId: string) => { closeSessionMenus(); void action.run(async () => Boolean(await store.createSessionForTopicAsync(ownerId, topicId))) }, onTopicAssets: onOpenAssets ? openTopicAssets : undefined, sorting }),
         current ? h('div', { className: 'dsh-tp-header-options' },
           h(ModePicker, { store, session: current, key: `mode:${current.id}` }),
           h(LanguagePicker, { store, session: current, key: `language:${current.id}` }),

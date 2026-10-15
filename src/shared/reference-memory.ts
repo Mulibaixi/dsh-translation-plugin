@@ -9,6 +9,8 @@ export interface ReferenceScope {
   readonly namespaceId: string; readonly ownerId: string; readonly topicId: string; readonly generation: number
 }
 export interface ReferenceInput {
+  /** Original main conversation, independent of the shared topic storage anchor. */
+  readonly mainSessionId?: string
   readonly messageSeq: number; readonly messageId: string; readonly blockIndex: number
   readonly kind: 'file' | 'image'; readonly attachmentId: string; readonly name: string
   readonly bytes: number; readonly mediaType: string | null
@@ -114,7 +116,8 @@ export function parseReferenceScope(value: unknown): ReferenceScope {
   return structuredClone(value) as unknown as ReferenceScope
 }
 export function parseReferenceInput(value: unknown): ReferenceInput {
-  referenceObject(value); referenceExact(value, ['messageSeq', 'messageId', 'blockIndex', 'kind', 'attachmentId', 'name', 'bytes', 'mediaType'])
+  referenceObject(value); referenceExact(value, ['messageSeq', 'messageId', 'blockIndex', 'kind', 'attachmentId', 'name', 'bytes', 'mediaType'], ['mainSessionId'])
+  if (value.mainSessionId !== undefined) referenceString(value.mainSessionId)
   referenceInteger(value.messageSeq); referenceInteger(value.blockIndex); referenceInteger(value.bytes)
   for (const key of ['messageId', 'attachmentId', 'name']) referenceString(value[key])
   if (!['file', 'image'].includes(String(value.kind))) throw new TypeError('Invalid reference input kind')

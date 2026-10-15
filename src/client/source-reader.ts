@@ -1,3 +1,4 @@
+import type { LibrarySourceRequest, LibrarySourcesPort } from '../shared/library-sources.js'
 import type { TermEvidenceRef } from '../memory/topic-terms.js'
 import { isDocumentManifestReuse } from '../memory/document-correction.js'
 import { documentSourceLength, sameVersionReference, type ChunkPlanItem, type ChunkRevision, type DocumentChunkPlan, type DocumentRevision, type DocumentSourceVersion, type ManifestEntry } from '../shared/translation-batch.js'
@@ -46,6 +47,8 @@ export interface TranslationDocumentReader {
   captureDocument(target: DocumentReadTarget): DocumentReadSnapshot | EvidenceUnavailableResult
 }
 export interface TranslationSourceReaderOptions {
+  readonly library?: LibrarySourcesPort
+  readonly assetNamespaceId?: () => string
   readonly sessions: EvidenceSessionPort
   readonly sources?: TranslationSourcesPort
   readonly storage?: TranslationSourceStoragePort
@@ -127,8 +130,10 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
   }
   capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult {
     if (ref.kind === 'reference') return unavailable(null, 'unloaded', 'reference_registry_required')
+    const session = this.options.sessions.getSession(ref.sessionId)
+    if (session?.topicId !== topicId) return unavailable(null, 'forbidden', 'scope_mismatch')
     const unit = this.options.sessions.getTranslationHistory(ref.sessionId)?.units.find(unit => unit.id === ref.unitId)
-    const request: EvidenceReadRequest = { ownerId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
+    const request: EvidenceReadRequest = { ownerId: session.ownerId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
       sourceVersion: ref.kind === 'source' ? ref.sourceVersion ?? 1 : unit?.sourceVersion ?? 1,
       side: ref.kind, range: ref.range && { ...ref.range }, revisionId: ref.revisionId, selectionEventId: ref.selectionEventId }
     const snapshot = this.inspect(request)
@@ -238,7 +243,8 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
           if (changed) return changed
           if (!stored) return unavailable(request, 'unloaded', 'reference_unconfirmed')
           if (!same(stored.scope, scope) || !same(stored.source, source.body.reference)) return unavailable(request, 'forbidden', 'stored_scope_mismatch')
-          const response = await this.options.storage.openOriginal(stored, signal)
+          const proof = await this.libraryProof(request, snapshot)
+          const response = proof && this.options.library ? await this.options.library.readLibrarySource({ ...proof, action: 'open' }, signal) : await this.options.storage.openOriginal(stored, signal)
           const after = check()
           return after ?? (response.ok ? { status: 'opened' } : this.businessError(request, response.error.code, true))
         } catch { return unavailable(request, 'unloaded', 'transport_unavailable') }
@@ -379,10 +385,23 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     if ('status' in prepared) return prepared
     return this.after(request, snapshot)
   }
+  private async libraryProof(request: EvidenceReadRequest, snapshot: Snapshot): Promise<Omit<LibrarySourceRequest, 'action'> | undefined> {
+    if (!this.options.library || !this.options.assetNamespaceId || !('body' in snapshot.source) || snapshot.source.body.kind !== 'asset' || !snapshot.source.historyCommit) return undefined
+    const stored = await this.options.sessions.readStoredSourceRequest({ sessionId: request.sessionId, unitId: request.unitId, sourceVersion: request.sourceVersion })
+    if (!stored || !same(stored.scope, snapshot.scope) || !same(stored.source, snapshot.source.body.reference)) return undefined
+    return { stored, namespaceId: this.options.assetNamespaceId(), prepareToken: snapshot.source.historyCommit.reference.prepareToken }
+  }
   private async prepareAsset(request: EvidenceReadRequest, snapshot: Snapshot, forceRestore = false): Promise<{ readonly saved: boolean } | EvidenceUnavailableResult> {
     const source = snapshot.source
     if (!('body' in source) || source.body.kind !== 'asset') return { saved: false }
     if (!this.options.sources) return unavailable(request, 'unloaded', 'source_service_unavailable')
+    const proof = await this.libraryProof(request, snapshot)
+    if (proof && this.options.library) {
+      const checked = await this.options.library.readLibrarySource({ ...proof, action: 'page', range: { start: 0, end: 1 } })
+      const changed = this.after(request, snapshot)
+      if (changed) return changed
+      return checked.ok && checked.value.kind === 'page' ? { saved: true } : checked.ok ? unavailable(request, 'corrupt', 'page_identity_mismatch') : this.businessError(request, checked.error.code, true)
+    }
     if (!source.historyCommit) return { saved: false }
     if (!this.options.storage) return unavailable(request, 'unloaded', 'storage_service_unavailable')
     const stored = await this.options.sessions.readStoredSourceRequest({ sessionId: request.sessionId, unitId: request.unitId, sourceVersion: request.sourceVersion })
@@ -427,6 +446,15 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       const before = this.after(request, snapshot)
       if (before) return before
       const part = { start, end: Math.min(range.end, start + pageSize) }
+      const proof = await this.libraryProof(request, snapshot)
+      if (proof && this.options.library) {
+        const page = await this.options.library.readLibrarySource({ ...proof, action: 'page', range: part })
+        const changed = this.after(request, snapshot)
+        if (changed) return changed
+        if (!page.ok) return this.businessError(request, page.error.code, true)
+        if (page.value.kind !== 'page' || sourceCodePointLength(page.value.text) !== part.end - part.start) return unavailable(request, 'corrupt', 'page_identity_mismatch')
+        text += page.value.text; start = part.end; continue
+      }
       const raw = await this.options.sources!.readRange({ scope: snapshot.scope, sourceId: source.body.reference.sourceId, version: source.body.reference.version, range: part })
       const changed = this.after(request, snapshot)
       if (changed) return changed
@@ -460,6 +488,13 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       return null
     }
     if ('body' in source && source.body.kind === 'asset') {
+      const proof = await this.libraryProof(request, snapshot)
+      if (proof && this.options.library) {
+        const response = await this.options.library.readLibrarySource({ ...proof, action: 'verify', range: chunk.content.range, sha256: chunk.content.sha256 })
+        const changed = this.after(request, snapshot)
+        if (changed) return changed
+        return response.ok && response.value.kind === 'verified' ? remember() : response.ok ? unavailable(request, 'corrupt', 'copy_verification_invalid') : this.businessError(request, response.error.code, true)
+      }
       if (!this.options.integrity) return unavailable(request, 'unloaded', 'copy_verification_unavailable')
       const target = { scope: snapshot.scope, sourceId: source.body.reference.sourceId,
         version: source.body.reference.version, range: chunk.content.range, sha256: chunk.content.sha256 }

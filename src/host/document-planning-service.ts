@@ -43,7 +43,7 @@ export class DocumentPlanningService {
       const baseline = [...capture.tasks].reverse().find(task => task.baseline)?.baseline
       if (capture.currentSourceVersion !== request.target.sourceVersion || !preparation || !baseline) return failure('preparation_not_ready', '当前原稿的准备复核或真实执行基线缺失。', 'capture_preparation')
       const terms = await this.topics!.requestOwned(request.target.mainSessionId, { kind: 'list_terms', translationSessionId: request.target.translationSessionId }, exec)
-      if (terms.kind !== 'terms' || terms.snapshot.topicId !== capture.scope.topicId || terms.snapshot.ownerId !== capture.scope.ownerId) return failure('invalid_reply', '文档固定条目查询范围不一致。', 'capture_preparation')
+      if (terms.kind !== 'terms' || terms.snapshot.topicId !== capture.scope.topicId) return failure('invalid_reply', '文档固定条目查询范围不一致。', 'capture_preparation')
       const excluded = preparation.correctionReview?.excludedRanges ?? [], relevantFixedIds = terms.snapshot.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === preparation.targetLanguage && entry.origin === 'user_explicit' && entry.confirmation !== null && [...entry.sourceForms, ...entry.aliases].some(form => {
         let offset = text.indexOf(form)
         while (offset >= 0) { const start = Array.from(text.slice(0, offset)).length, end = start + Array.from(form).length
@@ -65,7 +65,7 @@ export class DocumentPlanningService {
     let fixedSource: readonly string[] | undefined
     try {
       const terms = await this.topics!.requestOwned(request.target.mainSessionId, { kind: 'list_terms', translationSessionId: material.value.material.translationSessionId }, exec)
-      if (terms.kind !== 'terms' || terms.snapshot.ownerId !== material.value.ownerId || terms.snapshot.topicId !== material.value.material.topicId) return failure('invalid_reply', '规划固定条目查询不属于实际材料主题。', 'capture_preparation')
+      if (terms.kind !== 'terms' || terms.snapshot.topicId !== material.value.material.topicId) return failure('invalid_reply', '规划固定条目查询不属于实际材料主题。', 'capture_preparation')
       const fixed = terms.snapshot.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === material.value.material.targetLanguage && entry.origin === 'user_explicit' && entry.confirmation !== null && entry.confirmation.adoptedEntryVersion < entry.version)
       const relevantFixedIds: string[] = []
       if (fixed.length) {

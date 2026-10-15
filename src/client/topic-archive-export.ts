@@ -58,7 +58,7 @@ export function buildTopicArchiveMarkdownExport(input: TopicArchiveExportSnapsho
   const { archive } = input
   const lines = [`# ${md(input.topicName)} · 主题结构化档案快照`, '',
     '导出现有术语、实体、事实和关系的所有状态与版本，未触发自动提炼或整理。不包含证据正文、主聊天或完整主题备份。', '',
-    `- 导出时间：${md(input.exportedAt)}`, `- 所属主会话 ID：${md(archive.ownerId)}`, `- 主题 ID：${md(archive.topicId)}`,
+    `- 导出时间：${md(input.exportedAt)}`, `- 主题创建来源 ID：${md(archive.ownerId)}`, `- 主题 ID：${md(archive.topicId)}`,
     `- 历史保存开关：${input.rememberHistory ? '开启' : '关闭'}`,
     `- 术语实际保存状态：${storageLabels[input.termsStorageStatus]}`, `- 档案实际保存状态：${storageLabels[input.archiveStorageStatus]}`,
     '- 本文件记录冻结时的内存快照，不提供导入。', '',

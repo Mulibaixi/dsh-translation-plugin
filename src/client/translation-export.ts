@@ -113,7 +113,7 @@ function topicOf(session: LocalSession): TranslationExportTopic { return { owner
 function scopedSessions(topic: TranslationExportTopic, entries: readonly TranslationExportSession[]): TranslationExportSession[] {
   const ids = new Set<string>()
   for (const { session } of entries) {
-    if (session.ownerId !== topic.ownerId || session.topicId !== topic.topicId) throw new Error('Translation export session is outside the topic scope')
+    if (session.topicId !== topic.topicId) throw new Error('Translation export session is outside the topic scope')
     if (ids.has(session.id)) throw new Error('Duplicate translation export session')
     ids.add(session.id)
   }
@@ -148,7 +148,7 @@ function bilingualExport(topic: TranslationExportTopic, entries: readonly Transl
   const content = exportedUnitIds.length && (complete || options.allowPartial) ? JSON.stringify({
     format: 'dsh-translation-bilingual', schemaVersion: 1, exportedAt, scope,
     topic: { ownerId: topic.ownerId, topicId: topic.topicId, topicName: topic.topicName },
-    sessions: sessions.map(({ session, units }) => ({ id: session.id, name: session.name, remark: session.remark, sequence: session.sequence, units })),
+    sessions: sessions.map(({ session, units }) => ({ id: session.id, ownerId: session.ownerId, name: session.name, remark: session.remark, sequence: session.sequence, units })),
     summary: { complete, missingUnits, exportedUnitIds },
   }, null, 2) : null
   const name = scope === 'session' ? sessions[0]!.session.name : topic.topicName
@@ -219,7 +219,7 @@ export async function buildTranslationExportAsync(request: TranslationExportRequ
       finalRevisionId: final?.id ?? null, manifest, snapshot }
   }) }))
   const missingUnits: MissingTopicTextUnit[] = [], missingRanges: MissingTranslationRange[] = [], exportedUnitIds: string[] = [], texts: string[] = []
-  const exportedSessions: { id: string; name: string; remark: string; sequence: number; units: unknown[] }[] = []
+  const exportedSessions: { id: string; ownerId: string; name: string; remark: string; sequence: number; units: unknown[] }[] = []
   const hasDocument = sessions.some(entry => entry.units.some(unit => unit.kind === 'document'))
   for (const { session, units } of sessions) {
     const exportedUnits: unknown[] = []
@@ -255,7 +255,7 @@ export async function buildTranslationExportAsync(request: TranslationExportRequ
         finalRevisionId: unit.finalRevisionId, manifestRevisionId: unit.manifest?.id ?? null, manifest: unit.manifest,
         blocks: projection.blocks, missingRanges: ranges })
     }
-    exportedSessions.push({ id: session.id, name: session.name, remark: session.remark, sequence: session.sequence, units: exportedUnits })
+    exportedSessions.push({ id: session.id, ownerId: session.ownerId, name: session.name, remark: session.remark, sequence: session.sequence, units: exportedUnits })
   }
   const complete = missingUnits.length === 0
   const check = (): boolean => sessions.every(entry => entry.units.every(unit => unit.kind !== 'document' || 'status' in unit.snapshot || unit.snapshot.check() === null))

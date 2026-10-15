@@ -99,7 +99,7 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
         return snapshot.entries.flatMap(entry => entry.evidence.map((ref, evidenceIndex) => {
           if (ref.kind === 'reference') return {entryId: entry.id, evidenceIndex, sessionName: null, unitOrder: null, revisionOrder: null, readable: false, sourceLabel:'参考资料：'+ref.referenceId+' / '+ref.segmentId, readability:'not_loaded' as const}
           const candidate = store.getSession(ref.sessionId)
-          const session = candidate?.ownerId === ownerId && candidate.topicId === topicId && !store.isSessionDeleted(candidate.id) ? candidate : undefined
+          const session = candidate?.topicId === topicId && !store.isSessionDeleted(candidate.id) ? candidate : undefined
           const unit = session ? store.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined
           const revision = unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === ref.revisionId) : undefined
           return { entryId: entry.id, evidenceIndex, sessionName: session?.name ?? null, unitOrder: unit?.order ?? null, revisionOrder: revision?.order ?? null,

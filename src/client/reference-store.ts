@@ -38,6 +38,7 @@ export class ReferenceStore implements ReferenceEvidencePort {
       catch { this.notice = '部分参考资料索引不可读，原副本已保留。' }
     }
   }
+  getAssetNamespaceId(): string { return this.namespaceId }
   async bind(ownerId: string, operationId: string, start: TopicSessionStart): Promise<ReferenceFacts> {
     const bindingKey = 'dsh-translation-plugin:reference-binding:v1:' + JSON.stringify([this.namespaceId, ownerId, operationId])
     const run = async (): Promise<ReferenceFacts> => {
@@ -69,12 +70,13 @@ export class ReferenceStore implements ReferenceEvidencePort {
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   private emit(): void { for (const listener of this.listeners) listener() }
-  isSaved(ownerId:string,topicId:string):boolean{const index=this.facts(ownerId,topicId).index;try{return this.storage?.getItem(indexKey(ownerId,topicId))===JSON.stringify(index)}catch{return false}}
+  isSaved(ownerId:string,topicId:string):boolean{const index=this.facts(ownerId,topicId).index;try{return this.storage?.getItem(indexKey(index.scope.ownerId,topicId))===JSON.stringify(index)}catch{return false}}
   getNotice(): string | undefined { return this.notice }
   facts(ownerId: string, topicId: string): ReferenceFacts {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     if (this.disposed) throw Object.assign(new Error('参考资料窗口已关闭，请重新启用插件。'), {code:'reference_unavailable'})
     const topic = this.sessions.getTopics(ownerId).find(topic => topic.id === topicId)
-    if (!topic) throw Object.assign(new Error('主题不属于当前主会话或已经删除。'), { code: 'scope_mismatch' })
+    if (!topic) throw Object.assign(new Error('主题不存在或已经删除。'), { code: 'scope_mismatch' })
     const key = indexKey(ownerId, topicId)
     let index = this.indices.get(key)
     try {
@@ -88,7 +90,7 @@ export class ReferenceStore implements ReferenceEvidencePort {
   sync(ownerId: string, raw: ReferenceIndex, expectedVersion: number): ReferenceFacts {
     const index = parseReferenceIndex(raw), before = this.facts(ownerId, index.scope.topicId)
     if (JSON.stringify(before.index.scope) !== JSON.stringify(index.scope) || before.index.version !== expectedVersion && JSON.stringify(before.index) !== JSON.stringify(index) || index.version < before.index.version) throw Object.assign(new Error('参考索引已变化，请查询原操作。'), { code: 'stale_reference' })
-    const key = indexKey(ownerId, index.scope.topicId)
+    const key = indexKey(before.index.scope.ownerId, index.scope.topicId)
     if (referenceBytes(index) > 196608) throw Object.assign(new Error('参考资料索引超出预算。'), { code: 'reference_index_limit' })
     this.indices.set(key, index); this.cache.clear(); this.dirty.add(key)
     if (before.rememberHistory) {
@@ -151,6 +153,7 @@ export class ReferenceStore implements ReferenceEvidencePort {
     }
   }
   async clearTopic(ownerId: string, topicId: string): Promise<boolean> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const before = this.facts(ownerId, topicId), remote = await this.remote()
     if (!remote) return false
     const result = await remote.clearRemote(before.index.scope) as { ok?: boolean; value?: { cleared?: boolean } }

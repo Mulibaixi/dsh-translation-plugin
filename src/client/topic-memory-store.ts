@@ -79,7 +79,7 @@ export class TopicMemoryStore {
         try {
           const raw = this.storage.getItem(key), snapshot = raw === null ? undefined : decodeTopicTermSnapshot(JSON.parse(raw))
           if (!snapshot || topicTermsKey(snapshot.topicId) !== key) throw new Error('invalid snapshot')
-          if (this.sessions.getTopics().some(topic => topic.id === snapshot.topicId) && !this.sessions.getTopics(snapshot.ownerId).some(topic => topic.id === snapshot.topicId)) throw new Error('topic owner mismatch')
+          if (this.sessions.getTopicAssetOwner(snapshot.topicId) !== undefined && this.sessions.getTopicAssetOwner(snapshot.topicId) !== snapshot.ownerId) throw new Error('topic owner mismatch')
           const current = this.reconcile(snapshot)
           this.seats.set(snapshot.topicId, { snapshot: current, stored: raw, dirty: current !== snapshot, status: current === snapshot ? 'saved' : 'memory' })
         } catch { this.notice = '部分主题术语无法读取，原副本已保留。' }
@@ -87,6 +87,7 @@ export class TopicMemoryStore {
     } catch { this.notice = '主题术语读取失败，原副本已保留。' }
   }
   private seat(ownerId: string, topicId: string): Seat {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const existing = this.seats.get(topicId)
     if (existing) {
       if (existing.snapshot.ownerId !== ownerId) throw new Error('Topic term owner mismatch')
@@ -104,6 +105,7 @@ export class TopicMemoryStore {
       this.sessions.getTopics(snapshot.ownerId).some(topic => topic.id === snapshot.topicId)
   }
   readEvidenceAvailability(ownerId: string, topicId: string, ref: TermEvidenceRef): 'ready' | 'unloaded' | 'unavailable' {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     if (isTopicEvidenceUnloaded(this.sessions, { ownerId, topicId }, ref)) return 'unloaded'
     return resolveTermEvidence({ ownerId, topicId }, ref, (sessionId, unitId) => this.readEvidence(sessionId, unitId)) !== undefined ? 'ready' : 'unavailable'
   }
@@ -113,6 +115,7 @@ export class TopicMemoryStore {
   }
   /** Explicit UI range reads use the same identity and bounds as mutation evidence. */
   async readEvidenceAsync(ownerId: string, topicId: string, ref: TermEvidenceRef): Promise<EvidenceReadResult> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const reader = this.evidenceReader ?? new TranslationSourceReader({ sessions: this.sessions })
     const captured = reader.capture(ownerId, topicId, structuredClone(ref))
     if ('status' in captured) return captured
@@ -131,11 +134,13 @@ export class TopicMemoryStore {
       final: revision && event?.revisionId === revision.id ? { revisionId: revision.id, selectionEventId: event.id, sourceVersion: revision.sourceVersion, text: revision.text } : null }
   }
   query(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): TopicTermSnapshot {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const snapshot = this.getSnapshot(ownerId, topicId)
     return { ...snapshot, entries: this.getStatus(ownerId, topicId) === 'conflict' ? [] :
       queryTopicTerms(snapshot, { ...query, ownerId, topicId }, cachedTopicEvidence((sessionId, unitId) => this.readEvidence(sessionId, unitId), this.referenceEvidence)) }
   }
   async queryAsync(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): Promise<TopicTermSnapshot> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const fixed = structuredClone(query), seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
     if (fixed.mode !== 'normal' || seat.status === 'conflict') return { ...snapshot, entries: [] }
     const entries = snapshot.entries.filter(entry => entry.status === 'active' && entry.origin !== 'user_explicit' &&
@@ -148,6 +153,7 @@ export class TopicMemoryStore {
     return { ...snapshot, entries: queryTopicTerms(snapshot, { ...fixed, ownerId, topicId }, prepared.resolver) }
   }
   async reconcileAsync(ownerId: string, topicId: string): Promise<TopicTermSnapshot> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
     const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry =>
       entry.origin !== 'user_explicit' && entry.status !== 'disabled' && entry.status !== 'review_required').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')),
@@ -220,6 +226,7 @@ export class TopicMemoryStore {
     catch { this.notice = '主题术语操作失败，当前内容仍保留。'; this.emit(); return failure }
   }
   async apply(ownerId: string, topicId: string, expectedVersion: number, command: TopicTermCommand): Promise<TermMutationResult> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), failure: TermMutationResult = { status: 'invalid', snapshot: seat.snapshot, entry: null }
     const fixed: TopicTermCommand = structuredClone(command), reader = this.evidenceReader
     if (fixed.kind === 'put' && !decodeTopicTermPut(fixed.input)) return failure
@@ -241,6 +248,7 @@ export class TopicMemoryStore {
     })
   }
   async saveUserTerm(ownerId: string, topicId: string, expectedVersion: number, input: TopicTermUserInput): Promise<TermMutationResult> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const parsed = decodeTopicTermUserInput(input), snapshot = this.getSnapshot(ownerId, topicId)
     if (!parsed) return { status: 'invalid', snapshot, entry: null }
     let id = parsed.id
@@ -252,6 +260,7 @@ export class TopicMemoryStore {
     return this.apply(ownerId, topicId, expectedVersion, { kind: 'user_put', input: { ...parsed, id } })
   }
   reload(ownerId: string, topicId: string): boolean {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId)
     try {
       const raw = this.storage?.getItem(topicTermsKey(topicId)) ?? null
@@ -277,13 +286,14 @@ export class TopicMemoryStore {
   captureVersions(scopes: readonly { readonly ownerId: string; readonly topicId: string }[]): readonly TopicTermVersion[] {
     return [...new Map(scopes.map(scope => [scope.topicId, scope])).values()].map(scope => {
       const seat = this.seat(scope.ownerId, scope.topicId)
-      return { ...scope, stored: seat.stored, current: JSON.stringify(seat.snapshot) }
+      return { ownerId: seat.snapshot.ownerId, topicId: scope.topicId, stored: seat.stored, current: JSON.stringify(seat.snapshot) }
     })
   }
   captureForSessions(ids: readonly string[]): readonly TopicTermVersion[] {
     return this.captureVersions(ids.flatMap(id => { const session = this.sessions.getSession(id); return session ? [{ ownerId: session.ownerId, topicId: session.topicId }] : [] }))
   }
   captureClearVersion(ownerId: string, topicId: string): TopicTermClearVersion {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), saved = seat.stored === null ? null : decodeTopicTermSnapshot(JSON.parse(seat.stored))
     const version = { ownerId, topicId, stored: seat.stored, current: JSON.stringify(seat.snapshot), version: seat.snapshot.version, storageAvailable: !!this.storage,
       currentCount: seat.snapshot.entries.length, storedCount: saved?.entries.length ?? 0 }
@@ -345,6 +355,7 @@ export class TopicMemoryStore {
     })
   }
   async deleteEntryAsync(ownerId: string, topicId: string, id: string, expectedVersion: number, expectedEntryVersion: number): Promise<boolean> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     return this.locked(false, () => {
       const seat = this.seat(ownerId, topicId), entry = seat.snapshot.entries.find(entry => entry.id === id)
       if (seat.snapshot.version !== expectedVersion || entry?.version !== expectedEntryVersion || !this.currentRaw(seat)) return false

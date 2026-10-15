@@ -96,6 +96,11 @@ export class TopicBridgeClient {
   }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private key(ownerId: string, sessionId: string, unitId: string): string { return JSON.stringify([ownerId, sessionId, unitId]) }
+  /** Reuse a live local-library connection for asset persistence, including assets created by an old Session. */
+  getLibraryOwner(): string | undefined {
+    return [...this.connections].find(([, connection]) => connection.ready && !connection.controller.signal.aborted)?.[0]
+      ?? [...this.connections].find(([, connection]) => !connection.controller.signal.aborted)?.[0]
+  }
   getStatus(ownerId: string): { readonly ready: boolean; readonly reason: string | undefined } {
     const connection = this.connections.get(ownerId)
     return { ready: connection?.ready ?? false, reason: connection?.reason }
@@ -145,7 +150,7 @@ export class TopicBridgeClient {
         if (response.ok === true && response.value?.ready && response.value.referenceProtocol === 1) protocol = 3
       }
       if (!current()) return
-      const handle = protocol === 3 ? remote.connectV3!({ ownerId, mainSessionId: ownerId }, connection.controller.signal) : protocol === 2 ? remote.connectV2!({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
+      const handle = protocol === 3 ? remote.connectV3!({ ownerId, mainSessionId: ownerId, ...(this.references ? { assetNamespaceId: this.references.getAssetNamespaceId() } : {}) }, connection.controller.signal) : protocol === 2 ? remote.connectV2!({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
         : remote.connect({ ownerId, mainSessionId: ownerId }, connection.controller.signal)
       connection.handle = handle
       let opened = false
@@ -403,11 +408,11 @@ export class TopicBridgeClient {
     if (command.kind === 'list_topics') return success({ kind: 'topics', topics: this.sessions.getTopics(ownerId).map(topic => ({ ...topic,
       sessionIds: this.sessions.getAvailableSessions(ownerId).filter(session => session.topicId === topic.id && !this.sessions.isSessionDeleted(session.id)).map(session => session.id) })) })
     if (command.kind === 'list_topic_terms') {
-      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不属于当前主会话或不存在。')
+      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
       return success({ kind: 'terms', snapshot: await (this.terms.reconcileAsync?.(ownerId, command.topicId) ?? this.terms.getSnapshot(ownerId, command.topicId)) })
     }
     if (command.kind === 'list_topic_archive' || command.kind === 'upsert_archive') {
-      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不属于当前主会话或不存在。')
+      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
       if (command.kind === 'list_topic_archive') return success({ kind: 'archive', snapshot: await (this.archive.reconcileAsync?.(ownerId, command.topicId) ?? this.archive.getSnapshot(ownerId, command.topicId)) })
       if (!command.entry.evidence.every(ref => this.publishedEvidence(ownerId, command.topicId, ref))) return error(request.requestId, 'reference_not_published', '档案依据不在用户明确提供的历史范围中。')
       const result = await this.archive.apply(ownerId, command.topicId, command.expectedVersion, { kind: 'put', input: command.entry })

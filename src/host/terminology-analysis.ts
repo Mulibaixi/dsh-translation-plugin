@@ -229,7 +229,7 @@ export class TerminologyAnalysisService {
       const value = await this.topics!.requestOwned(job.run.scope.ownerId, { kind: 'list_terms', translationSessionId: job.run.scope.translationSessionId },
         { agent: job.agent, callId: `analysis-constraints:${job.run.analysisId}`, signal: job.controller.signal })
       if (!this.current(job)) throw reject('scope_mismatch', '固定材料或实际主 Agent 已失效。', 'prepare_analysis')
-      if (value.kind !== 'terms' || value.snapshot.ownerId !== job.run.scope.ownerId || value.snapshot.topicId !== job.run.scope.topicId) throw reject('invalid_reply', '主题术语约束不属于固定分析范围。', 'prepare_analysis')
+      if (value.kind !== 'terms' || value.snapshot.topicId !== job.run.scope.topicId) throw reject('invalid_reply', '主题术语约束不属于固定分析范围。', 'prepare_analysis')
       job.constraints = value.snapshot.entries.filter(entry => entry.status !== 'disabled' && entry.targetLanguage === job.envelope.material.targetLanguage && (entry.status === 'active' || entry.origin === 'user_explicit'))
         .map(entry => ({ id: entry.id, entryVersion: entry.version, forms: [...entry.sourceForms, ...entry.aliases], preferred: entry.preferred, description: entry.sense, userFixed: entry.origin === 'user_explicit' }))
       if (!await this.adapter.ready()) throw reject('execution_unavailable', '术语分析模型运行服务尚未就绪。', 'prepare_analysis')

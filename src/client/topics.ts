@@ -3,6 +3,7 @@ export interface TopicAllocation { readonly sessionId: string; readonly sequence
 export interface TopicIdentity {
   readonly schemaVersion: 1
   readonly id: string
+  /** Legacy asset storage anchor (original creator); main Sessions may share this topic. */
   readonly ownerId: string
   readonly sequenceNamespaceId: string
   readonly nextSequence: number

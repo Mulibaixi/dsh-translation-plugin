@@ -77,7 +77,7 @@ export class TopicArchiveStore {
         try {
           const raw = this.storage.getItem(key), snapshot = raw === null ? undefined : decodeTopicArchiveSnapshot(JSON.parse(raw))
           if (!snapshot || topicArchiveKey(snapshot.topicId) !== key) throw new Error('invalid snapshot')
-          if (this.sessions.getTopics().some(topic => topic.id === snapshot.topicId) && !this.sessions.getTopics(snapshot.ownerId).some(topic => topic.id === snapshot.topicId)) throw new Error('topic owner mismatch')
+          if (this.sessions.getTopicAssetOwner(snapshot.topicId) !== undefined && this.sessions.getTopicAssetOwner(snapshot.topicId) !== snapshot.ownerId) throw new Error('topic owner mismatch')
           const current = this.reconcile(snapshot)
           this.seats.set(snapshot.topicId, { snapshot: current, stored: raw, dirty: current !== snapshot, status: current === snapshot ? 'saved' : 'memory' })
         } catch { this.notice = '部分主题档案无法读取，原副本已保留。' }
@@ -85,14 +85,14 @@ export class TopicArchiveStore {
     } catch { this.notice = '主题档案读取失败，原副本已保留。' }
   }
   private seat(ownerId: string, topicId: string): Seat {
-    const known = this.sessions.getTopics().some(topic => topic.id === topicId), owned = this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)
-    if (known && !owned) throw new Error('Topic archive owner mismatch')
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
+    const known = this.sessions.getTopics().some(topic => topic.id === topicId)
     const existing = this.seats.get(topicId)
     if (existing) {
       if (existing.snapshot.ownerId !== ownerId) throw new Error('Topic archive owner mismatch')
       return existing
     }
-    if (!owned) throw new Error('Unknown topic archive scope')
+    if (!known) throw new Error('Unknown topic archive scope')
     const seat: Seat = { snapshot: emptyTopicArchive(ownerId, topicId, now()), stored: null, dirty: false, status: 'memory' }
     this.seats.set(topicId, seat); return seat
   }
@@ -101,10 +101,12 @@ export class TopicArchiveStore {
     return reconcileTopicArchive(snapshot, this.resolver, now(), ref => isTopicEvidenceUnloaded(this.sessions, snapshot, ref))
   }
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId)
     return { ...seat.snapshot, entries: seat.status === 'conflict' ? [] : queryTopicArchive(seat.snapshot, { ...query, ownerId, topicId }, cachedTopicEvidence(this.resolver, this.referenceEvidence)) }
   }
   async queryAsync(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const fixed = structuredClone(query), seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
     if (fixed.mode !== 'normal' || seat.status === 'conflict') return { ...snapshot, entries: [] }
     const candidates = snapshot.entries.filter(entry => {
@@ -124,6 +126,7 @@ export class TopicArchiveStore {
     return { ...snapshot, entries: queryTopicArchive(snapshot, { ...fixed, ownerId, topicId }, prepared.resolver) }
   }
   async reconcileAsync(ownerId: string, topicId: string): Promise<TopicArchiveSnapshot> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), snapshot = seat.snapshot, reader = this.evidenceReader
     const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry => entry.origin !== 'user_explicit' &&
       entry.status !== 'disabled' && entry.status !== 'review_required').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader, this.referenceEvidence)
@@ -193,6 +196,7 @@ export class TopicArchiveStore {
     catch { this.notice = '主题档案操作失败，当前内容仍保留。'; this.emit(); return failure }
   }
   async apply(ownerId: string, topicId: string, expectedVersion: number, command: TopicArchiveCommand): Promise<ArchiveMutationResult> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), failure: ArchiveMutationResult = { status: 'invalid', snapshot: seat.snapshot, entry: null }
     const fixed: TopicArchiveCommand = structuredClone(command), reader = this.evidenceReader
     if (fixed.kind === 'put' && !decodeTopicArchivePut(fixed.input)) return failure
@@ -223,6 +227,7 @@ export class TopicArchiveStore {
     })
   }
   async saveUserEntry(ownerId: string, topicId: string, expectedVersion: number, input: TopicArchiveUserInput): Promise<ArchiveMutationResult> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const parsed = decodeTopicArchiveUserInput(input), snapshot = this.getSnapshot(ownerId, topicId)
     if (!parsed) return { status: 'invalid', snapshot, entry: null }
     let id = parsed.id
@@ -230,6 +235,7 @@ export class TopicArchiveStore {
     return this.apply(ownerId, topicId, expectedVersion, { kind: 'user_put', input: { ...parsed, id } })
   }
   reload(ownerId: string, topicId: string): boolean {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId)
     try {
       const raw = this.storage?.getItem(topicArchiveKey(topicId)) ?? null, parsed = raw === null ? emptyTopicArchive(ownerId, topicId, now()) : decodeTopicArchiveSnapshot(JSON.parse(raw))
@@ -253,6 +259,7 @@ export class TopicArchiveStore {
     this.emit()
   }
   captureClearVersion(ownerId: string, topicId: string): TopicArchiveVersion {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), saved = seat.stored === null ? null : decodeTopicArchiveSnapshot(JSON.parse(seat.stored))
     const version = { ownerId, topicId, stored: seat.stored, current: JSON.stringify(seat.snapshot), version: seat.snapshot.version, storageAvailable: !!this.storage,
       currentCount: seat.snapshot.entries.length, storedCount: saved?.entries.length ?? 0 }
@@ -285,6 +292,7 @@ export class TopicArchiveStore {
     } catch { this.notice = '主题结构化档案清空失败，该范围的当前与已保存内容保留。'; this.emit(); return false }
   }
   async deleteEntryAsync(ownerId: string, topicId: string, id: string, expectedVersion: number, expectedEntryVersion: number): Promise<boolean> {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     return this.locked(false, () => {
       const seat = this.seat(ownerId, topicId), entry = seat.snapshot.entries.find(entry => entry.id === id)
       if (seat.snapshot.version !== expectedVersion || entry?.version !== expectedEntryVersion || !this.currentRaw(seat)) return false

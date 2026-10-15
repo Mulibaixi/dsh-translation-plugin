@@ -492,7 +492,7 @@ export function parsePreparationCorrectionReviewFacts(value: unknown): Preparati
   preparationPacket(value); exact(value, ['scope', 'unitId', 'sourceVersion', 'sourceSha256', 'totalCodePoints', 'correctionOperationId', 'analysisActualCalls', 'topicTerms', 'termMatches', 'relevantFixedIds'])
   const scope = parseTranslationSourceScope(value.scope), topicTerms = decodeTopicTermSnapshot(value.topicTerms)
   text(value.unitId, 2048); text(value.correctionOperationId, 2048); preparationInteger(value.sourceVersion); preparationInteger(value.totalCodePoints)
-  if (typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || !topicTerms || topicTerms.ownerId !== scope.ownerId || topicTerms.topicId !== scope.topicId) throw new TypeError('Invalid correction review source or terms')
+  if (typeof value.sourceSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceSha256) || !topicTerms || topicTerms.topicId !== scope.topicId) throw new TypeError('Invalid correction review source or terms')
   if (value.analysisActualCalls !== null) preparationInteger(value.analysisActualCalls, 0, MAX_ANALYSIS_CALLS)
   preparationList(value.termMatches, 100)
   const termMatches = value.termMatches.map(item => { exact(item, ['ref', 'matched']); if (typeof item.matched !== 'boolean') throw new TypeError('Invalid source term match'); return { ref: preparationRef(item.ref), matched: item.matched } })
@@ -539,7 +539,7 @@ export function parsePreparationAnalysisFacts(value: unknown): PreparationAnalys
 }
 export function parsePreparationCurrentFacts(value: unknown): PreparationCurrentFacts {
   exact(value, ['envelope', 'topicTerms']); const envelope = parseTranslationMaterialEnvelope(value.envelope), topicTerms = decodeTopicTermSnapshot(value.topicTerms)
-  if (envelope.kind !== 'material' || !topicTerms || topicTerms.ownerId !== envelope.ownerId || topicTerms.topicId !== envelope.material.topicId) throw new TypeError('Invalid preparation current facts')
+  if (envelope.kind !== 'material' || !topicTerms || topicTerms.topicId !== envelope.material.topicId) throw new TypeError('Invalid preparation current facts')
   return { envelope, topicTerms }
 }
 export function parsePreparationReceipt(value: unknown): PreparationReceipt {

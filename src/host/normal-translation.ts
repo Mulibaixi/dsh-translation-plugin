@@ -314,7 +314,7 @@ export class NormalTranslationService {
     return job.acceptance.then(() => structuredClone(job.operation!))
   }
   private validateTerms(request: NormalTranslationExecute, envelope: Envelope, snapshot: TopicTermSnapshot): void {
-    if (snapshot.ownerId !== request.target.mainSessionId || snapshot.topicId !== envelope.material.topicId ||
+    if (snapshot.topicId !== envelope.material.topicId ||
       snapshot.entries.length !== request.termReferences.length || request.termReferences.some(ref => !snapshot.entries.some(entry =>
         entry.id === ref.id && entry.version === ref.entryVersion && entry.status === 'active' && entry.targetLanguage === envelope.material.targetLanguage))) throw rejected('invalid_reply', '普通翻译术语回执与指定范围或版本不一致。', 'prepare')
   }

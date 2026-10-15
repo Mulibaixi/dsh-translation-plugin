@@ -29,7 +29,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
 }): unknown {
   const [, refresh] = react.useState(0)
   const associated = associatedSessionId ? store.getSession(associatedSessionId) : undefined
-  const validAssociated = associated?.ownerId === ownerId && associated.topicId === topicId && !store.isSessionDeleted(associated.id) ? associated.id : undefined
+  const validAssociated = associated?.topicId === topicId && !store.isSessionDeleted(associated.id) ? associated.id : undefined
   const [scope, setScope] = react.useState<RecordsScope>(() => validAssociated ? 'session' : 'topic')
   const [sessionId, setSessionId] = react.useState<string | undefined>(validAssociated)
   const [expanded, setExpanded] = react.useState(() => new Set<string>())
@@ -61,7 +61,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   react.useEffect(() => {
     if (visible && reader.current) reader.current.scrollTop = scrollPositions.current.get(scrollKey) ?? 0
   }, [visible, scrollKey])
-  const sessions = [...store.getAvailableSessions(ownerId)].filter(session => session.topicId === topicId && !store.isSessionDeleted(session.id))
+  const sessions = [...store.getTopicSessions(topicId)]
     .sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id))
   const selectedSession = sessions.find(session => session.id === sessionId)
   const viewedSessions = scope === 'topic' ? sessions : selectedSession ? [selectedSession] : []
@@ -72,7 +72,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   function deliverExport(result: TopicTranslationExport, request: Omit<PendingRecordsExport, 'result'>): void {
     if (request.entries.some(({ session, history }) => {
       const current = store.getSession(session.id)
-      return !current || store.isSessionDeleted(session.id) || current.ownerId !== request.topic.ownerId || current.topicId !== request.topic.topicId || revisionDeletionChanged(history, store.getTranslationHistory(session.id))
+      return !current || store.isSessionDeleted(session.id) || current.ownerId !== session.ownerId || current.topicId !== request.topic.topicId || revisionDeletionChanged(history, store.getTranslationHistory(session.id))
     })) { setMessage('导出范围已不可用，请重新导出。'); return }
     try {
       const download = allowPartialTranslationExport(result)
@@ -98,8 +98,8 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
         if (!history) throw new Error('Session no longer available')
         return { session, history }
       })
-      const references = targets.flatMap(session => objects?.getSnapshot(ownerId, topicId, session.id).references ?? [])
-      const frozen = { ...structuredClone({ topic: { ownerId, topicId, topicName: topic.name }, references, scope, format, exportedAt: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
+      const references = targets.flatMap(session => objects?.getSnapshot(session.ownerId, topicId, session.id).references ?? [])
+      const frozen = { ...structuredClone({ topic: { ownerId: store.getTopicAssetOwner(topicId) ?? ownerId, topicId, topicName: topic.name }, references, scope, format, exportedAt: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
       setExportLabel(scope === 'topic' ? `主题「${topic.name}」` : `会话「${selectedSession!.remark || selectedSession!.name}」`)
       const result = await projectExport(frozen, documents)
       if (!active()) return
@@ -154,7 +154,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
           const latest = unit.revisions.at(-1)
           const candidate = latest?.accepted && latest.status === 'completed' && latest.text.trim() && latest.id !== final?.id ? latest : undefined
           const archived = session.archivedAt !== null
-          const target = { ownerId, topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
+          const target = { ownerId: session.ownerId, topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
           function startEditing(revision: TextRevision): void {
             setDrafts(current => {
               const existing = current.get(key)

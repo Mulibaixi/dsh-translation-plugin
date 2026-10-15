@@ -73,7 +73,7 @@ export function buildTopicTermsMarkdownExport(input: TopicTermsExportSnapshot): 
     `# ${md(input.topicName)} · 主题术语快照`, '',
     '仅导出现有术语档案，未触发自动提炼或整理。包含所有状态的条目及证据引用，不包含来源正文、主聊天或完整主题备份。', '',
     `- 导出时间：${md(input.exportedAt)}`,
-    `- 所属主会话 ID：${md(snapshot.ownerId)}`,
+    `- 主题创建来源 ID：${md(snapshot.ownerId)}`,
     `- 主题 ID：${md(snapshot.topicId)}`,
     `- 档案版本：${snapshot.version}；生效集版本：${snapshot.activeVersion}`,
     `- 档案更新时间：${md(snapshot.updatedAt)}`,

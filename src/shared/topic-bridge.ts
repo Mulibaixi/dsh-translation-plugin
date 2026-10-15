@@ -28,7 +28,7 @@ import { parseDocumentReviewPageRequest, parseDocumentReviewPage, parseDocumentR
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
-export interface TopicBridgeOpen { readonly ownerId: string; readonly mainSessionId: string }
+export interface TopicBridgeOpen { readonly ownerId: string; readonly mainSessionId: string; readonly assetNamespaceId?: string }
 export interface TopicBridgeCapability { readonly ready: boolean; readonly reason?: string }
 export interface TopicBridgeV2Capability extends TopicBridgeCapability { readonly normalProtocol: 2 }
 export type TopicPersistence = 'saved' | 'runtime_only'
@@ -188,9 +188,10 @@ function strings(value: unknown, maximum = 2048, count = 1000): asserts value is
   value.forEach(item => text(item, maximum))
 }
 export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
-  object(value); exact(value, ['ownerId', 'mainSessionId']); text(value.ownerId); text(value.mainSessionId)
+  object(value); exact(value, ['ownerId', 'mainSessionId', ...(value.assetNamespaceId === undefined ? [] : ['assetNamespaceId'])]); text(value.ownerId); text(value.mainSessionId)
+  if (value.assetNamespaceId !== undefined) text(value.assetNamespaceId)
   if (value.ownerId !== value.mainSessionId) throw new TypeError('Topic bridge requires its own main Session')
-  return { ownerId: value.ownerId, mainSessionId: value.mainSessionId }
+  return { ownerId: value.ownerId, mainSessionId: value.mainSessionId, ...(value.assetNamespaceId === undefined ? {} : { assetNamespaceId: value.assetNamespaceId }) }
 }
 export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 = 1): TopicBridgeCommand {
   object(value)
@@ -338,8 +339,8 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 = 1)
 export function parseTopicBridgeDown(value: unknown, protocol: 1 | 2 | 3 = 1): TopicBridgeDown {
   object(value)
   if (value.kind === 'ready') {
-    exact(value, ['kind', 'ownerId', 'mainSessionId'])
-    return { kind: 'ready', ...parseTopicBridgeOpen({ ownerId: value.ownerId, mainSessionId: value.mainSessionId }) }
+    exact(value, ['kind', 'ownerId', 'mainSessionId', ...(value.assetNamespaceId === undefined ? [] : ['assetNamespaceId'])])
+    return { kind: 'ready', ...parseTopicBridgeOpen({ ownerId: value.ownerId, mainSessionId: value.mainSessionId, ...(value.assetNamespaceId === undefined ? {} : { assetNamespaceId: value.assetNamespaceId }) }) }
   }
   exact(value, ['kind', 'requestId', 'mainSessionId', 'callId', 'command'])
   if (value.kind !== 'request') throw new TypeError('Invalid topic bridge frame')
@@ -426,7 +427,7 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3): TopicBridgeValue {
     case 'normal_operation': {
       exact(value, ['kind', 'operation', 'termSnapshot'])
       const operation = parseNormalTranslationOperation(value.operation), termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)
-      if (!termSnapshot || termSnapshot.ownerId !== operation.mainSessionId || termSnapshot.topicId !== operation.topicId || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation term package')
+      if (!termSnapshot || termSnapshot.topicId !== operation.topicId || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation term package')
       return { kind: 'normal_operation', operation, termSnapshot }
     }
     case 'sessions':

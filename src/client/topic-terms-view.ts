@@ -37,7 +37,7 @@ function UnitEvidenceView({ sessions, terms, snapshot, reference, active = true,
   const [pendingKey, setPendingKey] = react.useState<string | undefined>(undefined)
   const generation = react.useRef(0)
   const candidate = sessions.getSession(reference.sessionId)
-  const session = candidate?.ownerId === snapshot.ownerId && candidate.topicId === snapshot.topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
+  const session = candidate?.topicId === snapshot.topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
   const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === reference.unitId) : undefined
   const revision = reference.revisionId && unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === reference.revisionId) : undefined
   const body = resolveTermEvidence(snapshot, reference, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
@@ -53,7 +53,7 @@ function UnitEvidenceView({ sessions, terms, snapshot, reference, active = true,
   }, [identity, terms])
   const result = loaded?.key === identity ? loaded.result : undefined
   const pending = pendingKey === identity
-  const state = result?.status ?? (body !== undefined ? 'ready' : unloaded ? 'unloaded' : candidate && candidate.ownerId !== snapshot.ownerId ? 'forbidden' : 'missing')
+  const state = result?.status ?? (body !== undefined ? 'ready' : unloaded ? 'unloaded' : candidate && candidate.topicId !== snapshot.topicId ? 'forbidden' : 'missing')
   const visibleBody = result?.status === 'ready' ? result.text : body
   const statusLabels = { ready: '来源已加载', unloaded: '来源尚未加载', missing: '来源已缺失或变化', corrupt: '来源完整性校验失败', forbidden: '无权读取此来源' } as const
   const title = `${session?.name ?? '已删除会话'} · ${unit ? `${isTextUnit(unit) ? '文本' : '文档'} ${unit.order}` : '来源不可用'}${revision ? ` · 版本 ${revision.order}` : ''} · ${reference.kind === 'source' ? '原文' : '最终译文'}${reference.role === 'example' ? '（示例）' : ''}`
@@ -188,7 +188,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
         evidenceAvailability: frozen.entries.flatMap(entry => entry.evidence.map((ref, evidenceIndex) => {
           if (ref.kind === 'reference') return {entryId: entry.id, evidenceIndex, sessionName: null, unitOrder: null, revisionOrder: null, readable: false, sourceLabel:'参考资料：'+ref.referenceId+' / '+ref.segmentId, readability:'not_loaded' as const}
           const candidate = sessions.getSession(ref.sessionId)
-          const session = candidate?.ownerId === ownerId && candidate.topicId === topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
+          const session = candidate?.topicId === topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
           const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined
           const revision = unit && isTextUnit(unit) ? unit.revisions.find(revision => revision.id === ref.revisionId) : undefined
           return { entryId: entry.id, evidenceIndex, sessionName: session?.name ?? null, unitOrder: unit?.order ?? null,

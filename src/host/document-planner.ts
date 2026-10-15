@@ -169,7 +169,7 @@ export class DocumentPlanner {
   }
   private budget(preparation: PreparationSnapshot, item: ChunkPlanItem, points: readonly string[], capacity: DocumentPreparedCapacity,
     maximum: number, protectedRanges: readonly TranslationSourceRange[] = [], references?: FrozenReferenceContext): { readonly budget: DocumentChunkBudget; readonly prompt: DocumentTranslationPrompt | null } {
-    if(preparation.referenceContextRef && (!references || !same(references.manifestRef,preparation.referenceContextRef) || references.scope.topicId!==preparation.scope.topicId || references.scope.ownerId!==preparation.scope.ownerId))throw reject('reference_context_unavailable','准确的参考上下文不可用，不能省略后执行。')
+    if(preparation.referenceContextRef && (!references || !same(references.manifestRef,preparation.referenceContextRef) || references.scope.topicId!==preparation.scope.topicId))throw reject('reference_context_unavailable','准确的参考上下文不可用，不能省略后执行。')
     const contextRef = { preparationRef: { id: preparation.id, version: preparation.version }, termRefs: [], referenceRefs: [], contextRanges: [], supplementRefs: [] }
     if (item.mode === 'copy') return { budget: { chunkId: item.chunkId, mode: 'copy', outputCodePoints: item.outputRange.end - item.outputRange.start,
       inputTokens: 0, countKind: 'estimated', outputReservationTokens: 0, contextWindow: capacity.contextWindow, maxOutputTokens: capacity.maxOutputTokens, contextRef }, prompt: null }

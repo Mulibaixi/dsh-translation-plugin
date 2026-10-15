@@ -179,7 +179,7 @@ export function resolveTermEvidence(snapshot: Pick<TopicTermSnapshot, 'ownerId' 
   }
   if (ref.kind === 'reference') return undefined
   const fact = resolver(ref.sessionId, ref.unitId)
-  if (!fact || fact.ownerId !== snapshot.ownerId || fact.topicId !== snapshot.topicId || !integer(fact.sourceVersion, 1)) return undefined
+  if (!fact || fact.topicId !== snapshot.topicId || !integer(fact.sourceVersion, 1)) return undefined
   let body: string
   if (ref.kind === 'source') {
     if ((ref.sourceVersion ?? 1) !== fact.sourceVersion) return undefined

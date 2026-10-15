@@ -105,7 +105,7 @@ export class TranslationPreparationService {
       const total = Array.from(sourceText).length
       if (capture.source.body.kind === 'asset' && (capture.source.body.reference.sha256 !== hash || capture.source.body.reference.totalCodePoints !== total)) return failure('source_mismatch', '实际读到的纠错原稿与固定身份不一致。', 'review_correction_preparation')
       const reply = await this.topics!.requestOwned(request.target.mainSessionId, { kind: 'list_terms', translationSessionId: request.target.translationSessionId }, exec)
-      if (reply.kind !== 'terms' || reply.snapshot.ownerId !== capture.scope.ownerId || reply.snapshot.topicId !== capture.scope.topicId) return failure('invalid_reply', '当前主题词不属于此单元。', 'review_correction_preparation')
+      if (reply.kind !== 'terms' || reply.snapshot.topicId !== capture.scope.topicId) return failure('invalid_reply', '当前主题词不属于此单元。', 'review_correction_preparation')
       const points = Array.from(sourceText), termMatches = request.termSelections.map(selected => {
         const selectedRef = selected.ref
         const forms = selectedRef.kind === 'candidate'

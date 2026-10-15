@@ -1,3 +1,4 @@
+import { adaptLibrarySourcesRemote, type LibrarySourcesRemotePort } from './library-sources-client.js'
 import { LocalDataClient, LocalDataClearView, useLocalDataFrozen, ClearedDataView } from './local-data.js'
 import type { LocalDataRemotePort } from '../shared/local-data.js'
 import { ReferenceStore } from './reference-store.js'
@@ -63,7 +64,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   get(name: 'remote.translationNormalV2'): NormalTranslationV2RemotePort | undefined
   get(name: 'remote.translationBatch'): TranslationBatchRemotePort | undefined
   get(name: 'remote.translationReview'): DocumentReviewRemotePort | undefined
-  get(name: 'remote.translationSources'): (TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort) | undefined
+  get(name: 'remote.translationSources'): (TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort & LibrarySourcesRemotePort) | undefined
   readonly conversation?: { readonly submissions?: NativeMaterialSubmissionRegistry }
   readonly composerExtension?: ComposerExtensionService
   readonly fileUpload: NativeFileUploadPort
@@ -79,7 +80,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
     readonly translationNormalV2?: NormalTranslationV2RemotePort
     readonly translationBatch?: TranslationBatchRemotePort
     readonly translationReview?: DocumentReviewRemotePort
-    readonly translationSources?: TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort
+    readonly translationSources?: TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort & LibrarySourcesRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
   }
@@ -148,7 +149,7 @@ export function apply(ctx: ClientPluginContext): void {
     const sources = adaptTranslationSourcesRemote(sourcesRemote)
     const storage = adaptTranslationSourceStorageRemote(sourcesRemote)
     const integrity = adaptTranslationSourceIntegrityRemote(sourcesRemote)
-    const evidence = new TranslationSourceReader({ sessions: store, sources, storage, integrity })
+    const evidence = new TranslationSourceReader({ sessions: store, sources, storage, integrity, library: adaptLibrarySourcesRemote(sourcesRemote), assetNamespaceId: () => references.getAssetNamespaceId() })
     const objects = new RecordObjectStore(store)
     const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
@@ -166,6 +167,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (ctx.remote.$mount) await mountedRemote
       return remoteDisposed ? undefined : ctx.get ? ctx.get('remote.translationReferences') : ctx.remote.translationReferences
     }, undefined, {withOwner:async <T>(ownerId:string,action:()=>Promise<T>):Promise<T>=>{
+      ownerId = topics.getLibraryOwner() ?? ownerId
       const release=topics.retain(ownerId)
       try{
         if(!topics.getStatus(ownerId).ready)await new Promise<void>((resolve,reject)=>{

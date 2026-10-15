@@ -17,7 +17,7 @@ export function buildRecordObjectExportAsync(request: RecordObjectExportRequest,
 }
 /** Frozen references decorate exports; canonical source and revision bodies stay unchanged. */
 export function buildRecordObjectExport(request: RecordObjectExportRequest, allowPartial = false): TopicTranslationExport {
-  if (request.scope === 'session' && request.entries.length !== 1 || request.entries.some(({ session }) => session.ownerId !== request.topic.ownerId || session.topicId !== request.topic.topicId)) throw new Error('Record object export scope mismatch')
+  if (request.scope === 'session' && request.entries.length !== 1 || request.entries.some(({ session }) => session.topicId !== request.topic.topicId)) throw new Error('Record object export scope mismatch')
   const refs = request.references ?? []
   const entries = request.entries
   const first = entries[0]!
