@@ -215,21 +215,19 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       const bound = this.prepared.get(packet.operationId)
       if (!bound || key(bound.route) !== key(packet.model)) throw Object.assign(new Error('Analysis preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
       const bytes = new TextEncoder().encode(packet.systemPrompt + packet.userMessage).byteLength + extraInputBytes
-      if (bytes > 196608) throw Object.assign(new Error('Analysis package exceeds input budget'), { code: 'INPUT_LIMIT' })
-      if (bound.call.context && bound.call.config.maxTokens !== undefined && bytes + 16 + bound.call.config.maxTokens > bound.call.context.contextWindow) {
-        throw Object.assign(new Error('Estimated analysis input plus output reservation exceeds context'), { code: 'CONTEXT_WINDOW_EXCEEDED' })
-      }
+      // UTF-8 bytes are an estimate, not proof of token overflow. The bound adapter
+      // applies the actual call parameters and reports real provider rejections.
       this.prepared.set(packet.operationId, { ...bound, analysisContext: frozen({ systemPrompt: packet.systemPrompt, userMessage: packet.userMessage }) })
       return { tokens: bytes + 16, kind: 'estimated', contextWindow: bound.call.context?.contextWindow ?? null, maxOutputTokens: bound.call.config.maxTokens ?? null,
         route: { provider: bound.call.config.provider, model: bound.call.config.model,
           ...(bound.call.config.reasoningEffort === undefined ? {} : { reasoningEffort: bound.call.config.reasoningEffort }) } }
     } catch (error) { this.failures.set(packet.operationId, failure(error, 'prepare')); throw error }
   }
+  /** Legacy scheduling hint, never a preflight rejection threshold. */
   analysisInputBudget(operationId: string): number {
     const bound = this.prepared.get(operationId)
     if (!bound) throw Object.assign(new Error('Analysis preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
-    return Math.min(196608, bound.call.context && bound.call.config.maxTokens !== undefined
-      ? bound.call.context.contextWindow - bound.call.config.maxTokens - 16 : 196608)
+    return bound.call.context ? bound.call.context.contextWindow - (bound.call.config.maxTokens ?? 0) - 16 : 196608
   }
   /** Document calls keep their actual prompt version and reference-only context metadata. */
   preflightDocument(packet: DocumentExecutionPacket): DocumentCallRecord {
@@ -290,10 +288,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       const context = requestContext
         ? reconstructNormalExchangeTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, bound.exchangeResume, packet.referenceContext)
         : reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, packet.referenceContext)
-      const bytes = new TextEncoder().encode(context.systemPrompt + context.userMessage).byteLength
-      // This is a conservative UTF-8 based estimate, not a tokenizer measurement.
-      if (bytes > 196_608) throw Object.assign(new Error('Normal execution package exceeds short-text budget'), { code: 'INPUT_LIMIT' })
-      if (bound.call.context && bound.call.config.maxTokens !== undefined && bytes + 16 + bound.call.config.maxTokens > bound.call.context.contextWindow) throw Object.assign(new Error('Estimated input plus output reservation exceeds model context'), { code: 'CONTEXT_WINDOW_EXCEEDED' })
+      // Model capacity is decided by the bound adapter, not by treating bytes as tokens.
       const normalContext = frozen(structuredClone(packet.context))
       this.prepared.set(packet.operationId, { ...bound, normalContext, requestContext })
       return { promptVersion: requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION, model: { provider: bound.call.config.provider, model: bound.call.config.model,

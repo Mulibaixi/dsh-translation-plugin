@@ -3,9 +3,10 @@ import { downloadExport } from './browser-download.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
 import type { SessionStore } from './session-store.js'
 import type { QuickTranslationClient } from './quick-translation.js'
-import { currentFinalRevision, isTextUnit, revisionDeletionChanged, type TextRevision } from './translation-history.js'
-import { DocumentUnitView, TextUnitOpenLinks, type DocumentViewProps } from './document-unit-view.js'
-import { allowPartialTranslationExport, type TopicTranslationExport, type TranslationExportSession, type TranslationExportTopic } from './translation-export.js'
+import { currentFinalRevision, isDeletedUnit, isTextUnit, revisionDeletionChanged, type TextRevision } from './translation-history.js'
+import { DocumentUnitView, ResultOpenLink, SourceOpenLink, type DocumentViewProps } from './document-unit-view.js'
+import { FileJobView, type FileJobViewProps } from './file-job-view.js'
+import { allowPartialTranslationExport, type FileJobExportUnit, type TopicTranslationExport, type TranslationExportSession, type TranslationExportTopic } from './translation-export.js'
 import { buildRecordObjectExportAsync, recordObjectPlainText } from './record-object-export.js'
 import type { RecordObjectReference } from '../shared/record-objects.js'
 import { RecordObjectEditor, RecordObjectText, type RecordObjectsProps } from './record-object-view.js'
@@ -16,6 +17,7 @@ interface PendingRecordsExport {
   readonly topic: TranslationExportTopic; readonly entries: readonly TranslationExportSession[]; readonly scope: RecordsScope
   readonly format: 'txt' | 'json'; readonly exportedAt: string; readonly result: TopicTranslationExport
   readonly references: readonly RecordObjectReference[]
+  readonly fileJobs?: readonly FileJobExportUnit[] | undefined
 }
 function editable(revision: TextRevision): boolean {
   return Boolean(revision.text.trim()) && ['completed', 'failed', 'cancelled', 'interrupted'].includes(revision.status)
@@ -23,9 +25,10 @@ function editable(revision: TextRevision): boolean {
 function projectExport(request: Omit<PendingRecordsExport, 'result'>, documents: DocumentViewProps['documents']): Promise<TopicTranslationExport> {
   return buildRecordObjectExportAsync(request, documents, true)
 }
-export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, documents, documentTasks, documentReviews, ownerId, topicId, associatedSessionId, navigationRevision, visible = true }: RecordObjectsProps & DocumentViewProps & {
+export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, ownerId, topicId, associatedSessionId, navigationRevision, visible = true, onOpenAssets }: RecordObjectsProps & DocumentViewProps & FileJobViewProps & {
   readonly store: SessionStore; readonly quick: QuickTranslationClient; readonly ownerId: string; readonly topicId: string
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined; readonly visible?: boolean
+  readonly onOpenAssets?: ((ownerId: string, topicId: string, sessionId?: string, jobId?: string) => void) | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   const associated = associatedSessionId ? store.getSession(associatedSessionId) : undefined
@@ -54,6 +57,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     })))
   }), [store])
   react.useEffect(() => objects?.subscribe(() => refresh(value => value + 1)), [objects])
+  react.useEffect(() => fileJobs?.subscribe(() => refresh(value => value + 1)), [fileJobs])
   react.useEffect(() => {
     if (!validAssociated) return
     rememberScroll(); setScope('session'); setSessionId(validAssociated)
@@ -65,7 +69,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     .sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id))
   const selectedSession = sessions.find(session => session.id === sessionId)
   const viewedSessions = scope === 'topic' ? sessions : selectedSession ? [selectedSession] : []
-  const groups = viewedSessions.map(session => ({ session, units: [...(store.getTranslationHistory(session.id)?.units ?? [])].sort((a, b) => a.order - b.order) })).filter(group => group.units.length)
+  const groups = viewedSessions.map(session => ({ session, jobs: fileJobs?.units(session.id) ?? [], units: [...(store.getTranslationHistory(session.id)?.units ?? [])].filter(unit => !fileJobs?.forUnit(session.id, unit.id) && !isDeletedUnit(unit)).sort((a, b) => a.order - b.order) })).filter(group => group.units.length || group.jobs.length)
   async function copy(text: string): Promise<void> {
     try { await navigator.clipboard.writeText(text); setMessage('已复制。') } catch { setMessage('复制失败，请重试。') }
   }
@@ -91,7 +95,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
       const topic = store.getTopics(ownerId).find(candidate => candidate.id === topicId)
       if (!topic) throw new Error('Topic no longer available')
       const targets = scope === 'topic' ? sessions : selectedSession ? [selectedSession] : []
-      if (!targets.some(session => store.getTranslationHistory(session.id)?.units.length)) { setMessage('当前范围尚无译文记录。'); return }
+      if (!targets.some(session => store.getTranslationHistory(session.id)?.units.length || fileJobs?.all(session.id).length)) { setMessage('当前范围尚无译文记录。'); return }
       for (const session of targets) if (!quick.finalizeForExport(session.id)) throw new Error('Cannot finalize export')
       const entries = targets.map(session => {
         const history = store.getTranslationHistory(session.id)
@@ -99,7 +103,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
         return { session, history }
       })
       const references = targets.flatMap(session => objects?.getSnapshot(session.ownerId, topicId, session.id).references ?? [])
-      const frozen = { ...structuredClone({ topic: { ownerId: store.getTopicAssetOwner(topicId) ?? ownerId, topicId, topicName: topic.name }, references, scope, format, exportedAt: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
+      const frozen = { ...structuredClone({ topic: { ownerId: store.getTopicAssetOwner(topicId) ?? ownerId, topicId, topicName: topic.name }, references, fileJobs: fileJobs?.exportUnits(targets.map(session => session.id)), scope, format, exportedAt: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
       setExportLabel(scope === 'topic' ? `主题「${topic.name}」` : `会话「${selectedSession!.remark || selectedSession!.name}」`)
       const result = await projectExport(frozen, documents)
       if (!active()) return
@@ -142,11 +146,12 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     h('div', { className: 'dsh-tp-records-reader', 'aria-label': '连续译文记录', ref: reader,
       onScroll: (event: { currentTarget: { scrollTop: number } }) => { if (visible) scrollPositions.current.set(scrollKey, event.currentTarget.scrollTop) } },
       groups.length === 0 ? h('p', { className: 'dsh-tp-muted', role: 'status' }, scope === 'session' && !selectedSession ? '此会话已不可用，请选择其他会话或主题范围。' : '当前范围尚无译文记录。') : null,
-      ...groups.map(({ session, units }) => h('section', { key: session.id, className: 'dsh-tp-records-session', 'aria-label': `会话译文：${session.remark || session.name}`, 'data-session-id': session.id },
+      ...groups.map(({ session, units, jobs }) => h('section', { key: session.id, className: 'dsh-tp-records-session', 'aria-label': `会话译文：${session.remark || session.name}`, 'data-session-id': session.id },
         h('h3', null, session.remark || session.name),
         session.archivedAt !== null ? h('p', { className: 'dsh-tp-muted' }, '会话已归档，请先在翻译工作区恢复后编辑。') : null,
+        ...jobs.map(record => h(FileJobView, { key: record.summary.unitId, jobs: fileJobs, record, viewFiles, onOpenAssets, ownerId })),
         ...units.map(unit => {
-          if (!isTextUnit(unit)) return h(DocumentUnitView, { key: unit.id, unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, visible, navigationRevision })
+          if (!isTextUnit(unit)) return h(DocumentUnitView, { key: unit.id, unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, visible, navigationRevision })
           const revisions = unit.revisions
           const key = JSON.stringify([session.id, unit.id]), draft = drafts.get(key), open = expanded.has(key)
           const pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
@@ -205,13 +210,15 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
               h('button', { type: 'button', 'aria-label': `${session.name} · 文本 ${unit.order}`, 'aria-expanded': open, onClick: () => {
                 setExpanded(current => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
               } }, `文本 ${unit.order} · ${candidate || !final ? '待定稿' : '已定稿'}`),
-              h('small', { className: 'dsh-tp-muted' }, `目标语言：${unit.targetLanguage}${unit.sourceVersion > 1 ? ` · 原文版本 ${unit.sourceVersion}` : ''}`),
-              h(TextUnitOpenLinks, { unit, session, objects, objectAssets, visible, navigationRevision })),
+              h('small', { className: 'dsh-tp-muted' }, `目标语言：${unit.targetLanguage}${unit.sourceVersion > 1 ? ` · 原文版本 ${unit.sourceVersion}` : ''}`)),
             h('div', { className: 'dsh-tp-record-pair' },
-              h('div', { className: 'dsh-tp-record-source', 'aria-label': '原文' }, h('h4', null, '原文'), h(RecordObjectText, { text: unit.source, target, objects, objectAssets }),
+              h('div', { className: 'dsh-tp-record-source', 'aria-label': '原文' },
+                h('div', { className: 'dsh-tp-record-column-heading' }, h('h4', null, '原文'), h(SourceOpenLink, { unit, session, objects, viewFiles, visible, navigationRevision })),
+                h(RecordObjectText, { text: unit.source, target, objects, objectAssets }),
                 open && unit.sourceVersions.length > 1 ? h('div', null, ...unit.sourceVersions.slice(0, -1).map(source => h('section', { key: source.version },
                   h('small', { className: 'dsh-tp-muted' }, `历史原文版本 ${source.version}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null),
-              h('div', { className: 'dsh-tp-record-target', 'aria-label': '最终译文' }, h('h4', null, '最终译文'),
+              h('div', { className: 'dsh-tp-record-target', 'aria-label': '最终译文' },
+                h('div', { className: 'dsh-tp-record-column-heading' }, h('h4', null, '最终译文'), h(ResultOpenLink, { unit, session, objects, viewFiles, visible, navigationRevision })),
                 final ? revisionView(final, 'final') : null,
                 candidate ? revisionView(candidate, 'candidate') : null,
                 !final && !candidate ? h('p', { className: 'dsh-tp-muted' }, '尚无最终译文。') : null,

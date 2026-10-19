@@ -1,11 +1,11 @@
 import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
 import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import {
-  emptyTopicArchive, decodeTopicArchiveSnapshot, decodeTopicArchivePut, decodeTopicArchiveUserInput, putTopicArchive, putUserTopicArchive, adoptTopicArchive,
+  emptyTopicArchive, decodeTopicArchiveSnapshot, decodeTopicArchivePut, decodeTopicArchiveUserInput, putTopicArchive, putUserTopicArchive, adoptTopicArchive, acceptTopicArchiveProposal,
   disableTopicArchive, deleteTopicArchiveEntry, reconcileTopicArchive, queryTopicArchive, referencedEntityIds,
   type TopicArchiveSnapshot, type TopicArchivePut, type TopicArchiveUserInput, type TopicArchiveUserPut, type ArchiveMutationResult, type TopicArchiveQuery,
 } from '../memory/topic-archive.js'
-import type { TermEvidenceResolver } from '../memory/topic-terms.js'
+import type { TermEvidenceResolver, FileProposalAcceptance } from '../memory/topic-terms.js'
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
@@ -26,6 +26,8 @@ export interface TopicArchiveVersion {
   readonly storedCount: number
 }
 export type TopicArchiveCommand = { readonly kind: 'put'; readonly input: TopicArchivePut }
+  | { readonly kind: 'accept_file_proposal'; readonly input: TopicArchivePut; readonly acceptance: FileProposalAcceptance }
+  | { readonly kind: 'revise_file_proposal'; readonly input: TopicArchivePut; readonly acceptance: FileProposalAcceptance }
   | { readonly kind: 'user_put'; readonly input: TopicArchiveUserPut }
   | { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }
 interface Seat { snapshot: TopicArchiveSnapshot; stored: string | null; dirty: boolean; status: HistoryStatus }
@@ -199,17 +201,19 @@ export class TopicArchiveStore {
     ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), failure: ArchiveMutationResult = { status: 'invalid', snapshot: seat.snapshot, entry: null }
     const fixed: TopicArchiveCommand = structuredClone(command), reader = this.evidenceReader
-    if (fixed.kind === 'put' && !decodeTopicArchivePut(fixed.input)) return failure
+    const fileProposal = fixed.kind === 'accept_file_proposal' || fixed.kind === 'revise_file_proposal'
+    if ((fixed.kind === 'put' || fileProposal) && !decodeTopicArchivePut(fixed.input)) return failure
     if (seat.snapshot.version !== expectedVersion) return { status: 'stale', snapshot: seat.snapshot, entry: null }
-    const content = fixed.kind === 'put' || fixed.kind === 'user_put' ? fixed.input : seat.snapshot.entries.find(entry => entry.id === fixed.id)
+    const content = fixed.kind === 'put' || fileProposal || fixed.kind === 'user_put' ? fixed.input : seat.snapshot.entries.find(entry => entry.id === fixed.id)
     const dependencyIds = new Set(content ? referencedEntityIds(content) : [])
-    const refs = fixed.kind === 'disable' ? [] : [...(fixed.kind === 'put' ? fixed.input.evidence : []),
+    const refs = fixed.kind === 'disable' ? [] : [...(fixed.kind === 'put' || fileProposal ? fixed.input.evidence : []),
       ...seat.snapshot.entries.filter(entry => dependencyIds.has(entry.id) && entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))]
     const prepared = await prepareTopicEvidence(this.sessions, seat.snapshot, refs, this.resolver, reader, this.referenceEvidence)
     return this.locked(failure, () => {
       if (reader !== this.evidenceReader || !prepared.isCurrent() || !this.sessions.getTopics(ownerId).some(topic => topic.id === topicId) ||
         !this.currentRaw(seat) || seat.snapshot.version !== expectedVersion) { this.emit(); return { status: 'stale', snapshot: seat.snapshot, entry: null } }
       const result = fixed.kind === 'put' ? putTopicArchive(seat.snapshot, fixed.input, prepared.resolver, now()) :
+        fileProposal ? acceptTopicArchiveProposal(seat.snapshot, fixed.input, prepared.resolver, fixed.acceptance, fixed.kind === 'revise_file_proposal') :
         fixed.kind === 'user_put' ? putUserTopicArchive(seat.snapshot, fixed.input, prepared.resolver, { eventId: eventId('archive-user-save'), at: now() }) :
           fixed.kind === 'adopt' ? adoptTopicArchive(seat.snapshot, fixed.id, fixed.expectedEntryVersion, prepared.resolver, { eventId: eventId('archive-adoption'), at: now() }) :
             disableTopicArchive(seat.snapshot, fixed.id, fixed.expectedEntryVersion, now())

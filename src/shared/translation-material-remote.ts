@@ -16,6 +16,12 @@ export interface TranslationMaterialReceipt extends TranslationMaterialScope {
 export interface TranslationMaterialQuery {
   readonly receipt: TranslationMaterialReceipt
   readonly snapshot: TranslationMaterialEnvelope
+  readonly workflow?: TranslationMaterialWorkflow
+}
+/** Actual preparation facts only; an absent analysis is explicitly waiting. */
+export interface TranslationMaterialWorkflow {
+  readonly phase: 'waiting' | 'frozen' | 'preparing' | 'running' | 'completed' | 'failed' | 'unknown'
+  readonly message: string
 }
 export interface TranslationMaterialFinish extends TranslationMaterialScope {
   readonly outcome: 'submitted' | 'no_prompt' | 'failed' | 'unknown'
@@ -82,9 +88,14 @@ export function parseTranslationMaterialResult(method: typeof methods[number], v
       if (typeof value.value.released !== 'boolean') throw new TypeError('Invalid material release receipt')
     } else if (method === 'query') {
       if (value.value !== null) {
-        object(value.value); fields(value.value, ['receipt', 'snapshot'])
+        object(value.value); fields(value.value, ['receipt', 'snapshot'], ['workflow'])
         const facts = receipt(value.value.receipt), snapshot = parseTranslationMaterialEnvelope(value.value.snapshot)
         if (scopeFields.some(key => facts[key] !== snapshot[key]) || facts.kind !== snapshot.kind || facts.stage === 'released') throw new TypeError('Material query identity mismatch')
+        if (value.value.workflow !== undefined) {
+          object(value.value.workflow); fields(value.value.workflow, ['phase', 'message'])
+          if (!['waiting', 'frozen', 'preparing', 'running', 'completed', 'failed', 'unknown'].includes(value.value.workflow.phase as string)) throw new TypeError('Invalid material workflow phase')
+          text(value.value.workflow.message, 1000)
+        }
       }
     } else receipt(value.value)
   }

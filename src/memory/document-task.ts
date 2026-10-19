@@ -145,6 +145,7 @@ function validateDocumentAudit(unit: DocumentUnit, audit: DocumentReviewAudit): 
 /** Strict saved-history boundary; no I/O, execution capability, or replay is reconstructed. */
 export function parseDocumentUnit(value: unknown): DocumentUnit {
   const unit = parseDocumentUnitShape(value)
+  if (unit.deletion) return unit
   unique(unit.tasks, item => item.taskId); unique(unit.tasks, item => item.operationId)
   unique([...unit.chunkRevisions, ...unit.revisions], item => item.id)
   unique(unit.chunkRevisions.filter(item => item.callId !== null), item => item.callId!)

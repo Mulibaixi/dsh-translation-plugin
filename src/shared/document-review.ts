@@ -57,7 +57,14 @@ export interface DocumentReviewReadRequest {
   readonly revisionId?: string
   readonly range: TranslationSourceRange
 }
-export interface DocumentManualRevisionRequest extends DocumentReviewBeginRequest { readonly chunkId: string; readonly baseRevisionId: string; readonly text: string }
+export interface DocumentTextEdit { readonly oldText: string; readonly newText: string }
+/** Exactly one body form: a complete replacement `text`, or precise `edits` against the same immutable base. */
+export type DocumentManualRevisionRequest = DocumentReviewBeginRequest & {
+  readonly chunkId: string
+  readonly baseRevisionId: string
+  readonly text?: string
+  readonly edits?: readonly DocumentTextEdit[]
+}
 export interface DocumentFinalRequest extends DocumentReviewBeginRequest {}
 export interface DocumentReviewReceipt {
   readonly target: DocumentReviewTarget
@@ -150,9 +157,43 @@ export function parseDocumentReviewReadRequest(value: unknown): DocumentReviewRe
   return { target: parseDocumentReviewTarget(value.target), kind: value.kind, range: part, ...(value.revisionId === undefined ? {} : { revisionId: value.revisionId as string }) }
 }
 export function parseDocumentManualRevisionRequest(value: unknown): DocumentManualRevisionRequest {
-  exact(value, ['target', 'operationId', 'expectedReviewVersion', 'chunkId', 'baseRevisionId', 'text']); text(value.chunkId); text(value.baseRevisionId); text(value.text, 16 * 1024 * 1024)
-  if (new TextEncoder().encode(value.text).byteLength > 16 * 1024 * 1024) throw new TypeError('Manual revision exceeds text budget')
-  return { ...begin(value), chunkId: value.chunkId, baseRevisionId: value.baseRevisionId, text: value.text }
+  packet(value); exact(value, ['target', 'operationId', 'expectedReviewVersion', 'chunkId', 'baseRevisionId'], ['text', 'edits'])
+  text(value.chunkId); text(value.baseRevisionId)
+  if ((value.text === undefined) === (value.edits === undefined)) throw new TypeError('Manual revision requires exactly one of text or edits')
+  if (value.text !== undefined) {
+    text(value.text, 16 * 1024 * 1024)
+    if (new TextEncoder().encode(value.text).byteLength > 16 * 1024 * 1024) throw new TypeError('Manual revision exceeds text budget')
+    return { ...begin(value), chunkId: value.chunkId, baseRevisionId: value.baseRevisionId, text: value.text }
+  }
+  list(value.edits, 100)
+  if (!value.edits.length) throw new TypeError('Empty manual edits')
+  const edits = value.edits.map(raw => {
+    exact(raw, ['oldText', 'newText']); text(raw.oldText, 2_000_000); text(raw.newText, 16 * 1024 * 1024, true)
+    return { oldText: raw.oldText, newText: raw.newText }
+  })
+  return { ...begin(value), chunkId: value.chunkId, baseRevisionId: value.baseRevisionId, edits }
+}
+/**
+ * Apply precise edits against one immutable base string. Every oldText must match exactly once and all
+ * matches are located in the original base, so replacements never chain. Nothing is normalized.
+ */
+export function applyDocumentEdits(base: string, edits: readonly DocumentTextEdit[]): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly code: string; readonly message: string } {
+  if (!edits.length) return { ok: false, code: 'edit_empty', message: '至少需要一条精确修改。' }
+  const spans: { start: number; end: number; newText: string }[] = []
+  for (const [index, edit] of edits.entries()) {
+    if (!edit.oldText) return { ok: false, code: 'edit_empty', message: `第 ${index + 1} 条修改的 oldText 为空。` }
+    const first = base.indexOf(edit.oldText)
+    if (first < 0) return { ok: false, code: 'edit_no_match', message: `第 ${index + 1} 条修改的 oldText 在基准正文中不存在；请提供更准确的上下文。` }
+    if (base.indexOf(edit.oldText, first + 1) >= 0) return { ok: false, code: 'edit_ambiguous', message: `第 ${index + 1} 条修改的 oldText 在基准正文中命中多处；请提供足够上下文使其唯一。` }
+    spans.push({ start: first, end: first + edit.oldText.length, newText: edit.newText })
+  }
+  spans.sort((left, right) => left.start - right.start)
+  for (let index = 1; index < spans.length; index++) {
+    if (spans[index]!.start < spans[index - 1]!.end) return { ok: false, code: 'edit_overlap', message: '多条修改的定位范围重叠；请按原文分别给出互不重叠的替换。' }
+  }
+  let text = base
+  for (const span of [...spans].reverse()) text = text.slice(0, span.start) + span.newText + text.slice(span.end)
+  return { ok: true, text }
 }
 export const parseDocumentFinalRequest = parseDocumentReviewBeginRequest
 export function parseDocumentReviewReceipt(value: unknown): DocumentReviewReceipt {

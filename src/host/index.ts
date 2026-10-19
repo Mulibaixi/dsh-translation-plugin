@@ -5,6 +5,7 @@ import { installQuickTranslation, type QuickHostContext } from './quick-translat
 import { installTopicTools, type TopicHostContext } from './topic-tools.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { installObjectAssets } from './object-assets.js'
+import { installViewFiles } from './view-files.js'
 import { installTranslationMaterials, type TranslationMaterialHostContext } from './translation-materials.js'
 import { installNormalTranslation } from './normal-translation.js'
 import { installTranslationSources } from './translation-sources.js'
@@ -14,6 +15,7 @@ import { installDocumentPlanning } from './document-planning-service.js'
 import { installDocumentExecution } from './document-execution-service.js'
 import { installDocumentCorrection } from './document-correction-service.js'
 import { installDocumentReview } from './document-review-service.js'
+import { installFileJobs } from './file-jobs.js'
 import type { AnalysisNotification, AnalysisRun } from '../shared/translation-preparation.js'
 import type { TaskPhaseEvent, TranslationExchangeService } from 'dsh-composer-extension/contracts'
 
@@ -23,6 +25,7 @@ export { QuickTranslationService, installQuickTranslation } from './quick-transl
 export { DshTextExecutionAdapter } from './dsh-text-adapter.js'
 export { TopicToolsService, installTopicTools } from './topic-tools.js'
 export { ObjectAssetsService, installObjectAssets } from './object-assets.js'
+export { ViewFilesService, installViewFiles } from './view-files.js'
 export { TranslationMaterialsService, installTranslationMaterials } from './translation-materials.js'
 export { NormalTranslationService, installNormalTranslation } from './normal-translation.js'
 export { TranslationSourcesService, installTranslationSources } from './translation-sources.js'
@@ -33,6 +36,8 @@ export { DocumentPlanningService, installDocumentPlanning } from './document-pla
 export { DocumentPlanner } from './document-planner.js'
 export { DocumentExecutionService, installDocumentExecution } from './document-execution-service.js'
 export { DocumentReviewService, installDocumentReview } from './document-review-service.js'
+export { FileJobsService, installFileJobs } from './file-jobs.js'
+export type * from '../shared/file-jobs.js'
 export type * from '../shared/document-execution.js'
 export type * from '../shared/document-planning.js'
 export type * from '../shared/translation-preparation.js'
@@ -42,7 +47,7 @@ export type * from '../shared/translation-source-storage.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationLocalData'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationLocalData', 'translationFileJobs'] as const
 
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
@@ -109,6 +114,7 @@ export function apply(ctx: QuickHostContext): void {
   ctx.provide('translationReferences', references)
   ctx.effect?.(() => () => references.dispose(), 'reference files lifetime')
   installObjectAssets(ctx, {}, false)
+  installViewFiles(ctx, {}, false)
   installTranslationMaterials(ctx as TranslationMaterialHostContext, undefined, false)
   installNormalTranslation(ctx as TopicHostContext, undefined, false)
   installTranslationSources(ctx, false)
@@ -118,6 +124,7 @@ export function apply(ctx: QuickHostContext): void {
   installDocumentExecution(ctx as TopicHostContext)
   installDocumentCorrection(ctx as TopicHostContext)
   installDocumentReview(ctx as TopicHostContext)
+  installFileJobs(ctx as TopicHostContext, false)
   const quick = installQuickTranslation(ctx, undefined, false)
   const register = (scope: QuickHostContext): void => {
     const registry = scope.get ? scope.get('typert') as QuickHostContext['typert'] : scope.typert

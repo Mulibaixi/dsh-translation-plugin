@@ -347,10 +347,12 @@ export class TranslationSourcesService {
     return { ok: true, value: { bytes, text } }
   }
   /** Read-only access proved by an exact saved history commit, independent of the old main Agent. */
-  async readLibrarySource(input: LibrarySourceRequest, signal?: AbortSignal): Promise<TranslationSourceStorageResult<LibrarySourceValue>> {
+  async readLibrarySource(input: LibrarySourceRequest, signal?: AbortSignal, capturedPeerId?: string): Promise<TranslationSourceStorageResult<LibrarySourceValue>> {
     let request: LibrarySourceRequest
     try { request = parseLibrarySourceRequest(input) } catch { return storageBad('invalid_input', '共享原稿读取凭据或范围无效。', 'read_library_source') }
-    const peerId = this.ctx.invocation?.peer.id
+    // In-process background restoration passes the actual peer captured at admission.
+    // The public Remote supplies no third argument and uses its own invocation.
+    const peerId = capturedPeerId ?? this.ctx.invocation?.peer.id
     const topics = this.ctx.get?.('translationTopics') as { ownsAssetConnection(scope: { namespaceId: string; ownerId: string }, peerId: string): boolean } | undefined
     const current = (): boolean => !this.disposed && !signal?.aborted && !!peerId && !!topics?.ownsAssetConnection({ namespaceId: request.namespaceId, ownerId: request.stored.scope.ownerId }, peerId)
     if (!current()) return storageBad('scope_mismatch', '共享原稿读取不属于已连接的本地资产库。', 'read_library_source')

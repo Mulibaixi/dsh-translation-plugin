@@ -4,7 +4,7 @@ import { parseTranslationSourceScope, type TranslationSourceScope } from './tran
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
 import type { TranslationMaterialRoute } from './translation-material.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
-import { decodeTopicTermSnapshot, type TopicTermSnapshot, type TermUserAdoption, type TermEvidenceRef } from '../memory/topic-terms.js'
+import { decodeTopicTermSnapshot, type TopicTermSnapshot, type TermUserAdoption, type TermEvidenceRef, type FileProposalAcceptance } from '../memory/topic-terms.js'
 
 export const MAX_ANALYSIS_CALLS = 512
 export const MAX_ANALYSIS_RANGES = 256
@@ -317,6 +317,7 @@ export interface PreparationFrozenTerm {
   readonly forbidden: readonly string[]
   readonly userFixed: boolean
   readonly confirmation: TermUserAdoption | null
+  readonly acceptance?: FileProposalAcceptance
   readonly origin: 'model_inferred' | 'main_model_adjusted' | 'inferred' | 'source_checked' | 'reference_derived' | 'user_explicit'
   /** Topic evidence remains its real reference; analysis never invents a unit. */
   readonly evidence: readonly TermEvidenceRef[]
@@ -573,7 +574,7 @@ function candidateSourceRefs(value: unknown): readonly { readonly id: string; re
   return value.map(item => { exact(item, ['id', 'version', 'callId']); text(item.id, 2048); text(item.callId, 2048); if (item.version !== 1) throw new TypeError('Invalid analysis source ref'); return { id: item.id, version: 1, callId: item.callId } })
 }
 function parseFrozenPreparationTerm(value: unknown): PreparationFrozenTerm {
-  exact(value, ['ref', 'sourceForms', 'aliases', 'preferred', 'description', 'sourceLanguage', 'targetLanguage', 'sense', 'forbidden', 'userFixed', 'confirmation', 'origin', 'evidence', 'candidateRefs', 'ranges'])
+  exact(value, ['ref', 'sourceForms', 'aliases', 'preferred', 'description', 'sourceLanguage', 'targetLanguage', 'sense', 'forbidden', 'userFixed', 'confirmation', 'origin', 'evidence', 'candidateRefs', 'ranges'], ['acceptance'])
   const ref = preparationRef(value.ref), sourceForms = preparationStrings(value.sourceForms, 500, true), aliases = preparationStrings(value.aliases, 500), forbidden = preparationStrings(value.forbidden, 4000)
   text(value.preferred, ref.kind === 'candidate' ? 2000 : 4000); text(value.description, 4000, true); text(value.sense, 4000, true); text(value.targetLanguage, 80)
   if (value.sourceLanguage !== null) text(value.sourceLanguage, 80)
@@ -582,11 +583,12 @@ function parseFrozenPreparationTerm(value: unknown): PreparationFrozenTerm {
   const candidateRefs = candidateSourceRefs(value.candidateRefs), selectedRanges = ranges(value.ranges)
   if (!selectedRanges.length) throw new TypeError('Frozen term has no semantic scope')
   if (ref.kind === 'candidate') {
-    if (!['model_inferred', 'main_model_adjusted'].includes(String(value.origin)) || value.userFixed || value.confirmation !== null || value.evidence.length || !candidateRefs.length || sourceForms.length !== 1 || aliases.length || value.sourceLanguage !== null || value.sense !== '' || forbidden.length) throw new TypeError('Candidate cannot fabricate topic or fixed evidence')
+    if (!['model_inferred', 'main_model_adjusted'].includes(String(value.origin)) || value.userFixed || value.confirmation !== null || value.acceptance !== undefined || value.evidence.length || !candidateRefs.length || sourceForms.length !== 1 || aliases.length || value.sourceLanguage !== null || value.sense !== '' || forbidden.length) throw new TypeError('Candidate cannot fabricate topic or fixed evidence')
   } else {
-    const auditTime = '2000-01-01T00:00:00.000Z', decoded = decodeTopicTermSnapshot({ schemaVersion: value.origin === 'reference_derived' ? 2 : 1, ownerId: 'audit', topicId: 'audit', version: ref.entryVersion,
+    const auditTime = '2000-01-01T00:00:00.000Z', decoded = decodeTopicTermSnapshot({ schemaVersion: value.acceptance !== undefined ? 3 : value.origin === 'reference_derived' ? 2 : 1, ownerId: 'audit', topicId: 'audit', version: ref.entryVersion,
       activeVersion: ref.entryVersion, updatedAt: auditTime, entries: [{ id: ref.id, version: ref.entryVersion, sourceLanguage: value.sourceLanguage, targetLanguage: value.targetLanguage,
-        sourceForms, aliases, sense: value.sense, preferred: value.preferred, forbidden, evidence: value.evidence, status: 'active', origin: value.origin, confirmation: value.confirmation, createdAt: auditTime, updatedAt: auditTime }] })
+        sourceForms, aliases, sense: value.sense, preferred: value.preferred, forbidden, evidence: value.evidence, status: 'active', origin: value.origin, confirmation: value.confirmation,
+        ...(value.acceptance === undefined ? {} : { acceptance: value.acceptance }), createdAt: auditTime, updatedAt: auditTime }] })
     if (!decoded || candidateRefs.length || value.description !== value.sense || value.userFixed !== (decoded.entries[0]!.confirmation !== null)) throw new TypeError('Invalid fixed topic term facts')
   }
   return { ...(structuredClone(value) as unknown as PreparationFrozenTerm), ref, sourceForms, aliases, forbidden, candidateRefs, ranges: selectedRanges }

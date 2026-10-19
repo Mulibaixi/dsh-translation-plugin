@@ -48,3 +48,7 @@ sdk-consumer/
 *.integration
 *.snap
 *.snap.json
+
+# ---- WorkBuddy 工作区本地数据 ----
+# 会话/记忆/项目状态等本地数据，不纳入版本管理
+.workbuddy/

@@ -202,7 +202,7 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
             deletedForm ? h('button', { type: 'button', disabled: pending, onClick: copyDraft }, '复制编辑稿') : null,
             h('button', { type: 'button', disabled: pending, onClick: () => { drafts.current.delete(form.id); setForm(undefined); setOriginal(undefined) } }, '取消')),
         ) : entry ? h('div', { className: 'dsh-tp-term-details' }, h('h3', null, title(snapshot, entry)),
-          h('div', { className: 'dsh-tp-muted' }, `${statuses[entry.status]} · ${origins[entry.origin]} · 条目版本 ${entry.version}`),
+          h('div', { className: 'dsh-tp-muted' }, `${statuses[entry.status]} · ${entry.acceptance ? entry.origin === 'inferred' ? '模型推断 · 用户已采纳' : `${origins[entry.origin]} · 用户已采纳` : origins[entry.origin]} · 条目版本 ${entry.version}`),
           h('button', { type: 'button', disabled: pending, onClick: () => edit(entry) }, '编辑'),
           entry.kind === 'entity' ? [h('div', null, `别名：${entry.aliases.join('、') || '无'}`), h('div', { className: 'dsh-tp-translation-text' }, entry.description)] :
             entry.kind === 'fact' ? [h('div', { className: 'dsh-tp-translation-text' }, entry.body), h('div', null, `关联实体：${entry.entityIds.map(id => entityLabel(snapshot, id)).join('、') || '无'}`)] :

@@ -33,7 +33,7 @@ const unknownUsage = (): PluginStorageUsage => ({ status: 'unknown', total: null
 
 function category(key: string): StorageUsageCategory {
   const name = key.slice(PLUGIN_STORAGE_PREFIX.length)
-  if (name.startsWith('history:') || name.startsWith('draft:')) return 'history'
+  if (name.startsWith('history:') || name.startsWith('draft:') || name.startsWith('file-intake:') || name.startsWith('file-jobs:')) return 'history'
   if (name.startsWith('topic-terms:')) return 'terms'
   if (name.startsWith('topic-archive:')) return 'archive'
   if (name.startsWith('preparation:')) return 'preparation'

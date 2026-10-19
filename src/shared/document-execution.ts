@@ -1,4 +1,4 @@
-import { parseNormalTranslationTarget, type NormalTranslationTarget } from './normal-translation.js'
+import { parseNormalTranslationTarget, parseNormalTranslationUnitRequest, type NormalTranslationTarget, type NormalTranslationUnitTarget } from './normal-translation.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { parseTranslationSourceScope, type TranslationSourceScope } from './translation-sources.js'
 import { sourceCodePointLength } from './translation-source-read.js'
@@ -12,6 +12,12 @@ import { parseDocumentReuseRequests, parseDocumentReuseApproval, type DocumentRe
 
 export const MAX_DOCUMENT_OUTPUT_BYTES = 16 * 1024 * 1024
 export const MAX_DOCUMENT_EXECUTION_PACKET_BYTES = 196608
+/** This acknowledges only delivery of an explicit intent to the main Agent, never a translation task. */
+export interface DocumentUnitSubmitReceipt {
+  readonly accepted: true
+  readonly operationId: string
+  readonly target: NormalTranslationUnitTarget
+}
 export interface TranslationBatchExecute {
   readonly target: NormalTranslationTarget
   readonly operationId: string
@@ -379,13 +385,40 @@ function parseDocumentRemoteResult(method: string, value: unknown): import('./tr
   exact(value, ['ok', 'error']); exact(value.error, ['code', 'message', 'stage']); text(value.error.code, 128); text(value.error.message, 2048); text(value.error.stage, 128)
   return { ok: false, error: { code: value.error.code, message: value.error.message, stage: value.error.stage } }
 }
+function parseDocumentUnitIntentResult(value: unknown, nullable: boolean): import('./translation-preparation.js').AnalysisResult<DocumentUnitSubmitReceipt | null> {
+  exact(value, ['ok'], ['value', 'error'])
+  if (value.ok === true) {
+    exact(value, ['ok', 'value'])
+    if (nullable && value.value === null) return { ok: true, value: null }
+    exact(value.value, ['accepted', 'operationId', 'target'])
+    if (value.value.accepted !== true) throw new TypeError('Invalid document intent receipt')
+    const request = parseNormalTranslationUnitRequest({ operationId: value.value.operationId, target: value.value.target })
+    return { ok: true, value: { accepted: true, operationId: request.operationId, target: request.target } }
+  }
+  if (value.ok !== false) throw new TypeError('Invalid document intent result')
+  exact(value, ['ok', 'error']); exact(value.error, ['code', 'message', 'stage']); text(value.error.code, 128); text(value.error.message, 2048); text(value.error.stage, 128)
+  return { ok: false, error: { code: value.error.code, message: value.error.message, stage: value.error.stage } }
+}
+export function parseDocumentUnitSubmitResult(value: unknown): import('./translation-preparation.js').AnalysisResult<DocumentUnitSubmitReceipt> {
+  return parseDocumentUnitIntentResult(value, false) as import('./translation-preparation.js').AnalysisResult<DocumentUnitSubmitReceipt>
+}
+/** Null is an unknown intent acknowledgement, including an unavailable runtime record after Host restart. */
+export function parseDocumentUnitQueryResult(value: unknown): import('./translation-preparation.js').AnalysisResult<DocumentUnitSubmitReceipt | null> {
+  return parseDocumentUnitIntentResult(value, true)
+}
 const executionPackage = 'dsh-translation-plugin'
-export const DOCUMENT_EXECUTION_REMOTE = { package: executionPackage, descriptors: (['status', 'pause', 'cancel', 'resume', 'update'] as const).map(method => ({
+export const DOCUMENT_EXECUTION_REMOTE = { package: executionPackage, descriptors: [...(['status', 'pause', 'cancel', 'resume', 'update'] as const).map(method => ({
   id: `${executionPackage}#translationBatch/${method}`, service: 'translationBatch', namespace: 'translationBatch', method,
   invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const,
     codec: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Request`, create: () => ({ parse: (value: unknown) => method === 'status' ? parseTranslationBatchStatus(value) : method === 'update' ? parseTranslationBatchUpdate(value) : parseTranslationBatchControl(value) }) } }],
   result: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Result`, create: () => ({ parse: (value: unknown) => parseDocumentRemoteResult(method, value) }) },
-})) }
+})), ...(['submitUnit', 'queryUnit'] as const).map(method => ({
+  id: `${executionPackage}#translationBatch/${method}`, service: 'translationBatch', namespace: 'translationBatch', method,
+  invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const,
+    codec: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Request`, create: () => ({ parse: parseNormalTranslationUnitRequest }) } }],
+  ...(method === 'submitUnit' ? { cancellation: { parameter: 'signal' } } : {}),
+  result: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Result`, create: () => ({ parse: method === 'submitUnit' ? parseDocumentUnitSubmitResult : parseDocumentUnitQueryResult }) },
+}))] }
 export function parseDocumentBlockReceipt(value: unknown): DocumentBlockReceipt {
   packet(value); exact(value, ['scope', 'taskId', 'unitId', 'childOperationId', 'revisionId', 'callId', 'attemptId', 'sequence', 'registered'])
   text(value.childOperationId); text(value.revisionId); nullableIdentity(value.callId); nullableIdentity(value.attemptId); integer(value.sequence, 0)

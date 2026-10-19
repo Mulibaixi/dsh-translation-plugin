@@ -20,10 +20,32 @@ export interface TopicNameRecord {
 export const TOPIC_IDENTITY_PREFIX = 'dsh-translation-plugin:topic-identity:v1:'
 export const TOPIC_NAME_PREFIX = 'dsh-translation-plugin:topic-name:v1:'
 export const DELETED_SESSION_PREFIX = 'dsh-translation-plugin:deleted-session:v1:'
+export const DELETED_TOPIC_PREFIX = 'dsh-translation-plugin:deleted-topic:v1:'
+export const TOPIC_DELETION_INTENT_PREFIX = 'dsh-translation-plugin:topic-deletion-intent:v1:'
 export const TOPIC_LOCK_NAME = 'dsh-translation-plugin:topic-structures:v1'
 export function topicIdentityKey(id: string): string { return `${TOPIC_IDENTITY_PREFIX}${encodeURIComponent(id)}` }
 export function topicNameKey(id: string): string { return `${TOPIC_NAME_PREFIX}${encodeURIComponent(id)}` }
 export function deletedSessionKey(id: string): string { return `${DELETED_SESSION_PREFIX}${encodeURIComponent(id)}` }
+export function deletedTopicKey(id: string): string { return `${DELETED_TOPIC_PREFIX}${encodeURIComponent(id)}` }
+export function topicDeletionIntentKey(id: string): string { return `${TOPIC_DELETION_INTENT_PREFIX}${encodeURIComponent(id)}` }
+export interface TopicDeletionTombstone {
+  readonly schemaVersion: 1
+  readonly topicId: string
+  readonly sequenceNamespaceId: string
+  readonly nextSequence: number
+  readonly sessionCount: number
+  readonly at: string
+  readonly operationId: string
+}
+export interface TopicDeletionIntent {
+  readonly schemaVersion: 1
+  readonly topicId: string
+  readonly operationId: string
+  readonly at: string
+  readonly sessionIds: readonly string[]
+  readonly identityStored: string | null
+  readonly nameStored: string | null
+}
 
 function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) }
 function text(value: unknown, maximum: number): value is string { return typeof value === 'string' && !!value.trim() && Array.from(value).length <= maximum }
@@ -63,5 +85,31 @@ export function decodeDeletion(raw: string, id: string): { readonly legacyKey: s
     if (!record(value) || !exact(value, ['schemaVersion', 'sessionId', 'legacyKey']) || value.schemaVersion !== 1 || value.sessionId !== id ||
       !(value.legacyKey === null || (text(value.legacyKey, 2000) && value.legacyKey.startsWith('dsh-translation-plugin:draft:v1:')))) return undefined
     return { legacyKey: value.legacyKey }
+  } catch { return undefined }
+}
+
+function time(value: unknown): value is string { return text(value, 40) && Number.isFinite(Date.parse(value)) }
+
+/** A deleted topic keeps its numbering namespace but never reappears in listings. */
+export function decodeTopicDeletion(raw: string, id: string): TopicDeletionTombstone | undefined {
+  try {
+    const value: unknown = JSON.parse(raw)
+    if (!record(value) || !exact(value, ['schemaVersion', 'topicId', 'sequenceNamespaceId', 'nextSequence', 'sessionCount', 'at', 'operationId']) ||
+      value.schemaVersion !== 1 || value.topicId !== id || !text(value.sequenceNamespaceId, 3000) || !integer(value.nextSequence) ||
+      !integer(value.sessionCount) || !time(value.at) || !text(value.operationId, 3000)) return undefined
+    return value as unknown as TopicDeletionTombstone
+  } catch { return undefined }
+}
+
+/** The intent blocks late writes between local commit and Host reclamation. */
+export function decodeTopicDeletionIntent(raw: string, id: string): TopicDeletionIntent | undefined {
+  try {
+    const value: unknown = JSON.parse(raw)
+    if (!record(value) || !exact(value, ['schemaVersion', 'topicId', 'operationId', 'at', 'sessionIds', 'identityStored', 'nameStored']) ||
+      value.schemaVersion !== 1 || value.topicId !== id || !time(value.at) || !text(value.operationId, 3000) ||
+      !Array.isArray(value.sessionIds) || value.sessionIds.length > 500 || new Set(value.sessionIds).size !== value.sessionIds.length ||
+      !value.sessionIds.every(sessionId => text(sessionId, 2048)) ||
+      !(value.identityStored === null || text(value.identityStored, 200000)) || !(value.nameStored === null || text(value.nameStored, 100000))) return undefined
+    return value as unknown as TopicDeletionIntent
   } catch { return undefined }
 }

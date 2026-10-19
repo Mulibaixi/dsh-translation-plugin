@@ -37,6 +37,12 @@ export async function loadObjectAssetStorage(ctx: QuickHostContext): Promise<Obj
     if (!/^asset-[0-9a-f-]{36}$/u.test(assetId)) throw new TypeError('Invalid asset identity')
     return path.join(root, `${assetId}.json`)
   }
+  // Serialize with the profile-wide data clear; the writer generation must be current at call time.
+  const gate = <T>(action: () => Promise<T>): Promise<T> => {
+    const data = ctx.get?.('translationLocalData') as { storageWriter?: () => <U>(action: () => Promise<U>) => Promise<U> } | undefined
+    const writer = typeof data?.storageWriter === 'function' ? data.storageWriter() : undefined
+    return writer ? writer(action) : action()
+  }
   return {
     async read(assetId) {
       let text: string
@@ -48,7 +54,7 @@ export async function loadObjectAssetStorage(ctx: QuickHostContext): Promise<Obj
       if (record.asset.assetId !== assetId) throw new TypeError('Asset identity mismatch')
       return record
     },
-    async write(record) { await atomic.writeFileAtomic(locate(record.asset.assetId), JSON.stringify(stored(record)), { mode: 0o600 }) },
+    async write(record) { await gate(() => atomic.writeFileAtomic(locate(record.asset.assetId), JSON.stringify(stored(record)), { mode: 0o600 })) },
   }
 }
 
@@ -82,6 +88,10 @@ export class ObjectAssetsService {
     if (record.asset.assetId !== assetId) throw new TypeError('Asset identity mismatch')
     this.records.set(assetId, record); this.saved.add(assetId)
     return record
+  }
+  /** Drop cached registrations after a topic purge; files are removed by the local-data service. */
+  forgetTopic(ownerId: string, topicId: string): void {
+    for (const [assetId, record] of this.records) if (record.ownerId === ownerId && record.topicId === topicId) { this.records.delete(assetId); this.saved.delete(assetId) }
   }
   async capabilities(): Promise<ObjectAssetResult<ObjectAssetCapability>> {
     const attachments = this.ctx.get?.('attachments') as Attachments | undefined, uploads = this.ctx.get?.('fileUploads') as { resolve?: unknown } | undefined

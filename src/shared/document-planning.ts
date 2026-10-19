@@ -20,17 +20,20 @@ export interface TranslationPlanSuggest {
   readonly cursor?: string
   readonly limit?: number
 }
-export interface TranslationPlanSet {
+export type TranslationPlanSet = {
   readonly target: NormalTranslationTarget
   readonly planId: string
   /** Zero creates the first plan; later revisions use the current immutable version. */
   readonly expectedVersion: number
   readonly operationId: string
   readonly preparationRef: VersionReference
-  readonly items: readonly ChunkPlanItem[]
   /** Explicit semantic protections; appearance never creates a copy instruction. */
   readonly protectedRanges?: readonly TranslationSourceRange[]
-}
+} & (
+  /** Explicit items, or one program suggestion; exactly one form is accepted. */
+  { readonly items: readonly ChunkPlanItem[]; readonly suggestionRef?: undefined }
+  | { readonly items?: undefined; readonly suggestionRef: VersionReference }
+)
 export interface TranslationPlanQuery {
   readonly target: NormalTranslationTarget
   readonly planId: string
@@ -89,6 +92,8 @@ export interface DocumentPlanSuggestion {
   readonly budget: DocumentChunkBudget
 }
 export interface DocumentPlanSuggestionPage extends TranslationPlanSuggest {
+  /** Stable identity of the complete runtime suggestion; a page cursor is not this reference. */
+  readonly suggestionRef: VersionReference
   readonly items: readonly DocumentPlanSuggestion[]
   readonly capacity: DocumentPreparedCapacity
   readonly callBudget: DocumentPlanCallBudget
@@ -139,9 +144,24 @@ export function parseTranslationPlanSuggest(value: unknown): TranslationPlanSugg
   return { target: target(value.target), preparationRef: reference(value.preparationRef), ...paging(value) }
 }
 export function parseTranslationPlanSet(value: unknown): TranslationPlanSet {
-  packet(value); exact(value, ['target', 'planId', 'expectedVersion', 'operationId', 'preparationRef', 'items'], ['protectedRanges'])
+  packet(value); exact(value, ['target', 'planId', 'expectedVersion', 'operationId', 'preparationRef'], ['items', 'suggestionRef', 'protectedRanges'])
   text(value.planId); text(value.operationId); integer(value.expectedVersion, 0)
   const fixedTarget = target(value.target), preparationRef = reference(value.preparationRef)
+  if ((value.items === undefined) === (value.suggestionRef === undefined)) throw new TypeError('Plan requires exactly one of items or suggestionRef')
+  if (value.suggestionRef !== undefined) {
+    // The program suggestion already holds complete ordered items; bounds are checked against the real preparation.
+    let protectedRanges: TranslationSourceRange[] | undefined
+    if (value.protectedRanges !== undefined) {
+      if (!Array.isArray(value.protectedRanges) || value.protectedRanges.length > MAX_DOCUMENT_PLAN_CHUNKS) throw new TypeError('Too many protected ranges')
+      let end = 0
+      protectedRanges = value.protectedRanges.map(raw => {
+        exact(raw, ['start', 'end']); integer(raw.start, end); integer(raw.end, raw.start + 1); end = raw.end
+        return { start: raw.start, end: raw.end }
+      })
+    }
+    return { target: fixedTarget, planId: value.planId, expectedVersion: value.expectedVersion, operationId: value.operationId, preparationRef,
+      suggestionRef: reference(value.suggestionRef), ...(protectedRanges === undefined ? {} : { protectedRanges }) }
+  }
   if (!Array.isArray(value.items) || !value.items.length) throw new TypeError('Empty planning items')
   const last = value.items[value.items.length - 1]
   exact(last, ['chunkId', 'outputRange', 'mode', 'contextRanges']); exact(last.outputRange, ['start', 'end']); integer(last.outputRange.end)

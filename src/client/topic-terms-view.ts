@@ -251,7 +251,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
             return message
           }) } }, pending ? '正在保存…' : '保存并采用'), h('button', { type: 'button', disabled: pending, onClick: () => { drafts.current.delete(form.id); setForm(undefined); setOriginal(undefined) } }, '取消')),
         ) : entry ? h('div', { className: 'dsh-tp-term-details' },
-          h('h3', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`), h('div', { className: 'dsh-tp-muted' }, `${labels[entry.status]} · ${entry.sourceLanguage ?? '未指定源语言'} → ${entry.targetLanguage} · ${origins[entry.origin]} · 条目版本 ${entry.version}`),
+          h('h3', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`), h('div', { className: 'dsh-tp-muted' }, `${labels[entry.status]} · ${entry.sourceLanguage ?? '未指定源语言'} → ${entry.targetLanguage} · ${entry.acceptance ? entry.origin === 'inferred' ? '模型推断 · 用户已采纳' : `${origins[entry.origin]} · 用户已采纳` : origins[entry.origin]} · 条目版本 ${entry.version}`),
           h('button', { type: 'button', disabled: pending, onClick: () => startEdit(entry) }, '编辑'),
           entry.sense ? h('div', null, `说明：${entry.sense}`) : null, entry.aliases.length ? h('div', null, `别名：${entry.aliases.join('、')}`) : null,
           entry.forbidden.length ? h('div', null, `避免：${entry.forbidden.join('、')}`) : null,

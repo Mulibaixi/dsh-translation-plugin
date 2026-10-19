@@ -1,5 +1,5 @@
 import { parseReferenceEvidence } from '../shared/reference-memory.js'
-import { resolveTermEvidence, type TermEvidenceRef, type TermEvidenceResolver, type TermUserAdoption } from './topic-terms.js'
+import { resolveTermEvidence, fileProposalAcceptance, type FileProposalAcceptance, type TermEvidenceRef, type TermEvidenceResolver, type TermUserAdoption } from './topic-terms.js'
 
 export type TopicArchiveKind = 'entity' | 'fact' | 'relation'
 export type TopicArchiveStatus = 'proposal' | 'active' | 'review_required' | 'disabled'
@@ -12,9 +12,10 @@ export type TopicArchiveContent = TopicArchiveSemantic & { readonly evidence: re
 export type TopicArchiveEntry = TopicArchiveContent & {
   readonly id: string; readonly version: number; readonly status: TopicArchiveStatus; readonly origin: TopicArchiveOrigin
   readonly confirmation: TermUserAdoption | null; readonly createdAt: string; readonly updatedAt: string
+  readonly acceptance?: FileProposalAcceptance
 }
 export interface TopicArchiveSnapshot {
-  readonly schemaVersion: 1 | 2; readonly ownerId: string; readonly topicId: string; readonly version: number
+  readonly schemaVersion: 1 | 2 | 3; readonly ownerId: string; readonly topicId: string; readonly version: number
   readonly activeVersion: number; readonly updatedAt: string; readonly entries: readonly TopicArchiveEntry[]
 }
 export type TopicArchivePut = TopicArchiveContent & {
@@ -75,7 +76,8 @@ function referenceOriginValid(value: { readonly origin: unknown; readonly eviden
   return value.origin === 'reference_derived' ? references.some(ref => ref.role === 'basis') : value.origin !== 'source_checked' || references.length === 0
 }
 function adoption(value: unknown): value is TermUserAdoption {
-  return record(value) && exact(value, ['eventId', 'at', 'adoptedEntryVersion']) && text(value.eventId, 2048) && time(value.at) && integer(value.adoptedEntryVersion, 1)
+  return record(value) && exact(value, ['eventId', 'at', 'adoptedEntryVersion', ...(Object.hasOwn(value, 'edited') ? ['edited'] : [])]) &&
+    (value.edited === undefined || typeof value.edited === 'boolean') && text(value.eventId, 2048) && time(value.at) && integer(value.adoptedEntryVersion, 1)
 }
 
 /** Storage/RPC parsing is kept at the boundary; internal mutations use trusted domain values. */
@@ -94,22 +96,23 @@ export function decodeTopicArchiveUserInput(value: unknown): TopicArchiveUserInp
   return { ...copySemantic(value), id: value.id, expectedEntryVersion: value.expectedEntryVersion }
 }
 function decodeSnapshot(value: unknown, projection: boolean): TopicArchiveSnapshot | undefined {
-  if (!record(value) || !exact(value, ['schemaVersion', 'ownerId', 'topicId', 'version', 'activeVersion', 'updatedAt', 'entries']) || ![1, 2].includes(value.schemaVersion as number) ||
+  if (!record(value) || !exact(value, ['schemaVersion', 'ownerId', 'topicId', 'version', 'activeVersion', 'updatedAt', 'entries']) || ![1, 2, 3].includes(value.schemaVersion as number) ||
     !text(value.ownerId, 2048) || !text(value.topicId, 2048) || !integer(value.version) || !integer(value.activeVersion) || value.activeVersion > value.version || !time(value.updatedAt) || !Array.isArray(value.entries)) return undefined
   const entries: TopicArchiveEntry[] = [], ids = new Set<string>()
   for (const raw of value.entries) {
-    if (!record(raw) || !exact(raw, [...semanticKeys(raw.kind), 'evidence', 'id', 'version', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt']) ||
+    if (!record(raw) || !exact(raw, [...semanticKeys(raw.kind), 'evidence', 'id', 'version', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt', ...(Object.hasOwn(raw, 'acceptance') ? ['acceptance'] : [])]) ||
       !content(raw) || !text(raw.id, 2048) || ids.has(raw.id) || !integer(raw.version, 1) || raw.version > value.version || !time(raw.createdAt) || !time(raw.updatedAt) ||
       !statuses.includes(raw.status as TopicArchiveStatus) || !['inferred', 'source_checked', 'reference_derived', 'user_explicit'].includes(raw.origin as string)) return undefined
     if (raw.origin === 'user_explicit' ? (!adoption(raw.confirmation) || raw.confirmation.adoptedEntryVersion >= raw.version || raw.evidence.some(ref => ref.role === 'basis')) : raw.confirmation !== null) return undefined
-    if (raw.status === 'active' && (raw.origin === 'inferred' || (['source_checked', 'reference_derived'].includes(String(raw.origin)) && !sourceBasis(raw)))) return undefined
+    if (raw.acceptance !== undefined && (value.schemaVersion !== 3 || raw.origin === 'user_explicit' || !fileProposalAcceptance(raw.acceptance))) return undefined
+    if (raw.status === 'active' && ((raw.origin === 'inferred' && !raw.acceptance) || (raw.origin !== 'user_explicit' && !sourceBasis(raw)))) return undefined
     if (!referenceOriginValid(raw as unknown as TopicArchiveEntry)) return undefined
     ids.add(raw.id); entries.push(structuredClone(raw) as unknown as TopicArchiveEntry)
   }
   // Deleted references remain visible only as explicitly unavailable review/disabled entries.
   if (projection ? entries.some(entry => entry.status !== 'active') : entries.some(entry => entry.status !== 'review_required' && entry.status !== 'disabled' && referencedEntityIds(entry).some(id => !entries.some(candidate => candidate.id === id && candidate.kind === 'entity')))) return undefined
   if (value.schemaVersion === 1 && entries.some(entry => entry.origin === 'reference_derived' || entry.evidence.some(ref => ref.kind === 'reference'))) return undefined
-  return { schemaVersion: value.schemaVersion as 1 | 2, ownerId: value.ownerId, topicId: value.topicId, version: value.version, activeVersion: value.activeVersion, updatedAt: value.updatedAt, entries }
+  return { schemaVersion: value.schemaVersion as 1 | 2 | 3, ownerId: value.ownerId, topicId: value.topicId, version: value.version, activeVersion: value.activeVersion, updatedAt: value.updatedAt, entries }
 }
 export function decodeTopicArchiveSnapshot(value: unknown): TopicArchiveSnapshot | undefined { return decodeSnapshot(value, false) }
 /** Query entries are active projections; entity IDs may refer to omitted matching context. */
@@ -125,7 +128,7 @@ function validBasis(snapshot: TopicArchiveSnapshot, entry: TopicArchiveContent, 
   return sourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined || isUnloaded(ref))
 }
 function effectiveOwn(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
-  return entry.status === 'active' && (entry.origin === 'user_explicit' || (['source_checked', 'reference_derived'].includes(entry.origin) && validBasis(snapshot, entry, resolver, isUnloaded)))
+  return entry.status === 'active' && (entry.origin === 'user_explicit' || ((!!entry.acceptance || ['source_checked', 'reference_derived'].includes(entry.origin)) && validBasis(snapshot, entry, resolver, isUnloaded)))
 }
 function validReferences(snapshot: TopicArchiveSnapshot, value: TopicArchiveSemantic, resolver: TermEvidenceResolver, active: boolean, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
   return referencedEntityIds(value).every(id => {
@@ -139,7 +142,7 @@ function activeProjection(entry: TopicArchiveEntry | undefined): unknown {
 }
 function replace(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, at: string): TopicArchiveSnapshot {
   const old = snapshot.entries.find(item => item.id === entry.id), activeChanged = JSON.stringify(activeProjection(old)) !== JSON.stringify(activeProjection(entry))
-  return { ...snapshot, schemaVersion: 2 as const, version: snapshot.version + 1, activeVersion: snapshot.activeVersion + (activeChanged ? 1 : 0), updatedAt: at,
+  return { ...snapshot, schemaVersion: entry.acceptance || snapshot.schemaVersion === 3 ? 3 as const : 2 as const, version: snapshot.version + 1, activeVersion: snapshot.activeVersion + (activeChanged ? 1 : 0), updatedAt: at,
     entries: old ? snapshot.entries.map(item => item.id === entry.id ? entry : item) : [...snapshot.entries, entry] }
 }
 function reviewDependents(snapshot: TopicArchiveSnapshot, entityId: string, at: string): TopicArchiveSnapshot {
@@ -159,7 +162,7 @@ function result(snapshot: TopicArchiveSnapshot, status: ArchiveMutationResult['s
 export function putTopicArchive(snapshot: TopicArchiveSnapshot, input: TopicArchivePut, resolver: TermEvidenceResolver, at: string): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
-  if (old?.origin === 'user_explicit') return result(snapshot, 'requires_user_action', old)
+  if (old?.origin === 'user_explicit' || old?.acceptance) return result(snapshot, 'requires_user_action', old)
   if (!referenceOriginValid(input) || !text(input.id, 2048) || !time(at) || !content(input) || (old && old.kind !== input.kind) || !['inferred', 'source_checked', 'reference_derived'].includes(input.origin) ||
     !['proposal', 'active'].includes(input.status) || (input.status === 'active' && (input.origin !== 'source_checked' || !validBasis(snapshot, input, resolver))) ||
     !validReferences(snapshot, input, resolver, input.status === 'active')) return result(snapshot, 'invalid', old)
@@ -176,20 +179,40 @@ export function putUserTopicArchive(snapshot: TopicArchiveSnapshot, input: Topic
   if (old?.origin === 'user_explicit' && old.status === 'active' && JSON.stringify(copyContent(old)) === JSON.stringify(fields)) return result(snapshot, 'unchanged', old)
   if (!old) {
     const candidate = putTopicArchive(snapshot, { ...fields, id: input.id, expectedEntryVersion: null, origin: 'inferred', status: 'proposal' }, resolver, action.at)
-    return candidate.entry ? adoptTopicArchive(candidate.snapshot, input.id, candidate.entry.version, resolver, action) : candidate
+    return candidate.entry ? adoptTopicArchive(candidate.snapshot, input.id, candidate.entry.version, resolver, { ...action, edited: true }) : candidate
   }
   const entry: TopicArchiveEntry = { ...fields, id: old.id, createdAt: old.createdAt, updatedAt: action.at, version: old.version + 1,
-    origin: 'user_explicit', status: 'active', confirmation: { ...action, adoptedEntryVersion: old.version } }
+    origin: 'user_explicit', status: 'active', confirmation: { ...action, adoptedEntryVersion: old.version, edited: true } }
   return result(replaceAndReview(snapshot, entry, action.at), 'updated', entry)
 }
-export function adoptTopicArchive(snapshot: TopicArchiveSnapshot, id: string, expectedEntryVersion: number, resolver: TermEvidenceResolver, action: { readonly eventId: string; readonly at: string }): ArchiveMutationResult {
+export function adoptTopicArchive(snapshot: TopicArchiveSnapshot, id: string, expectedEntryVersion: number, resolver: TermEvidenceResolver, action: { readonly eventId: string; readonly at: string; readonly edited?: boolean }): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === id) ?? null
   if (!old || old.version !== expectedEntryVersion) return result(snapshot, 'stale', old)
   if (!text(action.eventId, 2048) || !time(action.at) || !validReferences(snapshot, old, resolver, true)) return result(snapshot, 'invalid', old)
   if (old.origin === 'user_explicit' && old.status === 'active') return result(snapshot, 'unchanged', old)
-  const entry: TopicArchiveEntry = { ...old, origin: 'user_explicit', status: 'active', version: old.version + 1, updatedAt: action.at,
-    evidence: old.evidence.map(ref => ({ ...ref, role: 'example' })), confirmation: { ...action, adoptedEntryVersion: old.version } }
+  const { acceptance: _acceptance, ...previous } = old
+  const entry: TopicArchiveEntry = { ...previous, origin: 'user_explicit', status: 'active', version: old.version + 1, updatedAt: action.at,
+    evidence: old.evidence.map(ref => ({ ...ref, role: 'example' })), confirmation: { ...action, adoptedEntryVersion: old.version, edited: action.edited ?? old.acceptance?.edited ?? false } }
   return result(replace(snapshot, entry, action.at), 'updated', entry)
+}
+/** User confirmation preserves model attribution and source basis, including inferred statements. */
+export function acceptTopicArchiveProposal(snapshot: TopicArchiveSnapshot, input: TopicArchivePut, resolver: TermEvidenceResolver, action: FileProposalAcceptance, revision = false): ArchiveMutationResult {
+  const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
+  if (old?.acceptance?.candidateId === action.candidateId && old.acceptance.batchId === action.batchId && old.status === 'active' &&
+    old.origin === input.origin && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
+  if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
+  if (revision ? !old : old?.origin === 'user_explicit' || old?.acceptance) return result(snapshot, 'requires_user_action', old)
+  if ((old && old.kind !== input.kind) || !decodeTopicArchivePut({ ...input, status: 'proposal' }) || !fileProposalAcceptance(action) || !validBasis(snapshot, input, resolver) ||
+    !validReferences(snapshot, input, resolver, true)) return result(snapshot, 'invalid', old)
+  if (old?.origin === 'user_explicit') {
+    const entry: TopicArchiveEntry = { ...copyContent(input), evidence: input.evidence.map(ref => ({ ...ref, role: 'example' })), id: old.id,
+      origin: 'user_explicit', status: 'active', confirmation: { eventId: action.eventId, at: action.at, adoptedEntryVersion: old.version, edited: old.confirmation?.edited !== false || action.edited },
+      version: old.version + 1, createdAt: old.createdAt, updatedAt: action.at }
+    return result(replaceAndReview(snapshot, entry, action.at), 'updated', entry)
+  }
+  const entry: TopicArchiveEntry = { ...copyContent(input), id: input.id, origin: input.origin, status: 'active', confirmation: null,
+    acceptance: { ...action, edited: action.edited || !!old?.acceptance?.edited }, version: (old?.version ?? 0) + 1, createdAt: old?.createdAt ?? action.at, updatedAt: action.at }
+  return result(replaceAndReview(snapshot, entry, action.at), 'updated', entry)
 }
 export function disableTopicArchive(snapshot: TopicArchiveSnapshot, id: string, expectedEntryVersion: number, at: string): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === id) ?? null

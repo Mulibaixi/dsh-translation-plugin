@@ -8,6 +8,7 @@ export interface MemoryAssetsScope {
   readonly ownerId: string
   readonly topicId: string
   readonly sessionId?: string | undefined
+  readonly jobId?: string | undefined
 }
 
 export interface MemoryAssetsTab {
@@ -17,7 +18,7 @@ export interface MemoryAssetsTab {
   readonly signal: AbortSignal
   readonly navigation: { readonly address: string; readonly params?: unknown; readonly revision?: number }
   readonly actions: {
-    openResource(address: string, options?: { readonly params: { readonly topicId: string; readonly sessionId?: string | undefined } }): void
+    openResource(address: string, options?: { readonly params: { readonly topicId: string; readonly sessionId?: string | undefined; readonly jobId?: string | undefined } }): void
     close(): void
   }
 }
@@ -71,7 +72,8 @@ export function readMemoryAssetsNavigation(ownerId: string | undefined, tab: Mem
   const params = tab.navigation.params
   return { ...scope, navigationRevision: tab.navigation.revision,
     requestedTopicId: params && typeof params === 'object' && 'topicId' in params && typeof params.topicId === 'string' ? params.topicId : undefined,
-    associatedSessionId: params && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' ? params.sessionId : undefined }
+    associatedSessionId: params && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' ? params.sessionId : undefined,
+    jobId: params && typeof params === 'object' && 'jobId' in params && typeof params.jobId === 'string' ? params.jobId : undefined }
 }
 
 export function resolveMemoryAssetsSelection(store: SessionStore, scope: MemoryAssetsNavigation) {
@@ -96,7 +98,7 @@ export function openMemoryAssets(
   const existing = sidebar.openTabs.getSnapshot().find(tab => tab.sessionId === scope.ownerId
     && tab.kind === MEMORY_ASSETS_TAB_KIND && parseMemoryAssetsAddress(tab.contentId, scope.ownerId))
   const address = existing?.contentId ?? memoryAssetsAddress(scope.ownerId, scope.topicId)
-  origin.tab.actions.openResource(address, { params: { topicId: scope.topicId, sessionId: scope.sessionId } })
+  origin.tab.actions.openResource(address, { params: { topicId: scope.topicId, sessionId: scope.sessionId, jobId: scope.jobId } })
   // The public open returns void. Adopted membership commits synchronously publish openTabs.
   const opened = sidebar.openTabs.getSnapshot().find(tab => tab.sessionId === scope.ownerId
     && tab.kind === MEMORY_ASSETS_TAB_KIND && tab.contentId === address)

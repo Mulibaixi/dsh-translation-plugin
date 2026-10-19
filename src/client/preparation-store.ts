@@ -292,7 +292,7 @@ export class PreparationStore {
         if (selected.descriptionRef || selected.content) return bad('description_mismatch', '主题术语正文由当前条目冻结，不能在任务采用中替换。')
         terms.push({ ref, sourceForms: entry.sourceForms, aliases: entry.aliases, preferred: entry.preferred, description: entry.sense,
           sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sense: entry.sense, forbidden: entry.forbidden,
-          userFixed: fixed(entry), confirmation: entry.confirmation, origin: entry.origin, evidence: entry.evidence, candidateRefs: [], ranges: selected.ranges })
+          userFixed: fixed(entry), confirmation: entry.confirmation, ...(entry.acceptance ? { acceptance: entry.acceptance } : {}), origin: entry.origin, evidence: entry.evidence, candidateRefs: [], ranges: selected.ranges })
       }
     }
     const conflicts = this.conflicts(seat.catalog.candidates, facts.topicTerms, terms, required, request, latest.targetLanguage)
@@ -373,7 +373,7 @@ export class PreparationStore {
         if (selected.content || selected.descriptionRef) return bad('description_mismatch', '主题术语使用当前真实条目，任务复核不能改写固定规则。')
         terms.push({ ref, sourceForms: entry.sourceForms, aliases: entry.aliases, preferred: entry.preferred, description: entry.sense,
           sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sense: entry.sense, forbidden: entry.forbidden,
-          userFixed: fixed(entry), confirmation: entry.confirmation, origin: entry.origin, evidence: entry.evidence, candidateRefs: [], ranges: selected.ranges })
+          userFixed: fixed(entry), confirmation: entry.confirmation, ...(entry.acceptance ? { acceptance: entry.acceptance } : {}), origin: entry.origin, evidence: entry.evidence, candidateRefs: [], ranges: selected.ranges })
       }
     }
     if (new Set(terms.map(term => JSON.stringify(term.ref))).size !== terms.length) return bad('duplicate_candidate', '同一个合并候选只能采用一次。')

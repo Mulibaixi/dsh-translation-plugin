@@ -172,6 +172,14 @@ export interface DocumentFinalPointer {
   readonly selectedAt: string
   readonly selectionEventId?: string
 }
+/** Content-free aggregate retained after deleting a whole document unit. */
+export interface DocumentUnitDeletion {
+  readonly eventId: string
+  readonly at: string
+  readonly calls: number
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+}
 export interface DocumentUnit {
   readonly kind: 'document'
   readonly id: string
@@ -190,6 +198,7 @@ export interface DocumentUnit {
   readonly corrections?: readonly DocumentCorrectionFact[]
   readonly reuseApprovals?: readonly DocumentReuseApproval[]
   readonly reviewAudits?: readonly DocumentReviewAudit[]
+  readonly deletion?: DocumentUnitDeletion
 }
 
 type Data = Record<string, unknown>
@@ -446,10 +455,22 @@ export function parseDocumentRevision(value: unknown, sourceLength: number): Doc
 
 /** Validates structural facts only; document-task validates their cross references and eligibility. */
 export function parseDocumentUnitShape(value: unknown): DocumentUnit {
-  exact(value, ['kind', 'id', 'order', 'targetLanguage', 'instruction', 'sourceVersion', 'sourceVersions', 'createdAt', 'preparations', 'plans', 'tasks', 'chunkRevisions', 'revisions', 'final'], ['corrections', 'reuseApprovals', 'reviewAudits'])
+  exact(value, ['kind', 'id', 'order', 'targetLanguage', 'instruction', 'sourceVersion', 'sourceVersions', 'createdAt', 'preparations', 'plans', 'tasks', 'chunkRevisions', 'revisions', 'final'], ['corrections', 'reuseApprovals', 'reviewAudits', 'deletion'])
   if (value.kind !== 'document') throw new TypeError('Invalid document unit kind')
   string(value.id); integer(value.order); string(value.targetLanguage, 80); string(value.instruction, 4000, false); integer(value.sourceVersion); time(value.createdAt)
   array(value.sourceVersions); array(value.preparations); array(value.plans); array(value.tasks); array(value.chunkRevisions); array(value.revisions)
+  if (value.deletion !== undefined) {
+    exact(value.deletion, ['eventId', 'at', 'calls', 'inputTokens', 'outputTokens'])
+    string(value.deletion.eventId); time(value.deletion.at); integer(value.deletion.calls, 0)
+    for (const count of [value.deletion.inputTokens, value.deletion.outputTokens]) if (count !== null) integer(count, 0)
+    if (value.instruction !== '' || value.sourceVersion !== 1 || value.sourceVersions.length || value.preparations.length || value.plans.length ||
+      value.tasks.length || value.chunkRevisions.length || value.revisions.length || value.final !== null ||
+      (value.corrections as unknown[] | undefined)?.length || (value.reuseApprovals as unknown[] | undefined)?.length || (value.reviewAudits as unknown[] | undefined)?.length) throw new TypeError('Deleted document unit still contains content')
+    return { kind: 'document', id: value.id, order: value.order, targetLanguage: value.targetLanguage, instruction: '', sourceVersion: 1, sourceVersions: [],
+      createdAt: value.createdAt, preparations: [], plans: [], tasks: [], chunkRevisions: [], revisions: [], final: null,
+      deletion: { eventId: value.deletion.eventId, at: value.deletion.at, calls: value.deletion.calls, inputTokens: value.deletion.inputTokens as number | null,
+        outputTokens: value.deletion.outputTokens as number | null } }
+  }
   const sourceVersions = value.sourceVersions.map(parseDocumentSourceVersion)
   if (!sourceVersions.length || sourceVersions.some((source, index) => source.version !== index + 1) || value.sourceVersion !== sourceVersions.length) throw new TypeError('Invalid document source versions')
   const sourceLength = (version: unknown): number => {

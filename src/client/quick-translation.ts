@@ -90,6 +90,7 @@ export class QuickTranslationClient {
     const unit = this.getUnits(session.id).find(unit => unit.id === unitId)
     if (!unit) return '该处理单元已不存在。'
     if (!isTextUnit(unit)) return '整篇文档重译尚未接通。'
+    if (unit.deletion) return '此单元已删除。'
     return this.blockedReason({ ...session, input: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction })
   }
   selectFinal(id: string, unitId: string, revisionId: string): boolean {

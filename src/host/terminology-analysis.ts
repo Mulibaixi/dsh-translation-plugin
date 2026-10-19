@@ -12,6 +12,8 @@ import type { ModelSelection } from '../shared/contracts.js'
 import { DshTextExecutionAdapter, type AnalysisExecutionPacket, type LlmModuleLoader } from './dsh-text-adapter.js'
 import type { MainAgent, ToolExecution, TopicHostContext, TopicToolsService } from './topic-tools.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
+import type { TranslationMaterialWorkflow } from '../shared/translation-material-remote.js'
+import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
 
 type Envelope = Extract<TranslationMaterialEnvelope, { kind: 'material' }>
 type MaterialBinding = Omit<Envelope, 'material'> & { readonly material: TranslationMaterialConfig & { readonly sourceRef?: TranslationSourceAsset } }
@@ -108,6 +110,18 @@ export class TerminologyAnalysisService {
   }
   private get topics(): TopicToolsService | undefined { return this.ctx.get?.('translationTopics') as TopicToolsService | undefined }
   private get materials(): TranslationMaterialsService | undefined { return this.ctx.get?.('translationMaterials') as TranslationMaterialsService | undefined }
+  /** Owner verification is performed by the material service before this read-only projection. */
+  materialWorkflow(target: NormalTranslationMaterialTarget): TranslationMaterialWorkflow {
+    const jobs = [...this.jobs.values()].filter(job => job.request.target.mainSessionId === target.mainSessionId &&
+      job.request.target.requestId === target.requestId && job.request.target.materialId === target.materialId && job.request.target.sourceVersion === target.sourceVersion)
+    const job = [...jobs].reverse().find(job => ['frozen', 'preparing', 'running', 'unknown'].includes(job.run.status)) ?? jobs.at(-1)
+    if (!job) return { phase: 'waiting', message: '材料已交付，等待主模型继续处理。' }
+    const phase = job.run.status, error = job.run.error
+    const message = error ? `${error.stage}：${error.message}` : phase === 'completed' ? '术语分析已完成，等待主模型形成准备和计划。'
+      : phase === 'unknown' ? '原术语分析调用状态未知，请查询原分析；不能重发或移除材料。'
+        : phase === 'failed' ? '术语分析失败，原稿保留；可撤销旧授权后重新发送。' : '正在分析术语；请等待此分析结束，再重新发送或移除材料。'
+    return { phase, message: message.slice(0, 1000) }
+  }
   private authorized(target: TranslationAnalysisQuery['target'], agent: MainAgent | undefined): AnalysisResult<Envelope> {
     if (this.disposed || !agent || !this.topics?.ownsAgent(target.mainSessionId, agent)) return bad('scope_mismatch', '术语分析不属于已连接的实际主 Agent。', 'authorize_analysis')
     return this.materials?.deliveredForAgent(target, agent) ?? bad('unavailable', '固定材料服务尚未就绪。', 'authorize_analysis')
@@ -352,7 +366,7 @@ export class TerminologyAnalysisService {
       !['completed', 'failed', 'unknown'].includes(job.run.status)) return null
     return structuredClone(job.run)
   }
-  hasActiveJobs(): boolean { return [...this.jobs.values()].some(job => ['running', 'unknown'].includes(job.run.status)) }
+  hasActiveJobs(ownerId?: string): boolean { return [...this.jobs.values()].some(job => (ownerId === undefined || job.run.scope.ownerId === ownerId) && (ownerId === undefined ? ['running', 'unknown'] : ['frozen', 'preparing', 'running', 'unknown']).includes(job.run.status)) }
   dispose(): void {
     this.disposed = true
     for (const job of this.jobs.values()) job.controller.abort()

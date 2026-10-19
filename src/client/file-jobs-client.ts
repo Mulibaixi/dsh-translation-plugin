@@ -1,0 +1,541 @@
+import { MAX_FILE_JOB_TEXT_POINTS, parseFileJobResult, type FileJobsPort, type FileJobRestart, type FileJobReadReview, type FileJobSummary, type FileJobReviewPage, type FileJobProposal, type FileJobWorker, type FileJobResult } from '../shared/file-jobs.js'
+import type { EvidenceReadRequest, EvidenceReadResult, EvidenceUnavailableResult } from '../shared/translation-evidence.js'
+import type { FileProposalAcceptance, TermEvidenceFact, TermEvidenceRef, TopicTermPut } from '../memory/topic-terms.js'
+import type { TopicArchivePut } from '../memory/topic-archive.js'
+import type { SessionStore } from './session-store.js'
+import type { TranslationEvidenceReader } from './source-reader.js'
+import type { TopicMemoryStore } from './topic-memory-store.js'
+import type { TopicArchiveStore } from './topic-archive-store.js'
+import type { ViewFilesClient } from './view-files-client.js'
+import type { MaterialSubmissionsClient } from './material-submissions.js'
+import { FileJobsStore, type FileJobCardState, type FileJobRecord, type FileJobTextVersion } from './file-jobs-store.js'
+import type { FileJobExportUnit } from './translation-export.js'
+import { reviewFileProposals, fileRevisionEvidence, type FileProposalReviews } from './file-proposal-revisions.js'
+import { applyFileJobEdits } from '../shared/file-job-edits.js'
+import type { FileJobRevision } from '../shared/file-jobs.js'
+import { isDocumentUnit } from './translation-history.js'
+export type { FileJobRecord, FileJobCardState } from './file-jobs-store.js'
+
+export type FileJobsRemotePort = { [K in keyof FileJobsPort]: (request: Parameters<FileJobsPort[K]>[0]) => Promise<unknown> }
+type Remote = FileJobsRemotePort | (() => Promise<FileJobsRemotePort | undefined>) | undefined
+const running = (job: FileJobSummary): boolean => !['completed', 'failed', 'cancelled'].includes(job.phase)
+const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right)
+const unavailable = (request: EvidenceReadRequest | null, reason: string): EvidenceUnavailableResult => ({ status: 'missing', request, reason })
+function rememberText(values: readonly FileJobTextVersion[], version: number, text: string, createdAt: string): readonly FileJobTextVersion[] {
+  const old = values.find(value => value.version === version)
+  if (old && old.text !== text) throw new Error('固定文件版本内容已变化；原副本仍保留。')
+  return old ? values : [...values, { version, text, createdAt }]
+}
+export function proposalDependencies(proposal: FileJobProposal): readonly string[] {
+  return proposal.kind === 'fact' ? proposal.entityCandidateIds : proposal.kind === 'relation' ? [...new Set([proposal.sourceEntityCandidateId, proposal.targetEntityCandidateId])] : []
+}
+export function proposalTitle(proposal: FileJobProposal): string {
+  return proposal.kind === 'term' ? proposal.sourceForms.join('、') : proposal.kind === 'entity' ? proposal.name : proposal.kind === 'fact' ? proposal.title : proposal.relation
+}
+async function assetIdentity(jobId: string, candidateId: string): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([jobId, candidateId])))
+  return `file-asset:${Array.from(new Uint8Array(hash), value => value.toString(16).padStart(2, '0')).join('')}`
+}
+
+/** Root-owned polling copies exact Host facts and stays alive while individual views are closed. */
+export class FileJobsClient implements TranslationEvidenceReader {
+  private readonly records: FileJobsStore
+  private readonly listeners = new Set<() => void>()
+  private readonly pending = new Set<string>()
+  private readonly leases = new Map<string, () => void>()
+  private readonly retentions = new Map<string, () => void>()
+  private readonly stopStore: () => void
+  private readonly timer: ReturnType<typeof setInterval>
+  private retainOwner: ((ownerId: string) => () => void) | undefined
+  private assets: { terms: TopicMemoryStore; archive: TopicArchiveStore } | undefined
+  private stopAssets: (() => void)[] = []
+  private materials: MaterialSubmissionsClient | undefined
+  private assetNamespaceId: (() => string) | undefined
+  private syncing = false
+  private disposed = false
+  private notice: string | undefined
+  private references: { publishDocumentUnit(ownerId: string, sessionId: string, unitId: string, sourceVersion: number): boolean; revokeUnit(ownerId: string, sessionId: string, unitId: string): void; isPublished(ownerId: string, sessionId: string, unitId: string): boolean } | undefined
+  setReferenceControl(port: NonNullable<FileJobsClient['references']>): void { this.references = port }
+  isReferenced(jobId: string, ownerId?: string): boolean { const job = this.get(jobId)?.summary; return !!job && this.references?.isPublished(ownerId ?? job.ownerId, job.translationSessionId, job.unitId) === true }
+  toggleReference(jobId: string, ownerId?: string): void {
+    const job = this.get(jobId)?.summary
+    if (!job || !this.references) return
+    const currentOwner = ownerId ?? job.ownerId
+    if (this.isReferenced(jobId, currentOwner)) this.references.revokeUnit(currentOwner, job.translationSessionId, job.unitId)
+    else if (!this.references.publishDocumentUnit(currentOwner, job.translationSessionId, job.unitId, job.sourceVersion)) this.notice = '未能提供此准确文件参考。'
+    this.emit()
+  }
+  private readonly missingHosts = new Set<string>()
+  private readonly projectedVersions = new Map<string, number>()
+  private readonly boundOwners = new Map<string, number>()
+  private readonly retranslationIntents = new Map<string, { request: import('../shared/normal-translation.js').NormalTranslationUnitRequest; status: 'pending' | 'submitted' | 'unknown' | 'failed'; message: string }>()
+  getRetranslationStatus(jobId: string) { return this.retranslationIntents.get(jobId) }
+  constructor(private readonly sessions: SessionStore, private readonly fallback: TranslationEvidenceReader, private readonly remote: Remote,
+    private readonly uiLocale?: () => string | undefined) {
+    this.records = new FileJobsStore(sessions.createFileJobsStoreOptions(), () => this.emit())
+    this.stopStore = sessions.subscribe(() => { this.records.reconcile(); this.reconcileLeases() })
+    this.timer = setInterval(() => { void this.refresh() }, 1800)
+    queueMicrotask(() => { void this.refresh() })
+  }
+  setAssets(terms: TopicMemoryStore, archive: TopicArchiveStore, retain: (ownerId: string) => () => void): void {
+    for (const stop of this.stopAssets) stop()
+    this.stopAssets = [terms.subscribe(() => this.emit()), archive.subscribe(() => this.emit())]
+    this.assets = { terms, archive }; this.retainOwner = retain; this.reconcileLeases()
+  }
+  proposalReviews(record: FileJobRecord): FileProposalReviews {
+    return reviewFileProposals(record, this.assets?.terms.getSnapshot(record.summary.ownerId, record.summary.topicId).entries ?? [],
+      this.assets?.archive.getSnapshot(record.summary.ownerId, record.summary.topicId).entries ?? [])
+  }
+  setMaterials(materials: MaterialSubmissionsClient, assetNamespaceId?: () => string): void { this.materials = materials; this.assetNamespaceId = assetNamespaceId }
+  subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
+  bindOwner(ownerId: string): () => void {
+    this.boundOwners.set(ownerId, (this.boundOwners.get(ownerId) ?? 0) + 1); void this.refresh()
+    return () => { const count = this.boundOwners.get(ownerId) ?? 0; if (count <= 1) this.boundOwners.delete(ownerId); else this.boundOwners.set(ownerId, count - 1) }
+  }
+  private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
+  getNotice(): string | undefined { return this.notice }
+  get(jobId: string): FileJobRecord | undefined { return this.records.all().find(record => record.summary.jobId === jobId) }
+  all(sessionId?: string, topicId?: string): readonly FileJobRecord[] {
+    return this.records.all().filter(record => (!sessionId || record.summary.translationSessionId === sessionId) && (!topicId || record.summary.topicId === topicId))
+      .sort((left, right) => Date.parse(left.summary.createdAt) - Date.parse(right.summary.createdAt))
+  }
+  units(sessionId?: string, includeRemoved = false): readonly FileJobRecord[] {
+    const groups = new Map<string, FileJobRecord[]>()
+    for (const record of this.all(sessionId)) {
+      const key = JSON.stringify([record.summary.translationSessionId, record.summary.unitId])
+      groups.set(key, [...groups.get(key) ?? [], record])
+    }
+    return [...groups.values()].filter(records => includeRemoved || !records.some(record => record.summary.removedAt)).map(records => {
+      const latest = records.at(-1)!, sources = new Map<number, FileJobTextVersion>(), results = new Map<number, FileJobTextVersion>()
+      for (const record of records) { for (const source of record.sources) sources.set(source.version, source); for (const result of record.results) results.set(result.version, result) }
+      const fixed = records.map(record => record.final).filter(value => value?.selection === 'user_fixed').sort((left, right) => Date.parse(right!.selectedAt) - Date.parse(left!.selectedAt))[0]
+      const automatic = records.map(record => record.final).filter(value => value !== null).sort((left, right) => right!.version - left!.version)[0]
+      return { ...latest, summary: { ...latest.summary, createdAt: records[0]!.summary.createdAt }, sources: [...sources.values()].sort((left, right) => left.version - right.version),
+        results: [...results.values()].sort((left, right) => left.version - right.version), final: fixed ?? automatic ?? null }
+    })
+  }
+  unitRecord(jobId: string): FileJobRecord | undefined { const record = this.get(jobId); return record && this.forUnit(record.summary.translationSessionId, record.summary.unitId) }
+  forUnit(sessionId: string, unitId: string): FileJobRecord | undefined { return this.units(sessionId, true).find(record => record.summary.unitId === unitId) }
+  isUnitRemoved(sessionId: string, unitId: string): boolean { return this.all(sessionId).some(record => record.summary.unitId === unitId && !!record.summary.removedAt) }
+  exportUnits(sessionIds: readonly string[]): readonly FileJobExportUnit[] {
+    return this.units().filter(record => sessionIds.includes(record.summary.translationSessionId)).map(record => ({ sessionId: record.summary.translationSessionId,
+      topicId: record.summary.topicId, unitId: record.summary.unitId, createdAt: record.summary.createdAt, sourceVersion: record.summary.sourceVersion, targetLanguage: record.summary.targetLanguage,
+      source: record.sources.find(value => value.version === record.summary.sourceVersion)?.text ?? null,
+      translation: record.results.find(value => value.version === record.final?.version)?.text ?? null, resultVersion: record.final?.version ?? null, selection: record.final?.selection ?? null }))
+  }
+  status(jobId: string) { return this.records.status(jobId) }
+  async preserveDocument(record: FileJobRecord): Promise<void> {
+    if (this.forUnit(record.summary.translationSessionId, record.summary.unitId)) return
+    this.records.put(record)
+    if (!await this.records.persist(record.summary.jobId)) throw new Error('旧文档版本保存未完成，尚未启动重译。')
+  }
+  isBusy(jobId: string): boolean { return this.pending.has(jobId) }
+  hostUnavailable(jobId: string): boolean { return this.missingHosts.has(jobId) }
+  pendingCount(record: FileJobRecord): number {
+    return record.summary.proposalBatch?.status === 'reviewed' ? record.proposals.filter(proposal => proposal.disposition !== 'rejected' &&
+      !record.cards.some(card => card.candidateId === proposal.candidateId && card.status !== 'pending')).length : 0
+  }
+  private async call<K extends keyof FileJobsPort>(method: K, request: Parameters<FileJobsPort[K]>[0]): Promise<Awaited<ReturnType<FileJobsPort[K]>> extends FileJobResult<infer T> ? T : never> {
+    const remote = typeof this.remote === 'function' ? await this.remote() : this.remote
+    if (!remote || this.disposed) throw new Error('文件任务服务暂不可用；已保存版本仍可查阅。')
+    const raw = await (remote[method] as (request: unknown) => Promise<unknown>)(request)
+    const transport = raw as { readonly ok?: boolean; readonly value?: { readonly ok?: boolean } }
+    const result = parseFileJobResult(transport?.ok === true && typeof transport.value?.ok === 'boolean' ? transport.value : raw) as FileJobResult<unknown>
+    if (!result.ok) throw Object.assign(new Error(result.error.message), { code: result.error.code, stage: result.error.stage })
+    return result.value as Awaited<ReturnType<FileJobsPort[K]>> extends FileJobResult<infer T> ? T : never
+  }
+  private reconcileLeases(): void {
+    const live = this.records.all().filter(record => running(record.summary) && !this.missingHosts.has(record.summary.jobId))
+    const ids = new Set(live.map(record => record.summary.jobId))
+    for (const [id, release] of this.leases) if (!ids.has(id)) { this.leases.delete(id); release() }
+    for (const [id, release] of this.retentions) if (!ids.has(id)) { this.retentions.delete(id); release() }
+    for (const record of live) {
+      const job = record.summary
+      if (!this.leases.has(job.jobId)) { const release = this.sessions.claimDocumentLease(job.translationSessionId, job.jobId); if (release) this.leases.set(job.jobId, release) }
+      if (!this.retentions.has(job.jobId) && this.retainOwner) this.retentions.set(job.jobId, this.retainOwner(job.ownerId))
+    }
+  }
+  async refresh(): Promise<void> {
+    if (this.disposed || this.syncing) return
+    this.syncing = true
+    try {
+      const owners = [...new Set([...this.boundOwners.keys(), ...this.sessions.getOpenOwnerIds(), ...this.records.all().map(record => record.summary.ownerId)])]
+      const errors: string[] = []
+      for (const ownerId of owners) {
+        try {
+        let offset: number | null = 0
+        const found = new Set<string>()
+        do {
+          const page: { readonly items: readonly FileJobSummary[]; readonly nextOffset: number | null } = await this.call('list', { ownerId, offset, limit: 20 })
+          for (const summary of page.items) { found.add(summary.jobId); await this.project(summary) }
+          offset = page.nextOffset
+        } while (offset !== null && !this.disposed)
+        for (const record of this.records.all()) if (record.summary.ownerId === ownerId && !found.has(record.summary.jobId)) this.missingHosts.add(record.summary.jobId)
+        } catch (cause) { errors.push(cause instanceof Error ? cause.message : '文件任务状态暂未取得。') }
+      }
+      this.notice = [...new Set(errors)].join(' ') || undefined
+      for (const [jobId, intent] of this.retranslationIntents) if (this.records.all().some(record => record.summary.operationId === intent.request.operationId && record.summary.ownerId === intent.request.target.mainSessionId && record.summary.unitId === intent.request.target.unitId)) this.retranslationIntents.delete(jobId)
+    } catch (cause) { this.notice = cause instanceof Error ? cause.message : '文件任务状态暂未取得。' }
+    finally { this.syncing = false; this.reconcileLeases(); this.emit() }
+  }
+  private async text(summary: FileJobSummary, section: 'source' | 'result', length: number, resultVersion?: number): Promise<string> {
+    const pieces: string[] = []
+    for (let start = 0; start < length; start += MAX_FILE_JOB_TEXT_POINTS) {
+      const range = { start, end: Math.min(length, start + MAX_FILE_JOB_TEXT_POINTS) }
+      const page = await this.call('readReview', { ownerId: summary.ownerId, jobId: summary.jobId, section, range, ...(resultVersion === undefined ? {} : { resultVersion }) })
+      if (page.summary.version !== summary.version || !same(page.range, range) || typeof page.text !== 'string' || Array.from(page.text).length !== range.end - range.start) throw new Error('文件任务在读取期间有更新，将读取新的完整版本。')
+      pieces.push(page.text)
+    }
+    return pieces.join('')
+  }
+  private async items(summary: FileJobSummary, section: FileJobReadReview['section']): Promise<NonNullable<FileJobReviewPage['items']>> {
+    const items: NonNullable<FileJobReviewPage['items']>[number][] = []
+    let offset: number | null = 0
+    do {
+      const page: FileJobReviewPage = await this.call('readReview', { ownerId: summary.ownerId, jobId: summary.jobId, section, offset, limit: 40 })
+      if (page.summary.version !== summary.version) throw new Error('文件任务在读取期间有更新，将读取新的完整批次。')
+      items.push(...page.items ?? []); offset = page.nextOffset
+    } while (offset !== null)
+    return items
+  }
+  private async project(summary: FileJobSummary): Promise<void> {
+    const session = this.sessions.getSession(summary.translationSessionId)
+    if (!session || (session.ownerId !== summary.ownerId && !this.sessions.isSessionOpen(summary.ownerId, session.id)) || session.topicId !== summary.topicId || this.sessions.isSessionDeleted(session.id)) return
+    this.missingHosts.delete(summary.jobId)
+    const previous = this.records.get(summary.jobId)
+    if (previous?.summary.removedAt && !summary.removedAt) return
+    if (previous && this.projectedVersions.get(summary.jobId) === summary.version) return
+    let record: FileJobRecord = previous ?? { schemaVersion: 1, summary, sources: [], results: [], proposals: [], proposalVersion: null, cards: [], workers: [], final: null }
+    // Publish the stage first; body paging never hides accepted/preparing progress.
+    this.records.put({ ...record, summary })
+    const source = record.sources.find(value => value.version === summary.sourceVersion)
+    if (!source) {
+      const text = await this.text(summary, 'source', summary.sourceTotalCodePoints)
+      if (summary.sourceRef) {
+        const bytes = new TextEncoder().encode(text), hash = await crypto.subtle.digest('SHA-256', bytes)
+        if (bytes.byteLength !== summary.sourceRef.bytes || Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('') !== summary.sourceRef.sha256) throw new Error('原稿内容与固定来源校验不一致。')
+      }
+      record = { ...record, sources: rememberText(record.sources, summary.sourceVersion, text, summary.createdAt) }
+    }
+    const versions = await this.items(summary, 'results') as readonly { readonly version: number; readonly totalCodePoints: number; readonly semanticStatus?: 'pending' | 'passed' | 'changes_requested' }[]
+    for (const version of versions) {
+      if (!record.results.some(value => value.version === version.version)) record = { ...record,
+        results: rememberText(record.results, version.version, await this.text(summary, 'result', version.totalCodePoints, version.version), summary.updatedAt) }
+      record = { ...record, results: record.results.map(value => value.version === version.version ? { ...value,
+        semanticStatus: version.semanticStatus ?? (summary.result?.version === value.version ? summary.result.semanticStatus : value.semanticStatus ?? 'pending') } : value) }
+    }
+    if (summary.proposalBatch?.status === 'reviewed' && record.proposalVersion !== summary.proposalBatch.version) record = { ...record,
+      proposals: await this.items(summary, 'proposals') as readonly FileJobProposal[], proposalVersion: summary.proposalBatch.version }
+    const workers = await this.items(summary, 'workers') as readonly FileJobWorker[]
+    const constraints = await this.items(summary, 'constraints'), plan = await this.items(summary, 'plan'), checks = await this.items(summary, 'checks')
+    const contexts = await this.items(summary, 'contexts'), reviews = await this.items(summary, 'reviews')
+    if (summary.baselineVersion !== null && record.preparation?.version !== summary.baselineVersion) {
+      const page = await this.call('readReview', { ownerId: summary.ownerId, jobId: summary.jobId, section: 'baseline', offset: 0, limit: 40 })
+      record = { ...record, preparation: { version: summary.baselineVersion, context: page.context ?? '', items: await this.items(summary, 'baseline') } }
+    }
+    const current = this.records.get(summary.jobId)
+    const final = current?.final ?? record.final
+    record = { ...record, summary, workers, constraints, plan, checks, contexts, reviews, cards: (current?.cards ?? record.cards).map(card => card.draft && card.draftBatchVersion !== undefined && card.draftBatchVersion !== summary.proposalBatch?.version
+      ? { ...card, message: '主模型已更新提案；当前编辑草稿基于旧批次，请核对新内容后再采纳。' } : card),
+      final: final?.selection === 'user_fixed' ? final : summary.result?.semanticStatus === 'passed' ? { version: summary.result.version, selection: 'automatic', selectedAt: summary.review.decidedAt ?? summary.updatedAt } : final }
+    this.records.put(record)
+    this.projectedVersions.set(summary.jobId, summary.version)
+  }
+  async cancel(jobId: string): Promise<void> {
+    await this.action(jobId, async record => { await this.project(await this.call('control', { ownerId: record.summary.ownerId, jobId, action: 'cancel' })) })
+  }
+  async retranslate(jobId: string, executionOwnerId?: string): Promise<void> {
+    const previous = this.retranslationIntents.get(jobId)
+    if (previous && previous.status !== 'failed') { this.notice = previous.message; this.emit(); return }
+    await this.action(jobId, async record => {
+      if (this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('此文件单元已移除，不能重新发送旧材料。')
+      if (running(record.summary)) throw new Error('请先确认当前任务已结束，再明确重译。')
+      const ownerId = executionOwnerId ?? record.summary.ownerId, locale = this.uiLocale?.()?.trim().slice(0, 64)
+      const request: import('../shared/normal-translation.js').NormalTranslationUnitRequest = { target: { kind: 'unit', mainSessionId: ownerId, translationSessionId: record.summary.translationSessionId,
+        unitId: record.summary.unitId, sourceVersion: record.summary.sourceVersion }, operationId: `file-retranslate-intent:${crypto.randomUUID()}`, ...(locale ? { uiLocale: locale } : {}) }
+      const intent = { request, status: 'pending' as 'pending' | 'submitted' | 'unknown' | 'failed', message: '正在发送文件重译意图…' }
+      this.retranslationIntents.set(jobId, intent)
+      try {
+        const receipt = await this.call('submitUnit', request)
+        if (receipt.accepted !== true || receipt.operationId !== request.operationId || !same(receipt.target, request.target)) throw new Error('文件重译意图回执身份不一致。')
+        intent.status = 'submitted'; intent.message = '重译意图已发送，等待主模型整理要求并受理；尚未启动翻译。'
+      } catch (cause) {
+        const code = (cause as { code?: string }).code
+        intent.status = !code || ['main_admission_unknown', 'outcome_unknown'].includes(code) ? 'unknown' : 'failed'
+        intent.message = intent.status === 'unknown' ? '重译意图发送状态未知，请检查原操作；未自动重发。' : cause instanceof Error ? cause.message : '重译意图未发送。'
+      }
+      this.notice = intent.message
+    })
+  }
+  async queryRetranslation(jobId: string): Promise<void> {
+    const intent = this.retranslationIntents.get(jobId)
+    if (!intent || this.pending.has(jobId)) return
+    this.pending.add(jobId); this.emit()
+    try {
+      const receipt = await this.call('queryUnit', intent.request)
+      if (!receipt) { intent.status = 'unknown'; intent.message = '原重译意图暂无确切回执，未重新发送。' }
+      else if (receipt.accepted !== true || receipt.operationId !== intent.request.operationId || !same(receipt.target, intent.request.target)) throw new Error('重译意图查询回执身份不一致。')
+      else { intent.status = 'submitted'; intent.message = '已确认重译意图发送，仍在等待主模型受理。' }
+      await this.refresh()
+    } catch { intent.status = 'unknown'; intent.message = '原重译意图仍待确认，未重新发送。' }
+    finally { this.pending.delete(jobId); this.emit() }
+  }
+  async prepareRestart(jobId: string, operationId: string, organizedRequirements: string, executionOwnerId?: string): Promise<FileJobRestart> {
+      const record = this.get(jobId)
+      if (!record || this.records.blocked(jobId) || this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('文件历史已移除或变化。')
+      if (running(record.summary)) throw new Error('此文件仍有未结算或结果未知的任务，不能重新派发。')
+      const config = record.summary, session = this.sessions.getSession(config.translationSessionId)!, ownerId = executionOwnerId ?? config.ownerId
+      if (ownerId !== session.ownerId && !this.sessions.isSessionOpen(ownerId, session.id)) throw new Error('请先在当前主会话打开此翻译会话。')
+      const commit = this.materials?.getFileHistoryCommit(session.id, config.unitId), namespaceId = this.assetNamespaceId?.()
+      let librarySource: FileJobRestart['librarySource'] = commit && namespaceId ? {
+        stored: { scope: commit.reference.scope, referenceKey: commit.reference.referenceKey, source: commit.reference.source, historyToken: commit.historyToken },
+        namespaceId, prepareToken: commit.reference.prepareToken,
+      } : undefined
+      if (!librarySource && namespaceId) {
+        const document = this.sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === config.unitId)
+        const source = document && isDocumentUnit(document) ? document.sourceVersions.find(source => source.version === config.sourceVersion) : undefined
+        const stored = source?.body.kind === 'asset' && source.historyCommit ? await this.sessions.readStoredSourceRequest({ sessionId: session.id, unitId: config.unitId, sourceVersion: config.sourceVersion }) : null
+        if (stored && source?.historyCommit) librarySource = { stored, namespaceId, prepareToken: source.historyCommit.reference.prepareToken }
+      }
+      // Saved proof reads through the local library; it never tries to restore into an old owner's live scope first.
+      const sourceRef = librarySource ? { ...librarySource.stored.source, persistence: 'runtime_only' as const }
+        : (!this.missingHosts.has(jobId) && ownerId === config.ownerId ? config.sourceRef : undefined)
+          ?? (await this.materials?.resolveFileSource(session.id, config.unitId))?.sourceRef
+      if (!sourceRef) throw new Error('已保存原稿未能恢复，且运行期引用不可用；请打开原稿后重新选择文件。')
+      const locale = this.uiLocale?.()?.trim().slice(0, 64)
+      return { operationId, previousResultVersion: this.unitRecord(jobId)?.results.at(-1)?.version ?? 0,
+        organizedRequirements: organizedRequirements.trim() ? organizedRequirements : config.organizedRequirements ?? '',
+        envelope: { ownerId, mainSessionId: ownerId, requestId: `file-restart:${operationId}`, operationId,
+          ...(locale ? { uiLocale: locale } : {}),
+          kind: 'material', material: { materialId: config.materialId, sourceVersion: config.sourceVersion, topicId: config.topicId, translationSessionId: config.translationSessionId,
+            draftVersion: 1, targetLanguage: config.targetLanguage, instruction: config.instruction, model: session.model, maxInputChars: session.maxInputChars, sourceRef } },
+        ...(librarySource ? { librarySource } : {}) }
+  }
+  async reviseSaved(request: FileJobRevision, actingOwner = request.ownerId): Promise<FileJobSummary> {
+    const signature = JSON.stringify({ ...request, actingOwner })
+    const updated = await this.records.mutate(request.jobId, record => {
+      if (record.summary.ownerId !== request.ownerId) throw new Error('文件修订不属于当前主会话。')
+      const old = record.revisionOperations?.find(item => item.operationId === request.operationId)
+      if (old) { if (old.signature !== signature) throw new Error('同一修订操作不能更换内容。'); return record }
+      if (record.summary.phase !== 'completed' || !record.summary.result || record.summary.removedAt) throw new Error('仅可修订已完成且未移除的文件。')
+      if (record.summary.version !== request.expectedVersion) throw new Error('文件版本已变化，请重新读取当前译文。')
+      const source = record.results.find(result => result.version === record.summary.result!.version)
+      if (!source) throw new Error('此准确结果尚未完整保存，未修改译文。')
+      const text = applyFileJobEdits(source.text, request.edits), at = new Date().toISOString(), version = text === source.text ? source.version : Math.max(...record.results.map(result => result.version)) + 1
+      const summary: FileJobSummary = text === source.text ? record.summary : { ...record.summary, version: record.summary.version + 1, updatedAt: at,
+        result: { version, totalCodePoints: Array.from(text).length, semanticStatus: 'passed' },
+        review: { version: record.summary.review.version + 1, status: 'passed', reviewedBy: actingOwner, decidedAt: at } }
+      return { ...record, summary, results: text === source.text ? record.results : [...record.results, { version, text, createdAt: at, semanticStatus: 'passed' }],
+        final: record.final?.selection === 'user_fixed' ? record.final : { version, selection: 'automatic', selectedAt: at },
+        revisionOperations: [...record.revisionOperations ?? [], { operationId: request.operationId, signature, summary }] }
+    })
+    return updated.revisionOperations!.find(item => item.operationId === request.operationId)!.summary
+  }
+  readSaved(request: FileJobReadReview): FileJobReviewPage {
+    const record = this.get(request.jobId)
+    if (!record || record.summary.ownerId !== request.ownerId || this.records.blocked(request.jobId) || this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('已保存文件不存在、已移除或不属于当前主会话。')
+    const { summary } = record
+    if (request.section === 'source' || request.section === 'result') {
+      const value = request.section === 'source' ? record.sources.find(item => item.version === summary.sourceVersion) : record.results.find(item => item.version === (request.resultVersion ?? summary.result?.version))
+      if (!value) throw new Error('准确正文版本尚未完整保存。')
+      const text = Array.from(value.text), range = request.range ?? { start: 0, end: Math.min(4000, text.length) }
+      if (range.start < 0 || range.end > text.length || range.end <= range.start || range.end - range.start > 4000) throw new Error('正文范围必须为准确版本内的最多4000码点。')
+      return { summary, section: request.section, text: text.slice(range.start, range.end).join(''), range, nextOffset: range.end < text.length ? range.end : null }
+    }
+    const values: Record<string, readonly unknown[]> = { results: record.results.map(result => ({ version: result.version, totalCodePoints: Array.from(result.text).length, semanticStatus: result.semanticStatus ?? 'pending' })),
+      proposals: record.proposals, baseline: record.preparation?.items ?? [], conflicts: [], workers: record.workers, constraints: record.constraints ?? [], plan: record.plan ?? [], checks: record.checks ?? [], contexts: record.contexts ?? [], reviews: record.reviews ?? [] }
+    const all = values[request.section] ?? [], offset = request.offset ?? 0, items = all.slice(offset, offset + Math.min(200, request.limit ?? 40)) as NonNullable<FileJobReviewPage['items']>
+    return { summary, section: request.section, items, total: all.length, ...(request.section === 'baseline' ? { context: record.preparation?.context ?? '' } : {}), nextOffset: offset + items.length < all.length ? offset + items.length : null }
+  }
+  async remove(jobId: string): Promise<void> {
+    await this.action(jobId, async record => {
+      const related = this.all(record.summary.translationSessionId).filter(value => value.summary.unitId === record.summary.unitId)
+      if (related.some(value => running(value.summary) || value.results.length || value.summary.result)) throw new Error('请先确认文件任务已结束；已有译文结果的单元不能移除。')
+      const summary = await this.call('control', { ownerId: record.summary.ownerId, jobId, action: 'remove' })
+      if (!summary.removedAt) throw new Error('文件移除尚未确认，记录仍保留。')
+      await this.project(summary)
+      for (const value of related) {
+        const current = this.records.get(value.summary.jobId)
+        if (current && current.summary.jobId !== summary.jobId) this.records.put({ ...current, summary: { ...current.summary, removedAt: summary.removedAt } })
+      }
+      await this.records.persist(summary.jobId)
+    })
+  }
+  private async action(jobId: string, action: (record: FileJobRecord) => Promise<void>): Promise<void> {
+    const record = this.get(jobId)
+    if (!record || this.pending.has(jobId) || this.records.blocked(jobId)) return
+    this.pending.add(jobId); this.notice = undefined; this.emit()
+    try { await action(record) } catch (cause) { this.notice = cause instanceof Error ? cause.message : '操作未完成，已有内容保留。' }
+    finally { this.pending.delete(jobId); this.reconcileLeases(); this.emit() }
+  }
+  edit(jobId: string, proposal: FileJobProposal): void {
+    const record = this.get(jobId), old = record?.cards.find(card => card.candidateId === proposal.candidateId)
+    if (!record || old?.status === 'adopted' || !record.proposals.some(value => value.candidateId === proposal.candidateId && value.kind === proposal.kind)) return
+    this.card(record, { candidateId: proposal.candidateId, status: 'pending', draft: structuredClone(proposal), draftBatchVersion: record.proposalVersion ?? undefined })
+  }
+  discardDraft(jobId: string, candidateId: string): void {
+    const record = this.get(jobId), state = record?.cards.find(card => card.candidateId === candidateId)
+    if (!record || state?.status === 'adopted') return
+    this.card(record, { candidateId, status: state?.status ?? 'pending' })
+  }
+  private card(record: FileJobRecord, state: FileJobCardState): void {
+    const current = this.get(record.summary.jobId)
+    if (!current) return
+    this.records.put({ ...current, cards: [...current.cards.filter(card => card.candidateId !== state.candidateId), state] })
+  }
+  reject(jobId: string, candidateIds: readonly string[]): void {
+    const record = this.get(jobId)
+    if (!record || this.pending.has(jobId)) return
+    for (const candidateId of candidateIds) {
+      const old = record.cards.find(card => card.candidateId === candidateId)
+      if (old?.status !== 'adopted') this.card(record, { ...old, candidateId, status: 'rejected' })
+    }
+  }
+  async adopt(jobId: string, candidateIds: readonly string[], reviewed?: FileProposalReviews): Promise<void> {
+    await this.action(jobId, async initial => {
+      if (!this.assets || initial.summary.proposalBatch?.status !== 'reviewed') throw new Error('资产尚未完成集中验收。')
+      const selected = new Set(candidateIds), ordered: FileJobProposal[] = [], visiting = new Set<string>(), visited = new Set<string>()
+      const visit = (id: string): void => {
+        if (visited.has(id)) return
+        if (visiting.has(id)) throw new Error('资产实体依赖存在循环，请提交意见。')
+        const source = initial.proposals.find(value => value.candidateId === id), state = initial.cards.find(value => value.candidateId === id)
+        if (!source || source.disposition === 'rejected' || state?.status === 'rejected' && !selected.has(id)) throw new Error('依赖实体未采用，请先检查所选卡片。')
+        if (state?.draft && state.draftBatchVersion !== initial.proposalVersion) throw new Error('编辑草稿基于旧提案批次，请核对主模型的新内容后再编辑或采纳。')
+        const proposal = state?.draft ?? source
+        visiting.add(id)
+        for (const dependency of proposalDependencies(proposal)) {
+          const entity = initial.proposals.find(value => value.candidateId === dependency)
+          if (entity?.kind !== 'entity') throw new Error('关系或事实缺少对应实体，尚未写入。')
+          visit(dependency)
+        }
+        visiting.delete(id); visited.add(id); ordered.push(proposal)
+      }
+      for (const id of selected) visit(id)
+      const approvals = { ...(reviewed ?? this.proposalReviews(initial)) }
+      let adopted = 0, failed = 0
+      for (const proposal of ordered) {
+        const record = this.get(jobId)!, previous = record.cards.find(card => card.candidateId === proposal.candidateId)
+        if (previous?.status === 'adopted') continue
+        const review = approvals[proposal.candidateId], currentReview = this.proposalReviews(record)[proposal.candidateId]
+        if (!review || review.kind === 'blocked' || !currentReview || currentReview.kind === 'blocked' || review.kind !== currentReview.kind ||
+          review.kind === 'update' && (currentReview.kind !== 'update' || review.entry.id !== currentReview.entry.id || review.entry.version !== currentReview.entry.version)) {
+          this.card(record, { ...previous, candidateId: proposal.candidateId, status: 'pending', message: review?.kind === 'blocked' ? review.message
+            : currentReview?.kind === 'blocked' ? currentReview.message : '既有资产已变化，请核对当前条目和版本后再采纳。' }); failed++; continue
+        }
+        const assetId = review.kind === 'update' ? review.entry.id : await assetIdentity(`${record.summary.translationSessionId}:${record.summary.unitId}:${jobId}:${record.summary.proposalBatch!.id}`, proposal.candidateId)
+        const sourceEvidence: readonly TermEvidenceRef[] = proposal.evidence.map(item => ({ kind: 'source', sessionId: record.summary.translationSessionId,
+          unitId: record.summary.unitId, sourceVersion: record.summary.sourceVersion, revisionId: null, selectionEventId: null, role: 'basis', range: { ...item.range } }))
+        const evidence = fileRevisionEvidence(sourceEvidence, review.kind === 'update' ? review.entry.evidence : [], proposal.origin)
+        const acceptance: FileProposalAcceptance = { eventId: previous?.eventId ?? `file-card:${crypto.randomUUID()}`, at: new Date().toISOString(),
+          batchId: record.summary.proposalBatch!.id, candidateId: proposal.candidateId, edited: !!previous?.draft }
+        let status: string, active = false
+        if (proposal.kind === 'term') {
+          const snapshot = this.assets.terms.getSnapshot(record.summary.ownerId, record.summary.topicId)
+          const existing = snapshot.entries.find(entry => entry.id === assetId)
+          const input: TopicTermPut = { id: assetId, expectedEntryVersion: review.kind === 'update' ? review.entry.version : null, sourceLanguage: existing?.sourceLanguage ?? null,
+            targetLanguage: record.summary.targetLanguage, sourceForms: [...new Set([...(existing?.sourceForms ?? []), ...proposal.sourceForms])], aliases: existing?.aliases ?? [], sense: proposal.description, preferred: proposal.preferred,
+            forbidden: existing?.forbidden ?? [], evidence, origin: proposal.origin, status: 'proposal' }
+          const result = await this.assets.terms.apply(record.summary.ownerId, record.summary.topicId, snapshot.version, { kind: review.kind === 'update' ? 'revise_file_proposal' : 'accept_file_proposal', input, acceptance })
+          status = result.status; active = result.entry?.status === 'active' && !['error', 'conflict'].includes(this.assets.terms.getStatus(record.summary.ownerId, record.summary.topicId))
+        } else {
+          const snapshot = this.assets.archive.getSnapshot(record.summary.ownerId, record.summary.topicId)
+          const resolve = (id: string): string => {
+            const state = this.get(jobId)!.cards.find(card => card.candidateId === id)
+            if (state?.status !== 'adopted' || !state.assetId || !snapshot.entries.some(entry => entry.id === state.assetId && entry.kind === 'entity' && entry.status === 'active')) throw new Error('依赖实体未能生效，相关卡片仍待审。')
+            return state.assetId
+          }
+          try {
+            const semantic = proposal.kind === 'entity' ? { kind: 'entity' as const, name: proposal.name, aliases: proposal.aliases, description: proposal.description }
+              : proposal.kind === 'fact' ? { kind: 'fact' as const, title: proposal.title, body: proposal.body, entityIds: proposal.entityCandidateIds.map(resolve) }
+                : { kind: 'relation' as const, sourceEntityId: resolve(proposal.sourceEntityCandidateId), relation: proposal.relation, targetEntityId: resolve(proposal.targetEntityCandidateId), description: proposal.description }
+            const existing = snapshot.entries.find(entry => entry.id === assetId)
+            if (semantic.kind === 'entity' && existing?.kind === 'entity') semantic.aliases = [...new Set([...existing.aliases, ...(existing.name === semantic.name ? [] : [existing.name]), ...semantic.aliases])].filter(name => name !== semantic.name)
+            const input: TopicArchivePut = { ...semantic, id: assetId, expectedEntryVersion: review.kind === 'update' ? review.entry.version : null, evidence, origin: proposal.origin, status: 'proposal' }
+            const result = await this.assets.archive.apply(record.summary.ownerId, record.summary.topicId, snapshot.version, { kind: review.kind === 'update' ? 'revise_file_proposal' : 'accept_file_proposal', input, acceptance })
+            // Updating an entity may mark dependent entries for review. Keep this action's
+            // approvals only for that status-only cascade, never for concurrent content edits.
+            if (result.status === 'updated') for (const [id, approval] of Object.entries(approvals)) if (approval.kind === 'update') {
+              const before = snapshot.entries.find(entry => entry.id === approval.entry.id), after = result.snapshot.entries.find(entry => entry.id === approval.entry.id)
+              if (before && after && before.id !== assetId && before.version === approval.entry.version && after.version === before.version + 1 && after.status === 'review_required' &&
+                same({ ...before, status: null, version: null, updatedAt: null }, { ...after, status: null, version: null, updatedAt: null })) approvals[id] = { kind: 'update', entry: after }
+            }
+            status = result.status; active = result.entry?.status === 'active' && !['error', 'conflict'].includes(this.assets.archive.getStatus(record.summary.ownerId, record.summary.topicId))
+          } catch (cause) { status = cause instanceof Error ? cause.message : '依赖实体不可用' }
+        }
+        if ((status === 'updated' || status === 'unchanged') && active) {
+          this.card(record, { ...previous, candidateId: proposal.candidateId, status: 'adopted', assetId, adoptedAt: acceptance.at, eventId: acceptance.eventId, adoptedProposal: proposal,
+            message: review.kind === 'update' ? `已更新原条目（版本 ${review.entry.version} → ${review.entry.version + 1}）。` : '已新增条目。' }); adopted++
+        } else {
+          this.card(record, { ...previous, candidateId: proposal.candidateId, status: 'pending', eventId: acceptance.eventId,
+            message: status === 'conflict' || status === 'requires_user_action' ? '与已生效或已采纳资产冲突，请编辑或提出意见。' : `采纳未完成（${status}），卡片仍保留。` }); failed++
+        }
+      }
+      await this.records.persist(jobId)
+      this.notice = `已采纳 ${adopted} 条${failed ? `，${failed} 条仍待处理` : ''}。`
+    })
+  }
+  async feedback(jobId: string, candidateIds: readonly string[], comment: string): Promise<void> {
+    await this.action(jobId, async record => {
+      if (!candidateIds.length || !comment.trim() || !record.summary.proposalBatch) throw new Error('请选择卡片并填写意见。')
+      const summary = await this.call('feedback', { ownerId: record.summary.ownerId, jobId, candidateIds: [...candidateIds], comment: comment.trim(),
+        expectedBatchVersion: record.summary.proposalBatch.version, operationId: `file-feedback:${crypto.randomUUID()}`,
+        proposalEdits: record.cards.filter(card => candidateIds.includes(card.candidateId) && card.draft).map(card => card.draft!) })
+      await this.project(summary); this.notice = '意见已合并提交，将只复核所选资产及依赖。'
+    })
+  }
+  selectFinal(jobId: string, version: number): void {
+    const record = this.unitRecord(jobId)
+    if (!record || !record.results.some(result => result.version === version && result.semanticStatus === 'passed')) return
+    this.records.put({ ...record, final: { version, selection: 'user_fixed', selectedAt: new Date().toISOString() } })
+  }
+  async open(jobId: string, side: 'source' | 'result', version: number, views: ViewFilesClient): Promise<void> {
+    await this.action(jobId, async raw => {
+      const record = this.unitRecord(raw.summary.jobId) ?? raw
+      const value = (side === 'source' ? record.sources : record.results).find(value => value.version === version)
+      if (!value) throw new Error('所选固定版本尚未取得。')
+      const outcome = await views.open({ ownerId: record.summary.ownerId, sessionId: record.summary.translationSessionId, unitId: record.summary.unitId,
+        kind: side, title: `${side === 'source' ? '原稿' : '译文'} · 版本 ${version}`, revisionId: `${side}:${record.summary.unitId}:${version}`, fileName: `${side === 'source' ? '原稿' : '译文'}-v${version}.txt`, format: 'txt', text: value.text })
+      if (!outcome.ok) throw new Error(outcome.message)
+    })
+  }
+  readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined {
+    const record = this.forUnit(sessionId, unitId), session = this.sessions.getSession(sessionId)
+    if (!record || !session || this.records.blocked(record.summary.jobId) || this.sessions.getStatus(sessionId) === 'conflict') return undefined
+    const source = record.sources.find(value => value.version === record.summary.sourceVersion)
+    return source ? { ownerId: session.ownerId, topicId: session.topicId, sourceVersion: source.version, source: source.text, final: null } : undefined
+  }
+  capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult {
+    if (ref.kind === 'reference') return this.fallback.capture(ownerId, topicId, ref)
+    const record = this.forUnit(ref.sessionId, ref.unitId)
+    if (!record) return this.fallback.capture(ownerId, topicId, ref)
+    const request: EvidenceReadRequest = { ownerId: record.summary.ownerId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
+      sourceVersion: ref.kind === 'source' ? ref.sourceVersion ?? 1 : record.summary.sourceVersion, side: ref.kind,
+      range: ref.range, revisionId: ref.revisionId, selectionEventId: ref.selectionEventId }
+    if (record.summary.topicId !== topicId || ref.kind !== 'source' || !this.isCurrent(request)) return unavailable(request, 'file_job_source_unavailable')
+    return request
+  }
+  isCurrent(request: EvidenceReadRequest): boolean {
+    const record = this.forUnit(request.sessionId, request.unitId)
+    if (!record) return this.fallback.isCurrent(request)
+    return !this.disposed && request.side === 'source' && record.summary.ownerId === request.ownerId && record.summary.topicId === request.topicId &&
+      !this.records.blocked(record.summary.jobId) && this.sessions.getStatus(request.sessionId) !== 'conflict' && record.sources.some(source => source.version === request.sourceVersion)
+  }
+  async read(request: EvidenceReadRequest): Promise<EvidenceReadResult> {
+    const record = this.forUnit(request.sessionId, request.unitId)
+    if (!record) return this.fallback.read(request)
+    if (!this.isCurrent(request)) return unavailable(request, 'file_job_source_unavailable')
+    const source = record.sources.find(source => source.version === request.sourceVersion)!, points = Array.from(source.text)
+    const range = request.range ?? { start: 0, end: points.length }
+    if (range.start < 0 || range.end > points.length || range.end <= range.start) return unavailable(request, 'range_out_of_bounds')
+    if (range.end - range.start > MAX_FILE_JOB_TEXT_POINTS) return { status: 'unloaded', request, reason: 'range_required', totalCodePoints: points.length }
+    return { status: 'ready', request, range, totalCodePoints: points.length, sourceVersion: source.version, manifestRevisionId: null, text: points.slice(range.start, range.end).join('') }
+  }
+  dispose(): void {
+    this.disposed = true; clearInterval(this.timer); this.stopStore()
+    for (const stop of this.stopAssets) stop()
+    for (const release of this.leases.values()) release()
+    for (const release of this.retentions.values()) release()
+    this.leases.clear(); this.retentions.clear(); this.listeners.clear(); this.records.dispose()
+    this.retranslationIntents.clear()
+  }
+}

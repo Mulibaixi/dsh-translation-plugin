@@ -11,6 +11,7 @@ export class LocalDataClient {
   private clearing=false
   private cleared=false
   private operationId:string|undefined
+  private reclaimOperationId:string|undefined
   private message:string|undefined
   private readonly storage:Storage|undefined
   private readonly generation:string|null
@@ -33,6 +34,27 @@ export class LocalDataClient {
   getMessage():string|undefined{return this.message}
   async usage():Promise<HostStorageUsage|undefined>{
     try{const reply=await(await this.remote())?.usageRemote() as {ok?:boolean;value?:HostStorageUsage}|undefined;return reply?.ok===true?reply.value:undefined}catch{return undefined}
+  }
+  /** Scoped Host cleanup used by topic deletion; shared source bodies are not removed here. */
+  async purgeTopic(operationId:string,ownerId:string,topicId:string,namespaceId?:string):Promise<{readonly ok:boolean;readonly message?:string}>{
+    try{
+      const remote=await this.remote();if(!remote)return {ok:false,message:'宿主清理服务尚未就绪。'}
+      const reply=await remote.purgeTopicRemote({operationId,ownerId,topicId,...(namespaceId?{namespaceId}:{})}) as
+        {ok?:boolean;value?:{cleared?:boolean;error?:{message?:string}};error?:{message?:string}}
+      if(reply.ok===true&&reply.value?.cleared===true)return {ok:true}
+      return {ok:false,message:reply.value?.error?.message??reply.error?.message??'宿主主题文件清理未完成。'}
+    }catch{return {ok:false,message:'宿主主题文件清理未完成，请重试。'}}
+  }
+  /** Manual reachability reclaim: only source bodies with no saved mapping are removed. */
+  async reclaim():Promise<{readonly ok:boolean;readonly removed?:number;readonly bytes?:number;readonly message?:string}>{
+    try{
+      const remote=await this.remote();if(!remote)return {ok:false,message:'宿主清理服务尚未就绪。'}
+      this.reclaimOperationId??=`source-reclaim:${crypto.randomUUID()}`
+      const reply=await remote.reclaimRemote({operationId:this.reclaimOperationId}) as
+        {ok?:boolean;value?:{reclaimed?:boolean;removed?:number;bytes?:number;error?:{message?:string}};error?:{message?:string}}
+      if(reply.ok===true&&reply.value?.reclaimed===true)return {ok:true,removed:reply.value.removed??0,bytes:reply.value.bytes??0}
+      return {ok:false,message:reply.value?.error?.message??reply.error?.message??'原稿回收未完成。'}
+    }catch{return {ok:false,message:'原稿回收未完成，请重试。'}}
   }
   async clear():Promise<void>{
     if(this.clearing)return

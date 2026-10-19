@@ -1,6 +1,6 @@
 import { parseDocumentReviewBeginRequest, parseDocumentReviewSubmitRequest, parseDocumentReviewQueryRequest, parseDocumentReviewTarget, parseDocumentManualRevisionRequest,
   type DocumentReviewTarget, type DocumentReviewReceipt } from '../shared/document-review.js'
-import { parseDocumentReviewPageRequest, parseDocumentReviewRead, type DocumentReviewPage } from '../shared/document-review-bridge.js'
+import { parseDocumentReviewPageRequest, parseDocumentReviewRead, parseDocumentTaskTermsRequest, type DocumentReviewPage, type DocumentTaskTermsReply } from '../shared/document-review-bridge.js'
 import type { AnalysisResult } from '../shared/translation-preparation.js'
 import type { TranslationSourceScope } from '../shared/translation-sources.js'
 import type { TopicHostContext, TopicToolsService, ToolExecution } from './topic-tools.js'
@@ -65,6 +65,16 @@ export class DocumentReviewService {
       return { ok: true, value: reply.receipt }
     } catch (error) { const known = error as { code?: string; message?: string }; return failure(known.code ?? 'review_write_failed', known.message ?? '语义复核未确认；请查询原操作，不能重派。') }
   }
+  /** List or sediment the terms actually adopted by this exact document task; apply is user-confirmed. */
+  async terms(args: unknown, exec: ToolExecution): Promise<AnalysisResult<DocumentTaskTermsReply>> {
+    try {
+      const request = parseDocumentTaskTermsRequest(args)
+      if (!this.execution(request.scope, exec)) return failure('scope_mismatch', '任务术语操作不属于实际主 Agent。')
+      const reply = await this.topics.requestOwned(request.scope.mainSessionId, { kind: 'document_task_terms', request }, exec)
+      if (reply.kind !== 'document_task_terms') return failure('invalid_reply', '任务术语回执无效。')
+      return { ok: true, value: { terms: reply.terms, added: reply.added, skipped: reply.skipped, message: reply.message } }
+    } catch (error) { const known = error as { code?: string; message?: string }; return failure(known.code ?? 'task_terms_failed', known.message ?? '任务术语操作未完成。') }
+  }
   async observe(args: unknown, exec: ToolExecution): Promise<AnalysisResult<DocumentReviewReceipt | null>> {
     try {
       const request = parseDocumentReviewQueryRequest(args)
@@ -111,8 +121,9 @@ export class DocumentReviewService {
       const reply = await this.topics.requestOwned(request.target.scope.mainSessionId, { kind: 'document_review_manual', request }, exec)
       if (reply.kind !== 'document_review_receipt' || !same(reply.receipt.target, request.target) || reply.receipt.operationId !== request.operationId) return failure('invalid_reply', '局部修订写回未知；请查询原操作。')
       const target = { ...request.target, manifestRevisionId: reply.receipt.manifestRevisionId }
-      await this.completed(target.scope, target.unitId, target.sourceVersion, exec)
-      return { ok: true, value: reply.receipt }
+      // Program rechecks the new manifest; the current main-model flow continues without waking itself again.
+      const checked = await this.begin({ target, operationId: `document-mechanical:${target.manifestRevisionId}`, expectedReviewVersion: reply.receipt.reviewVersion }, exec)
+      return checked.ok ? checked : { ok: false, error: { ...checked.error, message: `局部修订已写入，但新候选机械检查未确认：${checked.error.message}` } }
     } catch (error) { const known = error as { code?: string; message?: string }; return failure(known.code ?? 'revision_failed', known.message ?? '局部修订未确认。') }
   }
 }

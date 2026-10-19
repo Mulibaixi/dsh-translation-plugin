@@ -1,4 +1,4 @@
-import { parseDocumentReviewBeginRequest, parseDocumentReviewSubmitRequest, parseDocumentReviewQueryRequest, parseDocumentManualRevisionRequest, parseDocumentFinalRequest,
+import { parseDocumentReviewBeginRequest, parseDocumentReviewSubmitRequest, parseDocumentReviewQueryRequest, parseDocumentManualRevisionRequest, parseDocumentFinalRequest, applyDocumentEdits,
   type DocumentReviewTarget, type DocumentReviewBeginRequest, type DocumentReviewSubmitRequest, type DocumentReviewQueryRequest, type DocumentManualRevisionRequest, type DocumentFinalRequest, type DocumentReviewReceipt } from '../shared/document-review.js'
 import { parseDocumentReviewPageRequest, parseDocumentReviewRead, parseDocumentReviewPage, parseDocumentReviewTextPage, documentReviewBytes, MAX_DOCUMENT_REVIEW_PAGE_BYTES,
   type DocumentReviewPageRequest, type DocumentReviewPage, type DocumentReviewRead, type DocumentReviewTextPage } from '../shared/document-review-bridge.js'
@@ -174,15 +174,24 @@ export class DocumentReviewClient {
     let request: DocumentManualRevisionRequest; try { request = parseDocumentManualRevisionRequest(raw) } catch { return Promise.resolve(bad('invalid_input', '人工块修订参数无效。')) }
     return this.operation(request.target.scope.ownerId, 'manual', request, async () => {
       const result = await this.locked(request.target.scope.ownerId, request, async (unit, _manifest, handle) => {
-        const sourceText = await this.sourceText(handle), now = new Date().toISOString(), changed = handle.check(); if (changed) throw error(changed.status, changed.reason)
+        const sourceText = await this.sourceText(handle), now = new Date().toISOString(), body = request.text ?? this.editedText(request, handle), changed = handle.check(); if (changed) throw error(changed.status, changed.reason)
         const revisionId = `document-manual:${crypto.randomUUID()}`, manifestRevisionId = `document-manifest:${crypto.randomUUID()}`
         if (!this.store.updateTranslationHistory(request.target.scope.translationSessionId, history => applyDocumentMutation(history, unit.id, { kind: 'manual', edit: { manifestRevisionId: request.target.manifestRevisionId,
-          expectedReviewVersion: request.expectedReviewVersion, chunkId: request.chunkId, baseRevisionId: request.baseRevisionId, revisionId, manifestId: manifestRevisionId, operationId: request.operationId, text: request.text, at: now, sourceText } }, now))) throw error('history_update_failed', '人工块修订 CAS 未完成。')
+          expectedReviewVersion: request.expectedReviewVersion, chunkId: request.chunkId, baseRevisionId: request.baseRevisionId, revisionId, manifestId: manifestRevisionId, operationId: request.operationId, text: body, at: now, sourceText } }, now))) throw error('history_update_failed', '人工块修订 CAS 未完成。')
         return manifestRevisionId
       })
       if (result.ok && notify) void this.notify({ ...request.target, manifestRevisionId: result.value.manifestRevisionId })
       return result
     })
+  }
+  /** Precise edits resolve against the immutable base chunk text, never against earlier replacements. */
+  private editedText(request: DocumentManualRevisionRequest, handle: DocumentReadHandle): string {
+    const block = handle.blocks.find(item => item.revisionId === request.baseRevisionId), content = block?.revision?.content
+    if (!content || content.kind !== 'text') throw error('edit_base_unavailable', '精确修改需要当前候选中的真实文本块基准。')
+    const applied = applyDocumentEdits(content.text, request.edits ?? [])
+    if (!applied.ok) throw error(applied.code, applied.message)
+    if (applied.text === content.text) throw error('edit_no_change', '精确修改没有改变正文；请核对 oldText 与 newText。')
+    return applied.text
   }
   selectFinal(raw: DocumentFinalRequest): Promise<AnalysisResult<DocumentReviewReceipt>> {
     let request: DocumentFinalRequest; try { request = parseDocumentFinalRequest(raw) } catch { return Promise.resolve(bad('invalid_input', '最终版本参数无效。')) }

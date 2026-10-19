@@ -15,11 +15,15 @@ import { TopicArchiveStore } from './topic-archive-store.js'
 import { ThemeMemoryClearing } from './theme-memory-clearing.js'
 import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
+import { ViewFilesClient, adaptViewFilesRemote, type ViewFilesRemotePort } from './view-files-client.js'
+import { TopicDeletionClient } from './topic-deletion.js'
 import { MemoryAssetsTitle } from './memory-assets-title.js'
 import { MaterialSubmissionsClient, type MaterialSubmissionRegistry, type NativeMaterialSubmissionRegistry, type TranslationMaterialsRemotePort } from './material-submissions.js'
 import { PreparationStore } from './preparation-store.js'
 import { DocumentTasksClient, type TranslationBatchRemotePort } from './document-tasks.js'
 import { DocumentReviewClient, type DocumentReviewRemotePort } from './document-review-client.js'
+import { FileJobsClient, type FileJobsRemotePort } from './file-jobs-client.js'
+import { FileHistoryClient } from './file-history.js'
 import { NormalTranslationClient, type NormalTranslationRemotePort, type NormalTranslationV2RemotePort } from './normal-translation.js'
 import { adaptTranslationSourcesRemote, type TranslationSourcesRemotePort } from './sources-client.js'
 import { adaptTranslationSourceStorageRemote, TranslationSourceStorageClient, type TranslationSourceStorageRemotePort } from './source-storage-client.js'
@@ -59,12 +63,15 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
   get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
   get(name: 'remote.translationObjects'): ObjectAssetsRemotePort | undefined
+  get(name: 'remote.translationViews'): ViewFilesRemotePort | undefined
   get(name: 'remote.translationMaterials'): TranslationMaterialsRemotePort | undefined
   get(name: 'remote.translationNormal'): NormalTranslationRemotePort | undefined
   get(name: 'remote.translationNormalV2'): NormalTranslationV2RemotePort | undefined
   get(name: 'remote.translationBatch'): TranslationBatchRemotePort | undefined
   get(name: 'remote.translationReview'): DocumentReviewRemotePort | undefined
+  get(name: 'remote.translationFileJobs'): FileJobsRemotePort | undefined
   get(name: 'remote.translationSources'): (TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort & LibrarySourcesRemotePort) | undefined
+  get(name: 'locale'): { getLocale(): { readonly active: string } } | undefined
   readonly conversation?: { readonly submissions?: NativeMaterialSubmissionRegistry }
   readonly composerExtension?: ComposerExtensionService
   readonly fileUpload: NativeFileUploadPort
@@ -75,11 +82,13 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
     readonly translationQuick?: QuickRemotePort
     readonly translationTopics?: TopicBridgeRemotePort
     readonly translationObjects?: ObjectAssetsRemotePort
+    readonly translationViews?: ViewFilesRemotePort
     readonly translationMaterials?: TranslationMaterialsRemotePort
     readonly translationNormal?: NormalTranslationRemotePort
     readonly translationNormalV2?: NormalTranslationV2RemotePort
     readonly translationBatch?: TranslationBatchRemotePort
     readonly translationReview?: DocumentReviewRemotePort
+    readonly translationFileJobs?: FileJobsRemotePort
     readonly translationSources?: TranslationSourcesRemotePort & TranslationSourceStorageRemotePort & TranslationSourceIntegrityRemotePort & LibrarySourcesRemotePort
     $mount?(contribution: typeof PLUGIN_REMOTE): Promise<AsyncDisposer>
     $on(event: string, listener: () => void): Disposer
@@ -131,6 +140,11 @@ function withClientDiagnostics<T>(stage: string, action: () => T): T {
   }
 }
 
+/** The active DSH interface locale resolved by the loaded locale service; undefined before it loads. */
+function activeUiLocale(ctx: ClientPluginContext): string | undefined {
+  try { return ctx.get?.('locale')?.getLocale().active } catch { return undefined }
+}
+
 export function apply(ctx: ClientPluginContext): void {
   withClientDiagnostics('apply', () => {
     const store = createSessionStore()
@@ -148,21 +162,27 @@ export function apply(ctx: ClientPluginContext): void {
     } : ctx.remote.translationSources
     const sources = adaptTranslationSourcesRemote(sourcesRemote)
     const storage = adaptTranslationSourceStorageRemote(sourcesRemote)
+    const sourceStorage = new TranslationSourceStorageClient(storage)
     const integrity = adaptTranslationSourceIntegrityRemote(sourcesRemote)
     const evidence = new TranslationSourceReader({ sessions: store, sources, storage, integrity, library: adaptLibrarySourcesRemote(sourcesRemote), assetNamespaceId: () => references.getAssetNamespaceId() })
+    const fileJobs = new FileJobsClient(store, evidence, ctx.remote.$mount ? async () => {
+      const unmountRemote = await mountedRemote
+      return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationFileJobs')
+    } : ctx.remote.translationFileJobs, () => activeUiLocale(ctx))
     const objects = new RecordObjectStore(store)
     const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationQuick')
     } : ctx.remote.translationQuick), store, models, { canManualEdit: (session, unitId, revisionId) => !objects.hasRevisionObjects(session.ownerId, session.topicId, session.id, unitId, revisionId) })
-    const terms = new TopicMemoryStore(store)
+    const terms = new TopicMemoryStore(store, undefined, undefined, undefined, (sessionId, unitId) => fileJobs.readEvidence(sessionId, unitId))
     const archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
-    terms.setEvidenceReader(evidence)
-    archive.setEvidenceReader(evidence)
+    terms.setEvidenceReader(fileJobs)
+    archive.setEvidenceReader(fileJobs)
     const topics = new TopicBridgeClient(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationTopics')
     } : ctx.remote.translationTopics, store, terms, archive)
+    fileJobs.setAssets(terms, archive, ownerId => topics.retain(ownerId))
     const references = new ReferenceStore(store, async () => {
       if (ctx.remote.$mount) await mountedRemote
       return remoteDisposed ? undefined : ctx.get ? ctx.get('remote.translationReferences') : ctx.remote.translationReferences
@@ -187,12 +207,17 @@ export function apply(ctx: ClientPluginContext): void {
     const materials = new MaterialSubmissionsClient({ store, topics, owner: ctx, ...submissionBridge,
       upload: ctx.fileUpload,
       sources,
+      sourceStorage, sourceStoragePort: storage,
+      uiLocale: () => activeUiLocale(ctx),
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationMaterials')
       } : ctx.remote.translationMaterials,
     })
     // Cordis re-runs this scope when the optional service is loaded or replaced.
+    fileJobs.setMaterials(materials, () => references.getAssetNamespaceId())
+    topics.setFileHistory(new FileHistoryClient(store, fileJobs, materials, () => references.getAssetNamespaceId(), () => activeUiLocale(ctx), evidence))
+    fileJobs.setReferenceControl(topics)
     // Keep drafts and submission receipts in the root client across those changes.
     ctx.inject(['composerExtension'], scope => {
       const bridge = materialSubmissionBridge(ctx, scope.get('composerExtension'))
@@ -209,10 +234,15 @@ export function apply(ctx: ClientPluginContext): void {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationObjects')
     } : ctx.remote.translationObjects), ctx.fileUpload, store, objects, ownerId => topics.getStatus(ownerId))
+    const viewFiles = new ViewFilesClient(adaptViewFilesRemote(ctx.remote.$mount ? async () => {
+      const unmountRemote = await mountedRemote
+      return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationViews')
+    } : ctx.remote.translationViews), store, { sources, sourceStorage: storage })
     const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), {
       isSessionBusy: sessionId => quick.isBusy(sessionId), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
       canAccessUnit: (ownerId, sessionId, unitId) => topics.isPublished(ownerId, sessionId, unitId),
       publishUnit: (ownerId, sessionId, unitId) => topics.publishUnit(ownerId, sessionId, unitId),
+      uiLocale: () => activeUiLocale(ctx),
       canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
@@ -232,13 +262,17 @@ export function apply(ctx: ClientPluginContext): void {
     const documents = new DocumentTasksClient(store, materials, preparations, ownerId => topics.retain(ownerId), {
       canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId), reader: evidence,
-      sourceStorage: new TranslationSourceStorageClient(storage), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
+      sourceStorage, subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
+      publishUnit: (ownerId, sessionId, unitId, sourceVersion) => topics.publishDocumentUnit(ownerId, sessionId, unitId, sourceVersion),
+      uiLocale: () => activeUiLocale(ctx),
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationBatch')
       } : ctx.remote.translationBatch,
     })
     topics.setDocumentTasks(documents)
+    const stopFileAcceptance = fileJobs.subscribe(() => { for (const record of fileJobs.all()) documents.observeFileTask(record.summary) })
+    ctx.effect(() => stopFileAcceptance, 'translation file retranslation acceptance')
     const documentReviews = new DocumentReviewClient(store, preparations, evidence, ownerId => topics.retain(ownerId), {
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId),
       remote: ctx.remote.$mount ? async () => {
@@ -253,10 +287,12 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => () => archive.dispose(), 'translation topic archive')
     ctx.effect(() => () => evidence.dispose(), 'translation evidence reader')
     ctx.effect(() => () => { objectAssets.dispose(); objects.dispose() }, 'translation record objects')
+    ctx.effect(() => () => viewFiles.dispose(), 'translation view files')
     ctx.effect(() => async () => {
       remoteDisposed = true
       materials.dispose()
       documents.dispose()
+      fileJobs.dispose()
       documentReviews.dispose()
       preparations.dispose()
       normal.dispose()
@@ -273,24 +309,26 @@ export function apply(ctx: ClientPluginContext): void {
       if (ctx.remote.$mount) await mountedRemote
       return ctx.get?.('remote.translationLocalData') ?? ctx.remote.translationLocalData
     }, async () => {
-      materials.dispose(); documents.dispose(); documentReviews.dispose(); preparations.dispose()
+      materials.dispose(); documents.dispose(); fileJobs.dispose(); documentReviews.dispose(); preparations.dispose()
       normal.dispose(); quick.dispose(); references.dispose(); terms.dispose(); archive.dispose()
-      evidence.dispose(); objects.dispose(); objectAssets.dispose(); models.dispose(); store.dispose()
+      evidence.dispose(); objects.dispose(); objectAssets.dispose(); viewFiles.dispose(); models.dispose(); store.dispose()
       await topics.dispose()
     }, () => store.hasUnsettledWork() || store.getAllSessions().some(session => quick.isBusy(session.id) || normal.isBusy(session.id)))
     ctx.effect(() => () => localData.dispose(), 'translation local data')
 
     const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
+    const topicDeletion = new TopicDeletionClient({ sessions: store, clearing: memoryClearing, references, viewFiles, localData, topics,
+      isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId) || store.hasDocumentLease(sessionId) })
     const TranslationPanel: ClientComponent = (props = {}) => {
       const frozen = useLocalDataFrozen(localData)
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       if (frozen) return h(ClearedDataView, null)
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, objects, objectAssets, documents: evidence, documentTasks: documents, documentReviews, onDeleteTerm, sessionId,
-        onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string) => {
+        store, models, quick, normal, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
+        onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string, jobId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
-          openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId },
+          openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId, jobId },
             typeof window === 'undefined' ? undefined : { width: window.innerWidth, height: window.innerHeight })
         } : undefined,
       })
@@ -305,7 +343,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, references, objects, objectAssets, documents: evidence, memoryClearing, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, references, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })

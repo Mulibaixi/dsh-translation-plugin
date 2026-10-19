@@ -1,12 +1,13 @@
 import type { RecordObjectReference } from '../shared/record-objects.js'
 import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import { projectRecordObjects } from './record-object-projection.js'
-import { buildBilingualExport, buildFinalTextExport, buildTopicBilingualExport, buildTopicFinalTextExport, buildTranslationExportAsync, type TranslationExportTopic, type TranslationExportSession, type TopicTranslationExport } from './translation-export.js'
+import { buildBilingualExport, buildFinalTextExport, buildTopicBilingualExport, buildTopicFinalTextExport, buildTranslationExportAsync, type FileJobExportUnit, type TranslationExportTopic, type TranslationExportSession, type TopicTranslationExport } from './translation-export.js'
 import type { TranslationDocumentReader } from './source-reader.js'
 
 export interface RecordObjectExportRequest {
   readonly topic: TranslationExportTopic; readonly entries: readonly TranslationExportSession[]; readonly scope: 'session' | 'topic'
   readonly format: 'txt' | 'json'; readonly exportedAt: string; readonly references?: readonly RecordObjectReference[]
+  readonly fileJobs?: readonly FileJobExportUnit[] | undefined
 }
 export function recordObjectPlainText(text: string, target: Parameters<typeof projectRecordObjects>[1], references: readonly RecordObjectReference[]): string {
   return projectRecordObjects(text, target, references).segments.map(segment => segment.kind === 'text' ? segment.text : `[${segment.label}]`).join('')

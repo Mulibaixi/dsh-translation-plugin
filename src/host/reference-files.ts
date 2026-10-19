@@ -288,6 +288,13 @@ export class ReferenceFilesService {
     if (!peerId || !this.topics.ownsAssetConnection(scope, peerId)) throw failure('scope_mismatch', '参考清理不属于此客户端连接。')
     await this.serial(scope, async () => { await (await this.storage()).remove(scope); this.retiredScopes.add(key(scope)); this.records.delete(key(scope)) })
   }
+  /** Topic deletion already removed the files; retire cached scopes so late writes cannot revive them. */
+  forgetTopic(topicId: string, ownerId: string): void {
+    for (const [scopeKey, record] of this.records) {
+      if (record.scope.topicId !== topicId || record.scope.ownerId !== ownerId) continue
+      this.records.delete(scopeKey); this.retiredScopes.add(scopeKey)
+    }
+  }
   readRemote(raw: unknown): Promise<ReferenceText> { return this.read(raw, this.ctx.invocation?.peer.id) }
   async persistRemote(raw: unknown): Promise<{ readonly persisted: true }> {
     const scope = parseReferenceScope(raw)
@@ -305,7 +312,8 @@ export class ReferenceFilesService {
 
 /** Descriptions encode the matching workflow; source strings never become tool authority. */
 export function registerReferenceTools(service: ReferenceFilesService, topics: TopicToolsService, agent: MainAgent,
-  define: (options: Record<string, unknown>) => unknown): readonly (() => void)[] {
+  define: (options: Record<string, unknown>) => unknown,
+  register: (definition: unknown) => () => void = definition => agent.ctx.tools.register(definition)): readonly (() => void)[] {
   const text = { type: 'string', required: true }, integer = { type: 'integer', required: true }
   const topic = { topicId: text }, operation = { ...topic, operationId: text }
   const document = { ...operation, referenceId: text, expectedRevision: integer }
@@ -340,7 +348,7 @@ export function registerReferenceTools(service: ReferenceFilesService, topics: T
     { name: 'translation_reference_revoke', description: 'Only on explicit user intent, revoke one topic reference and remove its stored segment bodies. This invalidates new evidence and tasks using it; existing results/call facts stay unchanged. Cannot remove original user files, main-chat content or already transmitted model inputs.', parameters: document,
       run: (args, exec) => service.mutate('revoke', args, exec) },
   ]
-  return definitions.map(definition => agent.ctx.tools.register(define({ name: definition.name, description: definition.description, parameters: definition.parameters,
+  return definitions.map(definition => register(define({ name: definition.name, description: definition.description, parameters: definition.parameters,
     output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
     execute: async (args: Record<string, unknown>, exec: ToolExecution) => {
       if (exec.agent !== agent || !topics.ownsAgent(agent.id, agent)) throw failure('scope_mismatch', '参考资料工具不属于此实际主 Agent。')

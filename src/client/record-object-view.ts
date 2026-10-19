@@ -4,12 +4,13 @@ import type { TranslationSourceRange } from '../shared/translation-source-read.j
 import { OBJECT_ASSET_KINDS, type ObjectAssetKind } from '../shared/object-assets.js'
 import type { RecordObjectStore } from './record-object-store.js'
 import type { ObjectAssetsClient } from './object-assets-client.js'
+import type { ViewFilesClient } from './view-files-client.js'
 import { projectRecordObjects, recordObjectLabel } from './record-object-projection.js'
 import { canEditTextRevision, type TextUnit } from './translation-history.js'
 import type { LocalSession } from './sessions.js'
 import { MarkdownText } from './native-ui.js'
 
-export interface RecordObjectsProps { readonly objects?: RecordObjectStore | undefined; readonly objectAssets?: ObjectAssetsClient | undefined }
+export interface RecordObjectsProps { readonly objects?: RecordObjectStore | undefined; readonly objectAssets?: ObjectAssetsClient | undefined; readonly viewFiles?: ViewFilesClient | undefined }
 function RecordObjectFormula({ source }: { readonly source: string }): unknown {
   return h('span', { className: 'dsh-tp-object-formula' },
     h('span', { className: 'dsh-tp-object-formula-preview' }, h(MarkdownText, { text: `$$\n${source}\n$$`, variant: 'compact' })),

@@ -10,14 +10,21 @@ import type { LocalSession } from './sessions.js'
 import type { NormalTranslationAcceptance, NormalTranslationUpdate } from '../shared/normal-translation.js'
 import type { NormalTranslationUnitRequest, NormalTranslationSourceCorrection } from '../shared/normal-translation.js'
 import type { NormalTranslationResolution, NormalTranslationV2Event } from '../shared/normal-translation-v2.js'
-import { currentFinalRevision, currentDocumentFinalRevision, isTextUnit, isDocumentUnit, applyDocumentMutation } from './translation-history.js'
+import { currentFinalRevision, currentDocumentFinalRevision, isTextUnit, isDocumentUnit, applyDocumentMutation, type TranslationHistory, type TextUnit } from './translation-history.js'
 import type { NormalTranslationReply } from './normal-translation.js'
 import type { PreparationStore } from './preparation-store.js'
 import type { TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import { MAX_ANALYSIS_PAGE_BYTES, type PreparationReceipt, type PreparationPage } from '../shared/translation-preparation.js'
 import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
+import type { FileHistoryClient } from './file-history.js'
 import type { DocumentTasksClient } from './document-tasks.js'
 import type { DocumentReviewClient } from './document-review-client.js'
+import { planDocumentTermSedimentation } from './document-term-sedimentation.js'
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
 
 export interface TopicBridgeRemotePort {
   capabilities(): Promise<unknown>
@@ -44,6 +51,25 @@ export interface TopicBridgeArchivePort {
   queryAsync?(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot>
   apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicArchivePut }): Promise<ArchiveMutationResult>
 }
+/** Read-only view of the terms a document task actually adopted; it never exposes source bodies. */
+export interface DocumentTaskTermSummary {
+  readonly sourceForms: readonly string[]
+  readonly preferred: string
+  readonly sense: string
+  readonly userFixed: boolean
+  readonly rangeCount: number
+}
+export interface DocumentTaskTermsView {
+  readonly status: 'ready' | 'unavailable'
+  readonly terms: readonly DocumentTaskTermSummary[]
+  readonly message?: string | undefined
+}
+export interface DocumentTermSedimentResult {
+  readonly status: 'completed' | 'unavailable' | 'failed'
+  readonly added: number
+  readonly skipped: number
+  readonly message: string
+}
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
 interface NormalPort {
   prepare(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
@@ -64,6 +90,7 @@ interface Connection {
   reason: string | undefined
   requests: Set<string>
 }
+/** automatic marks a snapshot published by the main-model admission flow; explicit snapshots come from the user's own reference choice. Every publication follows the unit's current state. */
 interface Publication { readonly sessionId: string; readonly topicId: string; readonly fact: TopicUnitFact; readonly automatic: boolean }
 function error(requestId: string, code: string, message: string): TopicBridgeReply { return { requestId, ok: false, error: { code, message } } }
 
@@ -80,6 +107,8 @@ export class TopicBridgeClient {
   private normal: NormalPort | undefined
   private preparation: PreparationStore | undefined
   private documents: DocumentTasksClient | undefined
+  private files: FileHistoryClient | undefined
+  setFileHistory(files: FileHistoryClient): void { this.files = files }
   private documentReviews: DocumentReviewClient | undefined
   private resolvePreparationMaterial: ((envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>) => Extract<TranslationMaterialEnvelope, { kind: 'material' }> | undefined) | undefined
   private resolvePreparationTarget: ((target: NormalTranslationMaterialTarget) => Extract<TranslationMaterialEnvelope, { kind: 'material' }> | undefined) | undefined
@@ -214,12 +243,18 @@ export class TopicBridgeClient {
   private sessionSummary(session: LocalSession): TopicSessionSummary {
     return { id: session.id, topicId: session.topicId, name: session.name, mode: session.mode,
       topicName: session.topicName, sequence: session.sequence, remark: session.remark, archived: session.archivedAt !== null,
-      publishedUnitIds: [...this.publications.values()].filter(item => item.sessionId === session.id).map(item => item.fact.id) }
+      publishedUnitIds: [...new Set([...this.publications.values()].filter(item => item.sessionId === session.id).map(item => item.fact.id)
+        .concat([...this.documentPublications.values()].filter(item => item.sessionId === session.id).map(item => item.unitId)))] }
   }
   private async dispatch(ownerId: string, request: TopicBridgeRequest): Promise<TopicBridgeReply> {
     this.reconcile()
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
+    if (command.kind === 'file_history') {
+      if (!this.files) return error(request.requestId, 'file_history_unavailable', '历史文件服务尚未就绪。')
+      try { return success({ kind: 'file_history', value: await this.files.handle(ownerId, command.request) }) }
+      catch (cause) { return error(request.requestId, String((cause as { code?: string }).code ?? 'file_history_failed'), (cause as Error).message) }
+    }
     if (command.kind === 'document_review_page' || command.kind === 'document_review_read' || command.kind === 'document_review_begin' || command.kind === 'document_review_submit' || command.kind === 'document_review_observe' || command.kind === 'document_review_manual') {
       if (!this.documentReviews) return error(request.requestId, 'review_unavailable', '整篇复核服务尚未就绪。')
       if (command.kind === 'document_review_page') {
@@ -240,6 +275,21 @@ export class TopicBridgeClient {
       }
       const result = command.kind === 'document_review_begin' ? await this.documentReviews.begin(ownerId, command.request) : await this.documentReviews.submit(ownerId, command.request)
       return result.ok ? success({ kind: 'document_review_receipt', receipt: result.value }) : error(request.requestId, result.error.code, result.error.message)
+    }
+    if (command.kind === 'document_task_terms') {
+      const termsRequest = command.request, session = this.sessions.getSession(termsRequest.scope.translationSessionId)
+      if (termsRequest.scope.ownerId !== ownerId || termsRequest.scope.mainSessionId !== ownerId || !session || session.ownerId !== ownerId ||
+        session.topicId !== termsRequest.scope.topicId || this.sessions.isSessionDeleted(session.id)) return error(request.requestId, 'scope_mismatch', '任务术语不属于当前主会话。')
+      const unit = this.sessions.getTranslationHistory(session.id)?.units.find(item => item.id === termsRequest.unitId)
+      if (!unit || !isDocumentUnit(unit) || unit.sourceVersion !== termsRequest.sourceVersion) return error(request.requestId, 'source_mismatch', '任务术语不属于当前文档原稿版本。')
+      const view = await this.documentTaskTerms(ownerId, session.id, unit.id, termsRequest.preparationRef)
+      if (view.status !== 'ready') return success({ kind: 'document_task_terms', terms: [], added: 0, skipped: 0, message: view.message ?? '尚无匹配的任务准备记录。' })
+      let added = 0, skipped = 0, message = view.terms.length ? `本任务采用 ${view.terms.length} 条术语。` : '本任务没有采用的术语。'
+      if (termsRequest.apply) {
+        const result = await this.sedimentDocumentTaskTerms(ownerId, session.id, unit.id, termsRequest.preparationRef)
+        added = result.added; skipped = result.skipped; message = result.message
+      }
+      return success({ kind: 'document_task_terms', terms: view.terms, added, skipped, message })
     }
     if (command.kind === 'document_correct_observe') {
       const result = await this.documents?.observeCorrection(ownerId, command.request)
@@ -404,7 +454,9 @@ export class TopicBridgeClient {
         return success({ kind: 'reference_facts', facts })
       } catch (cause) { return error(request.requestId, String((cause as {code?: string}).code ?? 'reference_unavailable'), (cause as Error).message) }
     }
-    if (command.kind === 'list_sessions') return success({ kind: 'sessions', sessions: this.sessions.getAvailableSessions(ownerId).filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => this.sessionSummary(session)) })
+    if (command.kind === 'list_sessions') return success({ kind: 'sessions',
+      sessions: [...new Map([...this.sessions.getAvailableSessions(ownerId), ...this.sessions.getDisplaySessions(ownerId)].map(session => [session.id, session])).values()]
+        .filter(session => !this.sessions.isSessionDeleted(session.id)).map(session => this.sessionSummary(session)) })
     if (command.kind === 'list_topics') return success({ kind: 'topics', topics: this.sessions.getTopics(ownerId).map(topic => ({ ...topic,
       sessionIds: this.sessions.getAvailableSessions(ownerId).filter(session => session.topicId === topic.id && !this.sessions.isSessionDeleted(session.id)).map(session => session.id) })) })
     if (command.kind === 'list_topic_terms') {
@@ -431,7 +483,7 @@ export class TopicBridgeClient {
         : error(request.requestId, result.code, result.message)
     }
     const session = this.sessions.getSession(command.translationSessionId)
-    if (!session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id)) return error(request.requestId, 'out_of_scope', '翻译会话不属于当前主会话或已删除。')
+    if (!session || session.ownerId !== ownerId && !(command.kind === 'read_unit' && this.files && this.sessions.isSessionOpen(ownerId, session.id)) || this.sessions.isSessionDeleted(session.id)) return error(request.requestId, 'out_of_scope', '翻译会话不属于当前主会话或已删除。')
     switch (command.kind) {
       case 'set_session_remark': {
         const result = await this.sessions.setSessionRemarkAsync(ownerId, session.id, command.expectedRemark, command.remark)
@@ -445,6 +497,13 @@ export class TopicBridgeClient {
       }
       case 'read_unit': {
         if (session.mode !== 'normal') return error(request.requestId, 'normal_required', '历史原文参考只在明确升级为普通后提供。')
+        const document = this.documentPublications.get(this.key(ownerId, session.id, command.unitId))
+        if (document && this.files) {
+          try { return success({ kind: 'file_unit', unit: this.files.unit({ kind: 'unit', mainSessionId: ownerId, translationSessionId: session.id, unitId: command.unitId, sourceVersion: document.sourceVersion }) }) }
+          catch { return error(request.requestId, 'reference_not_published', '此文档参考已删除或源版本已变化。') }
+        }
+        const unit = this.sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === command.unitId)
+        if (!unit || isTextUnit(unit) && unit.deletion) return error(request.requestId, 'reference_not_published', '此单元不存在、已删除或尚未选择供主模型参考。')
         const publication = this.publications.get(this.key(ownerId, session.id, command.unitId))
         return publication && publication.topicId === session.topicId ? success({ kind: 'unit', unit: structuredClone(publication.fact) })
           : error(request.requestId, 'reference_not_published', '用户尚未选择此单元供主模型参考。')
@@ -471,52 +530,124 @@ export class TopicBridgeClient {
   publishUnit(ownerId: string, sessionId: string, unitId: string): boolean {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     const unit = history?.units.find(unit => unit.id === unitId)
-    if (!unit || !isTextUnit(unit)) return false
+    if (!unit || !isTextUnit(unit) || unit.deletion) return false
     const latest = unit.revisions.at(-1)
-    if (this.disposed || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict' || session.mode !== 'normal' || !unit || !latest || !['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(latest.status)) return false
-    const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
-    const final = currentFinalRevision(unit)
-    const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, sourceVersion: revision.sourceVersion }]),
-      final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
-    // Include the largest allowed correlation ID so every future request fits without truncation.
-    const reply: TopicBridgeReply = { requestId: 'x'.repeat(2048), ok: true, value: { kind: 'unit', unit: fact } }
-    if (new TextEncoder().encode(JSON.stringify(reply)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) return false
+    if (this.disposed || !history || !session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict' || session.mode !== 'normal' || !latest || !['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(latest.status)) return false
+    const fact = this.unitFact(history, unit)
+    if (!this.unitFactFits(fact)) return false
     this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact: structuredClone(fact), automatic: false })
     this.emit(); return true
+  }
+  /** One snapshot of a text unit as it currently stands; every publication stores a value built by this single constructor. */
+  private unitFact(history: TranslationHistory, unit: TextUnit): TopicUnitFact {
+    const event = [...history.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
+    const final = currentFinalRevision(unit)
+    return { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
+      revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, sourceVersion: revision.sourceVersion }]),
+      final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
+  }
+  private unitFactFits(fact: TopicUnitFact): boolean {
+    // Include the largest allowed correlation ID so every future request fits without truncation.
+    const reply: TopicBridgeReply = { requestId: 'x'.repeat(2048), ok: true, value: { kind: 'unit', unit: fact } }
+    return new TextEncoder().encode(JSON.stringify(reply)).byteLength <= MAX_TOPIC_BRIDGE_REPLY_BYTES
   }
   private publishAdmittedUnit(ownerId: string, sessionId: string, unitId: string, automatic = true): void {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     const unit = history?.units.find(unit => unit.id === unitId)
-    if (!session || session.ownerId !== ownerId || this.sessions.getStatus(session.id) === 'conflict' || !unit || !isTextUnit(unit)) return
-    const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unitId)
-    const final = currentFinalRevision(unit)
-    const fact: TopicUnitFact = { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, sourceVersion: revision.sourceVersion }]),
-      final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
-    this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact, automatic })
+    if (!history || !session || session.ownerId !== ownerId || this.sessions.getStatus(session.id) === 'conflict' || !unit || !isTextUnit(unit) || unit.deletion) return
+    this.publications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, fact: this.unitFact(history, unit), automatic })
     this.emit()
   }
-  private publishDocumentUnit(ownerId: string, sessionId: string, unitId: string, sourceVersion: number): void {
+  publishDocumentUnit(ownerId: string, sessionId: string, unitId: string, sourceVersion: number): boolean {
     const session = this.sessions.getSession(sessionId), unit = this.sessions.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
-    if (!session || session.ownerId !== ownerId || this.sessions.isSessionDeleted(sessionId) || !unit || !isDocumentUnit(unit) || unit.sourceVersion !== sourceVersion) return
+    if (this.files) {
+      try {
+        this.files.unit({ kind: 'unit', mainSessionId: ownerId, translationSessionId: sessionId, unitId, sourceVersion })
+        this.documentPublications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session!.topicId, unitId, sourceVersion })
+        this.emit(); return true
+      } catch { return false }
+    }
+    if (this.disposed || !session || session.ownerId !== ownerId || session.mode !== 'normal' || this.sessions.getStatus(sessionId) === 'conflict' || this.sessions.isSessionDeleted(sessionId) || !unit || !isDocumentUnit(unit) || unit.deletion || unit.sourceVersion !== sourceVersion) return false
     this.documentPublications.set(this.key(ownerId, sessionId, unitId), { sessionId, topicId: session.topicId, unitId, sourceVersion })
+    this.emit(); return true
   }
   isPublished(ownerId: string, sessionId: string, unitId: string): boolean { const key = this.key(ownerId, sessionId, unitId); return this.publications.has(key) || this.documentPublications.has(key) }
+  /** Read the exact preparation version this result belongs to; an older source version is never substituted. */
+  private async documentTaskPreparation(ownerId: string, sessionId: string, unitId: string, reference?: { readonly id: string; readonly version: number }) {
+    const session = this.sessions.getSession(sessionId), unit = this.sessions.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
+    if (this.disposed || !session || !unit || !isDocumentUnit(unit) || session.ownerId !== ownerId || session.mode !== 'normal' ||
+      this.sessions.isSessionDeleted(sessionId) || this.sessions.getStatus(sessionId) === 'conflict' || !this.preparation) return undefined
+    const ref = reference ? unit.preparations.find(item => item.id === reference.id && item.version === reference.version) : unit.preparations.at(-1)
+    if (!ref || ref.sourceVersion !== unit.sourceVersion) return undefined
+    const source = unit.sourceVersions.find(item => item.version === ref.sourceVersion)
+    if (!source) return undefined
+    const hash = source.body.kind === 'asset' ? source.body.reference.sha256 : await sha256Hex(source.body.text)
+    const prepared = this.preparation.documentUnitPreparation({ ownerId, mainSessionId: ownerId, topicId: session.topicId, translationSessionId: sessionId }, ref, hash)
+    return prepared.ok ? { session, unit, ref, snapshot: prepared.value } : undefined
+  }
+  /** Task terms stay read-only here; sedimentation is a separate explicit user action. */
+  async documentTaskTerms(ownerId: string, sessionId: string, unitId: string, reference?: { readonly id: string; readonly version: number }): Promise<DocumentTaskTermsView> {
+    try {
+      const facts = await this.documentTaskPreparation(ownerId, sessionId, unitId, reference)
+      if (!facts) return { status: 'unavailable', terms: [], message: '尚无与当前原稿版本匹配的任务准备记录。' }
+      return { status: 'ready', terms: facts.snapshot.terms.map(term => ({ sourceForms: [...term.sourceForms], preferred: term.preferred,
+        sense: term.sense, userFixed: term.userFixed, rangeCount: term.ranges.length })) }
+    } catch { return { status: 'unavailable', terms: [], message: '任务术语读取失败，可重试。' } }
+  }
+  /** Write adopted task terms into the topic as pending proposals; nothing is activated or overwritten. */
+  async sedimentDocumentTaskTerms(ownerId: string, sessionId: string, unitId: string, reference?: { readonly id: string; readonly version: number }): Promise<DocumentTermSedimentResult> {
+    try {
+      const facts = await this.documentTaskPreparation(ownerId, sessionId, unitId, reference)
+      if (!facts) return { status: 'unavailable', added: 0, skipped: 0, message: '尚无与当前原稿版本匹配的任务准备记录，暂不能沉淀。' }
+      let snapshot = await (this.terms.reconcileAsync?.(ownerId, facts.session.topicId) ?? this.terms.getSnapshot(ownerId, facts.session.topicId))
+      const plan = planDocumentTermSedimentation({ terms: facts.snapshot.terms, existing: snapshot.entries, sessionId, unitId, sourceVersion: facts.ref.sourceVersion })
+      if (!plan.entries.length) return { status: 'completed', added: 0, skipped: plan.skipped,
+        message: plan.skipped ? `已有 ${plan.skipped} 条相同术语，无需重复沉淀。` : '本任务没有可沉淀的采用术语。' }
+      let added = 0, skipped = plan.skipped
+      for (const entry of plan.entries) {
+        let result = await this.terms.apply(ownerId, facts.session.topicId, snapshot.version, { kind: 'put', input: entry })
+        // One refresh on a concurrent topic edit; the entry identity is new, so retrying cannot duplicate content.
+        if (result.status === 'stale') result = await this.terms.apply(ownerId, facts.session.topicId, result.snapshot.version, { kind: 'put', input: entry })
+        snapshot = result.snapshot
+        if (result.status === 'updated') added++
+        else skipped++
+      }
+      return { status: 'completed', added, skipped,
+        message: added ? `已写入 ${added} 条待确认术语，可在记忆资产中采用。` : '未能写入新的术语，请核对主题记忆状态。' }
+    } catch { return { status: 'failed', added: 0, skipped: 0, message: '沉淀未完成，请稍后重试。' } }
+  }
   revokeUnit(ownerId: string, sessionId: string, unitId: string): void { const key = this.key(ownerId, sessionId, unitId); this.publications.delete(key); this.documentPublications.delete(key); this.emit() }
+  /** A deleted topic must not keep any main-model reference alive. */
+  revokeTopic(topicId: string): void {
+    let changed = false
+    for (const [key, publication] of this.publications) if (publication.topicId === topicId) { this.publications.delete(key); changed = true }
+    for (const [key, publication] of this.documentPublications) if (publication.topicId === topicId) { this.documentPublications.delete(key); changed = true }
+    if (changed) this.emit()
+  }
   private reconcile(): void {
     let changed = false
     for (const [key, publication] of this.documentPublications) {
+      if (this.files) {
+        const ownerId = JSON.parse(key)[0] as string
+        try { this.files.unit({ kind: 'unit', mainSessionId: ownerId, translationSessionId: publication.sessionId, unitId: publication.unitId, sourceVersion: publication.sourceVersion }); continue }
+        catch { this.documentPublications.delete(key); changed = true; continue }
+      }
       const session = this.sessions.getSession(publication.sessionId), unit = this.sessions.getTranslationHistory(publication.sessionId)?.units.find(unit => unit.id === publication.unitId)
-      if (!session || this.sessions.isSessionDeleted(session.id) || session.topicId !== publication.topicId || !unit || !isDocumentUnit(unit)) this.documentPublications.delete(key)
+      if (!session || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict' || session.topicId !== publication.topicId || !unit || !isDocumentUnit(unit) || unit.deletion || unit.sourceVersion !== publication.sourceVersion) { this.documentPublications.delete(key); changed = true }
     }
     for (const [key, publication] of this.publications) {
       const session = this.sessions.getSession(publication.sessionId)
-      const unit = this.sessions.getTranslationHistory(publication.sessionId)?.units.find(unit => unit.id === publication.fact.id)
+      const history = this.sessions.getTranslationHistory(publication.sessionId)
+      const unit = history?.units.find(unit => unit.id === publication.fact.id)
       if (!session || this.sessions.isSessionDeleted(publication.sessionId) || this.sessions.getStatus(session.id) === 'conflict' || session.topicId !== publication.topicId || !unit ||
-        isTextUnit(unit) && publication.fact.revisions.some(revision => unit.revisions.find(item => item.id === revision.id)?.status === 'deleted')) {
+        isTextUnit(unit) && (unit.deletion !== null || publication.fact.revisions.some(revision => unit.revisions.find(item => item.id === revision.id)?.status === 'deleted'))) {
         this.publications.delete(key); changed = true
-      } else if (publication.automatic) this.publishAdmittedUnit(session.ownerId, session.id, publication.fact.id)
+      } else if (isTextUnit(unit)) {
+        // Every publication follows the unit's current state. An explicit snapshot that no longer fits the reply budget is revoked instead of serving stale or truncated content.
+        const fact = this.unitFact(history!, unit)
+        if (!publication.automatic && !this.unitFactFits(fact)) { this.publications.delete(key); changed = true }
+        else this.publications.set(key, { sessionId: publication.sessionId, topicId: session.topicId, fact, automatic: publication.automatic })
+      }
     }
     if (changed) this.emit()
   }

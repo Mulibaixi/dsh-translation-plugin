@@ -24,6 +24,18 @@ export interface DocumentReviewRead {
   readonly target: DocumentReviewTarget; readonly side: 'source' | 'chunk'; readonly revisionId?: string; readonly range: TranslationSourceRange
 }
 export interface DocumentReviewTextPage extends DocumentReviewRead { readonly text: string; readonly totalCodePoints: number }
+/** Task terms are read from the exact preparation of one document source version; apply is explicit. */
+export interface DocumentTaskTermsRequest {
+  readonly scope: TranslationSourceScope; readonly unitId: string; readonly sourceVersion: number
+  readonly preparationRef?: VersionReference; readonly apply: boolean
+}
+export interface DocumentTaskTermEntry {
+  readonly sourceForms: readonly string[]; readonly preferred: string; readonly sense: string
+  readonly userFixed: boolean; readonly rangeCount: number
+}
+export interface DocumentTaskTermsReply {
+  readonly terms: readonly DocumentTaskTermEntry[]; readonly added: number; readonly skipped: number; readonly message: string
+}
 function exact(value: unknown, required: readonly string[], optional: readonly string[] = []): asserts value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value) || required.some(key => !Object.hasOwn(value, key)) || Object.keys(value).some(key => !required.includes(key) && !optional.includes(key))) throw new TypeError('Invalid document review bridge fields')
 }
@@ -55,6 +67,37 @@ export function parseDocumentReviewPage(value: unknown): DocumentReviewPage {
   const parsed = { ...value, target } as unknown as DocumentReviewPage
   if (documentReviewBytes({ ok: true, value: parsed }) > MAX_DOCUMENT_REVIEW_PAGE_BYTES) throw new TypeError('Document review page too large')
   return structuredClone(parsed)
+}
+export function parseDocumentTaskTermsRequest(value: unknown): DocumentTaskTermsRequest {
+  exact(value, ['scope', 'unitId', 'sourceVersion', 'apply'], ['preparationRef'])
+  id(value.unitId); number(value.sourceVersion, 1)
+  if (typeof value.apply !== 'boolean') throw new TypeError('Invalid document task terms apply flag')
+  let preparationRef: VersionReference | undefined
+  if (value.preparationRef !== undefined) {
+    exact(value.preparationRef, ['id', 'version']); id(value.preparationRef.id); number(value.preparationRef.version, 1)
+    preparationRef = { id: value.preparationRef.id, version: value.preparationRef.version }
+  }
+  return { scope: parseTranslationSourceScope(value.scope), unitId: value.unitId, sourceVersion: value.sourceVersion,
+    apply: value.apply, ...(preparationRef === undefined ? {} : { preparationRef }) }
+}
+export function parseDocumentTaskTermsReply(value: unknown): DocumentTaskTermsReply {
+  exact(value, ['terms', 'added', 'skipped', 'message'])
+  if (!Array.isArray(value.terms) || value.terms.length > 200) throw new TypeError('Invalid document task terms list')
+  const terms = value.terms.map(raw => {
+    exact(raw, ['sourceForms', 'preferred', 'sense', 'userFixed', 'rangeCount'])
+    if (!Array.isArray(raw.sourceForms) || !raw.sourceForms.length || raw.sourceForms.length > 20) throw new TypeError('Invalid document task term forms')
+    for (const form of raw.sourceForms) id(form)
+    id(raw.preferred)
+    if (typeof raw.sense !== 'string' || typeof raw.userFixed !== 'boolean') throw new TypeError('Invalid document task term entry')
+    number(raw.rangeCount)
+    return { sourceForms: raw.sourceForms.map(form => form as string), preferred: raw.preferred as string, sense: raw.sense,
+      userFixed: raw.userFixed, rangeCount: raw.rangeCount }
+  })
+  number(value.added); number(value.skipped)
+  if (typeof value.message !== 'string' || Array.from(value.message).length > 2000) throw new TypeError('Invalid document task terms message')
+  const reply = { terms, added: value.added as number, skipped: value.skipped as number, message: value.message }
+  if (documentReviewBytes({ ok: true, value: reply }) > MAX_DOCUMENT_REVIEW_PAGE_BYTES) throw new TypeError('Document task terms reply too large')
+  return reply
 }
 export function parseDocumentReviewRead(value: unknown): DocumentReviewRead {
   exact(value, ['target', 'side', 'range'], ['revisionId'])

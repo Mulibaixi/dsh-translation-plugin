@@ -45,6 +45,7 @@ interface PlanningRecord {
   readonly cursorToken: string
 }
 interface SuggestionRecord {
+  readonly id: string
   readonly signature: string
   readonly cursorToken: string
   readonly items: readonly DocumentPlanSuggestion[]
@@ -230,12 +231,16 @@ export class DocumentPlanner {
     return ok(frozen(result()))
   }
   private suggestionKey(request: TranslationPlanSuggest): string { return JSON.stringify([request.target, request.preparationRef]) }
+  /** One identity binds the exact source hash, preparation version, route, analysis facts and input limit. */
+  private suggestionSignature(preparation: PreparationSnapshot, input: DocumentPlanningInput): string {
+    return JSON.stringify([preparation.sourceSha256, preparation.route, preparation.version, input.analysis.actualCalls, inputLimit(input)])
+  }
 
   async suggest(input: DocumentPlanningInput, request: TranslationPlanSuggest, signal = new AbortController().signal): Promise<AnalysisResult<DocumentPlanSuggestionPage>> {
     const preparedId = `document-suggestion:${crypto.randomUUID()}`
     try {
       const preparation = this.check(input, request.target, request.preparationRef)
-      const suggestionKey = this.suggestionKey(request), signature = JSON.stringify([preparation.sourceSha256, preparation.route, preparation.version, input.analysis.actualCalls, inputLimit(input)])
+      const suggestionKey = this.suggestionKey(request), signature = this.suggestionSignature(preparation, input)
       let record = this.suggestions.get(suggestionKey)
       if (request.cursor !== undefined) {
         if (!record || record.signature !== signature) return bad('invalid_cursor', '建议游标的固定材料或分析事实已失效。', 'read_plan_suggestion')
@@ -275,8 +280,8 @@ export class DocumentPlanner {
         }
         if (items.length > MAX_DOCUMENT_PLAN_CHUNKS) throw reject('chunk_budget_exceeded', '建议包含超过 256 个计划块。')
         const budget = callBudget(input.analysis.actualCalls, items.map(item => item.item))
-        record = frozen({ signature, cursorToken: crypto.randomUUID(), items,
-          summary: { target: request.target, preparationRef: request.preparationRef, capacity, callBudget: budget,
+        record = frozen({ id: preparedId, signature, cursorToken: crypto.randomUUID(), items,
+          summary: { target: request.target, preparationRef: request.preparationRef, suggestionRef: { id: preparedId, version: 1 }, capacity, callBudget: budget,
             totalCodePoints: preparation.totalCodePoints, sourceBytes: source.bytes, suggestionOnly: true, executionStarted: false, executionAvailable: false } })
         this.suggestions.set(suggestionKey, record)
       }
@@ -314,11 +319,21 @@ export class DocumentPlanner {
       if ((previous?.plan.version ?? 0) !== request.expectedVersion) return bad('stale_version', '计划已变化，请读取当前版本后重新提交明确的新计划。')
       if (previous && !same(previous.target, request.target)) return bad('source_mismatch', '计划标识已绑定另一固定材料。')
       const protectedRanges = request.protectedRanges ?? previous?.protectedRanges ?? []
+      let items: readonly ChunkPlanItem[], adopted: SuggestionRecord | undefined
+      if (request.suggestionRef) {
+        adopted = [...this.suggestions.values()].find(record => record.id === request.suggestionRef!.id)
+        if (!adopted || request.suggestionRef.version !== 1) return bad('suggestion_not_found', '程序分块建议不存在或版本无效；请重新建议。')
+        if (!same(adopted.summary.target, request.target) || !same(adopted.summary.preparationRef, request.preparationRef)) return bad('suggestion_mismatch', '建议不属于此固定材料或准备版本。')
+        if (adopted.signature !== this.suggestionSignature(preparation, input)) return bad('suggestion_stale', '建议对应的原稿、准备、分析事实或单次上限已变化；请重新建议。')
+        if (adopted.summary.totalCodePoints !== preparation.totalCodePoints) return bad('suggestion_stale', '建议的固定源规模与当前准备不一致；请重新建议。')
+        items = adopted.items.map(item => item.item)
+      } else items = request.items
       const plan = parseDocumentChunkPlan({ id: request.planId, version: request.expectedVersion + 1, sourceVersion: request.target.sourceVersion,
-        preparationRef: request.preparationRef, items: request.items, protectedRanges,
+        preparationRef: request.preparationRef, items, protectedRanges,
         createdAt: new Date().toISOString(), operationId: request.operationId }, preparation.totalCodePoints)
       this.validatePlan(preparation, plan, protectedRanges)
       const source = await this.source(input, preparation, signal), capacity = await this.capacity(input, preparation, preparedId, signal)
+      if (adopted && (!same(capacity, adopted.summary.capacity) || source.bytes !== adopted.summary.sourceBytes)) return bad('suggestion_stale', '实际模型容量或固定源字节已变化；请重新建议后再采用。')
       const budgets = plan.items.map(item => {
         try { return this.budget(preparation, item, source.points, capacity, inputLimit(input), protectedRanges, input.referenceContext).budget }
         catch (error) {

@@ -1,8 +1,8 @@
 import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
 import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import {
-  emptyTopicTerms, decodeTopicTermSnapshot, decodeTopicTermPut, decodeTopicTermUserInput, putTopicTerm, putUserTopicTerm, adoptTopicTerm, disableTopicTerm, reconcileTopicTerms, queryTopicTerms, resolveTermEvidence, topicTermContentsConflict,
-  type TopicTermSnapshot, type TopicTermPut, type TopicTermUserInput, type TopicTermUserPut, type TermMutationResult, type TermEvidenceFact, type TopicTermQuery, type TermEvidenceRef,
+  emptyTopicTerms, decodeTopicTermSnapshot, decodeTopicTermPut, decodeTopicTermUserInput, putTopicTerm, putUserTopicTerm, adoptTopicTerm, acceptTopicTermProposal, disableTopicTerm, reconcileTopicTerms, queryTopicTerms, resolveTermEvidence, topicTermContentsConflict,
+  type TopicTermSnapshot, type TopicTermPut, type TopicTermUserInput, type TopicTermUserPut, type TermMutationResult, type TermEvidenceFact, type TopicTermQuery, type TermEvidenceRef, type TermEvidenceResolver, type FileProposalAcceptance,
 } from '../memory/topic-terms.js'
 import { SessionStore, type LocalStoragePort, type StructureLockPort, type HistoryVersion, type HistoryStatus } from './session-store.js'
 import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
@@ -28,6 +28,8 @@ export interface TopicTermClearVersion extends TopicTermVersion {
   readonly storedCount: number
 }
 export type TopicTermCommand = { readonly kind: 'put'; readonly input: TopicTermPut }
+  | { readonly kind: 'accept_file_proposal'; readonly input: TopicTermPut; readonly acceptance: FileProposalAcceptance }
+  | { readonly kind: 'revise_file_proposal'; readonly input: TopicTermPut; readonly acceptance: FileProposalAcceptance }
   | { readonly kind: 'user_put'; readonly input: TopicTermUserPut }
   | { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }
 interface Seat { snapshot: TopicTermSnapshot; stored: string | null; dirty: boolean; status: HistoryStatus }
@@ -53,7 +55,7 @@ export class TopicMemoryStore {
   private evidenceReader: TranslationEvidenceReader | undefined
 
   constructor(private readonly sessions: SessionStore, private readonly storage: LocalStoragePort | undefined = browserStorage(),
-    listen?: (onChange: (key: string | null) => void) => () => void, private readonly locks: StructureLockPort | undefined = browserLocks()) {
+    listen?: (onChange: (key: string | null) => void) => () => void, private readonly locks: StructureLockPort | undefined = browserLocks(), private supplementaryEvidence?: TermEvidenceResolver) {
     this.enabled = sessions.getSettings().rememberHistory
     this.load()
     this.stopSession = sessions.subscribe(() => this.sessionChanged())
@@ -68,6 +70,7 @@ export class TopicMemoryStore {
   getNotice(): string | undefined { return this.notice }
   getStatus(ownerId: string, topicId: string): HistoryStatus { return this.seat(ownerId, topicId).status }
   setEvidenceReader(reader: TranslationEvidenceReader | undefined): void { this.evidenceReader = reader }
+  setSupplementaryEvidenceResolver(resolver: TermEvidenceResolver): void { this.supplementaryEvidence = resolver }
   dispose(): void { this.disposed = true; this.stopSession(); this.stopStorage?.(); this.listeners.clear(); this.seats.clear() }
 
   private load(): void {
@@ -124,6 +127,8 @@ export class TopicMemoryStore {
   }
   readReferenceAsync(ownerId:string,topicId:string,ref:import('../shared/reference-memory.js').ReferenceEvidenceRef){return this.referenceEvidence?.view?.({ownerId,topicId},ref) ?? Promise.resolve(undefined)}
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined {
+    const supplementary = this.supplementaryEvidence?.(sessionId, unitId)
+    if (supplementary) return supplementary
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     if (!session || !history || this.sessions.isSessionDeleted(sessionId) || this.sessions.getStatus(sessionId) === 'conflict') return undefined
     const unit = history.units.find(unit => unit.id === unitId)
@@ -229,10 +234,11 @@ export class TopicMemoryStore {
     ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
     const seat = this.seat(ownerId, topicId), failure: TermMutationResult = { status: 'invalid', snapshot: seat.snapshot, entry: null }
     const fixed: TopicTermCommand = structuredClone(command), reader = this.evidenceReader
-    if (fixed.kind === 'put' && !decodeTopicTermPut(fixed.input)) return failure
+    const fileProposal = fixed.kind === 'accept_file_proposal' || fixed.kind === 'revise_file_proposal'
+    if ((fixed.kind === 'put' || fileProposal) && !decodeTopicTermPut(fixed.input)) return failure
     if (seat.snapshot.version !== expectedVersion) return { status: 'stale', snapshot: seat.snapshot, entry: null }
-    const refs = fixed.kind === 'put' ? [...fixed.input.evidence, ...seat.snapshot.entries.filter(entry =>
-      fixed.input.status === 'active' && entry.id !== fixed.input.id && entry.status === 'active' && entry.origin !== 'user_explicit' &&
+    const refs = fixed.kind === 'put' || fileProposal ? [...fixed.input.evidence, ...seat.snapshot.entries.filter(entry =>
+      (fileProposal || fixed.input.status === 'active') && entry.id !== fixed.input.id && entry.status === 'active' && entry.origin !== 'user_explicit' &&
       topicTermContentsConflict(entry, fixed.input)).flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))] : []
     const prepared = await prepareTopicEvidence(this.sessions, seat.snapshot, refs, (sessionId, unitId) => this.readEvidence(sessionId, unitId), reader, this.referenceEvidence)
     return this.locked(failure, () => {
@@ -240,10 +246,12 @@ export class TopicMemoryStore {
         this.emit(); return { status: 'stale', snapshot: seat.snapshot, entry: null }
       }
       const result = fixed.kind === 'put' ? putTopicTerm(seat.snapshot, fixed.input, prepared.resolver, now()) :
+        fileProposal ? acceptTopicTermProposal(seat.snapshot, fixed.input, prepared.resolver, fixed.acceptance, fixed.kind === 'revise_file_proposal') :
         fixed.kind === 'user_put' ? putUserTopicTerm(seat.snapshot, fixed.input, { eventId: `term-user-save:${Date.now()}:${Math.random()}`, at: now() }) :
         fixed.kind === 'adopt' ? adoptTopicTerm(seat.snapshot, fixed.id, fixed.expectedEntryVersion, { eventId: `term-adoption:${Date.now()}:${Math.random()}`, at: now() }) :
           disableTopicTerm(seat.snapshot, fixed.id, fixed.expectedEntryVersion, now())
-      if (result.snapshot !== seat.snapshot) { seat.snapshot = result.snapshot; seat.dirty = true; seat.status = 'memory'; this.notice = undefined; this.persistLocked(seat); this.emit() }
+      if (result.snapshot !== seat.snapshot) { seat.snapshot = result.snapshot; seat.dirty = true; seat.status = 'memory'; this.notice = undefined }
+      if ((result.status === 'updated' || result.status === 'unchanged') && seat.dirty) { this.persistLocked(seat); this.emit() }
       return result
     })
   }

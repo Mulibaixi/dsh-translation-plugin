@@ -1,8 +1,11 @@
 import type { ReferenceFilesService } from './reference-files.js'
+import { fileRetranslationNotice } from './file-retranslation-notice.js'
+import type { FileJobsService } from './file-jobs.js'
 import { parseTranslationBatchExecute, parseTranslationBatchStatus, parseTranslationBatchControl, parseTranslationBatchUpdate, parseDocumentRestoreCapture,
   type TranslationBatchControl, type TranslationBatchUpdate, type DocumentTaskControl, type TranslationBatchExecute,
   type TranslationBatchStatus, type DocumentTaskReceipt, type DocumentTaskEvent, type DocumentBlockRegistration,
-  type DocumentTaskScope } from '../shared/document-execution.js'
+  type DocumentTaskScope, type DocumentUnitSubmitReceipt } from '../shared/document-execution.js'
+import { parseNormalTranslationUnitRequest, type NormalTranslationUnitRequest } from '../shared/normal-translation.js'
 import type { AnalysisResult } from '../shared/translation-preparation.js'
 import type { DocumentTaskStatus, DocumentExecutionBaseline, DocumentSourceVersion, DocumentSupplementFact } from '../shared/translation-batch.js'
 import { verifyDocumentReuse } from '../memory/document-correction.js'
@@ -10,7 +13,8 @@ import type { DocumentCorrectionService } from './document-correction-service.js
 import type { DocumentReviewService } from './document-review-service.js'
 import type { DocumentReviewTarget } from '../shared/document-review.js'
 import { documentPlanningBytes, MAX_DOCUMENT_PLAN_CALLS, MAX_DOCUMENT_PLAN_PAGE_BYTES } from '../shared/document-planning.js'
-import { DshTextExecutionAdapter, type DocumentExecutionPacket } from './dsh-text-adapter.js'
+import { DshTextExecutionAdapter, hostLlmLoader, type DocumentExecutionPacket } from './dsh-text-adapter.js'
+import { uiLanguageDirective } from './ui-language.js'
 import type { DocumentExecutionFreeze, DocumentPlanningInput } from './document-planner.js'
 import type { DocumentPlanningService } from './document-planning-service.js'
 import type { NormalTranslationService } from './normal-translation.js'
@@ -89,6 +93,7 @@ export class DocumentExecutionService {
   private readonly jobs = new Map<string, Job>()
   private readonly operations = new Map<string, Job>()
   private readonly controls = new Map<string, { signature: string; result: Promise<AnalysisResult<DocumentTaskReceipt>> }>()
+  private readonly unitIntents = new Map<string, { readonly signature: string; readonly peerId: string; result: Promise<AnalysisResult<DocumentUnitSubmitReceipt>>; outcome: AnalysisResult<DocumentUnitSubmitReceipt> | null }>()
   private readonly resumeTokens = new Map<unknown, ResumeEntry>()
   private readonly children = new Map<string, Job>()
   private readonly exchangeRegistrations = new Map<TopicHostContext, ExchangeRegistration>()
@@ -151,6 +156,77 @@ export class DocumentExecutionService {
   private get topics(): TopicToolsService { return this.ctx.get?.('translationTopics') as TopicToolsService }
   private get planning(): DocumentPlanningService { return this.ctx.get?.('translationPlanning') as DocumentPlanningService }
   private get normal(): NormalTranslationService { return this.ctx.get?.('translationNormal') as NormalTranslationService }
+  /** UI admission sends one explicit document intent; preparation/execution stay with the actual main Agent. */
+  submitUnit(input: NormalTranslationUnitRequest, signal = new AbortController().signal): Promise<AnalysisResult<DocumentUnitSubmitReceipt>> {
+    let request: NormalTranslationUnitRequest
+    try { request = parseNormalTranslationUnitRequest(input) } catch { return Promise.resolve(failure('invalid_input', '文件重译参数无效。', 'submit_document_unit')) }
+    const peerId = this.ctx.invocation?.peer.id
+    if (!peerId || this.disposed || !this.topics?.ownsConnection(request.target.mainSessionId, peerId)) return Promise.resolve(failure('scope_mismatch', '文件重译请求不属于此实际主会话连接。', 'authorize_document'))
+    const files = this.ctx.get?.('translationFileJobs') as FileJobsService | undefined
+    if (files) return files.submitUnit(request, signal)
+    const operationKey = key(request.target.mainSessionId, request.operationId), signature = JSON.stringify({ target: request.target, operationId: request.operationId }), old = this.unitIntents.get(operationKey)
+    if (old) return old.peerId !== peerId ? Promise.resolve(failure('scope_mismatch', '文件重译意图属于另一连接。', 'authorize_document'))
+      : old.signature !== signature ? Promise.resolve(failure('idempotency_conflict', '同一文件重译标识不能更换单元或原稿版本。', 'submit_document_unit')) : old.result.then(result => structuredClone(result))
+    const entry: { readonly signature: string; readonly peerId: string; result: Promise<AnalysisResult<DocumentUnitSubmitReceipt>>; outcome: AnalysisResult<DocumentUnitSubmitReceipt> | null } = { signature, peerId, result: undefined!, outcome: null }
+    this.unitIntents.set(operationKey, entry)
+    entry.result = this.submitUnitIntent(request, peerId, signal).then(result => { entry.outcome = structuredClone(result); return result })
+    return entry.result.then(result => structuredClone(result))
+  }
+  /** A query never captures source, prompts the main Agent, or creates a missing intent. */
+  async queryUnit(input: NormalTranslationUnitRequest): Promise<AnalysisResult<DocumentUnitSubmitReceipt | null>> {
+    let request: NormalTranslationUnitRequest
+    try { request = parseNormalTranslationUnitRequest(input) } catch { return failure('invalid_input', '文件重译查询参数无效。', 'query_document_unit') }
+    const peerId = this.ctx.invocation?.peer.id
+    if (!peerId || this.disposed || !this.topics?.ownsConnection(request.target.mainSessionId, peerId)) return failure('scope_mismatch', '文件重译查询不属于此主会话连接。', 'authorize_document')
+    const files = this.ctx.get?.('translationFileJobs') as FileJobsService | undefined
+    if (files) return files.queryUnit(request)
+    const entry = this.unitIntents.get(key(request.target.mainSessionId, request.operationId))
+    if (!entry) return { ok: true, value: null }
+    if (entry.signature !== JSON.stringify({ target: request.target, operationId: request.operationId })) return failure('idempotency_conflict', '文件重译查询目标与原意图不一致。', 'query_document_unit')
+    if (entry.outcome?.ok === false && entry.outcome.error.code === 'main_admission_unknown') return { ok: true, value: null }
+    return structuredClone(entry.outcome ?? { ok: true, value: null })
+  }
+  private async submitUnitIntent(request: NormalTranslationUnitRequest, peerId: string, signal: AbortSignal): Promise<AnalysisResult<DocumentUnitSubmitReceipt>> {
+    let notificationAttempted = false
+    try {
+      const controller = this.ctx.get?.('sessionController') as { resolveAgent(id: string): Promise<{ agent: MainAgent & { followup(message: unknown): void | Promise<void> } } | { error: unknown }> } | undefined
+      if (!controller?.resolveAgent) return failure('unavailable', '当前宿主无法解析所属主会话。', 'resolve_main_agent')
+      const [found, helpers] = await Promise.all([controller.resolveAgent(request.target.mainSessionId), hostLlmLoader(this.ctx)()])
+      signal.throwIfAborted()
+      if ('error' in found || typeof found.agent.followup !== 'function') return failure('unavailable', '无法准备所属主会话。', 'resolve_main_agent')
+      const agent = found.agent, current = (): boolean => !this.disposed && this.topics.ownsConnection(request.target.mainSessionId, peerId) && this.topics.ownsAgent(request.target.mainSessionId, agent)
+      if (!current()) return failure('scope_mismatch', '所属主会话连接或实际 Agent 已变化。', 'authorize_document')
+      const correction = this.ctx.get?.('translationCorrection') as DocumentCorrectionService | undefined
+      if (!correction) return failure('unavailable', '文档源版本服务尚未就绪。', 'capture_document')
+      const captured = await correction.captureUnit(request.target, undefined, { agent, callId: request.operationId, signal }, { metadataOnly: true })
+      if (!captured.ok) return captured
+      signal.throwIfAborted()
+      if (!current()) return failure('scope_mismatch', '文档捕获后所属连接或实际 Agent 已变化。', 'authorize_document')
+      const capture = captured.value.capture
+      if (capture.currentSourceVersion !== request.target.sourceVersion) return failure('stale_source_version', '原稿版本已变化，请读取当前版本再重译。', 'capture_document')
+      if (capture.tasks.some(task => task.unsettled || ['running', 'waiting_context', 'waiting_user', 'unknown'].includes(task.status))) return failure('busy', '此文档仍有运行中、等待处理或结果未知的任务。', 'submit_document_unit')
+      const intentLease = `document-intent:${request.operationId}`
+      if (!this.normal?.claimDocumentSession(capture.scope.ownerId, capture.scope.translationSessionId, intentLease)) return failure('busy', '此翻译会话仍有未结算的任务。', 'submit_document_unit')
+      try {
+        signal.throwIfAborted()
+        if (!current()) return failure('scope_mismatch', '文件重译所属连接已变化。', 'authorize_document')
+        const directive = uiLanguageDirective(request.uiLocale)
+        this.topics.activateForMaterial(agent, 'file')
+        const message = helpers.createUserMessage({ content: [{ type: 'text', text: [
+          fileRetranslationNotice(request),
+          ...(directive === undefined ? [] : [directive]),
+        ].join('\n') }], source: { kind: 'translation-document-unit', form: 'notice', summary: '重译文件单元', plugin: 'dsh-translation-plugin', mainSessionId: request.target.mainSessionId,
+          translationSessionId: request.target.translationSessionId, unitId: request.target.unitId, sourceVersion: request.target.sourceVersion, operationId: request.operationId } })
+        notificationAttempted = true
+        await agent.followup(message)
+        return { ok: true, value: { accepted: true, target: request.target, operationId: request.operationId } }
+      } finally { this.normal.releaseDocumentSession(capture.scope.ownerId, capture.scope.translationSessionId, intentLease) }
+    } catch (error) {
+      const known = error as { code?: string; stage?: string }
+      return failure(notificationAttempted ? 'main_admission_unknown' : known.code ?? 'main_admission_failed', notificationAttempted
+        ? '文件重译意图回执未确认，请查询原操作；未确认前不要重新发送。' : '文件重译意图未进入主会话，请检查连接后重试。', known.stage ?? 'submit_document_unit')
+    }
+  }
   private execution(job: Job): ToolExecution { return { agent: job.agent, callId: job.request.operationId, signal: job.delivery.signal } }
   private release(job: Job): void { this.normal?.releaseDocumentSession(job.scope.ownerId, job.scope.translationSessionId, job.taskId) }
   private baseline(job: Job, snapshot = job.snapshot!, input = job.input!): DocumentExecutionBaseline {
@@ -856,9 +932,10 @@ export class DocumentExecutionService {
     if (available.length && !events.length || documentPlanningBytes({ ok: true, value: view() }) > MAX_DOCUMENT_PLAN_PAGE_BYTES) return failure('reply_too_large', '完整整篇状态单项超过 32768 字节。', 'status_document')
     return { ok: true, value: structuredClone(view()) }
   }
-  hasActiveJobs(): boolean { return [...this.jobs.values()].some(job => !!job.running || job.uncertain || ['running', 'waiting_context', 'waiting_user', 'unknown'].includes(job.status)) }
+  hasActiveJobs(ownerId?: string): boolean { return [...this.jobs.values()].some(job => (ownerId === undefined || job.scope.ownerId === ownerId) && (!!job.running || job.uncertain || ['running', 'waiting_context', 'waiting_user', 'unknown'].includes(job.status))) }
   dispose(): void {
     this.disposed = true
+    this.unitIntents.clear()
     for (const registration of this.exchangeRegistrations.values()) { registration.unregister(); registration.unregisterPhase() }
     this.exchangeRegistrations.clear()
     for (const job of this.jobs.values()) {

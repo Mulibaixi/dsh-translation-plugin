@@ -24,7 +24,8 @@ export interface NormalTranslationSourceCorrection {
   readonly sourceText: string
   readonly reason: string
 }
-export interface NormalTranslationUnitRequest { readonly target: NormalTranslationUnitTarget; readonly operationId: string }
+/** `uiLocale` is the submitting Client's interface locale; the Host uses it only for the notice's reply-language line. */
+export interface NormalTranslationUnitRequest { readonly target: NormalTranslationUnitTarget; readonly operationId: string; readonly uiLocale?: string }
 export interface NormalTranslationUnitReceipt extends NormalTranslationUnitRequest { readonly status: 'submitted' }
 export interface NormalTranslationCorrectionReceipt {
   readonly operationId: string
@@ -126,10 +127,11 @@ export function parseNormalTranslationSourceCorrection(value: unknown): NormalTr
   return { target, operationId: value.operationId, sourceText: value.sourceText, reason: value.reason }
 }
 export function parseNormalTranslationUnitRequest(value: unknown): NormalTranslationUnitRequest {
-  object(value); exact(value, ['target', 'operationId']); text(value.operationId)
+  object(value); exact(value, ['target', 'operationId', ...(Object.hasOwn(value, 'uiLocale') ? ['uiLocale'] : [])]); text(value.operationId)
+  if (value.uiLocale !== undefined) text(value.uiLocale, 64)
   const target = parseNormalTranslationTarget(value.target)
   if (target.kind !== 'unit') throw new TypeError('Retranslation requires a unit')
-  return { target, operationId: value.operationId }
+  return { target, operationId: value.operationId, ...(value.uiLocale === undefined ? {} : { uiLocale: value.uiLocale }) }
 }
 export function parseNormalTranslationCorrectionReceipt(value: unknown): NormalTranslationCorrectionReceipt {
   object(value); exact(value, ['operationId', 'mainSessionId', 'translationSessionId', 'unitId', 'previousSourceVersion', 'sourceVersion', 'persistence'])

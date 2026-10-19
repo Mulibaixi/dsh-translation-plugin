@@ -1,10 +1,11 @@
 import { h, react } from './react.js'
-import { currentDocumentFinalRevision, currentFinalRevision, type DocumentUnit, type TextUnit } from './translation-history.js'
+import { currentDocumentFinalRevision, currentResultRevision, type DocumentUnit, type TextUnit } from './translation-history.js'
 import type { LocalSession } from './sessions.js'
 import type { TranslationDocumentReader, DocumentReadHandle, DocumentReadBlock } from './source-reader.js'
 import type { EvidenceReadResult, EvidenceUnavailableResult } from '../shared/translation-evidence.js'
 import { sourceCodePointLength, type TranslationSourceRange } from '../shared/translation-source-read.js'
 import { RecordObjectText, type RecordObjectsProps } from './record-object-view.js'
+import type { ViewFilesClient } from './view-files-client.js'
 import { recordObjectPlainText } from './record-object-export.js'
 import { openDocumentOriginal, projectDocumentResult } from './document-open.js'
 import type { DocumentTasksClient } from './document-tasks.js'
@@ -12,44 +13,15 @@ import type { DocumentReviewClient } from './document-review-client.js'
 import { documentReviewVersion, documentManifestFinalEligibility } from '../memory/document-review.js'
 import type { DocumentReviewTarget } from '../shared/document-review.js'
 import { readDocumentText } from './document-export.js'
-import { downloadExport } from './browser-download.js'
-
-function TranslatedDocumentFile({ unit, session, documents, objects }: RecordObjectsProps & DocumentViewProps & {
-  readonly unit: DocumentUnit; readonly session: LocalSession
-}): unknown {
-  const final = currentDocumentFinalRevision(unit)
-  const [file, setFile] = react.useState<{ readonly identity: string; readonly content: string; readonly fileName: string; readonly mimeType: string } | undefined>(undefined)
-  const [failure, setFailure] = react.useState(false), [retry, setRetry] = react.useState(0)
-  const identity = JSON.stringify([session.id, unit.id, unit.sourceVersion, final?.id])
-  react.useEffect(() => {
-    let active = true
-    setFile(undefined); setFailure(false)
-    if (!final) return
-    if (!documents) { setFailure(true); return }
-    const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision' as const, revisionId: final.id }
-    const references = structuredClone(objects?.getReferences(target) ?? [])
-    void (async () => {
-      const handle = documents.captureDocument({ ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id,
-        unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: final.id })
-      if ('status' in handle) throw new Error('Final file unavailable')
-      const result = await projectDocumentResult(handle)
-      if (!result.complete || result.text === null) throw new Error('Final file incomplete')
-      if (active) setFile({ identity, content: recordObjectPlainText(result.text, target, references), fileName: result.fileName, mimeType: result.mimeType })
-    })().catch(() => { if (active) setFailure(true) })
-    return () => { active = false }
-  }, [identity, unit, documents, objects, retry])
-  if (!final) return null
-  return h('div', { className: 'dsh-tp-attachment', role: 'status' },
-    file?.identity === identity ? h('button', { type: 'button', className: 'dsh-tp-object-link', onClick: () => {
-      try { downloadExport(file) } catch { setFailure(true) }
-    } }, `已翻译文件：${file.fileName}`) : h('span', null, failure ? '译文文件暂不可用。' : '正在生成译文文件…'),
-    failure ? h('button', { type: 'button', onClick: () => setRetry(value => value + 1) }, '重试') : null)
-}
+import type { TopicBridgeClient } from './topic-bridge.js'
+import type { MaterialSubmissionsClient } from './material-submissions.js'
+import type { SessionStore, TextUnitDeletionPlan } from './session-store.js'
+import { Menu, MenuItemButton } from './native-ui.js'
 
 export interface DocumentViewProps { readonly documents?: TranslationDocumentReader | undefined; readonly documentTasks?: DocumentTasksClient | undefined; readonly documentReviews?: DocumentReviewClient | undefined }
 type Failure = Pick<EvidenceUnavailableResult, 'status' | 'reason'>
 function readNotice(failure: Failure): string {
-  if (failure.reason === 'document_incomplete') return '结果包含缺项，完整打开尚不可用；可明确选择部分导出。'
+  if (failure.reason === 'document_incomplete') return '此版本包含缺项，尚无可打开的译文。请在详情中核对处理状态。'
   if (failure.reason === 'final_missing') return '尚无最终译文。'
   if (failure.status === 'missing') return '内容已缺失，原位置保留。'
   if (failure.status === 'corrupt') return '内容完整性检查失败，原位置保留。'
@@ -57,52 +29,62 @@ function readNotice(failure: Failure): string {
   return '内容尚未加载或暂时不可读取，可重试。'
 }
 interface OpenText { readonly text: string; readonly fileName: string; readonly mimeType: string }
-interface OpenAction { readonly label: string; readonly native?: boolean; readonly run: (signal: AbortSignal) => Promise<OpenText | { readonly status: 'opened' } | Failure> }
+interface OpenAction { readonly label: string; readonly display?: string | undefined; readonly native?: boolean; readonly run: (signal: AbortSignal) => Promise<OpenText | { readonly status: 'opened' } | Failure> }
+interface OpenSlot { readonly ownerId: string; readonly sessionId: string; readonly unitId: string; readonly kind: 'source' | 'result'; readonly title: string; readonly revisionId?: string; readonly fileName?: string; readonly format?: 'txt' | 'html' }
 
-/** Reserve the browser tab during the click, then fill only the same mounted record. */
-function RecordOpenLink({ action, identity, visible = true, navigationRevision }: {
-  readonly action: OpenAction; readonly identity: string; readonly visible?: boolean; readonly navigationRevision?: number | undefined
+/** Build the text, then let the Host write one stable page and open the system browser; the link itself stays quiet. */
+function RecordOpenLink({ action, slot, viewFiles, identity, visible = true, navigationRevision }: {
+  readonly action: OpenAction; readonly slot: OpenSlot; readonly viewFiles?: ViewFilesClient | undefined
+  readonly identity: string; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
-  const [pending, setPending] = react.useState(false), [message, setMessage] = react.useState<string | undefined>(undefined)
-  const lifetime = react.useRef({ mounted: true, identity, visible, navigationRevision, controller: null as AbortController | null, popup: null as Window | null })
+  const [pending, setPending] = react.useState(false)
+  const [message, setMessage] = react.useState<string | undefined>(undefined)
+  const lifetime = react.useRef({ mounted: true, identity, visible, navigationRevision, controller: null as AbortController | null })
   lifetime.current.identity = identity; lifetime.current.visible = visible; lifetime.current.navigationRevision = navigationRevision
-  react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false; lifetime.current.controller?.abort(); lifetime.current.popup?.close() } }, [])
-  react.useEffect(() => { lifetime.current.controller?.abort(); lifetime.current.popup?.close() }, [visible, identity, navigationRevision])
+  react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false; lifetime.current.controller?.abort() } }, [])
+  react.useEffect(() => { lifetime.current.controller?.abort() }, [visible, identity, navigationRevision])
   async function open(): Promise<void> {
     if (lifetime.current.controller || !visible) return
     const controller = new AbortController(), key = identity, navigation = navigationRevision
-    const popup = action.native ? null : window.open('about:blank', '_blank')
-    if (!action.native && !popup) { setMessage('浏览器未能打开页面，请允许弹出窗口后重试。'); return }
-    if (popup) popup.opener = null
-    lifetime.current.controller = controller; lifetime.current.popup = popup; setPending(true); setMessage(undefined)
+    lifetime.current.controller = controller; setPending(true); setMessage(undefined)
     const active = (): boolean => lifetime.current.mounted && lifetime.current.identity === key && lifetime.current.visible && lifetime.current.navigationRevision === navigation && !controller.signal.aborted
     try {
       const result = await action.run(controller.signal)
-      if (!active()) { popup?.close(); return }
-      if (!('text' in result)) { popup?.close(); setMessage(result.status === 'opened' ? '已请求打开原稿。' : readNotice(result)); return }
-      if (!popup || popup.closed) throw new Error('Open page unavailable')
-      const url = URL.createObjectURL(new Blob([result.text], { type: result.mimeType }))
-      popup.location.replace(url); lifetime.current.popup = null
-      setTimeout(() => URL.revokeObjectURL(url), 60_000); setMessage('已在浏览器打开。')
-    } catch { popup?.close(); if (active()) setMessage('打开失败，可重试。') }
-    finally { if (lifetime.current.controller === controller) { lifetime.current.controller = null; lifetime.current.popup = null; if (lifetime.current.mounted) setPending(false) } }
+      if (!active() || 'status' in result && result.status === 'opened') return
+      if (!('text' in result)) { setMessage(readNotice(result)); return }
+      if (!viewFiles) { setMessage('打开服务尚未就绪，可重试。'); return }
+      const opened = await viewFiles.open({ ...slot, text: result.text })
+      if (active() && !opened.ok) setMessage(opened.message ?? '打开未完成，可重试。')
+    } catch { if (active()) setMessage('打开未完成，可重试。') }
+    finally { if (lifetime.current.controller === controller) { lifetime.current.controller = null; if (lifetime.current.mounted) setPending(false) } }
   }
-  return h('span', { className: 'dsh-tp-record-open' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: pending, onClick: () => { void open() } }, pending ? '正在打开…' : action.label),
-    message ? h('small', { role: 'status', className: 'dsh-tp-muted' }, message) : null)
+  return h('span', { className: 'dsh-tp-record-open' }, h('button', { type: 'button', className: 'dsh-tp-object-link', 'aria-label': action.label, disabled: pending, onClick: () => { void open() } }, pending ? '正在打开…' : action.display ?? action.label), message ? h('small', { role: 'status', className: 'dsh-tp-muted' }, message) : null)
 }
 
-export function TextUnitOpenLinks({ unit, session, objects, visible = true, navigationRevision }: RecordObjectsProps & {
+function recordOpenSlot(session: LocalSession, unit: TextUnit, kind: 'source' | 'result', label: string): OpenSlot {
+  return { ownerId: session.ownerId, sessionId: session.id, unitId: unit.id, kind, title: `${session.name} · 文本 ${unit.order} · ${label}` }
+}
+/** Quiet link for the unit source; it renders on the source row. */
+export function SourceOpenLink({ unit, session, objects, viewFiles, visible = true, navigationRevision }: RecordObjectsProps & {
   readonly unit: TextUnit; readonly session: LocalSession; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
-  const final = currentFinalRevision(unit), identity = JSON.stringify([session.ownerId, session.topicId, session.id, unit.id, unit.sourceVersion, final?.id])
+  const identity = JSON.stringify([session.ownerId, session.topicId, session.id, unit.id, unit.sourceVersion])
   const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
-  return h('span', { className: 'dsh-tp-actions dsh-tp-record-open-links' },
-    h(RecordOpenLink, { identity, visible, navigationRevision, action: { label: '打开原稿', run: async () => ({ text: recordObjectPlainText(unit.source, target, objects?.getReferences(target) ?? []), fileName: `${session.name}-source.txt`, mimeType: 'text/plain;charset=utf-8' }) } }),
-    h(RecordOpenLink, { identity, visible, navigationRevision, action: { label: '打开结果', run: async () => {
-      if (!final) return { status: 'missing', reason: 'final_missing' }
-      const revisionTarget = { ...target, side: 'revision' as const, revisionId: final.id }
-      return { text: recordObjectPlainText(final.text, revisionTarget, objects?.getReferences(revisionTarget) ?? []), fileName: `${session.name}-result.txt`, mimeType: 'text/plain;charset=utf-8' }
-    } } }))
+  return h(RecordOpenLink, { identity, visible, navigationRevision, viewFiles, slot: recordOpenSlot(session, unit, 'source', '原稿'),
+    action: { label: '打开原稿', display: '打开', run: async () => ({ text: recordObjectPlainText(unit.source, target, objects?.getReferences(target) ?? []), fileName: `${session.name}-source.txt`, mimeType: 'text/plain;charset=utf-8' }) } })
+}
+/** Quiet link for the frozen final result, falling back to the latest complete revision when the unit has no effective final; it renders on the latest translation row. */
+export function ResultOpenLink({ unit, session, objects, viewFiles, visible = true, navigationRevision }: RecordObjectsProps & {
+  readonly unit: TextUnit; readonly session: LocalSession; readonly visible?: boolean; readonly navigationRevision?: number | undefined
+}): unknown {
+  const result = currentResultRevision(unit), identity = JSON.stringify([session.ownerId, session.topicId, session.id, unit.id, unit.sourceVersion, result?.id])
+  const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
+  return h(RecordOpenLink, { identity, visible, navigationRevision, viewFiles, slot: recordOpenSlot(session, unit, 'result', '结果'),
+    action: { label: '打开结果', display: '打开', run: async () => {
+      if (!result) return { status: 'missing', reason: 'final_missing' }
+      const revisionTarget = { ...target, side: 'revision' as const, revisionId: result.id }
+      return { text: recordObjectPlainText(result.text, revisionTarget, objects?.getReferences(revisionTarget) ?? []), fileName: `${session.name}-result.txt`, mimeType: 'text/plain;charset=utf-8' }
+    } } })
 }
 
 /** One bounded page per side; changing pages never replaces the fixed chunk identity. */
@@ -170,13 +152,60 @@ interface ManualDraft {
   readonly target: DocumentReviewTarget; readonly reviewVersion: number; readonly chunkId: string; readonly baseRevisionId: string
   readonly original: string; readonly text: string
 }
-export function DocumentUnitView({ unit, session, documents, documentTasks, documentReviews, objects, objectAssets, visible = true, navigationRevision }: RecordObjectsProps & DocumentViewProps & {
-  readonly unit: DocumentUnit; readonly session: LocalSession; readonly visible?: boolean; readonly navigationRevision?: number | undefined
+function DocumentUnitDeletionControl({ store, unit, session, documentTasks, materials, topics }: {
+  readonly store: SessionStore; readonly unit: DocumentUnit; readonly session: LocalSession
+  readonly documentTasks?: DocumentTasksClient | undefined; readonly materials?: MaterialSubmissionsClient | undefined
+  readonly topics?: TopicBridgeClient | undefined
+}): unknown {
+  const [open, setOpen] = react.useState(false)
+  const [plan, setPlan] = react.useState<TextUnitDeletionPlan | undefined>(undefined)
+  const [pending, setPending] = react.useState(false)
+  const [message, setMessage] = react.useState<string | undefined>(undefined)
+  const lifetime = react.useRef({ mounted: true, busy: false })
+  react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false } }, [])
+  const operationId = store.getPendingTextUnitDeletion(session.id, unit.id)
+  const externalBlocked = (): string | undefined => {
+    if (documentTasks?.getRetranslationStatus(session.id, unit.id)?.pending) return '正在发送整篇重译意图，请稍候。'
+    if (materials?.getStatus(session.id, session.ownerId).busy || materials?.getStatus(session.id, session.ownerId).unknown) return '此会话仍有未结算的材料提交，请先结束或查询。'
+    return undefined
+  }
+  const blocked = store.getTextUnitDeletionBlockedReason(session.id, unit.id) ?? externalBlocked()
+  async function execute(query = false): Promise<void> {
+    if (lifetime.current.busy) return
+    lifetime.current.busy = true; setPending(true)
+    try {
+      const result = query && operationId ? await store.observeTextUnitDeletionAsync(operationId) : await store.deleteTextUnitAsync(plan, { blockedReason: externalBlocked })
+      if (result.status === 'deleted') topics?.revokeUnit(session.ownerId, session.id, unit.id)
+      if (lifetime.current.mounted) { setMessage(result.message); if (result.status === 'deleted') setPlan(undefined) }
+    } finally { lifetime.current.busy = false; if (lifetime.current.mounted) setPending(false) }
+  }
+  if (unit.deletion) return null
+  return h('div', null,
+    h(Menu, { open, onClose: () => setOpen(false), portal: true, align: 'end', compact: true, listClassName: 'dsh-tp-popup',
+      anchor: h('button', { type: 'button', 'aria-label': `文件 ${unit.order}单元操作`, 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => setOpen(value => !value) }, '操作'),
+    }, h(MenuItemButton, { danger: true, disabled: pending || !!blocked, title: blocked, onSelect: () => {
+      setOpen(false); setMessage(undefined); setPlan(store.captureTextUnitDeletion(session.id, unit.id))
+    } }, '删除此单元')),
+    plan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除文件单元确认', 'aria-busy': pending },
+      h('p', null, `删除文件 ${unit.order} 及其全部版本？`),
+      h('p', null, '将清除原稿、各版译文、准备与任务记录；编号保留但不再可用，引用此单元的记忆依据需复核。已导出文件和主模型已经收到的内容无法撤回。'),
+      h('div', { className: 'dsh-tp-actions' },
+        operationId ? h('button', { type: 'button', disabled: pending, onClick: () => { void execute(true) } }, '查询本次删除结果')
+          : h('button', { type: 'button', disabled: pending, onClick: () => { void execute() } }, pending ? '正在删除…' : '确认删除文件单元'),
+        h('button', { type: 'button', disabled: pending || !!operationId, onClick: () => setPlan(undefined) }, '取消')),
+    ) : operationId ? h('button', { type: 'button', disabled: pending, onClick: () => { void execute(true) } }, '查询本次删除结果') : null,
+    message ? h('p', { className: 'dsh-tp-muted', role: 'status' }, message) : null)
+}
+
+export function DocumentUnitView({ unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, topics, materials, visible = true, navigationRevision }: RecordObjectsProps & DocumentViewProps & {
+  readonly unit: DocumentUnit; readonly session: LocalSession; readonly store?: SessionStore | undefined; readonly topics?: TopicBridgeClient | undefined; readonly materials?: MaterialSubmissionsClient | undefined; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => documentTasks?.subscribe(() => refresh(value => value + 1)), [documentTasks])
   react.useEffect(() => documentReviews?.subscribe(() => refresh(value => value + 1)), [documentReviews])
   const [selectedManifestId, setSelectedManifestId] = react.useState<string | undefined>(undefined)
+  const [details, setDetails] = react.useState(false), [versionsExpanded, setVersionsExpanded] = react.useState(false)
+  const [removeRequested, setRemoveRequested] = react.useState(false)
   const followReview = react.useRef<string | undefined>(undefined)
   const [draft, setDraft] = react.useState<ManualDraft | undefined>(undefined)
   const [pending, setPending] = react.useState(false), [message, setMessage] = react.useState<string | undefined>(undefined)
@@ -191,24 +220,50 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, docu
   }, [unit, selectedManifestId])
   const source = unit.sourceVersions.find(version => version.version === unit.sourceVersion), final = currentDocumentFinalRevision(unit)
   const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion), actualStatus = task?.status
+  react.useEffect(() => { if (!draft) setSelectedManifestId(undefined) }, [task?.taskId, unit.sourceVersion])
   const manifests = unit.revisions.filter(revision => revision.sourceVersion === unit.sourceVersion)
-  const currentCandidate = [...manifests].reverse().find(revision => revision.taskId === task?.taskId)
+  const currentCandidate = task ? [...manifests].reverse().find(revision => revision.taskId === task.taskId) : manifests.at(-1)
   const manifest = selectedManifestId === '' ? undefined : selectedManifestId ? manifests.find(revision => revision.id === selectedManifestId) : currentCandidate
-  const handle = react.useMemo(() => documents?.captureDocument({ ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }), [documents, session.ownerId, session.topicId, session.id, unit, manifest?.id])
+  const handle = react.useMemo(() => unit.deletion ? undefined : documents?.captureDocument({ ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }), [documents, session.ownerId, session.topicId, session.id, unit, manifest?.id])
+  if (unit.deletion) return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'aria-label': `文件 ${unit.order}` },
+    h('div', { className: 'dsh-tp-unit-header' },
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `文件 ${unit.order} · 已删除`),
+      h('time', { dateTime: unit.deletion.at, className: 'dsh-tp-muted' }, new Date(unit.deletion.at).toLocaleString())),
+    h('p', { className: 'dsh-tp-muted' }, unit.deletion.calls
+      ? `正文已清除；保留 ${unit.deletion.calls} 次实际调用事实。编号保留，不再参与导出或记忆依据。`
+      : '正文已清除；编号保留，不再参与导出或记忆依据。'))
   const name = source?.body.kind === 'asset' ? source.body.reference.name : '长原稿'
   const identity = JSON.stringify([session.ownerId, session.topicId, session.id, unit.id, unit.sourceVersion, manifest?.id ?? null])
   lifetime.current.identity = identity
   const readable = handle && !('status' in handle) ? handle : undefined
   const missing: Failure = handle && 'status' in handle ? handle : { status: 'unloaded', reason: 'reader_unavailable' }
   const controls = task && documentTasks?.uiState(session.id, task.taskId)
-  const status = actualStatus === 'unknown' ? '执行状态未知' : actualStatus === 'running' ? '正在翻译' : actualStatus === 'paused' ? '已暂停' : actualStatus === 'waiting_context' ? '等待补充' : actualStatus === 'waiting_user' ? '等待讨论' : final?.id === manifest?.id && final ? '已定稿' : actualStatus === 'interrupted' ? '已中断' : actualStatus === 'failed' ? '翻译失败' : actualStatus === 'cancelled' ? '已取消' : manifest?.review.status === 'pending' ? '待复核' : manifest ? '待定稿' : '待准备'
-  const originalAction: OpenAction = { label: '打开原稿', native: source?.body.kind === 'asset' && Boolean(source.historyCommit), run: async signal => readable ? openDocumentOriginal(readable, signal) : missing }
+  const retranslation = documentTasks?.getRetranslationStatus(session.id, unit.id)
+  const recoveryMessage = materials?.getFileRecoveryMessage(session.id, unit.id)
+  const retranslationBlocked = documentTasks?.retranslationBlockedReason(session.id, unit.id) ?? (documentTasks ? undefined : '整篇重译服务尚未就绪。')
+  const status = actualStatus === 'unknown' ? '执行状态未知' : actualStatus === 'running' ? '正在翻译' : actualStatus === 'paused' ? '已暂停' : actualStatus === 'waiting_context' ? '等待补充' : actualStatus === 'waiting_user' ? '等待讨论' : final?.id === manifest?.id && final ? '已定稿' : actualStatus === 'interrupted' ? '已中断' : actualStatus === 'failed' ? '翻译失败' : actualStatus === 'cancelled' ? '已取消' : manifest && documentManifestFinalEligibility(unit, manifest.id).eligible ? '待定稿' : manifest ? '待复核' : '原稿已冻结'
+  const versionNumber = manifest ? manifests.findIndex(revision => revision.id === manifest.id) + 1 : 0
+  const resultFileName = `${name.replace(/\.[^./\\]+$/u, '')}.${unit.targetLanguage.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, '_') || '译文'}.v${versionNumber}${manifest && !manifest.eligibility.complete ? '.部分结果' : ''}.txt`
+  const originalSlot: OpenSlot = { ownerId: session.ownerId, sessionId: session.id, unitId: unit.id, kind: 'source', title: `${name} · 文档 ${unit.order} · 原稿`, revisionId: `source:${unit.sourceVersion}`, fileName: name, format: 'txt' }
+  const resultSlot: OpenSlot = { ownerId: session.ownerId, sessionId: session.id, unitId: unit.id, kind: 'result', title: `${name} · 版本 ${versionNumber} · ${manifest?.eligibility.complete ? '译文' : '部分结果'}`, revisionId: `source:${manifest?.sourceVersion ?? unit.sourceVersion}:manifest:${manifest?.id ?? 'none'}`, fileName: resultFileName, format: 'txt' }
+  const originalAction: OpenAction = { label: '打开原稿', native: source?.body.kind === 'asset' && Boolean(source.historyCommit), run: async signal => {
+    if (unit.sourceVersion === 1 && materials && viewFiles) {
+      const snapshot = await materials.resolveFileSource(session.id, unit.id)
+      signal.throwIfAborted()
+      if (snapshot) {
+        const opened = await viewFiles.openSource(originalSlot, snapshot, signal)
+        if (!opened.ok) throw new Error(opened.message ?? '原稿打开未完成。')
+        return { status: 'opened' }
+      }
+    }
+    return readable ? openDocumentOriginal(readable, signal) : missing
+  } }
   const resultAction: OpenAction = { label: '打开此版本', run: async () => {
     if (!readable) return missing
     const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision' as const, revisionId: readable.manifest?.id ?? null }
     const references = structuredClone(objects?.getReferences(target) ?? [])
-    const result = await projectDocumentResult(readable, false, 'candidate')
-    return result.text ? { text: recordObjectPlainText(result.text, target, references), fileName: result.fileName, mimeType: result.mimeType } : { status: 'missing', reason: result.complete ? 'result_empty' : 'document_incomplete' }
+    const result = await projectDocumentResult(readable, true, 'candidate')
+    return result.text && result.hasTranslation ? { text: recordObjectPlainText(result.text, target, references), fileName: resultFileName, mimeType: result.mimeType } : { status: 'missing', reason: result.complete ? 'result_empty' : 'document_incomplete' }
   } }
   const blocks = readable?.blocks.length ? readable.blocks : readable ? [{ chunkId: 'source', outputRange: { start: 0, end: readable.totalSourceCodePoints }, mode: 'translate' as const, contextRanges: [], revisionId: null, revision: null }] : []
   const targetTotal = readable && blocks.every(block => block.revision?.status === 'completed') ? blocks.reduce((total, block) => total + (block.revision!.content.kind === 'text' ? sourceCodePointLength(block.revision!.content.text) : block.revision!.content.range.end - block.revision!.content.range.start), 0) : undefined
@@ -217,6 +272,7 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, docu
   const unplacedSource = (objects?.getReferences(sourceTarget) ?? []).filter(ref => !readable || ref.offset < 0 || ref.offset > readable.totalSourceCodePoints).map(ref => ({ ...ref, offset: -1 }))
   const unplacedResult = (objects?.getReferences(resultTarget) ?? []).filter(ref => targetTotal === undefined || ref.offset < 0 || ref.offset > targetTotal).map(ref => ({ ...ref, offset: -1 }))
   const qualification = manifest ? documentManifestFinalEligibility(unit, manifest.id) : undefined
+  const published = topics?.isPublished(session.ownerId, session.id, unit.id) ?? false
   const canMutate = Boolean(documentReviews && manifest && session.archivedAt === null && task && !['running', 'unknown', 'waiting_context', 'waiting_user'].includes(task.status))
   const editable = canMutate && manifest?.id === currentCandidate?.id
   const audit = manifest && [...(unit.reviewAudits ?? [])].reverse().find(audit => audit.manifestRevisionId === manifest.id || audit.reviewedRevisionId === manifest.id)
@@ -263,25 +319,57 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, docu
     } catch { if (lifetime.current.mounted) setMessage('最终选择未确认，请核对当前版本。') }
     finally { if (lifetime.current.mounted) setPending(false) }
   }
+  const referenceControl = topics ? h('button', { type: 'button', 'aria-pressed': published, 'aria-label': published ? `取消文件 ${unit.order}参考` : `文件 ${unit.order}供主模型参考`,
+    title: published ? '撤回此文档单元的参考授权。' : '授权当前主会话读取此文档单元及其当前原文；不发送翻译命令。',
+    onClick: () => { if (published) topics.revokeUnit(session.ownerId, session.id, unit.id); else if (!topics.publishDocumentUnit(session.ownerId, session.id, unit.id, unit.sourceVersion)) setMessage('未能提供此参考，请核对会话与原文版本。') } }, published ? '取消参考' : '参考') : null
+  const detailsControl = h('button', { type: 'button', 'aria-expanded': details || Boolean(draft), 'aria-label': `文件 ${unit.order}详情`, onClick: () => setDetails(value => !value) }, details ? '收起详情' : '详情')
+  const oldVersionCount = manifests.length - (currentCandidate ? 1 : 0)
+  const versionsControl = oldVersionCount > 0 ? h('button', { type: 'button', 'aria-expanded': versionsExpanded, 'aria-label': `文件 ${unit.order}旧版本`, onClick: () => setVersionsExpanded(value => !value) }, `旧版本（${oldVersionCount}）`) : null
   let targetOffset: number | null = 0
-  return h('article', { className: 'dsh-tp-record-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'data-source-version': unit.sourceVersion, 'data-manifest-id': manifest?.id, 'aria-label': `文档 ${unit.order}` },
-    h('p', { role: 'status' }, `待处理文件：${name}`),
-    h(TranslatedDocumentFile, { unit, session, documents, objects }),
-    h('div', { className: 'dsh-tp-record-unit-heading' }, h('h3', null, `文档 ${unit.order} · ${name} · ${status}`), h('small', { className: 'dsh-tp-muted' }, `原文版本 ${unit.sourceVersion} · 目标语言：${unit.targetLanguage}`),
-      h('span', { className: 'dsh-tp-actions dsh-tp-record-open-links' }, h(RecordOpenLink, { identity, visible, navigationRevision, action: originalAction }), h(RecordOpenLink, { identity, visible, navigationRevision, action: resultAction }))),
-    manifests.length ? h('div', { className: 'dsh-tp-actions' },
+  return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'data-source-version': unit.sourceVersion, 'data-manifest-id': manifest?.id, 'aria-label': `文件 ${unit.order}：${name}` },
+    h('div', { className: 'dsh-tp-unit-header' },
+      h('span', { role: 'status', className: 'dsh-tp-muted' }, `原文 · ${status}`),
+      h('div', { className: 'dsh-tp-actions' },
+        store ? h(DocumentUnitDeletionControl, { store, unit, session, documentTasks, materials, topics }) : null,
+        h('button', { type: 'button', disabled: Boolean(retranslationBlocked) || Boolean(draft) || pending, title: retranslationBlocked ?? '沿用此原稿、目标语言与翻译要求，交由主模型准备新的整篇任务。', onClick: () => { void documentTasks?.requestRetranslation(session.id, unit.id) } }, '重译'),
+        retranslation?.unknown ? h('button', { type: 'button', disabled: retranslation.pending, onClick: () => { void documentTasks?.queryRetranslation(session.id, unit.id) } }, '检查重译状态') : null,
+        task && controls && ['failed', 'cancelled', 'interrupted', 'unknown'].includes(actualStatus ?? '') ?
+          actualStatus === 'unknown' ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'status') }, '检查状态')
+            : h('button', { type: 'button', disabled: controls.pending || !controls.canResume, title: controls.recoverability ?? '保留已完成块，只继续尚未完成的部分。', onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'resume') }, '重新发送') : null,
+        task && controls && ['failed', 'cancelled', 'interrupted'].includes(actualStatus ?? '') && materials && !final ? h('button', { type: 'button', disabled: controls.pending || pending || Boolean(draft), onClick: () => setRemoveRequested(true) }, '移除') : null,
+        !manifest ? referenceControl : null,
+        !manifest ? detailsControl : null,
+        !manifest ? versionsControl : null,
+        h(RecordOpenLink, { identity: `${identity}:source`, visible, navigationRevision, viewFiles, slot: originalSlot, action: { ...originalAction, display: '打开' } }))),
+    h('div', { className: 'dsh-tp-file-name' }, h(RecordOpenLink, { identity: `${identity}:source-name`, visible, navigationRevision, viewFiles, slot: originalSlot, action: { ...originalAction, display: name } })),
+    manifest ? h('div', { className: 'dsh-tp-version-header' },
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${versionNumber} · ${manifest.eligibility.complete ? '译文' : '部分结果 · 存在缺项'} · ${unit.targetLanguage}${final?.id === manifest.id ? ' · 已定稿' : qualification?.eligible ? ' · 待定稿' : ' · 待复核'}`),
+      h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
+        manifest ? h('button', { type: 'button', disabled: !canMutate || pending || Boolean(draft) || !qualification?.eligible || final?.id === manifest.id, title: !qualification?.eligible ? '须完成机械检查和主模型整篇复核，且无未解决问题。' : undefined, onClick: () => { void selectFinal() } }, final?.id === manifest.id ? '已定稿' : '设为最终') : null,
+        referenceControl, detailsControl, versionsControl,
+        h(RecordOpenLink, { identity: `${identity}:result`, visible, navigationRevision, viewFiles, slot: resultSlot, action: { ...resultAction, display: '打开' } }))) : null,
+    manifest ? h('div', { className: 'dsh-tp-file-name' }, h(RecordOpenLink, { identity: `${identity}:result-name`, visible, navigationRevision, viewFiles, slot: resultSlot, action: { ...resultAction, display: resultFileName } })) : null,
+    final && final.id !== manifest?.id ? h('p', { className: 'dsh-tp-muted', role: 'status' }, `原最终保留：版本 ${manifests.findIndex(revision => revision.id === final.id) + 1}；当前候选尚未替换最终。`) : null,
+    versionsExpanded ? h('div', { className: 'dsh-tp-actions dsh-tp-file-versions' },
       h('select', { 'aria-label': `文档 ${unit.order} 清单版本`, value: manifest?.id ?? '', disabled: pending || Boolean(draft), onChange: (event: { currentTarget: { value: string } }) => { setSelectedManifestId(event.currentTarget.value); setMessage(undefined) } },
-        h('option', { value: '' }, '当前任务进度'), ...manifests.map((revision, index) => h('option', { key: revision.id, value: revision.id }, `候选 ${index + 1}${final?.id === revision.id ? ` · ${unit.final?.selection === 'user_fixed' ? '用户固定最终' : '自动最终'}` : ''}${revision.review.status === 'pending' ? ' · 待复核' : revision.review.status === 'failed' ? ' · 有问题' : ' · 已复核'}`))),
-      manifest && final?.id !== manifest.id ? h('button', { type: 'button', disabled: !canMutate || pending || Boolean(draft) || !qualification?.eligible, title: !qualification?.eligible ? '须完成机械检查和主模型整篇复核，且无未解决问题。' : undefined, onClick: () => { void selectFinal() } }, '设为最终') : null) : null,
+        h('option', { value: '' }, '当前任务进度'), ...manifests.map((revision, index) => h('option', { key: revision.id, value: revision.id }, `版本 ${index + 1}${final?.id === revision.id ? ' · 最终' : ''}${revision.eligibility.complete ? '' : ' · 部分结果'}${revision.review.status === 'pending' ? ' · 待复核' : revision.review.status === 'failed' ? ' · 有问题' : ' · 已复核'}`)))) : null,
+    message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null,
+    recoveryMessage ? h('p', { role: 'status', className: 'dsh-tp-muted' }, recoveryMessage) : null,
+    retranslation ? h('p', { role: retranslation.unknown ? 'alert' : 'status', className: 'dsh-tp-muted' }, retranslation.message) : null,
+    removeRequested && materials ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '移除失败文件单元' },
+      h('p', null, '移除本单元，已有调用记录和主题记忆保留。'),
+      h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending, onClick: () => { setPending(true); void materials.recoverFile(session.id, unit.id, 'remove').finally(() => { if (lifetime.current.mounted) { setPending(false); setRemoveRequested(false) } }) } }, pending ? '正在移除…' : '确认移除'),
+        h('button', { type: 'button', disabled: pending, onClick: () => setRemoveRequested(false) }, '取消'))) : null,
+    controls?.message || controls?.recoverability ? h('p', { role: 'status', className: 'dsh-tp-muted' }, controls.message ?? controls.recoverability) : null,
+    details || draft ? h('div', { className: 'dsh-tp-file-details', 'aria-label': `文件 ${unit.order}详情内容` },
+    h('p', { className: 'dsh-tp-muted' }, `原文版本 ${unit.sourceVersion} · ${manifest ? `译文版本 ${versionNumber}` : '尚无译文版本'}`),
     manifest ? h('p', { role: 'status', className: 'dsh-tp-muted' }, `${audit ? audit.mechanical.status === 'passed' ? '机械检查通过' : '机械检查发现问题' : manifest.eligibility.complete ? '覆盖完整，待机械检查' : '覆盖未完整'} · ${audit ? audit.semantic.status === 'passed' ? '主模型复核已完成' : audit.semantic.status === 'review_required' ? '主模型复核发现问题' : '主模型复核待完成' : '主模型复核待完成'}`) : null,
     reviewIssues.length ? h('ul', { className: 'dsh-tp-muted' }, ...reviewIssues.map((issue, index) => h('li', { key: index }, `原文 ${issue.range.start}–${issue.range.end}：${issue.message}`))) : null,
-    message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null,
     task && controls ? h('div', { className: 'dsh-tp-actions' },
       actualStatus === 'running' ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'pause') }, controls.pausing ? '正在暂停…' : '暂停') : null,
       controls.canResume ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'resume') }, '继续') : null,
       ['running', 'paused', 'waiting_context', 'waiting_user', 'unknown'].includes(actualStatus ?? '') ? h('button', { type: 'button', disabled: controls.cancelling || controls.pending && !controls.pausing, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'cancel') }, '取消') : null,
       ['unknown', 'interrupted'].includes(actualStatus ?? '') ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'status') }, '查询状态') : null) : null,
-    controls?.message || controls?.recoverability ? h('p', { role: 'status', className: 'dsh-tp-muted' }, controls.message ?? controls.recoverability) : null,
     unresolvedDependencies.length ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '已完成块的准备依赖有变化，整篇结果需要复核。') : null,
     !readable ? h('p', { role: 'status', className: 'dsh-tp-muted' }, readNotice(missing)) : null,
     readable && !readable.manifest ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '尚无固定译文清单；原稿可查阅，结果暂不可完整打开或导出。') : null,
@@ -300,5 +388,5 @@ export function DocumentUnitView({ unit, session, documents, documentTasks, docu
         h('div', { className: 'dsh-tp-record-pair' }, ...(['source', 'target'] as const).map(side => h(DocumentPage, { key: side, handle: readable!, block, side, session, unitId: unit.id, objects, objectAssets, visible, navigationRevision, targetOffset: offset, targetTotal }))))
     }),
     unplacedSource.length ? h(RecordObjectText, { text: '', target: sourceTarget, references: unplacedSource, objectAssets }) : null,
-    unplacedResult.length ? h(RecordObjectText, { text: '', target: resultTarget, references: unplacedResult, objectAssets }) : null)
+    unplacedResult.length ? h(RecordObjectText, { text: '', target: resultTarget, references: unplacedResult, objectAssets }) : null) : null)
 }

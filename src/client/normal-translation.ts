@@ -62,7 +62,9 @@ export class NormalTranslationClient {
       readonly bridgeReady?: (ownerId: string) => boolean;
       readonly canAccessUnit?: (ownerId: string, sessionId: string, unitId: string) => boolean;
       readonly canCorrectSource?: (ownerId: string, topicId: string, sessionId: string, unitId: string) => boolean;
-      readonly publishUnit?: (ownerId: string, sessionId: string, unitId: string) => boolean } = {}) {
+      readonly publishUnit?: (ownerId: string, sessionId: string, unitId: string) => boolean;
+      /** Interface locale stamped onto a retranslation intent; the Host uses it only for the notice's reply-language line. */
+      readonly uiLocale?: () => string | undefined } = {}) {
     this.stopBridge = options.subscribeBridge?.(() => {
       for (const item of this.operations.values()) if (['accepted', 'running'].includes(item.operation.status) && options.bridgeReady?.(item.operation.mainSessionId) === false) this.unknown(item, '普通翻译连接中断，请查询本轮状态；未自动重发。')
     })
@@ -84,7 +86,7 @@ export class NormalTranslationClient {
     const target = parseNormalTranslationTarget(input.target)
     if (target.kind !== 'unit') return failure('invalid_input', '需要明确的历史单元引用。')
     const session = this.store.getSession(target.translationSessionId), unit = this.store.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
-    if (this.disposed || target.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || this.store.isSessionDeleted(session.id) || !unit ||
+    if (this.disposed || target.mainSessionId !== ownerId || !session || !this.store.isSessionOpen(ownerId, session.id) || this.store.isSessionDeleted(session.id) || !unit ||
       !this.options.canAccessUnit?.(ownerId, session.id, unit.id)) return failure('reference_not_published', '此单元尚未明确提供给当前主模型。')
     if (!isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
     if (session.mode !== 'normal' || session.archivedAt !== null) return failure('invalid_state', '请先恢复普通会话再处理历史单元。')
@@ -107,7 +109,7 @@ export class NormalTranslationClient {
   correctSource(ownerId: string, input: NormalTranslationSourceCorrection): NormalTranslationReply {
     const request = parseNormalTranslationSourceCorrection(input), target = request.target
     const session = this.store.getSession(target.translationSessionId), history = this.store.getTranslationHistory(target.translationSessionId), unit = history?.units.find(unit => unit.id === target.unitId)
-    if (this.disposed || target.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || !unit || this.store.isSessionDeleted(session.id) ||
+    if (this.disposed || target.mainSessionId !== ownerId || !session || !this.store.isSessionOpen(ownerId, session.id) || !unit || this.store.isSessionDeleted(session.id) ||
       !this.options.canAccessUnit?.(ownerId, session.id, unit.id)) return failure('reference_not_published', '此单元尚未明确提供给当前主模型。')
     if (!isTextUnit(unit)) return failure('requires_batch', '文档原稿纠错尚未接通。')
     const previous = this.store.getAvailableSessions(ownerId).flatMap(candidate => this.store.getTranslationHistory(candidate.id)?.events ?? []).find(event => event.operationId === request.operationId)
@@ -483,6 +485,7 @@ export class NormalTranslationClient {
     const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
     if (!session || session.mode !== 'normal' || !unit || this.store.isSessionDeleted(sessionId)) return '普通单元已不可用。'
     if (!isTextUnit(unit)) return '整篇文档重译尚未接通。'
+    if (unit.deletion) return '此单元已删除。'
     if (session.archivedAt !== null) return '请先恢复归档会话。'
     if (!session.model) return '请先选择本次翻译模型。'
     if (this.store.getStatus(sessionId) === 'conflict') return '本地记录已变化，请核对当前副本。'
@@ -494,7 +497,9 @@ export class NormalTranslationClient {
     if (this.disposed || this.retranslateBlockedReason(sessionId, unitId)) return
     const session = this.store.getSession(sessionId)!, unit = this.store.getTranslationHistory(sessionId)!.units.find(unit => unit.id === unitId)!
     const key = JSON.stringify([sessionId, unitId]), old = this.unitRequests.get(key), operationId = old?.outcome === 'unknown' ? old.operationId : `unit-intent:${crypto.randomUUID()}`
-    const request: NormalTranslationUnitRequest = { operationId, target: { kind: 'unit', mainSessionId: session.ownerId, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion } }
+    const locale = this.options.uiLocale?.()?.trim()
+    const request: NormalTranslationUnitRequest = { operationId, target: { kind: 'unit', mainSessionId: session.ownerId, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion },
+      ...(locale ? { uiLocale: locale.slice(0, 64) } : {}) }
     const release = this.retain(session.ownerId)
     old?.release?.()
     const item = { operationId, pending: true, outcome: 'pending' as 'pending' | 'submitted' | 'failed' | 'unknown', message: '正在发送重译意图…', release: release as (() => void) | undefined }; this.unitRequests.set(key, item); this.emit()

@@ -107,13 +107,16 @@ export class RecordObjectStore {
     const session = this.sessions.getSession(scope.sessionId)
     if (!session || session.ownerId !== scope.ownerId || session.topicId !== scope.topicId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict') return undefined
     const unit = this.sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === scope.unitId)
-    if (!unit || !isTextUnit(unit)) return undefined
+    if (!unit || !isTextUnit(unit) || unit.deletion) return undefined
     if (scope.side === 'source') return scope.revisionId === null ? unit.source : undefined
     const revision = scope.revisionId === null ? undefined : unit.revisions.find(revision => revision.id === scope.revisionId)
     return revision && revision.status !== 'deleted' && (!requireEnded || canEditTextRevision(revision)) ? revision.text : undefined
   }
   getAvailability(reference: RecordObjectReference): RecordObjectAvailability {
-    if (this.seat(reference.ownerId, reference.topicId, reference.sessionId).status === 'conflict') return 'storage_conflict'
+    let status: string | undefined
+    try { status = this.seat(reference.ownerId, reference.topicId, reference.sessionId).status } catch { status = undefined }
+    if (status === undefined) return 'record_unavailable'
+    if (status === 'conflict') return 'storage_conflict'
     const body = this.body(reference)
     return body === undefined ? 'record_unavailable' : reference.offset > Array.from(body).length ? 'position_unavailable' : 'available'
   }

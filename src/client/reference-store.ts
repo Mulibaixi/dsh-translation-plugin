@@ -71,6 +71,15 @@ export class ReferenceStore implements ReferenceEvidencePort {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   private emit(): void { for (const listener of this.listeners) listener() }
   isSaved(ownerId:string,topicId:string):boolean{const index=this.facts(ownerId,topicId).index;try{return this.storage?.getItem(indexKey(index.scope.ownerId,topicId))===JSON.stringify(index)}catch{return false}}
+  /** Confirmation preview only; a deleted topic reports zero instead of throwing. */
+  getTopicDocumentCount(ownerId: string, topicId: string): number { try { return this.facts(ownerId, topicId).index.documents.length } catch { return 0 } }
+  /** Topic deletion removes the empty index/barrier as well; the topic tombstone remains the authority. */
+  discardTopic(ownerId: string, topicId: string): boolean {
+    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
+    const key = indexKey(ownerId, topicId)
+    try { this.storage?.removeItem(key); this.indices.delete(key); this.cache.clear(); this.emit(); return true }
+    catch { this.notice = '参考资料索引未能随主题删除清理，请检查本地存储。'; this.emit(); return false }
+  }
   getNotice(): string | undefined { return this.notice }
   facts(ownerId: string, topicId: string): ReferenceFacts {
     ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId

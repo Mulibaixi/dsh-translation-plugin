@@ -11,6 +11,7 @@ import { isNormalExchangePromptVersion, type NormalTranslationContext, type Tran
 import type { RequestContextInput } from '../shared/request-context.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
 import { DshTextExecutionAdapter, hostLlmLoader, type LlmModuleLoader, type NormalExecutionPacket } from './dsh-text-adapter.js'
+import { uiLanguageDirective } from './ui-language.js'
 import type { TopicHostContext, TopicToolsService, ToolExecution, MainAgent } from './topic-tools.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TranslationExchangeService, ExecutorOperationRef, NeedsContextReference, ExchangeScope, ExchangeResolution,
@@ -65,7 +66,7 @@ function ok<T>(value: T): NormalTranslationResult<T> { return { ok: true, value:
 function bad<T>(code: string, message: string, stage: string): NormalTranslationResult<T> { return { ok: false, error: { code, message, stage } } }
 function identity(ownerId: string, operationId: string): string { return JSON.stringify([ownerId, operationId]) }
 function requireInline(envelope: Envelope): asserts envelope is InlineEnvelope {
-  if (envelope.material.sourceRef !== undefined) throw rejected('requires_batch', '文件原稿已固定，可供准备和讨论；完整文件翻译需要后续分批执行支持，材料保留。', 'prepare')
+  if (envelope.material.sourceRef !== undefined) throw rejected('requires_batch', '文件原稿已固定。请加载 file_jobs 并用 translation_file_start 启动文件任务；短文本执行器不接收完整文件。', 'prepare')
 }
 
 /** Transient calls and short receipts only. The Client owns all source and revision history. */
@@ -415,7 +416,8 @@ export class NormalTranslationService {
   requestUnit(input: NormalTranslationUnitRequest, signal = new AbortController().signal): Promise<NormalTranslationResult<NormalTranslationUnitReceipt>> {
     const request = parseNormalTranslationUnitRequest(input), peerId = this.ctx.invocation?.peer.id
     if (!peerId || this.disposed || !this.topics.ownsConnection(request.target.mainSessionId, peerId)) return Promise.resolve(bad('scope_mismatch', '重译请求不属于此主会话连接。', 'authorize'))
-    const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify(request), previous = this.unitRequests.get(key)
+    // The reply-language line is notice metadata: the identity of a retranslation request is its target and operation.
+    const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify({ target: request.target, operationId: request.operationId }), previous = this.unitRequests.get(key)
     if (previous && previous.signature !== signature) return Promise.resolve(bad('idempotency_conflict', '同一重译请求不能更换单元或版本。', 'main_admission'))
     if (!previous) this.unitRequests.set(key, { signature, result: this.submitUnitIntent(request, peerId, signal) })
     return this.unitRequests.get(key)!.result
@@ -432,9 +434,13 @@ export class NormalTranslationService {
         unitId: request.target.unitId }, { agent, callId: request.operationId, signal })
       if (value.kind !== 'unit' || value.unit.id !== request.target.unitId || value.unit.sourceVersion !== request.target.sourceVersion) return bad('stale_version', '原文版本已变化，请读取当前单元再重译。', 'resolve_unit')
       if (!this.topics.ownsConnection(request.target.mainSessionId, peerId)) return bad('scope_mismatch', '所属主会话连接已变化。', 'main_admission')
+      const directive = uiLanguageDirective(request.uiLocale)
+      this.topics.activateForMaterial(agent, 'short')
       agent.followup(helpers.createUserMessage({ content: [{ type: 'text', text: [
         'The user requests retranslation of this explicitly provided translation unit. Call translation_execute with this exact target and operationId; organize relevant requirements/term references first if needed. The program reads authoritative source, original target language and requirements, and the translation session current model. Do not translate in main chat or copy the translation back. No extra confirmation or user action is needed. The editable draft is unrelated and remains unchanged.',
-        JSON.stringify(request),
+        'The JSON below is a complete translation_execute argument example. Keep target as a nested JSON object, never a JSON-encoded string or the result of JSON.stringify. Fill organizedRequirements and termReferences with relevant requirements and prepared terminology when needed; the empty example values do not skip that preparation.',
+        JSON.stringify({ target: request.target, operationId: request.operationId, organizedRequirements: '', termReferences: [] }),
+        ...(directive === undefined ? [] : [directive]),
       ].join('\n') }], source: { kind: 'translation-unit', form: 'notice', summary: '重译单元', plugin: 'dsh-translation-plugin', mainSessionId: request.target.mainSessionId,
         translationSessionId: request.target.translationSessionId, unitId: request.target.unitId, sourceVersion: request.target.sourceVersion, operationId: request.operationId } }))
       return ok({ ...request, status: 'submitted' })
@@ -729,7 +735,10 @@ export class NormalTranslationService {
     if (['preparing', 'accepted', 'running', 'unknown'].includes(job.status)) job.controller.abort()
     return this.view(job, request.afterSequence)
   }
-  hasActiveJobs(): boolean { return this.activeSessions.size > 0 || this.documentSessions.size > 0 || [...this.jobs.values()].some(job => ['accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status)) }
+  hasActiveJobs(ownerId?: string): boolean {
+    if (ownerId === undefined) return this.activeSessions.size > 0 || this.documentSessions.size > 0 || [...this.jobs.values()].some(job => ['accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status))
+    return [...this.jobs.values()].some(job => job.envelope.ownerId === ownerId && (['preparing', 'accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status)))
+  }
   dispose(): void {
     this.disposed = true
     this.unregisterExchange?.(); this.unregisterExchange = undefined; this.exchange = undefined

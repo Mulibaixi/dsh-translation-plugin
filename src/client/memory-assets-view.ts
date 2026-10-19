@@ -21,8 +21,9 @@ import type { RecordObjectsProps } from './record-object-view.js'
 import type { DocumentViewProps } from './document-unit-view.js'
 import type { ThemeMemoryClearing } from './theme-memory-clearing.js'
 import { useThemeMemoryClearing } from './theme-memory-clearing-view.js'
+import { FileJobAssetsView, type FileJobViewProps } from './file-job-view.js'
 
-interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps {
+interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps {
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
   readonly references?: ReferenceStore | undefined
   readonly archive: TopicArchiveStore
@@ -32,8 +33,9 @@ interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps {
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, references, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, references, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, jobId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
+  readonly jobId?: string | undefined
   readonly onSelectTopic?: ((topicId: string) => void) | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
@@ -73,7 +75,7 @@ export function MemoryAssetsView({ store, terms, archive, references, quick, top
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: `${ownerId}:${id}`, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
-        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm,
+        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm, jobId: id === selectedTopicId ? jobId : undefined,
           active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
           navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
     }),
@@ -81,11 +83,17 @@ export function MemoryAssetsView({ store, terms, archive, references, quick, top
   )
 }
 
-function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, documents, documentTasks, documentReviews, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, navigationRevision }: MemoryAssetsProps & {
+function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, jobId, navigationRevision }: MemoryAssetsProps & {
   readonly topicName: string; readonly active: boolean
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined
+  readonly jobId?: string | undefined
 }): unknown {
-  const [category, setCategory] = react.useState<'terms' | 'translations'>('terms')
+  const [category, setCategory] = react.useState<'terms' | 'translations' | 'proposals'>(jobId ? 'proposals' : 'terms')
+  const [focusedJobId, setFocusedJobId] = react.useState(jobId)
+  const [, refreshJobs] = react.useState(0)
+  react.useEffect(() => fileJobs?.subscribe(() => refreshJobs(value => value + 1)), [fileJobs])
+  react.useEffect(() => { setFocusedJobId(jobId); if (jobId) setCategory('proposals') }, [jobId, navigationRevision])
+  const proposalCount = fileJobs?.all(undefined, topicId).reduce((sum, record) => sum + fileJobs.pendingCount(record), 0) ?? 0
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
   const exportFeedback = useExportDownloadFeedback(active && category === 'terms')
@@ -119,6 +127,7 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
       h('nav', { className: 'dsh-tp-assets-nav', 'aria-label': '资产分类' },
         h('button', { type: 'button', 'aria-current': category === 'translations', onClick: () => setCategory('translations') }, '译文记录'),
         h('button', { type: 'button', 'aria-current': category === 'terms', onClick: () => setCategory('terms') }, '结构化档案'),
+        fileJobs ? h('button', { type: 'button', 'aria-current': category === 'proposals', onClick: () => setCategory('proposals') }, `文件提案${proposalCount ? ` · ${proposalCount}` : ''}`) : null,
         h('button', { type: 'button', disabled: true }, '其他记忆 · 暂未开放'),
         h('button', { type: 'button', disabled: true }, '临时文件 · 暂未开放')),
       h('div', { className: 'dsh-tp-assets-content' },
@@ -144,6 +153,8 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
             ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
               h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type,
                 active: active && category === 'terms' && kind === type, evidenceContextKey }))))),
+        fileJobs ? h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'proposals' }, h(FileJobAssetsView, { jobs: fileJobs, topicId, sessionId: associatedSessionId, jobId: focusedJobId, navigationRevision })) : null,
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
-          h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, documents, documentTasks, documentReviews, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations' }))))
+          h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations',
+            onOpenAssets: fileJobs ? (_ownerId: string, _topicId: string, _sessionId?: string, selectedJobId?: string) => { setFocusedJobId(selectedJobId); setCategory('proposals') } : undefined }))))
 }
