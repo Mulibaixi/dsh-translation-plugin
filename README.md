@@ -34,13 +34,15 @@ Reading reference material depends on DSH and the main model. The memory asset w
 
 ## Requirements
 
-- DSH with local plugin support and a configured model. The currently targeted environment is based on DSH `0.2.0-rc.2`; other versions are not guaranteed to work unchanged.
+- DSH `0.2.0-rc.2` or `0.2.1-rc.2`, with local plugin support and a configured model.
 - **Quick mode** does not require the Composer extension.
-- **Normal mode** requires companion builds of `dsh-composer-extension` and DSH. Installing the extension alone does not add linked material submission to the official, unmodified `0.2.0-rc.2` application.
-- **File translation** also requires DSH support for one-shot subagents, used for candidate asset extraction. Missing capabilities are reported, and the main model can still read a text source and translate it directly.
+- **Normal mode** requires companion builds of `dsh-composer-extension` and DSH. Both supported DSH versions need the matching Composer submission patch; installing the extension alone does not add linked material submission to the official application.
+- **File translation** also requires native DSH subagents for candidate asset extraction. The plugin supports the run API in `0.2.0-rc.2` and the Activation API in `0.2.1-rc.2`. Missing capabilities are reported, and the main model can still read a text source and translate it directly.
 - Building from source requires Node.js 22 or later, pnpm, and the `dsh-composer-extension` source directory alongside this repository.
 
 The current companion builds use content protocol 3 and task-phase protocol 2. Update and build the translation plugin and Composer extension together; incompatible protocols make the affected features unavailable.
+
+After upgrading DSH, apply the matching host patch described in the Composer extension's documentation. The plugins do not modify or upgrade the desktop application automatically. Desktop workflows and real-model results still need validation in your environment.
 
 The plugin uses model services configured in DSH, which may charge for requests. Saving data locally does not make translation offline.
 

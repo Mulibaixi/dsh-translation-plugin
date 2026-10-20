@@ -4,8 +4,12 @@ import type { TranslationSourceRange } from '../shared/translation-source-read.j
 import type { DshExecutionContext } from './dsh-text-adapter.js'
 import { namesEntity } from '../shared/asset-classification.js'
 import { TRANSLATION_PRIORITY } from '../memory/asset-priority.js'
+import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-tools'
+import type {} from '@deepseek-ai/dsh-system-prompt'
 
-/** Narrow views checked against the public DSH 0.2.0-rc.2 service and spawn driver. */
+/** Public 0.2.0-rc.2 runs and 0.2.1-rc.2 Activations share the same collected result. */
 interface NativeAgentOptions { readonly provider?: string; readonly model?: string; readonly reasoningEffort?: string; readonly maxTokens?: number }
 interface NativeEvent { readonly type: string; readonly data: { readonly header?: { readonly config: NativeAgentOptions }; readonly message?: { readonly source?: { readonly provider?: string; readonly model?: string } }; readonly usage?: { readonly inputTokens: number; readonly outputTokens: number }; readonly reason?: { readonly kind: string } } }
 interface NativeAgent {
@@ -15,18 +19,26 @@ interface NativeAgent {
 }
 type StopReason = NonNullable<FileJobWorker['native']>['stopReason']
 interface NativeResult { readonly structured?: unknown; readonly diagnostic?: string; readonly stopReason: StopReason }
-interface NativeRun { readonly id: string; readonly localAgent: NativeAgent | undefined; readonly result: Promise<NativeResult>; dispose(): Promise<void> }
+interface NativeRun { readonly id: string; readonly localAgent: NativeAgent | undefined; readonly mode?: 'activation'; readonly result: Promise<NativeResult>; dispose(): Promise<void> }
+interface NativeActivation { readonly childId: string; readonly result: Promise<NativeResult>; dispose(): Promise<void> }
 interface NativeProvider {
   readonly name: string
   readonly inheritsParentContext: boolean
-  readonly capabilities: { readonly agentOptions: boolean; readonly outputSchema: boolean; readonly depthLimit: boolean; readonly toolFilter: boolean; readonly persona: boolean }
+  readonly prepareContinuable?: unknown
+  readonly capabilities: { readonly agentOptions: boolean; readonly outputSchema: boolean; readonly depthLimit: boolean; readonly toolFilter?: boolean; readonly persona?: boolean }
 }
 interface NativeStartRequest {
   readonly parent: NativeAgent; readonly label: string; readonly prompt: { type: 'text'; text: string }[]; readonly signal: AbortSignal
   readonly agentOptions?: NativeAgentOptions; readonly outputSchema: Schema; readonly maxDepth: number
   readonly toolFilter: { readonly allow: readonly string[] }; readonly persona: string
 }
-interface NativeService { getProvider(name: string): NativeProvider | undefined; start(name: string, request: NativeStartRequest): Promise<NativeRun> }
+interface NativeService {
+  getProvider(name: string): NativeProvider | undefined
+  start?(name: string, request: NativeStartRequest): Promise<NativeRun>
+  startActivation?(spec: { readonly provider: string; readonly label: string; readonly childId: string;
+    readonly request: Omit<NativeStartRequest, 'label' | 'signal' | 'toolFilter' | 'persona'>;
+    readonly signal: AbortSignal; readonly delivery: 'caller' }): Promise<NativeActivation>
+}
 export interface FileWorkerSdk {
   delegationDepthOf(parent: NativeAgent): number
   parentAgentOptionsForDelegation(parent: NativeAgent): NativeAgentOptions
@@ -337,10 +349,12 @@ export class FileWorkerRuntime {
     const unavailable = (reason: string): FileWorkerCapability => ({ available: false, provider: this.providerName, reason })
     if (this.disposed) return unavailable('原生子任务运行时已关闭。')
     const service = this.service(), provider = service?.getProvider?.(this.providerName)
-    if (!service?.start || !provider) return unavailable('宿主未注册原生一次性子代理后端。')
+    if ((!service?.start && !service?.startActivation) || !provider) return unavailable('宿主未注册原生子代理后端。')
     if (provider.inheritsParentContext !== false) return unavailable('子代理后端不能提供空白任务上下文。')
     const capabilities = provider.capabilities
-    if (!capabilities?.agentOptions || !capabilities.outputSchema || !capabilities.depthLimit || !capabilities.toolFilter || !capabilities.persona) {
+    if (!capabilities?.agentOptions || !capabilities.outputSchema || !capabilities.depthLimit ||
+      (service.startActivation ? typeof provider.prepareContinuable !== 'function' || typeof (this.ctx as DshExecutionContext & Partial<Pick<Context, 'on'>>).on !== 'function'
+        : !capabilities.toolFilter || !capabilities.persona)) {
       return unavailable('子代理后端缺少结构化结果、工具范围或任务路由能力。')
     }
     if (mainSessionId !== undefined && !this.parent(mainSessionId)) return unavailable('实际主 Agent 尚未就绪。')
@@ -440,7 +454,7 @@ export class FileWorkerRuntime {
     let run: NativeRun
     try {
       signal.throwIfAborted()
-      run = await this.service()!.start(this.providerName, {
+      run = await this.startWorker({
         parent, label: role === 'preparation' ? 'File translation preparation' : 'File translation review',
         prompt: [{ type: 'text', text: JSON.stringify(prompt) }, { type: 'text', text: structuredResultInstruction(role) }], signal, outputSchema: schema, persona,
         // An empty allow list removes inherited capabilities. The driver's child-local
@@ -489,6 +503,35 @@ export class FileWorkerRuntime {
     return { ...result!, worker: completedWorker! }
   }
 
+  /** The serial creation event runs before the child's first prompt. Keep its exact Session for facts after native teardown. */
+  private async startWorker(request: NativeStartRequest): Promise<NativeRun> {
+    const service = this.service()!
+    if (!service.startActivation) return service.start!(this.providerName, request)
+    const childId = crypto.randomUUID()
+    let child: NativeAgent | undefined
+    const context = this.ctx as DshExecutionContext & Pick<Context, 'on'>
+    const remove = context.on('agent/created', ({ agent }) => {
+      if (String(agent.id) !== childId) return
+      agent.ctx.tools.restrict(request.toolFilter)
+      agent.ctx.systemPrompt.section({ name: 'translation:file-worker',
+        order: agent.ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'), text: request.persona })
+      child = agent as unknown as NativeAgent
+      return undefined
+    }, { global: true })
+    let activation: NativeActivation
+    try {
+      const { label, signal, toolFilter: _filter, persona: _persona, ...task } = request
+      activation = await service.startActivation({ provider: this.providerName, label, childId, request: task, signal, delivery: 'caller' })
+    } finally { remove() }
+    let disposal: Promise<void> | undefined
+    const dispose = () => disposal ??= activation.dispose()
+    const abort = () => { void dispose().catch(() => { /* Report disposal failure from the awaited cleanup below. */ }) }
+    request.signal.addEventListener('abort', abort, { once: true })
+    if (request.signal.aborted) abort()
+    return { id: activation.childId, mode: 'activation', localAgent: child, result: activation.result,
+      async dispose() { request.signal.removeEventListener('abort', abort); await dispose() } }
+  }
+
   cancel(jobId: string): void { for (const task of this.active.values()) if (task.jobId === jobId) task.controller.abort() }
   async dispose(): Promise<void> {
     this.disposed = true
@@ -509,6 +552,6 @@ function workerFact(run: NativeRun, kind: 'preparation' | 'review', status: File
   return { id: run.id, callId: run.id, kind, status, range: null, startedAt, completedAt: new Date().toISOString(),
     ...(route?.provider ? { provider: route.provider } : {}), ...(route?.model ? { model: route.model } : {}),
     ...(usage.length ? { inputTokens: usage.reduce((sum, item) => sum + item.inputTokens, 0), outputTokens: usage.reduce((sum, item) => sum + item.outputTokens, 0) } : {}),
-    ...(result ? { native: { provider: providerName, mode: 'one-shot', stopReason: result.stopReason, observedAttempts: attempts.length } } : {}),
+    ...(result ? { native: { provider: providerName, mode: run.mode ?? 'one-shot', stopReason: result.stopReason, observedAttempts: attempts.length } } : {}),
   }
 }

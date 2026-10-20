@@ -14,4 +14,4 @@
 
 开发中的变更可先记入 CHANGELOG 的 `Unreleased`；每次本地版本提交时，更新版本号并将对应变化整理到带版本号与日期的章节。本地提交及版本记录不代表 npm 或远程发行页发布；远程发布仍需用户明确授权。
 
-本地 Native 验证运行 `pnpm test:native`，需先准备相应的本地测试脚本，并将 `DSH_RUNTIME_ROOT` 指向含 `dsh/node_modules` 的外部 DSH rc.2 组件目录。Composer 联动还需匹配的 submissions protocol 1 宿主补丁，以及任务阶段协议 2 的配套扩展源码构建。测试用临时会话与合成 provider，不能据此宣称真实提供商或桌面安装已验证。
+本地 Native 验证运行 `pnpm test:native`，需先准备相应的本地测试脚本，并将 `DSH_RUNTIME_ROOT` 指向含 `dsh/node_modules` 的目标 DSH 组件目录。分别核对 `0.2.0-rc.2` 与 `0.2.1-rc.2` 的实际契约；Composer 联动还需对应版本的 submissions protocol 1 宿主补丁，以及任务阶段协议 2 的配套扩展构建。测试用临时会话与合成 provider，不能据此宣称真实提供商或桌面安装已验证。
