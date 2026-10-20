@@ -134,7 +134,7 @@ export class DocumentExecutionService {
     const exchange = this.attachExchange(job.exchangeOwner)
     if (!exchange || exchange.batchCapabilities().taskPhase.state !== 'available') { job.phaseNotification = 'unavailable'; return }
     const event: BatchTaskPhaseEvent = { eventId: JSON.stringify([job.taskId, job.taskVersion, job.taskSequence, phase]), hostGeneration: exchange.hostGeneration,
-      scope: job.scope, operationId: job.request.operationId, phase, result: { kind: 'task', taskId: job.taskId, unitId: job.unitId,
+      scope: { mainSessionId: job.scope.mainSessionId, topicId: job.scope.topicId, translationSessionId: job.scope.translationSessionId }, operationId: job.request.operationId, phase, result: { kind: 'task', taskId: job.taskId, unitId: job.unitId,
         sourceVersion: job.request.target.sourceVersion, version: job.taskVersion, taskSequence: job.taskSequence } }
     this.phaseFacts.set(event.eventId, event)
     try { const result = await exchange.notifyBatchTaskPhase(job.exchangeOwner as unknown as Parameters<TranslationExchangeService['notifyBatchTaskPhase']>[0], event); job.phaseNotification = result.ok ? result.value.state : 'unavailable' }
@@ -147,7 +147,7 @@ export class DocumentExecutionService {
     const captured = await review.page({ scope: target.scope, unitId: target.unitId, sourceVersion: target.sourceVersion, manifestRevisionId: target.manifestRevisionId }, exec)
     if (!captured.ok || captured.value.summary.semanticStatus !== 'pending') return 'unavailable'
     const fact = captured.value.summary, event: BatchTaskPhaseEvent = { eventId: JSON.stringify([fact.taskId, target.manifestRevisionId, 'document_review_required']), hostGeneration: exchange.hostGeneration,
-      scope: target.scope, operationId: fact.operationId, phase: 'document_review_required', result: { kind: 'task', taskId: fact.taskId, unitId: target.unitId, sourceVersion: target.sourceVersion, version: fact.taskVersion, taskSequence: fact.taskSequence } }
+      scope: { mainSessionId: target.scope.mainSessionId, topicId: target.scope.topicId, translationSessionId: target.scope.translationSessionId }, operationId: fact.operationId, phase: 'document_review_required', result: { kind: 'task', taskId: fact.taskId, unitId: target.unitId, sourceVersion: target.sourceVersion, version: fact.taskVersion, taskSequence: fact.taskSequence } }
     const previous = this.reviewPhaseFacts.get(event.eventId)
     if (!previous) this.reviewPhaseFacts.set(event.eventId, { event, target, reviewVersion: captured.value.reviewVersion, owner, exec })
     try { const result = await exchange.notifyBatchTaskPhase(owner as unknown as Parameters<TranslationExchangeService['notifyBatchTaskPhase']>[0], event); return result.ok ? result.value.state : 'unavailable' }
@@ -261,7 +261,7 @@ export class DocumentExecutionService {
     const material = (this.ctx.get?.('translationMaterials') as import('./translation-materials.js').TranslationMaterialsService)?.deliveredForAgent(request.target, exec.agent!)
     if (!material?.ok) return material ?? failure('unavailable', '固定材料服务尚未就绪。', 'authorize_document')
     if (material.value.material.sourceVersion !== 1) return failure('source_version_unavailable', '本阶段只受理新材料的首个原稿版本；源纠错与范围复用尚未接入。', 'authorize_document')
-    const envelope = material.value, scope = { ownerId: envelope.ownerId, mainSessionId: envelope.mainSessionId,
+    const envelope = material.value, scope = { ownerId: envelope.mainSessionId, mainSessionId: envelope.mainSessionId,
       topicId: envelope.material.topicId, translationSessionId: envelope.material.translationSessionId }, taskId = `document-task:${crypto.randomUUID()}`
     if (!this.normal?.claimDocumentSession(scope.ownerId, scope.translationSessionId, taskId)) return failure('busy', '此翻译会话仍有未结算的短文或整篇任务。', 'accept_document')
     const job: Job = { request, scope, taskId, unitId: `unit:${envelope.material.materialId}`, agent: exec.agent!, exchangeOwner,

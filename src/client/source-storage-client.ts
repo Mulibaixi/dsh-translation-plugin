@@ -10,10 +10,10 @@ export type TranslationSourceStorageRemotePort = {
 
 /** Unwrap the native Gateway RemoteResult before parsing the independent storage protocol. */
 export function adaptTranslationSourceStorageRemote(remote: TranslationSourceStorageRemotePort | undefined |
-  (() => Promise<TranslationSourceStorageRemotePort | undefined>)): TranslationSourceStoragePort {
+  (() => Promise<TranslationSourceStorageRemotePort | undefined>), namespaceId?: () => string): TranslationSourceStoragePort {
   async function invoke<T>(method: TranslationSourceStorageMethod, request?: unknown, signal?: AbortSignal): Promise<TranslationSourceStorageResult<T>> {
     signal?.throwIfAborted()
-    const fixed = method === 'storageCapabilities' ? undefined : parseTranslationSourceStorageRequest(method, request)
+    const fixed = method === 'storageCapabilities' ? undefined : parseTranslationSourceStorageRequest(method, namespaceId ? { ...(request as object), namespaceId: namespaceId() } : request)
     const port = typeof remote === 'function' ? await remote() : remote
     // Mount resolution may finish after the caller has cancelled the open operation.
     signal?.throwIfAborted()
@@ -112,6 +112,21 @@ export class TranslationSourceStorageClient {
   }
   /** Read only: a retained prepared history commit alone does not prove confirmation. */
   queryPersistedReference(value: TranslationSourceHistoryCommit): Promise<TranslationSourceSaveOutcome> { return this.queryCommit(parseCommit(value)) }
+
+  /** Cache the exact bytes independently of chat-history saving; no history token is invented. */
+  async cache(transaction: Pick<TranslationSourceSaveTransaction, 'prepare'>): Promise<TranslationSourceSaveOutcome> {
+    const prepare = parseTranslationSourceStorageRequest('prepareSave', transaction.prepare) as TranslationSourcePrepareSave
+    let result: TranslationSourceStorageResult<TranslationSourceReference>
+    try { result = await this.port.prepareSave(prepare) }
+    catch { return { state: 'unknown', stage: 'prepare', message: '原稿缓存回执不明，请查询原引用；不要重新上传或新建事务。' } }
+    if (!result.ok) return { state: 'failed', stage: 'prepare', message: result.error.message }
+    const reference = parseTranslationSourceReference(result.value)
+    if (!same(reference.scope, prepare.scope) || reference.referenceKey !== prepare.referenceKey ||
+      !same(reference.source, toSourceIdentity(prepare.sourceRef))) return { state: 'failed', stage: 'prepare', message: '缓存回执与固定原稿或所属范围不一致。' }
+    if (reference.state === 'released') return { state: 'released', reference }
+    if (reference.state === 'confirmed') return { state: 'confirmed', reference }
+    return { state: 'prepared', reference, reason: 'history_disabled' }
+  }
 
   private async prepareAndPersist(transaction: TranslationSourceSaveTransaction, history: TranslationSourceHistoryCallbacks): Promise<TranslationSourceSaveOutcome> {
     let result: TranslationSourceStorageResult<TranslationSourceReference>

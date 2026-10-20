@@ -44,7 +44,7 @@ export function MemoryAssetsView({ store, terms, archive, references, quick, top
   const [pickerOpen, setPickerOpen] = react.useState(false)
   const [query, setQuery] = react.useState('')
   react.useEffect(() => store.subscribe(() => refresh(value => value + 1)), [store])
-  react.useEffect(() => topics?.retain(ownerId), [topics, ownerId])
+  react.useEffect(() => ownerId === store.getNamespaceId() ? undefined : topics?.retain(ownerId), [topics, ownerId, store])
   react.useEffect(() => topics?.subscribe(() => refresh(value => value + 1)), [topics])
   react.useEffect(() => {
     if (!pickerOpen) return

@@ -21,10 +21,7 @@ export class ReferenceStore implements ReferenceEvidencePort {
   private readonly bindings = new Map<string, {readonly signature:string;readonly topicId:string|null}>()
   constructor(private readonly sessions: SessionStore, private readonly remote: () => Promise<Remote | undefined>, private readonly storage = browserStorage(),
     private readonly options: {readonly withOwner?: <T>(ownerId:string,action:()=>Promise<T>)=>Promise<T>} = {}) {
-    let namespaceId: string | null = null
-    try { namespaceId = storage?.getItem(NAMESPACE_KEY) ?? null } catch { /* A runtime namespace remains usable without persistence. */ }
-    this.namespaceId = namespaceId ?? crypto.randomUUID()
-    try { storage?.setItem(NAMESPACE_KEY, this.namespaceId) } catch { this.notice = '参考资料命名空间未保存，本次新增内容仅在运行期可用。' }
+    this.namespaceId = sessions.getNamespaceId()
     let enabled=sessions.getSettings().rememberHistory
     this.stopSession=sessions.subscribe(()=> {
       const next=sessions.getSettings().rememberHistory
@@ -75,14 +72,14 @@ export class ReferenceStore implements ReferenceEvidencePort {
   getTopicDocumentCount(ownerId: string, topicId: string): number { try { return this.facts(ownerId, topicId).index.documents.length } catch { return 0 } }
   /** Topic deletion removes the empty index/barrier as well; the topic tombstone remains the authority. */
   discardTopic(ownerId: string, topicId: string): boolean {
-    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
+    ownerId = this.sessions.getTopicStorageScope(topicId) ?? ownerId
     const key = indexKey(ownerId, topicId)
     try { this.storage?.removeItem(key); this.indices.delete(key); this.cache.clear(); this.emit(); return true }
     catch { this.notice = '参考资料索引未能随主题删除清理，请检查本地存储。'; this.emit(); return false }
   }
   getNotice(): string | undefined { return this.notice }
   facts(ownerId: string, topicId: string): ReferenceFacts {
-    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
+    ownerId = this.sessions.getTopicStorageScope(topicId) ?? ownerId
     if (this.disposed) throw Object.assign(new Error('参考资料窗口已关闭，请重新启用插件。'), {code:'reference_unavailable'})
     const topic = this.sessions.getTopics(ownerId).find(topic => topic.id === topicId)
     if (!topic) throw Object.assign(new Error('主题不存在或已经删除。'), { code: 'scope_mismatch' })
@@ -162,7 +159,7 @@ export class ReferenceStore implements ReferenceEvidencePort {
     }
   }
   async clearTopic(ownerId: string, topicId: string): Promise<boolean> {
-    ownerId = this.sessions.getTopicAssetOwner(topicId) ?? ownerId
+    ownerId = this.sessions.getTopicStorageScope(topicId) ?? ownerId
     const before = this.facts(ownerId, topicId), remote = await this.remote()
     if (!remote) return false
     const result = await remote.clearRemote(before.index.scope) as { ok?: boolean; value?: { cleared?: boolean } }

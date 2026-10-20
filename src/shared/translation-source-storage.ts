@@ -11,19 +11,21 @@ export interface TranslationSourceStorageCapability {
   readonly reason?: string
 }
 export interface TranslationSourcePrepareSave {
+  readonly namespaceId?: string
   readonly scope: TranslationSourceScope
   readonly sourceRef: TranslationSourceAsset
   readonly referenceKey: string
   readonly operationId: string
 }
 export interface TranslationSourceConfirmReference {
+  readonly namespaceId?: string
   readonly scope: TranslationSourceScope
   readonly referenceKey: string
   readonly prepareToken: string
   readonly historyToken: string
   readonly operationId: string
 }
-export interface TranslationSourceQueryReference { readonly scope: TranslationSourceScope; readonly referenceKey: string }
+export interface TranslationSourceQueryReference { readonly namespaceId?: string; readonly scope: TranslationSourceScope; readonly referenceKey: string }
 export interface TranslationSourceStoredRead extends TranslationSourceQueryReference {
   readonly source: SourceIdentity
   readonly historyToken: string
@@ -82,9 +84,10 @@ function token(value: unknown): asserts value is string {
 export function parseTranslationSourceStorageRequest(method: Exclude<TranslationSourceStorageMethod, 'storageCapabilities'>, value: unknown): TranslationSourceStorageRequest {
   const extra = method === 'prepareSave' ? ['sourceRef', 'operationId'] : method === 'confirmReference' ? ['prepareToken', 'historyToken', 'operationId']
     : method === 'restore' || method === 'openOriginal' ? ['source', 'historyToken'] : method === 'releaseReference' ? ['expectedVersion', 'operationId'] : []
-  exact(value, ['scope', 'referenceKey', ...extra])
+  exact(value, ['scope', 'referenceKey', ...extra], ['namespaceId'])
+  if (value.namespaceId !== undefined) text(value.namespaceId)
   const scope = parseTranslationSourceScope(value.scope); text(value.referenceKey)
-  const base = { scope, referenceKey: value.referenceKey }
+  const base = { scope, referenceKey: value.referenceKey, ...(value.namespaceId === undefined ? {} : { namespaceId: value.namespaceId as string }) }
   if (method === 'prepareSave') { text(value.operationId); return { ...base, sourceRef: parseTranslationSourceAsset(value.sourceRef), operationId: value.operationId } }
   if (method === 'confirmReference') {
     token(value.prepareToken); text(value.historyToken); text(value.operationId)

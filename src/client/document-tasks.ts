@@ -1,3 +1,4 @@
+import { isTextUnit } from './translation-history.js'
 import { parseDocumentAcceptRequest, parseDocumentBlockRegistration, parseDocumentTaskEvent, parseDocumentTaskFinish, parseDocumentTaskScope,
   MAX_DOCUMENT_OUTPUT_BYTES, type DocumentAcceptRequest, type DocumentBlockRegistration, type DocumentBlockReceipt,
   parseDocumentTaskRelease, type DocumentTaskEvent, type DocumentTaskFinish, type DocumentTaskReceipt, type DocumentTaskRelease, type DocumentTaskScope } from '../shared/document-execution.js'
@@ -55,7 +56,6 @@ export interface DocumentTasksOptions {
   readonly subscribeBridge?: (listener: () => void) => () => void
   readonly bridgeReady?: (ownerId: string) => boolean
   readonly remote?: TranslationBatchRemotePort | (() => Promise<TranslationBatchRemotePort | undefined>) | undefined
-  readonly publishUnit?: (ownerId: string, sessionId: string, unitId: string, sourceVersion: number) => boolean
   readonly uiLocale?: () => string | undefined
 }
 function bad(code: string, message: string, stage = 'document_writeback'): AnalysisResult<never> { return { ok: false, error: { code, message, stage } } }
@@ -120,7 +120,7 @@ export class DocumentTasksClient {
       const intent = this.unitRequests.get(JSON.stringify([sessionId, unitId]))
       if (intent && (intent.pending || intent.unknown || intent.outcome === 'submitted')) return '此文档还有待确认的重译意图，请先查询或等待业务受理。'
       const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
-      if (session && unit && isDocumentUnit(unit) && unit.tasks.some(task => this.controlsPending.get(this.key(session.ownerId, task.taskId))?.size)) return '任务控制尚在处理中，请等待确切回执。'
+      if (session && unit && isDocumentUnit(unit) && unit.tasks.some(task => this.controlsPending.get(this.key(task.executionFacts?.blocks[0]?.request.scope.mainSessionId ?? '', task.taskId))?.size)) return '任务控制尚在处理中，请等待确切回执。'
       return undefined
     })
   }
@@ -132,7 +132,7 @@ export class DocumentTasksClient {
   private locate(ownerId: string, scope: DocumentTaskScope): Task | undefined {
     const task = this.tasks.get(this.key(ownerId, scope.taskId)), session = this.store.getSession(scope.scope.translationSessionId)
     return !this.disposed && task && same(task.scope, scope) && scope.scope.ownerId === ownerId && scope.scope.mainSessionId === ownerId && session &&
-      session.ownerId === ownerId && session.topicId === scope.scope.topicId && !this.store.isSessionDeleted(session.id) && !this.materials.fileAccessBlockedReason(session.id, scope.unitId) ? task : undefined
+      session.topicId === scope.scope.topicId && !this.store.isSessionDeleted(session.id) && !this.materials.fileAccessBlockedReason(session.id, scope.unitId) ? task : undefined
   }
   private receipt(task: Task): DocumentTaskReceipt {
     const request = task.request, record = this.unit(task)!.tasks.find(item => item.taskId === task.scope.taskId)!, status = record.status, facts = record.executionFacts
@@ -153,7 +153,7 @@ export class DocumentTasksClient {
     const blocked = this.materials.fileAccessBlockedReason(request.target.translationSessionId, request.target.unitId)
     if (blocked) return bad('unit_removed_or_conflicted', blocked, 'capture_document')
     const target = request.target, session = this.store.getSession(target.translationSessionId), unit = this.store.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
-    if (this.disposed || target.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || !unit || !isDocumentUnit(unit) || session.mode !== 'normal' || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档捕获不属于此实际主会话。', 'capture_document')
+    if (this.disposed || target.mainSessionId !== ownerId || !session || !unit || !isDocumentUnit(unit) || session.mode !== 'normal' || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档捕获不属于此实际主会话。', 'capture_document')
     if (this.store.getStatus(session.id) === 'conflict') return bad('history_conflict', '当前历史副本已变化。', 'capture_document')
     const source = unit.sourceVersions.find(source => source.version === target.sourceVersion)
     if (!source) return bad('source_version_missing', '准确原稿版本不存在。', 'capture_document')
@@ -190,7 +190,7 @@ export class DocumentTasksClient {
     const blocked = this.materials.fileAccessBlockedReason(request.scope.translationSessionId, request.unitId)
     if (blocked) return bad('unit_removed_or_conflicted', blocked)
     const scope = request.scope, session = this.store.getSession(scope.translationSessionId), unit = this.store.getTranslationHistory(scope.translationSessionId)?.units.find(unit => unit.id === request.unitId)
-    if (this.disposed || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || session.topicId !== scope.topicId || !unit || !isDocumentUnit(unit) || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '纠错查询不属于当前授权范围。')
+    if (this.disposed || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || !session || session.topicId !== scope.topicId || !unit || !isDocumentUnit(unit) || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '纠错查询不属于当前授权范围。')
     const fact = unit.corrections?.find(fact => fact.operationId === request.operationId)
     if (!fact) return ok(null)
     const source = unit.sourceVersions.find(source => source.version === fact.toSourceVersion)!, saved = this.store.getSettings().rememberHistory && this.store.getStatus(session.id) === 'saved' && await this.sourceConfirmed(session.id, unit.id, source)
@@ -207,7 +207,7 @@ export class DocumentTasksClient {
     const blocked = this.materials.fileAccessBlockedReason(request.scope.translationSessionId, request.unitId)
     if (blocked) return bad('unit_removed_or_conflicted', blocked, 'correct_document_source')
     const scope = request.scope, session = this.store.getSession(scope.translationSessionId), unit = this.store.getTranslationHistory(scope.translationSessionId)?.units.find(unit => unit.id === request.unitId)
-    if (this.disposed || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || session.topicId !== scope.topicId || !unit || !isDocumentUnit(unit) || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档纠错不属于当前授权范围。', 'correct_document_source')
+    if (this.disposed || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || !session || session.topicId !== scope.topicId || !unit || !isDocumentUnit(unit) || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档纠错不属于当前授权范围。', 'correct_document_source')
     if (this.store.getStatus(session.id) === 'conflict') return bad('history_conflict', '历史副本已变化，未修改原稿。', 'correct_document_source')
     if (this.options.canCorrectSource?.(ownerId, scope.topicId, session.id, unit.id) === false) return bad('object_source_unsupported', '此原稿含对象位置关联，不能自动纠错。', 'correct_document_source')
     const previous = unit.corrections?.find(fact => fact.operationId === request.fact.operationId)
@@ -222,7 +222,7 @@ export class DocumentTasksClient {
       saved = await this.store.saveTranslationHistoryAsync(session.id)
       if (saved && request.source.body.kind === 'asset' && this.options.sourceStorage) {
         const result = await this.options.sourceStorage.save({ prepare: { scope, sourceRef: { ...request.source.body.reference, persistence: 'runtime_only' }, referenceKey: `document-source:${unit.id}:${request.source.version}`, operationId: `document-source-prepare:${request.fact.operationId}` },
-          confirmOperationId: `document-source-confirm:${request.fact.operationId}` }, this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: unit.id, sourceVersion: request.source.version }))
+          confirmOperationId: `document-source-confirm:${request.fact.operationId}` }, this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: unit.id, sourceVersion: request.source.version }, scope))
         saved = result.state === 'confirmed'
       }
       storageError = saved ? null : '新原稿或历史保存未确认；当前运行期仍可读取。'
@@ -237,7 +237,7 @@ export class DocumentTasksClient {
     const target = request.target, session = this.store.getSession(target.translationSessionId), history = this.store.getTranslationHistory(target.translationSessionId), unit = history?.units.find(unit => unit.id === target.unitId), key = this.key(ownerId, request.taskId), signature = JSON.stringify(request)
     const existing = this.tasks.get(key)
     if (existing) return existing.signature === signature ? ok(this.receipt(existing)) : bad('idempotency_conflict', '新版本任务已绑定其他准备或计划。')
-    if (this.disposed || target.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || session.mode !== 'normal' || !unit || !isDocumentUnit(unit) || unit.sourceVersion !== target.sourceVersion || this.store.isSessionDeleted(session.id)) return bad('stale_source_version', '文档新版本不属于当前准确原稿。', 'accept_document')
+    if (this.disposed || target.mainSessionId !== ownerId || !session || session.mode !== 'normal' || !unit || !isDocumentUnit(unit) || unit.sourceVersion !== target.sourceVersion || this.store.isSessionDeleted(session.id)) return bad('stale_source_version', '文档新版本不属于当前准确原稿。', 'accept_document')
     if (this.store.getStatus(session.id) === 'conflict' || this.options.isSessionBusy?.(session.id) || this.store.hasDocumentLease(session.id) || unit.tasks.some(task => task.sourceVersion === unit.sourceVersion && ['running', 'unknown'].includes(task.status))) return bad('busy', '当前会话已有运行中或未知任务。', 'accept_document')
     const source = unit.sourceVersions.find(source => source.version === target.sourceVersion)!, hash = source.body.kind === 'asset' ? source.body.reference.sha256 : await digest(new TextEncoder().encode(source.body.text))
     const prepared = this.preparations.documentUnitPreparation({ ownerId, mainSessionId: ownerId, topicId: session.topicId, translationSessionId: session.id }, request.preparationRef, hash, true)
@@ -261,7 +261,7 @@ export class DocumentTasksClient {
     if (!this.store.updateTranslationHistory(session.id, current => {
       let next = applyDocumentMutation(current, unit.id, { kind: 'preparation', preparation: { ...request.preparationRef, sourceVersion: unit.sourceVersion } }, request.createdAt)
       next = applyDocumentMutation(next, unit.id, { kind: 'plan', plan: request.plan }, request.createdAt)
-      next = applyDocumentMutation(next, unit.id, { kind: 'task', task: { taskId: request.taskId, operationId: request.operationId, sourceVersion: unit.sourceVersion,
+      next = applyDocumentMutation(next, unit.id, { kind: 'task', task: { taskId: request.taskId, mainSessionId: ownerId, operationId: request.operationId, sourceVersion: unit.sourceVersion,
         planRef: { id: request.plan.id, version: request.plan.version }, preparationRef: request.preparationRef, createdAt: request.createdAt, status: 'running', executionFacts: {
           baseline: request.executionBaseline, taskVersion: 1, taskSequence: 0, actualCalls: request.executionBaseline.analysisActualCalls, outputBytes: request.reusedOutputBytes, automaticSupplementCalls: 0, blocks: [], controls: [], reviewIssues: [] } } }, request.createdAt)
       for (const approval of request.reuseApprovals) next = applyDocumentMutation(next, unit.id, { kind: 'reuse', approval }, request.createdAt)
@@ -288,12 +288,12 @@ export class DocumentTasksClient {
     const blocked = this.materials.fileAccessBlockedReason(request.envelope.material.translationSessionId, request.unitId)
     if (blocked) return bad('unit_removed_or_conflicted', blocked, 'accept_document')
     const envelope = this.materials.resolveSubmittedMaterial(request.envelope), material = envelope?.material, session = material && this.store.getSession(material.translationSessionId)
-    if (this.disposed || !envelope || envelope.ownerId !== ownerId || envelope.mainSessionId !== ownerId || !session || session.ownerId !== ownerId || session.topicId !== material!.topicId ||
+    if (this.disposed || !envelope || envelope.mainSessionId !== ownerId || !session || session.topicId !== material!.topicId ||
       session.mode !== 'normal' || session.archivedAt !== null || this.store.isSessionDeleted(session.id) || request.unitId !== `unit:${material!.materialId}` || !material!.model) return bad('material_mismatch', '文档需要确切已交付的普通模式材料。', 'accept_document')
     if (this.store.getStatus(session.id) === 'conflict') return bad('history_conflict', '当前历史副本已变化，未消费材料。', 'accept_document')
     const history = this.store.getTranslationHistory(session.id)!
     if (this.options.isSessionBusy?.(session.id) || this.store.hasDocumentLease(session.id) || history.units.some(unit => isDocumentUnit(unit)
-      ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status)) : unit.revisions.some(revision => ['submitting', 'running', 'unknown', 'context_requested'].includes(revision.status)))) return bad('busy', '此会话已有执行中或未知操作。', 'accept_document')
+      ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status)) : isTextUnit(unit) && unit.revisions.some(revision => ['submitting', 'running', 'unknown', 'context_requested'].includes(revision.status)))) return bad('busy', '此会话已有执行中或未知操作。', 'accept_document')
     if (history.units.some(unit => unit.id === request.unitId) || this.store.getAvailableSessions(ownerId).some(candidate => this.store.getTranslationHistory(candidate.id)?.events.some(event => event.operationId === request.operationId))) return bad('already_admitted', '此材料或操作已有历史事实，请查询原任务。', 'accept_document')
     const releaseLease = this.store.claimDocumentLease(session.id, request.taskId)
     if (!releaseLease) return bad('busy', '此会话已被另一翻译占用。', 'accept_document')
@@ -326,7 +326,7 @@ export class DocumentTasksClient {
       ...(fileCommit && material!.sourceRef && same(fileCommit.reference.source, toSourceIdentity(material!.sourceRef)) ? { historyCommit: fileCommit } : {}) }
     if (!this.store.updateTranslationHistory(session.id, current => appendDocumentUnit(current, { id: request.unitId, targetLanguage: material!.targetLanguage,
       instruction: material!.instruction, createdAt: fileCreatedAt, source, preparation: { ...request.preparationRef, sourceVersion: 1 }, plan: request.plan,
-      task: { taskId: request.taskId, operationId: request.operationId, sourceVersion: 1, planRef: { id: request.plan.id, version: request.plan.version },
+      task: { taskId: request.taskId, mainSessionId: ownerId, operationId: request.operationId, sourceVersion: 1, planRef: { id: request.plan.id, version: request.plan.version },
         preparationRef: request.preparationRef, createdAt: request.createdAt, status: 'running', ...(request.executionBaseline ? { executionFacts: {
           baseline: request.executionBaseline, taskVersion: 1, taskSequence: 0, actualCalls: request.executionBaseline.analysisActualCalls, outputBytes: 0, automaticSupplementCalls: 0, blocks: [], controls: [], reviewIssues: [] } } : {}) } }))) { release(); return bad('history_update_failed', '文档单元记录未完成，材料保留。', 'accept_document') }
     const scope: DocumentTaskScope = { scope: { ownerId, mainSessionId: ownerId, topicId: session.topicId, translationSessionId: session.id }, taskId: request.taskId, unitId: request.unitId }
@@ -341,9 +341,9 @@ export class DocumentTasksClient {
       if (material!.sourceRef && this.options.sourceStorage) {
         try {
           const saved = source.historyCommit ? await this.options.sourceStorage.confirmPersistedReference(source.historyCommit,
-            this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 })) : await this.options.sourceStorage.save({ prepare: { scope: scope.scope, sourceRef: material!.sourceRef,
+            this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 }, scope.scope)) : await this.options.sourceStorage.save({ prepare: { scope: scope.scope, sourceRef: material!.sourceRef,
           referenceKey: `document-source:${request.unitId}:1`, operationId: `document-source-prepare:${request.taskId}` }, confirmOperationId: `document-source-confirm:${request.taskId}` },
-        this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 }))
+        this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 }, scope.scope))
           sourceSaved = saved.state === 'confirmed'
         } catch { sourceSaved = false }
       }
@@ -520,7 +520,7 @@ export class DocumentTasksClient {
     let request: DocumentRestoreRequest
     try { request = parseDocumentRestoreRequest(raw) } catch { return bad('invalid_input', '文档恢复查询参数无效。', 'restore_document') }
     const scope = request.scope, session = this.store.getSession(scope.translationSessionId)
-    if (this.disposed || !session || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || session.ownerId !== ownerId || session.topicId !== scope.topicId || session.mode !== 'normal' || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档恢复不属于此主会话。', 'restore_document')
+    if (this.disposed || !session || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || session.topicId !== scope.topicId || session.mode !== 'normal' || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档恢复不属于此主会话。', 'restore_document')
     const current = this.store.getTranslationHistory(session.id)?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === request.taskId))
     if (!current || !isDocumentUnit(current) || request.unitId !== undefined && request.unitId !== current.id) return bad('task_not_found', '此范围内没有确切任务。', 'restore_document')
     const blocked = this.materials.fileAccessBlockedReason(session.id, current.id)
@@ -645,7 +645,7 @@ export class DocumentTasksClient {
   private emit(): void { for (const listener of this.listeners) listener() }
   uiState(sessionId: string, taskId: string): { readonly pending: boolean; readonly pausing: boolean; readonly cancelling: boolean; readonly message: string | null; readonly canResume: boolean; readonly recoverability: string | null } {
     const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === taskId))
-    const task = unit && isDocumentUnit(unit) ? unit.tasks.find(task => task.taskId === taskId) : undefined, key = session ? this.key(session.ownerId, taskId) : ''
+    const task = unit && isDocumentUnit(unit) ? unit.tasks.find(task => task.taskId === taskId) : undefined, key = session ? this.key(this.store.getOperationMainSessionId(sessionId, taskId) ?? '', taskId) : ''
     const uncertain = task?.executionFacts?.blocks.some(block => block.phase !== 'settled') || unit && isDocumentUnit(unit) && unit.chunkRevisions.some(chunk => chunk.taskId === taskId && ['running', 'unknown', 'interrupted'].includes(chunk.status))
     const recoverability = !task?.executionFacts ? '此旧任务缺少执行恢复事实；已有原稿与结果可查阅。' : uncertain && ['interrupted', 'unknown'].includes(task.status) ? '旧调用未确认结束，请查询任务状态。' : null
     return { pending: Boolean(this.controlsPending.get(key)?.size), pausing: this.controlsPending.get(key)?.has('pause') ?? false,
@@ -655,11 +655,13 @@ export class DocumentTasksClient {
   async requestControl(sessionId: string, taskId: string, kind: 'pause' | 'cancel' | 'resume' | 'status'): Promise<void> {
     const session = this.store.getSession(sessionId), history = this.store.getTranslationHistory(sessionId), unit = history?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === taskId))
     if (this.disposed || !session || !unit || !isDocumentUnit(unit) || this.materials.fileAccessBlockedReason(sessionId, unit.id)) return
-    const record = unit.tasks.find(task => task.taskId === taskId)!, facts = record.executionFacts, key = this.key(session.ownerId, taskId)
+    const record = unit.tasks.find(task => task.taskId === taskId)!, facts = record.executionFacts, key = this.key(this.store.getOperationMainSessionId(sessionId, taskId) ?? '', taskId)
     const pending = this.controlsPending.get(key) ?? new Set<'pause' | 'cancel' | 'resume' | 'status'>()
     if (pending.has(kind) || pending.size && !(kind === 'cancel' && pending.has('pause') && !pending.has('cancel'))) return
     if (kind !== 'status' && (!facts || kind === 'resume' && !this.uiState(sessionId, taskId).canResume)) { this.notices.set(key, '此任务目前只能查询执行状态。'); this.emit(); return }
-    const scope = { ownerId: session.ownerId, mainSessionId: session.ownerId, topicId: session.topicId, translationSessionId: sessionId }, release = this.retain(session.ownerId)
+    const executionOwner = this.store.getOperationMainSessionId(sessionId, taskId)
+    if (!executionOwner) return
+    const scope = { ownerId: executionOwner, mainSessionId: executionOwner, topicId: session.topicId, translationSessionId: sessionId }, release = this.retain(executionOwner)
     const noticeOwner = crypto.randomUUID(); this.noticeOwners.set(key, noticeOwner)
     pending.add(kind); this.controlsPending.set(key, pending); this.notices.delete(key); this.emit()
     try {
@@ -682,7 +684,7 @@ export class DocumentTasksClient {
   }
   observeFileTask(summary: import('../shared/file-jobs.js').FileJobSummary): void {
     const item = this.unitRequests.get(JSON.stringify([summary.translationSessionId, summary.unitId]))
-    if (!item || item.request.operationId !== summary.operationId || item.request.target.mainSessionId !== summary.ownerId || item.outcome === 'accepted') return
+    if (!item || item.request.operationId !== summary.operationId || item.request.target.mainSessionId !== summary.mainSessionId || item.outcome === 'accepted') return
     item.pending = false; item.unknown = false; item.outcome = 'accepted'; item.message = '文件重译已受理。'
     item.release?.(); delete item.release; this.emit()
   }
@@ -694,7 +696,7 @@ export class DocumentTasksClient {
     if (session.archivedAt !== null) return '请先恢复归档会话。'
     if (!session.model) return '请先选择本次翻译模型。'
     if (this.store.getStatus(sessionId) === 'conflict') return '本地历史副本已变化，请核对最新记录。'
-    if (this.options.bridgeReady?.(session.ownerId) === false) return '正在连接此主会话。'
+
     const intent = this.unitRequests.get(JSON.stringify([sessionId, unitId]))
     if (intent?.pending) return '正在发送或查询此文档的重译意图。'
     if (intent?.unknown) return '重译意图发送状态未知，请先检查状态。'
@@ -704,19 +706,18 @@ export class DocumentTasksClient {
         ['running', 'unknown', 'paused', 'waiting_user', 'waiting_context'].includes(task.status) || task.executionFacts?.blocks.some(block => block.phase !== 'settled')))) return '当前会话仍有未结束或未知任务，请先查询或取消。'
     return undefined
   }
-  async requestRetranslation(sessionId: string, unitId: string): Promise<void> {
-    if (this.retranslationBlockedReason(sessionId, unitId)) return
+  async requestRetranslation(sessionId: string, unitId: string, executionOwner?: string): Promise<void> {
+    if (!executionOwner || !this.store.isSessionOpen(executionOwner, sessionId) || this.retranslationBlockedReason(sessionId, unitId)) return
     const session = this.store.getSession(sessionId)!, unit = this.store.getTranslationHistory(sessionId)!.units.find(unit => unit.id === unitId)!
     if (!isDocumentUnit(unit)) return
     const locale = this.options.uiLocale?.()?.trim(), request: NormalTranslationUnitRequest = {
-      target: { kind: 'unit', mainSessionId: session.ownerId, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion },
+      target: { kind: 'unit', mainSessionId: executionOwner, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion },
       operationId: `document-unit-intent:${crypto.randomUUID()}`, ...(locale ? { uiLocale: locale.slice(0, 64) } : {}) }
     const key = JSON.stringify([sessionId, unitId]), item = { request, previousTasks: unit.tasks.map(task => task.taskId), pending: true, unknown: false,
-      outcome: 'pending' as 'pending' | 'submitted' | 'accepted' | 'failed' | 'unknown', message: '正在发送文档重译意图…', release: this.retain(session.ownerId) as (() => void) | undefined }
+      outcome: 'pending' as 'pending' | 'submitted' | 'accepted' | 'failed' | 'unknown', message: '正在发送文档重译意图…', release: this.retain(executionOwner) as (() => void) | undefined }
     this.unitRequests.get(key)?.release?.(); this.unitRequests.set(key, item); this.emit()
     let dispatched = false
     try {
-      if (!this.options.publishUnit?.(session.ownerId, sessionId, unitId, unit.sourceVersion)) throw new Error('此文档未能供主模型读取。')
       const port = typeof this.options.remote === 'function' ? await this.options.remote() : this.options.remote
       if (!port?.submitUnit) throw new Error('宿主尚未提供文档重译入口。')
       if (this.materials.fileAccessBlockedReason(sessionId, unitId)) throw new Error('此文件单元已移除或历史副本已变化。')

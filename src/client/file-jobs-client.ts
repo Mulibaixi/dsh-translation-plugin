@@ -13,7 +13,7 @@ import type { FileJobExportUnit } from './translation-export.js'
 import { reviewFileProposals, fileRevisionEvidence, type FileProposalReviews } from './file-proposal-revisions.js'
 import { applyFileJobEdits } from '../shared/file-job-edits.js'
 import type { FileJobRevision } from '../shared/file-jobs.js'
-import { isDocumentUnit } from './translation-history.js'
+import { isDocumentUnit, isFileJobUnit, type FileJobUnit } from './translation-history.js'
 export type { FileJobRecord, FileJobCardState } from './file-jobs-store.js'
 
 export type FileJobsRemotePort = { [K in keyof FileJobsPort]: (request: Parameters<FileJobsPort[K]>[0]) => Promise<unknown> }
@@ -54,17 +54,8 @@ export class FileJobsClient implements TranslationEvidenceReader {
   private syncing = false
   private disposed = false
   private notice: string | undefined
-  private references: { publishDocumentUnit(ownerId: string, sessionId: string, unitId: string, sourceVersion: number): boolean; revokeUnit(ownerId: string, sessionId: string, unitId: string): void; isPublished(ownerId: string, sessionId: string, unitId: string): boolean } | undefined
-  setReferenceControl(port: NonNullable<FileJobsClient['references']>): void { this.references = port }
-  isReferenced(jobId: string, ownerId?: string): boolean { const job = this.get(jobId)?.summary; return !!job && this.references?.isPublished(ownerId ?? job.ownerId, job.translationSessionId, job.unitId) === true }
-  toggleReference(jobId: string, ownerId?: string): void {
-    const job = this.get(jobId)?.summary
-    if (!job || !this.references) return
-    const currentOwner = ownerId ?? job.ownerId
-    if (this.isReferenced(jobId, currentOwner)) this.references.revokeUnit(currentOwner, job.translationSessionId, job.unitId)
-    else if (!this.references.publishDocumentUnit(currentOwner, job.translationSessionId, job.unitId, job.sourceVersion)) this.notice = '未能提供此准确文件参考。'
-    this.emit()
-  }
+  canExecute(ownerId?: string): boolean { return Boolean(ownerId && ownerId !== this.sessions.getNamespaceId()) }
+  getNamespaceId(): string { return this.sessions.getNamespaceId() }
   private readonly missingHosts = new Set<string>()
   private readonly projectedVersions = new Map<string, number>()
   private readonly boundOwners = new Map<string, number>()
@@ -72,7 +63,8 @@ export class FileJobsClient implements TranslationEvidenceReader {
   getRetranslationStatus(jobId: string) { return this.retranslationIntents.get(jobId) }
   constructor(private readonly sessions: SessionStore, private readonly fallback: TranslationEvidenceReader, private readonly remote: Remote,
     private readonly uiLocale?: () => string | undefined) {
-    this.records = new FileJobsStore(sessions.createFileJobsStoreOptions(), () => this.emit())
+    this.records = new FileJobsStore(sessions.createFileJobsStoreOptions(), () => { this.units(undefined, true); this.emit() })
+    this.units(undefined, true)
     this.stopStore = sessions.subscribe(() => { this.records.reconcile(); this.reconcileLeases() })
     this.timer = setInterval(() => { void this.refresh() }, 1800)
     queueMicrotask(() => { void this.refresh() })
@@ -83,8 +75,8 @@ export class FileJobsClient implements TranslationEvidenceReader {
     this.assets = { terms, archive }; this.retainOwner = retain; this.reconcileLeases()
   }
   proposalReviews(record: FileJobRecord): FileProposalReviews {
-    return reviewFileProposals(record, this.assets?.terms.getSnapshot(record.summary.ownerId, record.summary.topicId).entries ?? [],
-      this.assets?.archive.getSnapshot(record.summary.ownerId, record.summary.topicId).entries ?? [])
+    return reviewFileProposals(record, this.assets?.terms.getSnapshot(record.summary.mainSessionId, record.summary.topicId).entries ?? [],
+      this.assets?.archive.getSnapshot(record.summary.mainSessionId, record.summary.topicId).entries ?? [])
   }
   setMaterials(materials: MaterialSubmissionsClient, assetNamespaceId?: () => string): void { this.materials = materials; this.assetNamespaceId = assetNamespaceId }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
@@ -110,9 +102,24 @@ export class FileJobsClient implements TranslationEvidenceReader {
       for (const record of records) { for (const source of record.sources) sources.set(source.version, source); for (const result of record.results) results.set(result.version, result) }
       const fixed = records.map(record => record.final).filter(value => value?.selection === 'user_fixed').sort((left, right) => Date.parse(right!.selectedAt) - Date.parse(left!.selectedAt))[0]
       const automatic = records.map(record => record.final).filter(value => value !== null).sort((left, right) => right!.version - left!.version)[0]
-      return { ...latest, summary: { ...latest.summary, createdAt: records[0]!.summary.createdAt }, sources: [...sources.values()].sort((left, right) => left.version - right.version),
+      const merged = { ...latest, summary: { ...latest.summary, createdAt: records[0]!.summary.createdAt }, sources: [...sources.values()].sort((left, right) => left.version - right.version),
         results: [...results.values()].sort((left, right) => left.version - right.version), final: fixed ?? automatic ?? null }
+      this.registerUnit(merged)
+      return merged
     })
+  }
+  private registerUnit(record: FileJobRecord): void {
+    const job = record.summary, history = this.sessions.getTranslationHistory(job.translationSessionId)
+    if (!history || this.sessions.isSessionDeleted(job.translationSessionId)) return
+    const old = history.units.find(unit => unit.id === job.unitId)
+    if (old && !isFileJobUnit(old)) return
+    const removedAt = this.isUnitRemoved(job.translationSessionId, job.unitId) ? job.removedAt ?? this.all(job.translationSessionId).find(value => value.summary.unitId === job.unitId && value.summary.removedAt)!.summary.removedAt! : undefined
+    if (old && old.sourceVersion === job.sourceVersion && (!!old.deletion || !removedAt)) return
+    const identity: FileJobUnit = { kind: 'file_job', id: job.unitId, order: old?.order ?? history.units.length + 1,
+      createdAt: old?.createdAt ?? job.createdAt, sourceVersion: job.sourceVersion,
+      deletion: old?.deletion ?? (removedAt ? { eventId: `file-removed:${job.unitId}`, at: removedAt } : null) }
+    this.sessions.updateTranslationHistory(job.translationSessionId, current => ({ ...current,
+      units: old ? current.units.map(unit => unit.id === old.id ? identity : unit) : [...current.units, { ...identity, order: current.units.length + 1 }] }))
   }
   unitRecord(jobId: string): FileJobRecord | undefined { const record = this.get(jobId); return record && this.forUnit(record.summary.translationSessionId, record.summary.unitId) }
   forUnit(sessionId: string, unitId: string): FileJobRecord | undefined { return this.units(sessionId, true).find(record => record.summary.unitId === unitId) }
@@ -152,14 +159,14 @@ export class FileJobsClient implements TranslationEvidenceReader {
     for (const record of live) {
       const job = record.summary
       if (!this.leases.has(job.jobId)) { const release = this.sessions.claimDocumentLease(job.translationSessionId, job.jobId); if (release) this.leases.set(job.jobId, release) }
-      if (!this.retentions.has(job.jobId) && this.retainOwner) this.retentions.set(job.jobId, this.retainOwner(job.ownerId))
+      if (!this.retentions.has(job.jobId) && this.retainOwner) this.retentions.set(job.jobId, this.retainOwner(job.mainSessionId))
     }
   }
   async refresh(): Promise<void> {
     if (this.disposed || this.syncing) return
     this.syncing = true
     try {
-      const owners = [...new Set([...this.boundOwners.keys(), ...this.sessions.getOpenOwnerIds(), ...this.records.all().map(record => record.summary.ownerId)])]
+      const owners = [...new Set([...this.boundOwners.keys(), ...this.sessions.getOpenOwnerIds(), ...this.records.all().map(record => record.summary.mainSessionId)])].filter(ownerId => this.canExecute(ownerId))
       const errors: string[] = []
       for (const ownerId of owners) {
         try {
@@ -170,11 +177,11 @@ export class FileJobsClient implements TranslationEvidenceReader {
           for (const summary of page.items) { found.add(summary.jobId); await this.project(summary) }
           offset = page.nextOffset
         } while (offset !== null && !this.disposed)
-        for (const record of this.records.all()) if (record.summary.ownerId === ownerId && !found.has(record.summary.jobId)) this.missingHosts.add(record.summary.jobId)
+        for (const record of this.records.all()) if (record.summary.mainSessionId === ownerId && !found.has(record.summary.jobId)) this.missingHosts.add(record.summary.jobId)
         } catch (cause) { errors.push(cause instanceof Error ? cause.message : '文件任务状态暂未取得。') }
       }
       this.notice = [...new Set(errors)].join(' ') || undefined
-      for (const [jobId, intent] of this.retranslationIntents) if (this.records.all().some(record => record.summary.operationId === intent.request.operationId && record.summary.ownerId === intent.request.target.mainSessionId && record.summary.unitId === intent.request.target.unitId)) this.retranslationIntents.delete(jobId)
+      for (const [jobId, intent] of this.retranslationIntents) if (this.records.all().some(record => record.summary.operationId === intent.request.operationId && record.summary.mainSessionId === intent.request.target.mainSessionId && record.summary.unitId === intent.request.target.unitId)) this.retranslationIntents.delete(jobId)
     } catch (cause) { this.notice = cause instanceof Error ? cause.message : '文件任务状态暂未取得。' }
     finally { this.syncing = false; this.reconcileLeases(); this.emit() }
   }
@@ -182,7 +189,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const pieces: string[] = []
     for (let start = 0; start < length; start += MAX_FILE_JOB_TEXT_POINTS) {
       const range = { start, end: Math.min(length, start + MAX_FILE_JOB_TEXT_POINTS) }
-      const page = await this.call('readReview', { ownerId: summary.ownerId, jobId: summary.jobId, section, range, ...(resultVersion === undefined ? {} : { resultVersion }) })
+      const page = await this.call('readReview', { ownerId: summary.mainSessionId, jobId: summary.jobId, section, range, ...(resultVersion === undefined ? {} : { resultVersion }) })
       if (page.summary.version !== summary.version || !same(page.range, range) || typeof page.text !== 'string' || Array.from(page.text).length !== range.end - range.start) throw new Error('文件任务在读取期间有更新，将读取新的完整版本。')
       pieces.push(page.text)
     }
@@ -192,7 +199,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const items: NonNullable<FileJobReviewPage['items']>[number][] = []
     let offset: number | null = 0
     do {
-      const page: FileJobReviewPage = await this.call('readReview', { ownerId: summary.ownerId, jobId: summary.jobId, section, offset, limit: 40 })
+      const page: FileJobReviewPage = await this.call('readReview', { ownerId: summary.mainSessionId, jobId: summary.jobId, section, offset, limit: 40 })
       if (page.summary.version !== summary.version) throw new Error('文件任务在读取期间有更新，将读取新的完整批次。')
       items.push(...page.items ?? []); offset = page.nextOffset
     } while (offset !== null)
@@ -200,7 +207,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
   }
   private async project(summary: FileJobSummary): Promise<void> {
     const session = this.sessions.getSession(summary.translationSessionId)
-    if (!session || (session.ownerId !== summary.ownerId && !this.sessions.isSessionOpen(summary.ownerId, session.id)) || session.topicId !== summary.topicId || this.sessions.isSessionDeleted(session.id)) return
+    if (!session || session.topicId !== summary.topicId || this.sessions.isSessionDeleted(session.id)) return
     this.missingHosts.delete(summary.jobId)
     const previous = this.records.get(summary.jobId)
     if (previous?.summary.removedAt && !summary.removedAt) return
@@ -230,7 +237,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const constraints = await this.items(summary, 'constraints'), plan = await this.items(summary, 'plan'), checks = await this.items(summary, 'checks')
     const contexts = await this.items(summary, 'contexts'), reviews = await this.items(summary, 'reviews')
     if (summary.baselineVersion !== null && record.preparation?.version !== summary.baselineVersion) {
-      const page = await this.call('readReview', { ownerId: summary.ownerId, jobId: summary.jobId, section: 'baseline', offset: 0, limit: 40 })
+      const page = await this.call('readReview', { ownerId: summary.mainSessionId, jobId: summary.jobId, section: 'baseline', offset: 0, limit: 40 })
       record = { ...record, preparation: { version: summary.baselineVersion, context: page.context ?? '', items: await this.items(summary, 'baseline') } }
     }
     const current = this.records.get(summary.jobId)
@@ -242,15 +249,16 @@ export class FileJobsClient implements TranslationEvidenceReader {
     this.projectedVersions.set(summary.jobId, summary.version)
   }
   async cancel(jobId: string): Promise<void> {
-    await this.action(jobId, async record => { await this.project(await this.call('control', { ownerId: record.summary.ownerId, jobId, action: 'cancel' })) })
+    await this.action(jobId, async record => { await this.project(await this.call('control', { ownerId: record.summary.mainSessionId, jobId, action: 'cancel' })) })
   }
   async retranslate(jobId: string, executionOwnerId?: string): Promise<void> {
+    if (!this.canExecute(executionOwnerId)) { this.notice = '请选择本次任务使用的主会话。'; this.emit(); return }
     const previous = this.retranslationIntents.get(jobId)
     if (previous && previous.status !== 'failed') { this.notice = previous.message; this.emit(); return }
     await this.action(jobId, async record => {
       if (this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('此文件单元已移除，不能重新发送旧材料。')
       if (running(record.summary)) throw new Error('请先确认当前任务已结束，再明确重译。')
-      const ownerId = executionOwnerId ?? record.summary.ownerId, locale = this.uiLocale?.()?.trim().slice(0, 64)
+      const ownerId = executionOwnerId!, locale = this.uiLocale?.()?.trim().slice(0, 64)
       const request: import('../shared/normal-translation.js').NormalTranslationUnitRequest = { target: { kind: 'unit', mainSessionId: ownerId, translationSessionId: record.summary.translationSessionId,
         unitId: record.summary.unitId, sourceVersion: record.summary.sourceVersion }, operationId: `file-retranslate-intent:${crypto.randomUUID()}`, ...(locale ? { uiLocale: locale } : {}) }
       const intent = { request, status: 'pending' as 'pending' | 'submitted' | 'unknown' | 'failed', message: '正在发送文件重译意图…' }
@@ -281,11 +289,12 @@ export class FileJobsClient implements TranslationEvidenceReader {
     finally { this.pending.delete(jobId); this.emit() }
   }
   async prepareRestart(jobId: string, operationId: string, organizedRequirements: string, executionOwnerId?: string): Promise<FileJobRestart> {
+      if (!this.canExecute(executionOwnerId)) throw new Error('请选择本次任务使用的主会话。')
       const record = this.get(jobId)
       if (!record || this.records.blocked(jobId) || this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('文件历史已移除或变化。')
       if (running(record.summary)) throw new Error('此文件仍有未结算或结果未知的任务，不能重新派发。')
-      const config = record.summary, session = this.sessions.getSession(config.translationSessionId)!, ownerId = executionOwnerId ?? config.ownerId
-      if (ownerId !== session.ownerId && !this.sessions.isSessionOpen(ownerId, session.id)) throw new Error('请先在当前主会话打开此翻译会话。')
+      const config = record.summary, session = this.sessions.getSession(config.translationSessionId)!, ownerId = executionOwnerId!
+      if (!this.sessions.isSessionOpen(ownerId, session.id)) throw new Error('请先在当前主会话打开此翻译会话。')
       const commit = this.materials?.getFileHistoryCommit(session.id, config.unitId), namespaceId = this.assetNamespaceId?.()
       let librarySource: FileJobRestart['librarySource'] = commit && namespaceId ? {
         stored: { scope: commit.reference.scope, referenceKey: commit.reference.referenceKey, source: commit.reference.source, historyToken: commit.historyToken },
@@ -299,13 +308,13 @@ export class FileJobsClient implements TranslationEvidenceReader {
       }
       // Saved proof reads through the local library; it never tries to restore into an old owner's live scope first.
       const sourceRef = librarySource ? { ...librarySource.stored.source, persistence: 'runtime_only' as const }
-        : (!this.missingHosts.has(jobId) && ownerId === config.ownerId ? config.sourceRef : undefined)
+        : (!this.missingHosts.has(jobId) && ownerId === config.mainSessionId ? config.sourceRef : undefined)
           ?? (await this.materials?.resolveFileSource(session.id, config.unitId))?.sourceRef
       if (!sourceRef) throw new Error('已保存原稿未能恢复，且运行期引用不可用；请打开原稿后重新选择文件。')
       const locale = this.uiLocale?.()?.trim().slice(0, 64)
       return { operationId, previousResultVersion: this.unitRecord(jobId)?.results.at(-1)?.version ?? 0,
         organizedRequirements: organizedRequirements.trim() ? organizedRequirements : config.organizedRequirements ?? '',
-        envelope: { ownerId, mainSessionId: ownerId, requestId: `file-restart:${operationId}`, operationId,
+        envelope: {  mainSessionId: ownerId, requestId: `file-restart:${operationId}`, operationId,
           ...(locale ? { uiLocale: locale } : {}),
           kind: 'material', material: { materialId: config.materialId, sourceVersion: config.sourceVersion, topicId: config.topicId, translationSessionId: config.translationSessionId,
             draftVersion: 1, targetLanguage: config.targetLanguage, instruction: config.instruction, model: session.model, maxInputChars: session.maxInputChars, sourceRef } },
@@ -314,7 +323,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
   async reviseSaved(request: FileJobRevision, actingOwner = request.ownerId): Promise<FileJobSummary> {
     const signature = JSON.stringify({ ...request, actingOwner })
     const updated = await this.records.mutate(request.jobId, record => {
-      if (record.summary.ownerId !== request.ownerId) throw new Error('文件修订不属于当前主会话。')
+      if (record.summary.mainSessionId !== request.ownerId) throw new Error('文件修订不属于当前主会话。')
       const old = record.revisionOperations?.find(item => item.operationId === request.operationId)
       if (old) { if (old.signature !== signature) throw new Error('同一修订操作不能更换内容。'); return record }
       if (record.summary.phase !== 'completed' || !record.summary.result || record.summary.removedAt) throw new Error('仅可修订已完成且未移除的文件。')
@@ -333,7 +342,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
   }
   readSaved(request: FileJobReadReview): FileJobReviewPage {
     const record = this.get(request.jobId)
-    if (!record || record.summary.ownerId !== request.ownerId || this.records.blocked(request.jobId) || this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('已保存文件不存在、已移除或不属于当前主会话。')
+    if (!record || record.summary.mainSessionId !== request.ownerId || this.records.blocked(request.jobId) || this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('已保存文件不存在、已移除或不属于当前主会话。')
     const { summary } = record
     if (request.section === 'source' || request.section === 'result') {
       const value = request.section === 'source' ? record.sources.find(item => item.version === summary.sourceVersion) : record.results.find(item => item.version === (request.resultVersion ?? summary.result?.version))
@@ -351,7 +360,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     await this.action(jobId, async record => {
       const related = this.all(record.summary.translationSessionId).filter(value => value.summary.unitId === record.summary.unitId)
       if (related.some(value => running(value.summary) || value.results.length || value.summary.result)) throw new Error('请先确认文件任务已结束；已有译文结果的单元不能移除。')
-      const summary = await this.call('control', { ownerId: record.summary.ownerId, jobId, action: 'remove' })
+      const summary = await this.call('control', { ownerId: record.summary.mainSessionId, jobId, action: 'remove' })
       if (!summary.removedAt) throw new Error('文件移除尚未确认，记录仍保留。')
       await this.project(summary)
       for (const value of related) {
@@ -430,15 +439,15 @@ export class FileJobsClient implements TranslationEvidenceReader {
           batchId: record.summary.proposalBatch!.id, candidateId: proposal.candidateId, edited: !!previous?.draft }
         let status: string, active = false
         if (proposal.kind === 'term') {
-          const snapshot = this.assets.terms.getSnapshot(record.summary.ownerId, record.summary.topicId)
+          const snapshot = this.assets.terms.getSnapshot(record.summary.mainSessionId, record.summary.topicId)
           const existing = snapshot.entries.find(entry => entry.id === assetId)
           const input: TopicTermPut = { id: assetId, expectedEntryVersion: review.kind === 'update' ? review.entry.version : null, sourceLanguage: existing?.sourceLanguage ?? null,
             targetLanguage: record.summary.targetLanguage, sourceForms: [...new Set([...(existing?.sourceForms ?? []), ...proposal.sourceForms])], aliases: existing?.aliases ?? [], sense: proposal.description, preferred: proposal.preferred,
             forbidden: existing?.forbidden ?? [], evidence, origin: proposal.origin, status: 'proposal' }
-          const result = await this.assets.terms.apply(record.summary.ownerId, record.summary.topicId, snapshot.version, { kind: review.kind === 'update' ? 'revise_file_proposal' : 'accept_file_proposal', input, acceptance })
-          status = result.status; active = result.entry?.status === 'active' && !['error', 'conflict'].includes(this.assets.terms.getStatus(record.summary.ownerId, record.summary.topicId))
+          const result = await this.assets.terms.apply(record.summary.mainSessionId, record.summary.topicId, snapshot.version, { kind: review.kind === 'update' ? 'revise_file_proposal' : 'accept_file_proposal', input, acceptance })
+          status = result.status; active = result.entry?.status === 'active' && !['error', 'conflict'].includes(this.assets.terms.getStatus(record.summary.mainSessionId, record.summary.topicId))
         } else {
-          const snapshot = this.assets.archive.getSnapshot(record.summary.ownerId, record.summary.topicId)
+          const snapshot = this.assets.archive.getSnapshot(record.summary.mainSessionId, record.summary.topicId)
           const resolve = (id: string): string => {
             const state = this.get(jobId)!.cards.find(card => card.candidateId === id)
             if (state?.status !== 'adopted' || !state.assetId || !snapshot.entries.some(entry => entry.id === state.assetId && entry.kind === 'entity' && entry.status === 'active')) throw new Error('依赖实体未能生效，相关卡片仍待审。')
@@ -451,7 +460,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
             const existing = snapshot.entries.find(entry => entry.id === assetId)
             if (semantic.kind === 'entity' && existing?.kind === 'entity') semantic.aliases = [...new Set([...existing.aliases, ...(existing.name === semantic.name ? [] : [existing.name]), ...semantic.aliases])].filter(name => name !== semantic.name)
             const input: TopicArchivePut = { ...semantic, id: assetId, expectedEntryVersion: review.kind === 'update' ? review.entry.version : null, evidence, origin: proposal.origin, status: 'proposal' }
-            const result = await this.assets.archive.apply(record.summary.ownerId, record.summary.topicId, snapshot.version, { kind: review.kind === 'update' ? 'revise_file_proposal' : 'accept_file_proposal', input, acceptance })
+            const result = await this.assets.archive.apply(record.summary.mainSessionId, record.summary.topicId, snapshot.version, { kind: review.kind === 'update' ? 'revise_file_proposal' : 'accept_file_proposal', input, acceptance })
             // Updating an entity may mark dependent entries for review. Keep this action's
             // approvals only for that status-only cascade, never for concurrent content edits.
             if (result.status === 'updated') for (const [id, approval] of Object.entries(approvals)) if (approval.kind === 'update') {
@@ -459,7 +468,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
               if (before && after && before.id !== assetId && before.version === approval.entry.version && after.version === before.version + 1 && after.status === 'review_required' &&
                 same({ ...before, status: null, version: null, updatedAt: null }, { ...after, status: null, version: null, updatedAt: null })) approvals[id] = { kind: 'update', entry: after }
             }
-            status = result.status; active = result.entry?.status === 'active' && !['error', 'conflict'].includes(this.assets.archive.getStatus(record.summary.ownerId, record.summary.topicId))
+            status = result.status; active = result.entry?.status === 'active' && !['error', 'conflict'].includes(this.assets.archive.getStatus(record.summary.mainSessionId, record.summary.topicId))
           } catch (cause) { status = cause instanceof Error ? cause.message : '依赖实体不可用' }
         }
         if ((status === 'updated' || status === 'unchanged') && active) {
@@ -477,7 +486,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
   async feedback(jobId: string, candidateIds: readonly string[], comment: string): Promise<void> {
     await this.action(jobId, async record => {
       if (!candidateIds.length || !comment.trim() || !record.summary.proposalBatch) throw new Error('请选择卡片并填写意见。')
-      const summary = await this.call('feedback', { ownerId: record.summary.ownerId, jobId, candidateIds: [...candidateIds], comment: comment.trim(),
+      const summary = await this.call('feedback', { ownerId: record.summary.mainSessionId, jobId, candidateIds: [...candidateIds], comment: comment.trim(),
         expectedBatchVersion: record.summary.proposalBatch.version, operationId: `file-feedback:${crypto.randomUUID()}`,
         proposalEdits: record.cards.filter(card => candidateIds.includes(card.candidateId) && card.draft).map(card => card.draft!) })
       await this.project(summary); this.notice = '意见已合并提交，将只复核所选资产及依赖。'
@@ -493,7 +502,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
       const record = this.unitRecord(raw.summary.jobId) ?? raw
       const value = (side === 'source' ? record.sources : record.results).find(value => value.version === version)
       if (!value) throw new Error('所选固定版本尚未取得。')
-      const outcome = await views.open({ ownerId: record.summary.ownerId, sessionId: record.summary.translationSessionId, unitId: record.summary.unitId,
+      const outcome = await views.open({ namespaceId: this.sessions.getNamespaceId(), sessionId: record.summary.translationSessionId, unitId: record.summary.unitId,
         kind: side, title: `${side === 'source' ? '原稿' : '译文'} · 版本 ${version}`, revisionId: `${side}:${record.summary.unitId}:${version}`, fileName: `${side === 'source' ? '原稿' : '译文'}-v${version}.txt`, format: 'txt', text: value.text })
       if (!outcome.ok) throw new Error(outcome.message)
     })
@@ -502,13 +511,13 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const record = this.forUnit(sessionId, unitId), session = this.sessions.getSession(sessionId)
     if (!record || !session || this.records.blocked(record.summary.jobId) || this.sessions.getStatus(sessionId) === 'conflict') return undefined
     const source = record.sources.find(value => value.version === record.summary.sourceVersion)
-    return source ? { ownerId: session.ownerId, topicId: session.topicId, sourceVersion: source.version, source: source.text, final: null } : undefined
+    return source ? { ownerId: this.sessions.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sourceVersion: source.version, source: source.text, final: null } : undefined
   }
   capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult {
     if (ref.kind === 'reference') return this.fallback.capture(ownerId, topicId, ref)
     const record = this.forUnit(ref.sessionId, ref.unitId)
     if (!record) return this.fallback.capture(ownerId, topicId, ref)
-    const request: EvidenceReadRequest = { ownerId: record.summary.ownerId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
+    const request: EvidenceReadRequest = { ownerId: record.summary.mainSessionId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
       sourceVersion: ref.kind === 'source' ? ref.sourceVersion ?? 1 : record.summary.sourceVersion, side: ref.kind,
       range: ref.range, revisionId: ref.revisionId, selectionEventId: ref.selectionEventId }
     if (record.summary.topicId !== topicId || ref.kind !== 'source' || !this.isCurrent(request)) return unavailable(request, 'file_job_source_unavailable')
@@ -517,7 +526,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
   isCurrent(request: EvidenceReadRequest): boolean {
     const record = this.forUnit(request.sessionId, request.unitId)
     if (!record) return this.fallback.isCurrent(request)
-    return !this.disposed && request.side === 'source' && record.summary.ownerId === request.ownerId && record.summary.topicId === request.topicId &&
+    return !this.disposed && request.side === 'source' && record.summary.mainSessionId === request.ownerId && record.summary.topicId === request.topicId &&
       !this.records.blocked(record.summary.jobId) && this.sessions.getStatus(request.sessionId) !== 'conflict' && record.sources.some(source => source.version === request.sourceVersion)
   }
   async read(request: EvidenceReadRequest): Promise<EvidenceReadResult> {

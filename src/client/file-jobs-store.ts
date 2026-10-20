@@ -35,15 +35,16 @@ export interface FileJobRecord {
 }
 interface Seat { record: FileJobRecord; stored: string | null; error?: string; conflict?: boolean }
 function parse(raw: string): FileJobRecord {
-  const record = JSON.parse(raw) as FileJobRecord, summary = record?.summary
-  if (record?.schemaVersion !== 1 || !summary?.jobId || summary.ownerId !== summary.mainSessionId || !summary.translationSessionId ||
+  const record = JSON.parse(raw) as FileJobRecord & { summary: FileJobSummary & { ownerId?: string; historyOwnerId?: string } }, summary = record?.summary
+  if (record?.schemaVersion !== 1 || !summary?.jobId || typeof summary.mainSessionId !== 'string' || !summary.mainSessionId.trim() || (summary.ownerId !== undefined && summary.ownerId !== summary.mainSessionId) || !summary.translationSessionId ||
     !Number.isSafeInteger(summary.version) || !Array.isArray(record.sources) || !Array.isArray(record.results) ||
     !Array.isArray(record.proposals) || !Array.isArray(record.cards) || !Array.isArray(record.workers) ||
     [...record.sources, ...record.results].some(value => !Number.isSafeInteger(value.version) || value.version < 1 || typeof value.text !== 'string') ||
     new Set(record.proposals.map(value => value.candidateId)).size !== record.proposals.length ||
     new Set(record.cards.map(value => value.candidateId)).size !== record.cards.length ||
     record.final && !record.results.some(value => value.version === record.final!.version)) throw new Error('文件任务历史格式无效。')
-  return record
+  const { ownerId: _legacyOwner, historyOwnerId: _legacyHistoryOwner, ...execution } = summary
+  return { ...record, summary: execution }
 }
 const key = (record: FileJobRecord): string => `${fileJobsSessionPrefix(record.summary.translationSessionId)}${encodeURIComponent(record.summary.jobId)}`
 

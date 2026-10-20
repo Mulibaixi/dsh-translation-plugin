@@ -1,3 +1,4 @@
+import { isFileJobUnit } from './translation-history.js'
 import type { LibrarySourceRequest, LibrarySourcesPort } from '../shared/library-sources.js'
 import type { TermEvidenceRef } from '../memory/topic-terms.js'
 import { isDocumentManifestReuse } from '../memory/document-correction.js'
@@ -133,7 +134,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     const session = this.options.sessions.getSession(ref.sessionId)
     if (session?.topicId !== topicId) return unavailable(null, 'forbidden', 'scope_mismatch')
     const unit = this.options.sessions.getTranslationHistory(ref.sessionId)?.units.find(unit => unit.id === ref.unitId)
-    const request: EvidenceReadRequest = { ownerId: session.ownerId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
+    const request: EvidenceReadRequest = { ownerId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,
       sourceVersion: ref.kind === 'source' ? ref.sourceVersion ?? 1 : unit?.sourceVersion ?? 1,
       side: ref.kind, range: ref.range && { ...ref.range }, revisionId: ref.revisionId, selectionEventId: ref.selectionEventId }
     const snapshot = this.inspect(request)
@@ -149,10 +150,10 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       unitId: target.unitId, sourceVersion, side: 'source', range: null, revisionId: null, selectionEventId: null }
     if (this.disposed) return unavailable(request, 'unloaded', 'reader_disposed')
     if (!session || sessions.isSessionDeleted(target.sessionId)) return unavailable(request, 'missing', 'session_missing')
-    if (session.ownerId !== target.ownerId || session.topicId !== target.topicId || this.options.authorize && !this.options.authorize(request)) return unavailable(request, 'forbidden', 'scope_mismatch')
+    if (session.topicId !== target.topicId || this.options.authorize && !this.options.authorize(request)) return unavailable(request, 'forbidden', 'scope_mismatch')
     if (sessions.getStatus(session.id) === 'conflict') return unavailable(request, 'unloaded', 'history_conflict')
     if (!unit || !isDocumentUnit(unit)) return unavailable(request, 'missing', 'document_missing')
-    const source = unit.sourceVersions.find(source => source.version === sourceVersion)
+    const source = !isFileJobUnit(unit) && unit.sourceVersions.find(source => source.version === sourceVersion)
     if (!source) return unavailable(request, 'missing', 'source_version_missing')
     const selected = currentDocumentFinalRevision(unit)
     const manifest = target.manifestRevisionId === undefined ? (selected?.sourceVersion === sourceVersion ? selected : undefined) ?? (sourceVersion === unit.sourceVersion ? currentDocumentCandidateRevision(unit) : [...unit.revisions].reverse().find(revision => revision.sourceVersion === sourceVersion)) ?? null
@@ -171,13 +172,13 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
           unit.plans.some(actual => sameVersionReference(actual, chunk.planRef) && actual.items.some(original => original.chunkId === item.chunkId && same(original.outputRange, item.outputRange) && original.mode === item.mode))) ?? null : null
       return { ...item, revisionId: entry?.revisionId ?? revision?.id ?? null, revision, ...((entry?.reuseRef ?? (reusable ? approvedEntry.reuseRef : undefined)) ? { reuseRef: entry?.reuseRef ?? approvedEntry!.reuseRef } : {}) }
     })
-    const scope: TranslationSourceScope = { ownerId: target.ownerId, mainSessionId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId }
+    const scope: TranslationSourceScope = source.historyCommit?.reference.scope ?? { ...(this.options.assetNamespaceId ? { namespaceId: this.options.assetNamespaceId() } : {}), ownerId: target.ownerId, mainSessionId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId }
     const check = (): EvidenceUnavailableResult | null => {
       if (this.disposed) return unavailable(request, 'unloaded', 'reader_disposed')
       if (this.options.authorize && !this.options.authorize(request)) return unavailable(request, 'forbidden', 'authorization_changed')
       const currentSession = sessions.getSession(target.sessionId)
       if (!currentSession || sessions.isSessionDeleted(target.sessionId)) return unavailable(request, 'missing', 'session_missing')
-      if (currentSession.ownerId !== target.ownerId || currentSession.topicId !== target.topicId) return unavailable(request, 'forbidden', 'scope_mismatch')
+      if (currentSession.topicId !== target.topicId) return unavailable(request, 'forbidden', 'scope_mismatch')
       if (sessions.getStatus(target.sessionId) === 'conflict') return unavailable(request, 'unloaded', 'history_conflict')
       const current = sessions.getTranslationHistory(target.sessionId)?.units.find(unit => unit.id === target.unitId)
       if (!current || !isDocumentUnit(current)) return unavailable(request, 'missing', 'document_missing')
@@ -274,14 +275,14 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     if (this.options.authorize && !this.options.authorize(request)) return unavailable(request, 'forbidden', 'authorization_changed')
     const sessions = this.options.sessions, session = sessions.getSession(request.sessionId)
     if (!session || sessions.isSessionDeleted(request.sessionId)) return unavailable(request, 'missing', 'session_missing')
-    if (session.ownerId !== request.ownerId || session.topicId !== request.topicId) return unavailable(request, 'forbidden', 'scope_mismatch')
+    if (session.topicId !== request.topicId) return unavailable(request, 'forbidden', 'scope_mismatch')
     if (sessions.getStatus(session.id) === 'conflict') return unavailable(request, 'unloaded', 'history_conflict')
     const history = sessions.getTranslationHistory(session.id), unit = history?.units.find(unit => unit.id === request.unitId)
     if (!unit) return unavailable(request, 'missing', 'unit_missing')
     if (unit.sourceVersion !== request.sourceVersion) return unavailable(request, 'missing', 'stale_source')
-    const source = unit.sourceVersions.find(source => source.version === request.sourceVersion)
+    const source = !isFileJobUnit(unit) && unit.sourceVersions.find(source => source.version === request.sourceVersion)
     if (!source) return unavailable(request, 'missing', 'source_version_missing')
-    const scope: TranslationSourceScope = { ownerId: request.ownerId, mainSessionId: request.ownerId, topicId: request.topicId, translationSessionId: request.sessionId }
+    const scope: TranslationSourceScope = 'historyCommit' in source && source.historyCommit ? source.historyCommit.reference.scope : { ownerId: request.ownerId, mainSessionId: request.ownerId, topicId: request.topicId, translationSessionId: request.sessionId }
     if (request.side === 'source') {
       const totalCodePoints = isDocumentUnit(unit) ? documentSourceLength(source as DocumentSourceVersion) : sourceCodePointLength((source as { text: string }).text)
       if (request.range && request.range.end > totalCodePoints) return unavailable(request, 'missing', 'range_out_of_bounds', totalCodePoints)

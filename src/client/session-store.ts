@@ -1,3 +1,5 @@
+import { isFileJobUnit, hasUnitBody } from './translation-history.js'
+import { libraryNamespace } from './library-identity.js'
 import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
 import {
   DEFAULT_SESSION_SETTINGS, HISTORY_PREFIX, LEGACY_DRAFT_PREFIX, LEGACY_SETTINGS_KEY, SETTINGS_KEY,
@@ -10,7 +12,7 @@ import { decodeTranslationHistory, emptyTranslationHistory, isDocumentUnit, isTe
   deleteUnit, unitDeletionBlockedReason, isDeletedUnit,
   persistedTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
 import { parseTranslationSourceReference, parseTranslationSourceStorageRequest, type TranslationSourceQueryReference, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
-import type { TranslationSourceScope } from '../shared/translation-sources.js'
+import { parseTranslationSourceScope, type TranslationSourceScope } from '../shared/translation-sources.js'
 import type { TranslationSourceHistoryCallbacks, TranslationSourceHistoryCommit } from './source-storage-client.js'
 import {
   DELETED_SESSION_PREFIX, TOPIC_IDENTITY_PREFIX, TOPIC_NAME_PREFIX, TOPIC_LOCK_NAME, DELETED_TOPIC_PREFIX, TOPIC_DELETION_INTENT_PREFIX,
@@ -100,8 +102,8 @@ interface SessionSnapshot { readonly session: LocalSession; readonly translation
 function readSnapshot(raw: string): SessionSnapshot | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown> | null
-    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
-    const hasTranslations = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13].includes(value.schemaVersion as number)
+    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    const hasTranslations = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].includes(value.schemaVersion as number)
     const fields = hasTranslations ? ['schemaVersion', 'token', 'session', 'translationHistory'] : ['schemaVersion', 'token', 'session']
     if (Object.keys(value).length !== fields.length || fields.some(key => !Object.hasOwn(value, key))) return undefined
     if (hasTranslations && (value.translationHistory as { schemaVersion?: unknown } | null)?.schemaVersion !== (value.schemaVersion as number) - 3) return undefined
@@ -114,6 +116,9 @@ function readHistory(raw: string): LocalSession | undefined { return readSnapsho
 function currentVersion(seat: Seat): string { return JSON.stringify({ session: seat.session, translationHistory: seat.translationHistory }) }
 
 export class SessionStore {
+  private readonly namespaceId: string
+  private readonly legacyStorageOwners = new Map<string, string>()
+  private readonly legacyCreators = new Map<string, string>()
   private settings: SessionSettings = DEFAULT_SESSION_SETTINGS
   private readonly seats = new Map<string, Seat>()
   private readonly topics = new Map<string, TopicSeat>()
@@ -136,15 +141,40 @@ export class SessionStore {
   private disposed = false
 
   constructor(private readonly storage?: LocalStoragePort, listen?: (onChange: (key: string | null) => void) => Disposer, private readonly locks: StructureLockPort | undefined = browserLocks()) {
+    this.namespaceId = libraryNamespace(storage)
     this.readSettings(); this.loadHistory()
     this.stop = listen?.(key => this.externalChange(key))
   }
 
+  getNamespaceId(): string { return this.namespaceId }
+  /** Compatibility locator for old stored assets, never an execution identity. */
+  getTopicStorageScope(topicId: string): string | undefined {
+    if (this.deletedTopics.has(topicId) || !this.topics.has(topicId)) return undefined
+    return this.legacyStorageOwners.get(topicId) ?? this.namespaceId
+  }
+  private rememberLegacyStorage(topicId: string, owner: unknown): void {
+    if (typeof owner !== 'string' || !owner.trim() || this.legacyStorageOwners.has(topicId)) return
+    const key = 'dsh-translation-plugin:legacy-topic-storage:v1:' + encodeURIComponent(topicId)
+    this.legacyStorageOwners.set(topicId, owner)
+    try { this.storage?.setItem(key, owner) } catch { this.notice = '旧资产定位信息未保存；相关内容保留，迁移写入暂停。' }
+  }
+  getOperationMainSessionId(sessionId: string, operationId: string): string | undefined {
+    const history = this.getTranslationHistory(sessionId)
+    const event = history?.events.find(event => event.operationId === operationId && event.mainSessionId)
+    if (event?.mainSessionId) return event.mainSessionId
+    const exchange = history?.exchanges.find(exchange => exchange.operationId === operationId)
+    if (exchange) return exchange.mainSessionId
+    for (const unit of history?.units ?? []) {
+      if (isTextUnit(unit) && unit.material && history?.events.find(event => event.unitId === unit.id && event.type === 'operation.accepted')?.operationId === operationId) return unit.material.mainSessionId
+      if (isDocumentUnit(unit)) { const task = unit.tasks.find(task => task.taskId === operationId || task.operationId === operationId); if (task) return task.mainSessionId ?? task.executionFacts?.blocks[0]?.request.scope.mainSessionId }
+    }
+    return undefined
+  }
   getAllSessions(): readonly LocalSession[] { return [...this.seats.values()].map(seat => seat.session) }
   hasUnsettledWork(): boolean {
     return this.executionLeases.size > 0 || [...this.seats.values()].some(seat => seat.translationHistory.exchanges.some(exchange => ['open','waiting_user','resuming','unknown'].includes(exchange.status)) || seat.translationHistory.units.some(unit => isDocumentUnit(unit)
       ? unit.tasks.some(task => ['running','unknown','waiting_context','waiting_user'].includes(task.status))
-      : unit.revisions.some(revision => ['submitting','running','unknown','context_requested'].includes(revision.status))))
+      : isTextUnit(unit) && unit.revisions.some(revision => ['submitting','running','unknown','context_requested'].includes(revision.status))))
   }
   getSettings(): SessionSettings { return this.settings }
   getStorageUsage(): PluginStorageUsage { return readPluginStorageUsage(this.storage) }
@@ -192,8 +222,7 @@ export class SessionStore {
       isEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
       isScopeCurrent: scope => {
         const session = this.getSession(scope.translationSessionId)
-        return !this.disposed && !!session && !this.isSessionDeleted(session.id) && scope.ownerId === scope.mainSessionId &&
-          session.ownerId === scope.ownerId && session.topicId === scope.topicId && this.getTopics(scope.ownerId).some(topic => topic.id === scope.topicId)
+        return !this.disposed && !!session && !this.isSessionDeleted(session.id) && session.topicId === scope.topicId && this.getTopics(scope.ownerId).some(topic => topic.id === scope.topicId)
       },
     }
   }
@@ -220,17 +249,19 @@ export class SessionStore {
       isEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
       isScopeCurrent: scope => {
         const session = this.getSession(scope.translationSessionId)
-        return !this.disposed && !!session && !this.isSessionDeleted(session.id) && scope.ownerId === scope.mainSessionId &&
-          (retainConsumerHistory || session.ownerId === scope.ownerId) && session.topicId === scope.topicId && this.getTopics(scope.ownerId).some(topic => topic.id === scope.topicId)
+        return !this.disposed && !!session && !this.isSessionDeleted(session.id) &&
+          session.topicId === scope.topicId && this.getTopics().some(topic => topic.id === scope.topicId)
       },
       saveSession: sessionId => this.saveTranslationHistoryAsync(sessionId),
     }
   }
   /** Bind storage acknowledgments to an existing document source; this never admits a task. */
-  createSourceHistoryCallbacks(target: SourceHistoryTarget): TranslationSourceHistoryCallbacks {
+  createSourceHistoryCallbacks(target: SourceHistoryTarget, preparedScope?: TranslationSourceScope): TranslationSourceHistoryCallbacks {
     const fixed = { ...target }, session = this.getSession(fixed.sessionId)
     if (!session || !Number.isSafeInteger(fixed.sourceVersion) || fixed.sourceVersion < 1) throw new Error('Document source history target is unavailable')
-    const scope: TranslationSourceScope = { ownerId: session.ownerId, mainSessionId: session.ownerId, topicId: session.topicId, translationSessionId: session.id }
+    const storedScope = this.getTranslationHistory(session.id)?.units.find(unit => unit.id === target.unitId)
+    const retainedScope = storedScope && isDocumentUnit(storedScope) ? storedScope.sourceVersions.find(source => source.version === target.sourceVersion)?.historyCommit?.reference.scope : undefined
+    const scope = parseTranslationSourceScope(retainedScope ?? preparedScope ?? { namespaceId: this.namespaceId, ownerId: this.getTopicStorageScope(session.topicId)!, mainSessionId: this.getTopicStorageScope(session.topicId)!, topicId: session.topicId, translationSessionId: session.id })
     this.sourceHistoryVersion(fixed, scope)
     return {
       isHistoryEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
@@ -288,7 +319,9 @@ export class SessionStore {
   async readStoredSourceRequest(target: SourceHistoryTarget): Promise<TranslationSourceStoredRead | null> {
     const session = this.getSession(target.sessionId)
     if (!session) return null
-    const scope: TranslationSourceScope = { ownerId: session.ownerId, mainSessionId: session.ownerId, topicId: session.topicId, translationSessionId: session.id }
+    const storedScope = this.getTranslationHistory(session.id)?.units.find(unit => unit.id === target.unitId)
+    const retainedScope = storedScope && isDocumentUnit(storedScope) ? storedScope.sourceVersions.find(source => source.version === target.sourceVersion)?.historyCommit?.reference.scope : undefined
+    const scope: TranslationSourceScope = retainedScope ?? { namespaceId: this.namespaceId, ownerId: this.getTopicStorageScope(session.topicId)!, mainSessionId: this.getTopicStorageScope(session.topicId)!, topicId: session.topicId, translationSessionId: session.id }
     const source = this.sourceHistoryVersion(target, scope), key = source.historyCommit?.reference.referenceKey
     if (!key) return null
     const commit = this.readSourceHistoryCommit(target, scope, { scope, referenceKey: key })
@@ -296,7 +329,7 @@ export class SessionStore {
   }
   private sourceHistoryVersion(target: SourceHistoryTarget, scope: TranslationSourceScope) {
     const seat = this.seats.get(target.sessionId), session = seat?.session, unit = seat?.translationHistory.units.find(unit => unit.id === target.unitId)
-    if (this.disposed || !session || this.isDeleted(session.id) || session.ownerId !== scope.ownerId || scope.mainSessionId !== session.ownerId ||
+    if (this.disposed || !session || this.isDeleted(session.id) || scope.ownerId !== scope.mainSessionId ||
       session.topicId !== scope.topicId || session.id !== scope.translationSessionId || !unit || !isDocumentUnit(unit)) throw new Error('Document source history scope is unavailable')
     const source = unit.sourceVersions.find(version => version.version === target.sourceVersion)
     if (!source || source.body.kind !== 'asset') throw new Error('Document asset source version is unavailable')
@@ -310,7 +343,7 @@ export class SessionStore {
     const raw = this.storage.getItem(historyKey(target.sessionId))
     if (raw === null) return null
     const snapshot = readSnapshot(raw), session = snapshot?.session, unit = snapshot?.translationHistory.units.find(unit => unit.id === target.unitId)
-    if (!session || session.id !== target.sessionId || session.ownerId !== scope.ownerId || session.topicId !== scope.topicId ||
+    if (!session || session.id !== target.sessionId || session.topicId !== scope.topicId ||
       !this.matchesHistoryIdentity(session, this.seats.get(target.sessionId)!.session)) throw new Error('Persisted document source scope is unavailable')
     if (!unit) return null
     if (!isDocumentUnit(unit)) throw new Error('Persisted source target is not a document')
@@ -331,7 +364,6 @@ export class SessionStore {
       .map(topic => ({ id: topic.identity.id, name: topic.name, nextSequence: topic.identity.nextSequence }))
   }
   /** Stable storage anchor retained for existing topic assets; never an execution owner. */
-  getTopicAssetOwner(topicId: string): string | undefined { return this.deletedTopics.has(topicId) ? undefined : this.topics.get(topicId)?.identity.ownerId }
   isTopicDeleted(topicId: string): boolean { return this.deletedTopics.has(topicId) }
   isTopicDeleting(topicId: string): boolean { return this.topicIntents.has(topicId) }
   getTopicDeletionIntent(topicId: string): TopicDeletionIntent | undefined { return this.topicIntents.get(topicId) }
@@ -359,7 +391,8 @@ export class SessionStore {
   }
 
   private rememberModel(seat: Seat): void {
-    const { ownerId, id, model } = seat.session
+    const { id, model } = seat.session
+    const ownerId = this.namespaceId
     this.lastModels.set(ownerId, model)
     try {
       if (!this.storage) throw new Error('storage unavailable')
@@ -427,6 +460,10 @@ export class SessionStore {
       for (const key of keys.filter(key => key.startsWith(HISTORY_PREFIX))) {
         const raw = this.storage.getItem(key)
         const snapshot = raw === null ? undefined : readSnapshot(raw), session = snapshot?.session
+        if (raw && session) {
+          const legacy = JSON.parse(raw).session?.ownerId
+          if (typeof legacy === 'string') { this.legacyCreators.set(session.id, legacy); this.rememberLegacyStorage(session.topicId, legacy) }
+        }
         if (!session || historyKey(session.id) !== key) { this.notice = '部分会话历史无法读取，原存储副本已保留。'; continue }
         if (this.isDeleted(session.id)) continue
         if (this.deletedTopics.has(session.topicId)) { this.notice = '已删除主题的遗留会话未恢复，原存储副本已保留。'; continue }
@@ -465,12 +502,18 @@ export class SessionStore {
       const raw = this.storage?.getItem(key)
       if (raw === undefined || raw === null) continue
       const identity = decodeTopicIdentity(raw)
+      if (identity) {
+        const locator = this.storage?.getItem('dsh-translation-plugin:legacy-topic-storage:v1:' + encodeURIComponent(identity.id))
+        const legacy = JSON.parse(raw).ownerId
+        if (locator) this.legacyStorageOwners.set(identity.id, locator)
+        else if (typeof legacy === 'string') this.rememberLegacyStorage(identity.id, legacy)
+      }
       if (!identity || topicIdentityKey(identity.id) !== key) {
         this.corruptTopics.add(key); this.notice = '部分主题编号记录无法读取，相关持久主题暂停新建会话。'; continue
       }
       if (this.deletedTopics.has(identity.id)) continue
       const old = this.topics.get(identity.id)
-      if (old && (old.identity.ownerId !== identity.ownerId || old.identity.sequenceNamespaceId !== identity.sequenceNamespaceId)) {
+      if (old && (old.identity.sequenceNamespaceId !== identity.sequenceNamespaceId)) {
         this.corruptTopics.add(key); this.notice = '主题身份存在冲突，当前内容保留。'; continue
       }
       const nameRaw = this.storage?.getItem(topicNameKey(identity.id))
@@ -529,14 +572,14 @@ export class SessionStore {
     for (const source of this.migrationSources.values()) {
       if (!this.seats.has(source.id)) continue
       const known = assigned.get(source.id)
-      if (known && known.topic.identity.ownerId === source.ownerId) {
+      if (known) {
         this.applyMigration(source.id, known.topic, known.sequence); continue
       }
       let root = source
       const path = new Set([source.id])
       while (root.parentId) {
         const parent = this.migrationSources.get(root.parentId)
-        if (!parent || !this.seats.has(parent.id) || parent.ownerId !== source.ownerId) break
+        if (!parent || !this.seats.has(parent.id) || this.legacyCreators.get(parent.id) !== this.legacyCreators.get(source.id)) break
         if (path.has(parent.id)) { root = source; break }
         path.add(parent.id); root = parent
       }
@@ -549,7 +592,7 @@ export class SessionStore {
       let topic = this.topics.get(id)
       if (!topic) {
         topic = {
-          identity: { schemaVersion: 1, id, ownerId: root.ownerId, sequenceNamespaceId: `migration:${root.id}`, nextSequence: 0, version: 0, allocations: [] },
+          identity: { schemaVersion: 2, id, sequenceNamespaceId: `migration:${root.id}`, nextSequence: 0, version: 0, allocations: [] },
           name: root.legacyName ?? root.name, persistedName: root.legacyName ?? root.name, stored: null, durable: true, nameDirty: false,
         }
         this.topics.set(id, topic)
@@ -590,7 +633,7 @@ export class SessionStore {
     let topic = this.topics.get(session.topicId)
     if (!topic) {
       topic = {
-        identity: { schemaVersion: 1, id: session.topicId, ownerId: session.ownerId, sequenceNamespaceId: session.sequenceNamespaceId, nextSequence: session.sequence + 1, version: 0, allocations: [{ sessionId: session.id, sequence: session.sequence }] },
+        identity: { schemaVersion: 2, id: session.topicId, sequenceNamespaceId: session.sequenceNamespaceId, nextSequence: session.sequence + 1, version: 0, allocations: [{ sessionId: session.id, sequence: session.sequence }] },
         name: session.topicName, persistedName: seat.savedSession?.topicName, stored: null, durable: !!seat.savedSession, nameDirty: false,
       }
       this.topics.set(session.topicId, topic)
@@ -614,13 +657,13 @@ export class SessionStore {
   }
 
   getHistory(ownerId?: string): readonly LocalSession[] {
-    return [...this.seats.values()].flatMap(seat => seat.savedSession && (ownerId === undefined || seat.savedSession.ownerId === ownerId) ? [seat.savedSession] : [])
+    return [...this.seats.values()].flatMap(seat => seat.savedSession && (ownerId === undefined || this.isSessionOpen(ownerId, seat.savedSession.id)) ? [seat.savedSession] : [])
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
-  getOwnerIds(): readonly string[] { return [...new Set([...this.seats.values()].map(seat => seat.session.ownerId))] }
-  getOpenOwnerIds(): readonly string[] { return [...new Set([...this.workspaces.keys(), ...this.sessionOrders.keys()])].filter(ownerId => this.openSet(ownerId).length > 0) }
-  getAvailableSessions(ownerId: string): readonly LocalSession[] {
-    return [...this.seats.values()].map(seat => seat.session).filter(session => session.ownerId === ownerId)
+  getOwnerIds(): readonly string[] { return [...new Set([...this.workspaces.keys(), ...this.sessionOrders.keys()])] }
+  getOpenOwnerIds(): readonly string[] { return [...new Set([...this.workspaces.keys(), ...this.sessionOrders.keys()])].filter(ownerId => ownerId !== this.namespaceId && this.openSet(ownerId).length > 0) }
+  getAvailableSessions(_entryId?: string): readonly LocalSession[] {
+    return [...this.seats.values()].map(seat => seat.session)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
   }
   /** 打开集合与显示顺序共用同一份持久记录：ids 即本主会话当前打开（且可排序）的会话。 */
@@ -643,7 +686,7 @@ export class SessionStore {
   private writeOpenSet(ownerId: string, ids: readonly string[]): boolean { return this.saveSessionOrder(ownerId, ids) }
   /** 迁移：从未记录打开集合的既有主会话，把其名下未归档会话视为已打开。 */
   private seedOpenSet(ownerId: string): readonly string[] {
-    const seeded = this.getAvailableSessions(ownerId).filter(session => session.archivedAt === null).map(session => session.id)
+    const seeded = this.getAllSessions().filter(session => this.legacyCreators.get(session.id) === ownerId && session.archivedAt === null).map(session => session.id)
     if (seeded.length) this.saveSessionOrder(ownerId, seeded)
     else this.sessionOrders.set(ownerId, seeded)
     return seeded
@@ -673,12 +716,16 @@ export class SessionStore {
   getActiveSessions(ownerId: string): readonly LocalSession[] { return this.getDisplaySessions(ownerId) }
   getArchivedSessions(ownerId: string): readonly LocalSession[] {
     return [...this.seats.values()].map(seat => seat.session)
-      .filter(session => session.ownerId === ownerId && session.archivedAt !== null && !this.isSessionDeleted(session.id))
+      .filter(session => session.archivedAt !== null && !this.isSessionDeleted(session.id))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
   }
   getActiveSession(ownerId: string): LocalSession | undefined { const id = this.workspaces.get(ownerId)?.active; return id ? this.getSession(id) : undefined }
   /** 执行归属：会话已加入该主会话的打开集合即可在该主会话下执行，归属 ownerId 不变。 */
   isSessionOpen(ownerId: string, id: string): boolean { return this.openSet(ownerId).includes(id) }
+  canAccessUnit(mainSessionId: string, sessionId: string, unitId: string): boolean {
+    const unit = this.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
+    return this.isSessionOpen(mainSessionId, sessionId) && !this.isSessionDeleted(sessionId) && this.getStatus(sessionId) !== 'conflict' && !!unit && !unit.deletion
+  }
   private reconcileWorkspace(ownerId: string): void {
     const workspace = this.workspaces.get(ownerId)
     if (!workspace) return
@@ -699,7 +746,7 @@ export class SessionStore {
     this.readSettings()
     this.loadHistory()
     const parent = parentId ? this.getSession(parentId) : undefined
-    if (parentId && (!parent || parent.ownerId !== ownerId)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
+    if (parentId && (!parent)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
     const topic = parent ? this.topics.get(parent.topicId) : undefined
     if (topic?.durable || (parent && this.settings.rememberHistory)) {
       this.notice = '持久主题的新编号需要异步主题锁，请使用新建子会话操作。'; this.emit(); return undefined
@@ -723,7 +770,7 @@ export class SessionStore {
     if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
     const settings = parent ? { ...this.settings, defaultMode: parent.mode, targetLanguage: parent.targetLanguage, defaultInstruction: parent.instruction, maxInputChars: parent.maxInputChars } : this.settings
     const initial = newSession(settings, ownerId, id, topic?.name ?? '新翻译会话', parent?.id ?? null, topic?.identity.id, topic?.identity.sequenceNamespaceId, sequence)
-    const model = parent ? parent.model : this.lastModels.has(ownerId) ? this.lastModels.get(ownerId)! : this.readModelPreference(ownerModelKey(ownerId)) ?? null
+    const model = parent ? parent.model : this.lastModels.has(this.namespaceId) ? this.lastModels.get(this.namespaceId)! : this.readModelPreference(ownerModelKey(this.namespaceId)) ?? null
     const session = { ...initial, model: model ? { ...model } : null }
     if (topic && !reserved) topic.identity = { ...topic.identity, nextSequence: sequence + 1, allocations: [...topic.identity.allocations, { sessionId: id, sequence }] }
     this.seats.set(id, { session, savedSession: undefined, translationHistory: emptyTranslationHistory(), savedTranslationHistory: emptyTranslationHistory(), stored: null, legacyRaw: null, status: 'memory' })
@@ -743,12 +790,22 @@ export class SessionStore {
     this.writeOpenSet(ownerId, next)
   }
 
+  private lockTimeoutMs = 15_000
   private async withStructureLock<T>(failure: T, action: () => T | Promise<T>): Promise<T> {
     if (!this.storage || !this.locks) {
       this.notice = '当前环境缺少 Web Locks 或本地存储。持久主题的新建、重命名与迁移保存已暂停；当前输入仍保留。'; this.emit(); return failure
     }
-    try { return await this.locks.request(TOPIC_LOCK_NAME, () => this.disposed ? failure : action()) }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      // Two panels (for example one main Session and an opened cross-owner Session) share one
+      // origin-wide topic lock. A stuck holder must not block this panel forever.
+      return await Promise.race([
+        this.locks.request(TOPIC_LOCK_NAME, () => this.disposed ? failure : action()),
+        new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('主题写入等待超时')), this.lockTimeoutMs) }),
+      ])
+    }
     catch (error) { this.notice = storageSaveFailureMessage(error, '主题编号或名称', '主题编号或名称保存失败，当前输入仍保留；请检查本地存储后重试。'); this.emit(); return failure }
+    finally { if (timer) clearTimeout(timer) }
   }
 
   /** 有历史保存或既有持久身份时，先可靠发号；正文保存失败可留下空号。 */
@@ -757,7 +814,7 @@ export class SessionStore {
     if (!this.readSettings()) { this.emit(); return undefined }
     this.loadHistory()
     const parent = parentId ? this.getSession(parentId) : undefined
-    if (parentId && (!parent || parent.ownerId !== ownerId)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
+    if (parentId && (!parent)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
     if (!this.settings.rememberHistory && (!parent || !this.topics.get(parent.topicId)?.durable)) return this.createSession(ownerId, parentId, activate)
     return this.withStructureLock(undefined, () => this.createSessionLocked(ownerId, parentId, undefined, activate))
   }
@@ -766,7 +823,7 @@ export class SessionStore {
     if (!this.readSettings()) return undefined
     this.loadHistory()
     const currentParent = parentId ? this.getSession(parentId) : topicId ? this.getAvailableSessions(ownerId).find(session => session.topicId === topicId && !this.isDeleted(session.id)) : undefined
-    if (parentId && (!currentParent || currentParent.ownerId !== ownerId || this.isDeleted(parentId))) {
+    if (parentId && (!currentParent || this.isDeleted(parentId))) {
       this.notice = '原会话已变化或删除，新建未执行。'; this.emit(); return undefined
     }
     let topic = topicId ? this.topics.get(topicId) : currentParent ? this.topics.get(currentParent.topicId) : undefined
@@ -774,7 +831,7 @@ export class SessionStore {
     const id = this.freshId()
     if (!topic) {
       topic = {
-        identity: { schemaVersion: 1, id: `topic:${id}`, ownerId, sequenceNamespaceId: `sequence:${id}`, nextSequence: 0, version: 0, allocations: [] },
+        identity: { schemaVersion: 2, id: `topic:${id}`, sequenceNamespaceId: `sequence:${id}`, nextSequence: 0, version: 0, allocations: [] },
         name: '新翻译会话', persistedName: undefined, stored: null, durable: false, nameDirty: false,
       }
       this.topics.set(topic.identity.id, topic)
@@ -821,9 +878,11 @@ export class SessionStore {
   /** 关闭 = 仅从本主会话的打开集合移除，不改归属与归档状态；可经主题 [打开] 再次打开。 */
   closeSession(ownerId: string, id: string): boolean {
     const workspace = this.workspaces.get(ownerId)
-    if (!workspace || !workspace.open.includes(id)) return false
-    const next = workspace.open.filter(value => value !== id)
-    workspace.open = next
+    const open = workspace?.open ?? this.openSet(ownerId)
+    if (!open.includes(id)) return false
+    const next = open.filter(value => value !== id)
+    if (workspace) workspace.open = next
+    else this.workspaces.set(ownerId, { active: undefined, open: next })
     this.writeOpenSet(ownerId, next)
     this.reconcileWorkspace(ownerId)
     this.notice = undefined
@@ -831,13 +890,13 @@ export class SessionStore {
   }
   archiveSession(ownerId: string, id: string, archived = true, activate = true): boolean {
     const seat = this.seats.get(id)
-    if (!seat || seat.session.ownerId !== ownerId) return false
+    if (!seat) return false
     const time = new Date().toISOString()
     seat.session = { ...seat.session, archivedAt: archived ? time : null, updatedAt: time }
     if (seat.status !== 'conflict') seat.status = 'memory'
     this.notice = undefined
     if (this.settings.rememberHistory) this.persist(id)
-    this.reconcileWorkspace(ownerId)
+    for (const entry of this.workspaces.keys()) this.reconcileWorkspace(entry)
     if (!archived && activate) this.openSession(ownerId, id)
     this.emit(); return true
   }
@@ -892,7 +951,7 @@ export class SessionStore {
       const parentId = start.kind === 'parent_session' ? start.translationSessionId : undefined
       const topicId = start.kind === 'existing_topic' ? start.topicId : undefined
       const parent = parentId ? this.seats.get(parentId) : undefined
-      if (parentId && (!parent || parent.session.ownerId !== ownerId || this.isDeleted(parentId))) return this.managementFailure('out_of_scope', '起点会话不属于当前主会话或已删除。')
+      if (parentId && (!parent || this.isDeleted(parentId))) return this.managementFailure('out_of_scope', '起点会话不属于当前主会话或已删除。')
       if (parent && !this.managedSessionCurrent(parent)) return this.managementFailure('conflict', '起点会话在其他窗口变化，请先核对当前记录。')
       if (topicId && (!this.topics.has(topicId) || this.deletedTopics.has(topicId) || this.topicIntents.has(topicId))) return this.managementFailure('out_of_scope', '主题不存在或已删除。')
       const session = this.createSessionLocked(ownerId, parentId, topicId, false)
@@ -912,18 +971,17 @@ export class SessionStore {
     const topic = this.topics.get(topicId)
     if (!topic || this.deletedTopics.has(topicId)) return undefined
     const sessions = this.getTopicSessions(topicId), intent = this.topicIntents.get(topicId)
-    return { callerOwnerId, ownerId: topic.identity.ownerId, topicId, topicName: topic.name,
+    return { callerOwnerId, ownerId: this.getTopicStorageScope(topicId)!, topicId, topicName: topic.name,
       operationId: intent?.operationId ?? deletionOperationId('topic'), identityStored: topic.stored,
       nameStored: this.storage?.getItem(topicNameKey(topicId)) ?? null,
       versions: this.captureHistoryVersions(sessions.map(session => session.id)), sessionIds: sessions.map(session => session.id),
       sessionCount: sessions.length, archivedCount: sessions.filter(session => session.archivedAt !== null).length,
-      otherOwnerCount: sessions.filter(session => session.ownerId !== callerOwnerId).length }
+      otherOwnerCount: 0 }
   }
   getTopicDeletionBlockedReason(plan: TopicDeletionPlan): string | undefined {
     const topic = this.topics.get(plan.topicId)
     if (!topic || this.deletedTopics.has(plan.topicId)) return '此主题已删除。'
     if (!this.storage || !this.locks) return '当前环境缺少本地存储或 Web Locks，无法写入删除屏障。'
-    if (topic.identity.ownerId !== plan.callerOwnerId && plan.otherOwnerCount > 0) return '主题包含其他主会话的会话，请由主题资产归属主会话操作。'
     for (const sessionId of plan.sessionIds) {
       const seat = this.seats.get(sessionId)
       if (!seat) return '会话已变化，请重新打开删除确认。'
@@ -931,7 +989,7 @@ export class SessionStore {
       if (this.executionLeases.has(sessionId) || [...this.revisionDeletions.values(), ...this.unitDeletions.values()].some(item => item.plan.sessionId === sessionId)) return '主题内仍有未结算操作或删除回执，请先结束或查询。'
       const active = (history: TranslationHistory): boolean => history.units.some(unit => isDocumentUnit(unit)
         ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status))
-        : unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
+        : isTextUnit(unit) && unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
         history.exchanges.some(exchange => ['open', 'waiting_user', 'resuming', 'unknown'].includes(exchange.status))
       if (active(seat.translationHistory) || seat.stored !== null && active(seat.savedTranslationHistory)) return '主题内仍有运行中、等待处理或结果未知的翻译，请先结束或查询。'
     }
@@ -1039,7 +1097,7 @@ export class SessionStore {
   async setSessionRemarkAsync(ownerId: string, id: string, expectedRemark: string, remark: string): Promise<SessionManagementResult> {
     return this.manageSessions(() => {
       const seat = this.seats.get(id)
-      if (!seat || seat.session.ownerId !== ownerId || this.isDeleted(id)) return this.managementFailure('out_of_scope', '翻译会话不属于当前主会话或已删除。')
+      if (!seat || this.isDeleted(id)) return this.managementFailure('out_of_scope', '翻译会话不属于当前主会话或已删除。')
       if (!this.managedSessionCurrent(seat) || seat.session.remark !== expectedRemark) return this.managementFailure('conflict', '会话备注已变化，未采用陈旧修改，请查询当前记录。')
       if (Array.from(remark).length > 1000) return this.managementFailure('invalid_input', '备注最多 1000 个字符。')
       if (this.settings.rememberHistory && (!this.storage || !this.locks)) return this.managementFailure('storage_error', '当前环境无法协调会话保存，未执行修改。')
@@ -1053,13 +1111,13 @@ export class SessionStore {
   async setSessionArchivedAsync(ownerId: string, id: string, expectedArchived: boolean, archived: boolean): Promise<SessionManagementResult> {
     return this.manageSessions(() => {
       const seat = this.seats.get(id)
-      if (!seat || seat.session.ownerId !== ownerId || this.isDeleted(id)) return this.managementFailure('out_of_scope', '翻译会话不属于当前主会话或已删除。')
+      if (!seat || this.isDeleted(id)) return this.managementFailure('out_of_scope', '翻译会话不属于当前主会话或已删除。')
       if (!this.managedSessionCurrent(seat) || (seat.session.archivedAt !== null) !== expectedArchived) return this.managementFailure('conflict', '会话归档状态已变化，未采用陈旧修改，请查询当前记录。')
       if (this.settings.rememberHistory && (!this.storage || !this.locks)) return this.managementFailure('storage_error', '当前环境无法协调会话保存，未执行修改。')
       if (expectedArchived !== archived) {
         const time = new Date().toISOString()
         seat.session = { ...seat.session, archivedAt: archived ? time : null, updatedAt: time }; seat.status = 'memory'
-        this.reconcileWorkspace(ownerId)
+        for (const entry of this.workspaces.keys()) this.reconcileWorkspace(entry)
       }
       return this.finishManagedSession(seat)
     })
@@ -1120,7 +1178,7 @@ export class SessionStore {
     if (this.executionLeases.has(sessionId) && this.executionLeases.get(sessionId) !== leaseId) return '此会话仍有未结算操作，请先结束或查询。'
     const active = (history: TranslationHistory): boolean => history.units.some(unit => isDocumentUnit(unit)
       ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status))
-      : unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
+      : isTextUnit(unit) && unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
       history.exchanges.some(exchange => ['open', 'waiting_user', 'resuming', 'unknown'].includes(exchange.status)) ||
       history.events.some(event => event.revisionId === null && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) &&
         !history.units.filter(isTextUnit).some(unit => unit.revisions.some(revision => revision.operationId === event.operationId)) &&
@@ -1129,7 +1187,7 @@ export class SessionStore {
     const runtime = textRevisionDeletionBlockedReason(seat.translationHistory, unitId, revisionId)
     if (runtime) return runtime
     const savedUnit = seat.savedTranslationHistory.units.find(unit => unit.id === unitId)
-    if (seat.stored !== null && savedUnit?.revisions.some(revision => revision.id === revisionId)) {
+    if (seat.stored !== null && (savedUnit && !isFileJobUnit(savedUnit) ? savedUnit.revisions : []).some(revision => revision.id === revisionId)) {
       const saved = textRevisionDeletionBlockedReason(seat.savedTranslationHistory, unitId, revisionId)
       if (saved) return `已保存副本：${saved} 请先保存当前状态或调整最终选择。`
     }
@@ -1151,7 +1209,7 @@ export class SessionStore {
       if (reason) return stopped('blocked', reason)
       const at = new Date().toISOString(), input = { eventId: fixed.eventId, at }
       const runtime = deleteTextRevision(seat.translationHistory, fixed.unitId, fixed.revisionId, input)
-      const savedHasTarget = seat.stored !== null && seat.savedTranslationHistory.units.find(unit => unit.id === fixed.unitId)?.revisions.some(revision => revision.id === fixed.revisionId)
+      const savedHasTarget = seat.stored !== null && seat.savedTranslationHistory.units.filter(hasUnitBody).find(unit => unit.id === fixed.unitId)?.revisions.some(revision => revision.id === fixed.revisionId)
       if (!savedHasTarget) {
         seat.translationHistory = runtime; seat.session = { ...seat.session, updatedAt: at }; seat.status = 'memory'; this.emit()
         return stopped('deleted', '已删除此旧版本的正文；未保存内容仍只保留在本次运行。')
@@ -1159,7 +1217,7 @@ export class SessionStore {
       if (!this.storage || !seat.savedSession) return stopped('failed', '保存副本不可用，本次未删除正文。')
       const saved: SessionSnapshot = { session: { ...seat.savedSession, updatedAt: at },
         translationHistory: deleteTextRevision(seat.savedTranslationHistory, fixed.unitId, fixed.revisionId, input) }
-      const serialized = JSON.stringify({ schemaVersion: 13, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
+      const serialized = JSON.stringify({ schemaVersion: 14, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
       const pending: PendingRevisionDeletion = { plan: fixed, at, saved, serialized, release }
       this.revisionDeletions.set(fixed.eventId, pending)
       try { this.storage.setItem(historyKey(fixed.sessionId), serialized) } catch { /* Read the original operation below; a thrown write is not proof of failure. */ }
@@ -1221,7 +1279,7 @@ export class SessionStore {
     if ([...this.revisionDeletions.values(), ...this.unitDeletions.values()].some(item => item.plan.sessionId === sessionId)) return '此会话的删除回执尚未确认，请先查询本次删除结果。'
     const active = (history: TranslationHistory): boolean => history.units.some(unit => isDocumentUnit(unit)
       ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status))
-      : unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
+      : isTextUnit(unit) && unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
       history.exchanges.some(exchange => ['open', 'waiting_user', 'resuming', 'unknown'].includes(exchange.status))
     if (active(seat.translationHistory) || seat.stored !== null && active(seat.savedTranslationHistory)) return '此会话仍有运行中、等待处理或结果未知的翻译，请先结束或查询。'
     const runtime = unitDeletionBlockedReason(seat.translationHistory, unitId)
@@ -1259,7 +1317,7 @@ export class SessionStore {
       if (!this.storage || !seat.savedSession) return stopped('failed', '保存副本不可用，本次未删除正文。')
       const saved: SessionSnapshot = { session: { ...seat.savedSession, updatedAt: at },
         translationHistory: deleteUnit(seat.savedTranslationHistory, fixed.unitId, input) }
-      const serialized = JSON.stringify({ schemaVersion: 13, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
+      const serialized = JSON.stringify({ schemaVersion: 14, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
       const pending: PendingUnitDeletion = { plan: fixed, at, saved, serialized, release }
       this.unitDeletions.set(fixed.eventId, pending)
       try { this.storage.setItem(historyKey(fixed.sessionId), serialized) } catch { /* Read the original operation below; a thrown write is not proof of failure. */ }
@@ -1361,10 +1419,12 @@ export class SessionStore {
 
   private writeIdentity(topic: TopicSeat, allocation?: { readonly sessionId: string; readonly sequence: number }): void {
     if (!this.storage || this.corruptTopics.has(topicIdentityKey(topic.identity.id))) throw new Error('topic unavailable')
+    const legacyOwner = this.legacyStorageOwners.get(topic.identity.id)
+    if (legacyOwner && this.storage.getItem('dsh-translation-plugin:legacy-topic-storage:v1:' + encodeURIComponent(topic.identity.id)) !== legacyOwner) throw new Error('legacy asset locator was not saved')
     const key = topicIdentityKey(topic.identity.id), raw = this.storage.getItem(key)
     const latest = raw === null ? undefined : decodeTopicIdentity(raw)
     if ((raw !== null && !latest) || (raw === null && topic.stored !== null) ||
-      (latest && (latest.ownerId !== topic.identity.ownerId || latest.sequenceNamespaceId !== topic.identity.sequenceNamespaceId))) throw new Error('topic conflict')
+      (latest && (latest.sequenceNamespaceId !== topic.identity.sequenceNamespaceId))) throw new Error('topic conflict')
     const allocations = [...(latest?.allocations ?? [])]
     for (const item of [...topic.identity.allocations, ...(allocation ? [allocation] : [])]) {
       const known = allocations.find(entry => entry.sessionId === item.sessionId)
@@ -1465,7 +1525,7 @@ export class SessionStore {
         }
       }
       const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
-      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 13 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
+      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 14 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
         ...(hasTranslations ? { translationHistory: persistedTranslationHistory(seat.translationHistory) } : {}) })
       this.storage.setItem(historyKey(id), serialized)
       if (this.storage.getItem(historyKey(id)) !== serialized) throw new Error('history read-back failed')
@@ -1500,7 +1560,7 @@ export class SessionStore {
     try {
       const raw = this.storage.getItem(historyKey(id))
       const snapshot = raw === null ? undefined : readSnapshot(raw), session = snapshot?.session
-      if (!session || session.id !== id || session.ownerId !== seat.session.ownerId || this.isDeleted(id) || !this.matchesHistoryIdentity(session, seat.session)) throw new Error('invalid history')
+      if (!session || session.id !== id || this.isDeleted(id) || !this.matchesHistoryIdentity(session, seat.session)) throw new Error('invalid history')
       this.notice = undefined
       seat.session = this.restoreModel(session); seat.savedSession = session; seat.translationHistory = restoreTranslationHistory(snapshot!.translationHistory)
       seat.savedTranslationHistory = snapshot!.translationHistory; seat.stored = raw; seat.status = 'saved'
@@ -1510,7 +1570,7 @@ export class SessionStore {
       if (session.sequenceNamespaceId.startsWith('legacy-pending:')) this.migrationSources.set(id, session)
       else this.migrationSources.delete(id)
       this.loadHistory(); this.adoptTopic(seat)
-      this.reconcileWorkspace(session.ownerId); this.emit(); return true
+      for (const entry of this.workspaces.keys()) this.reconcileWorkspace(entry); this.emit(); return true
     } catch { this.notice = '本地副本不存在或无法读取，当前输入保持不变。'; this.emit(); return false }
   }
 
@@ -1630,7 +1690,7 @@ export class SessionStore {
         this.seats.delete(seat.session.id)
         this.migrationSources.delete(seat.session.id)
         // 打开集合可能被尚未在本实例渲染的主会话持有，按工作区、缓存与已存记录三处汇总归属。
-        const openOwners = new Set<string>([...this.workspaces.keys(), ...this.sessionOrders.keys(), seat.session.ownerId])
+        const openOwners = new Set<string>([...this.workspaces.keys(), ...this.sessionOrders.keys()])
         for (let index = 0; index < (this.storage?.length ?? 0); index++) {
           const key = this.storage!.key(index)
           if (key?.startsWith(SESSION_ORDER_PREFIX)) openOwners.add(key.slice(SESSION_ORDER_PREFIX.length))
@@ -1684,7 +1744,7 @@ export class SessionStore {
           }
           if (raw !== seat.stored) {
             const snapshot = raw === null ? undefined : readSnapshot(raw), latest = snapshot?.session
-            if (seat.status === 'saved' && latest && latest.id === seat.session.id && latest.ownerId === seat.session.ownerId && this.matchesHistoryIdentity(latest, seat.session)) {
+            if (seat.status === 'saved' && latest && latest.id === seat.session.id && this.matchesHistoryIdentity(latest, seat.session)) {
               seat.session = this.restoreModel(latest); seat.savedSession = latest
               // A storage notification is live synchronization, not a restart: keep remote running facts intact.
               seat.translationHistory = snapshot!.translationHistory; seat.savedTranslationHistory = snapshot!.translationHistory; seat.stored = raw

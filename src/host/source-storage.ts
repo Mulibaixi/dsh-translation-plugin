@@ -79,7 +79,17 @@ export async function loadTranslationSourceStorage(ctx: QuickHostContext): Promi
   const fs = await import(fsName) as { readFile(path: string): Promise<Uint8Array>; readFile(path: string, encoding: 'utf8'): Promise<string> }
   const path = await import(pathName) as { join(...parts: string[]): string }
   const root = home.dshHomePath('translation-plugin', 'sources', 'v1')
-  const contentPath = (source: SourceIdentity): string => path.join(root, 'content', `${parseSourceIdentity(source).sha256}.txt`)
+  // The cached original keeps a real extension so the main model and system apps can read it directly.
+  const extension = (identity: SourceIdentity): string => {
+    const match = /\.([A-Za-z0-9]{1,16})$/u.exec(identity.name)
+    return match ? `.${match[1]!.toLowerCase()}` : identity.encoding === 'utf-8' ? '.txt' : '.bin'
+  }
+  const contentPath = (source: SourceIdentity): string => {
+    const identity = parseSourceIdentity(source)
+    return path.join(root, 'content', `${identity.sha256}${extension(identity)}`)
+  }
+  // Legacy TXT caches use the digest alone; they stay readable after this version.
+  const legacyPath = (source: SourceIdentity): string => path.join(root, 'content', `${parseSourceIdentity(source).sha256}.txt`)
   const mappingPath = async (scope: TranslationSourceScope, referenceKey: string): Promise<string> => {
     parseTranslationSourceScope(scope)
     return path.join(root, 'references', `${await sourceSha256(new TextEncoder().encode(JSON.stringify([scope, referenceKey])))}.json`)
@@ -100,17 +110,27 @@ export async function loadTranslationSourceStorage(ctx: QuickHostContext): Promi
       await write(() => atomic.writeFileAtomic(destination, JSON.stringify(record), { mode: 0o600, dirMode: 0o700 }))
     },
     async readContent(source) {
-      try { return new Uint8Array(await fs.readFile(contentPath(source))) } catch (error) { if (absent(error)) return undefined; throw error }
+      const current = contentPath(source)
+      try { return new Uint8Array(await fs.readFile(current)) } catch (error) { if (!absent(error)) throw error }
+      const legacy = legacyPath(source)
+      if (legacy === current) return undefined
+      let bytes: Uint8Array
+      try { bytes = new Uint8Array(await fs.readFile(legacy)) } catch (error) { if (absent(error)) return undefined; throw error }
+      // Best-effort promotion to the extension-preserving path; the old copy stays authoritative.
+      try { await write(() => atomic.writeFileAtomic(current, bytes, { mode: 0o600, dirMode: 0o700 })) } catch { /* A read still succeeds from the legacy path. */ }
+      return bytes
     },
     async writeContent(source, bytes) {
       if (bytes.byteLength !== source.bytes || await sourceSha256(bytes) !== source.sha256) throw new TypeError('Source content mismatch')
-      let prior: Uint8Array | undefined
-      try { prior = await fs.readFile(contentPath(source)) } catch (error) { if (!absent(error)) throw error }
-      if (prior) {
+      const current = contentPath(source)
+      for (const candidate of [current, legacyPath(source)]) {
+        let prior: Uint8Array | undefined
+        try { prior = await fs.readFile(candidate) } catch (error) { if (!absent(error)) throw error }
+        if (!prior) continue
         if (prior.byteLength !== source.bytes || await sourceSha256(prior) !== source.sha256) throw new TypeError('Saved source content corrupt')
-        return
+        if (candidate === current) return
       }
-      await write(() => atomic.writeFileAtomic(contentPath(source), bytes, { mode: 0o600, dirMode: 0o700 }))
+      await write(() => atomic.writeFileAtomic(current, bytes, { mode: 0o600, dirMode: 0o700 }))
     },
     originalPath: contentPath,
   }

@@ -16,9 +16,8 @@ export interface ModelRoute {
   readonly reasoningEffort?: string
 }
 export interface LocalSession {
-  readonly schemaVersion: 3
+  readonly schemaVersion: 4
   readonly id: string
-  readonly ownerId: string
   readonly topicId: string
   readonly sequenceNamespaceId: string
   readonly topicName: string
@@ -104,11 +103,12 @@ export function decodeRoute(value: unknown): ModelRoute | null | undefined {
 }
 
 export function decodeSession(value: unknown): LocalSession | undefined {
-  const keys = ['schemaVersion', 'id', 'ownerId', 'name', 'parentId', 'childSequence', 'createdAt', 'updatedAt', 'mode', 'targetLanguage', 'instruction', 'maxInputChars', 'model', 'input', 'legacyManualText', 'legacyKey']
-  if (!record(value) || (value.schemaVersion !== 2 && value.schemaVersion !== 3)) return undefined
-  const expected = value.schemaVersion === 3 ? [...keys, 'archivedAt', 'topicId', 'sequenceNamespaceId', 'topicName', 'sequence', 'remark', 'legacyName'] : Object.hasOwn(value, 'archivedAt') ? [...keys, 'archivedAt'] : keys
+  const keys = ['schemaVersion', 'id', 'name', 'parentId', 'childSequence', 'createdAt', 'updatedAt', 'mode', 'targetLanguage', 'instruction', 'maxInputChars', 'model', 'input', 'legacyManualText', 'legacyKey']
+  if (!record(value) || ![2, 3, 4].includes(value.schemaVersion as number)) return undefined
+  const base = value.schemaVersion === 4 ? keys : [...keys, 'ownerId']
+  const expected = value.schemaVersion !== 2 ? [...base, 'archivedAt', 'topicId', 'sequenceNamespaceId', 'topicName', 'sequence', 'remark', 'legacyName'] : Object.hasOwn(value, 'archivedAt') ? [...base, 'archivedAt'] : base
   if (!exact(value, expected)) return undefined
-  if (!text(value.id, 2048, true) || !text(value.ownerId, 1000, true) || !text(value.name, value.schemaVersion === 3 ? 150 : 120, true)) return undefined
+  if (!text(value.id, 2048, true) || (value.schemaVersion !== 4 && !text(value.ownerId, 1000, true)) || !text(value.name, value.schemaVersion !== 2 ? 150 : 120, true)) return undefined
   if (!(value.parentId === null || text(value.parentId, 2048, true)) || !Number.isSafeInteger(value.childSequence) || (value.childSequence as number) < 0) return undefined
   if (!text(value.createdAt, 40, true) || !Number.isFinite(Date.parse(value.createdAt)) || !text(value.updatedAt, 40, true) || !Number.isFinite(Date.parse(value.updatedAt))) return undefined
   if (!(value.archivedAt === undefined || value.archivedAt === null || (text(value.archivedAt, 40, true) && Number.isFinite(Date.parse(value.archivedAt))))) return undefined
@@ -116,15 +116,16 @@ export function decodeSession(value: unknown): LocalSession | undefined {
   const route = decodeRoute(value.model)
   if (route === undefined || !text(value.input, value.mode === 'normal' ? MAX_TRANSLATION_SOURCE_BYTES : 200000) || !text(value.legacyManualText, 200000)) return undefined
   if (!(value.legacyKey === null || (text(value.legacyKey, 2000) && value.legacyKey.startsWith(LEGACY_DRAFT_PREFIX)))) return undefined
-  if (value.schemaVersion === 3) {
+  const { ownerId: _legacyOwner, ...content } = value
+  if (value.schemaVersion !== 2) {
     if (!text(value.topicId, 3000, true) || !text(value.sequenceNamespaceId, 3000, true) || !text(value.topicName, 120, true) ||
       !Number.isSafeInteger(value.sequence) || (value.sequence as number) < 0 || (value.sequence as number) >= Number.MAX_SAFE_INTEGER || !text(value.remark, 1000) || !(value.legacyName === null || text(value.legacyName, 120, true))) return undefined
     if (value.name !== sessionName(value.topicName, value.sequence as number)) return undefined
-    return { ...value, model: route } as unknown as LocalSession
+    return { ...content, schemaVersion: 4, model: route } as unknown as LocalSession
   }
   // ID 及父边的归并由 SessionStore 在读完全部记录后完成，不依据旧名称。
   return {
-    ...value, schemaVersion: 3, archivedAt: value.archivedAt ?? null, model: route,
+    ...content, schemaVersion: 4, archivedAt: value.archivedAt ?? null, model: route,
     topicId: `legacy-pending:${value.id}`, sequenceNamespaceId: `legacy-pending:${value.id}`,
     topicName: value.name, sequence: 0, remark: '', legacyName: value.name,
   } as unknown as LocalSession
@@ -132,10 +133,10 @@ export function decodeSession(value: unknown): LocalSession | undefined {
 
 export function sessionName(topicName: string, sequence: number): string { return sequence === 0 ? topicName : `${topicName}-${String(sequence).padStart(2, '0')}` }
 
-export function newSession(settings: SessionSettings, ownerId: string, id: string, name = '新翻译会话', parentId: string | null = null, topicId = `topic:${id}`, sequenceNamespaceId = `sequence:${id}`, sequence = 0): LocalSession {
+export function newSession(settings: SessionSettings, _entryId: string, id: string, name = '新翻译会话', parentId: string | null = null, topicId = `topic:${id}`, sequenceNamespaceId = `sequence:${id}`, sequence = 0): LocalSession {
   const time = new Date().toISOString()
   return {
-    schemaVersion: 3, id, ownerId, topicId, sequenceNamespaceId, topicName: name, sequence, name: sessionName(name, sequence), remark: '', legacyName: null,
+    schemaVersion: 4, id, topicId, sequenceNamespaceId, topicName: name, sequence, name: sessionName(name, sequence), remark: '', legacyName: null,
     parentId, childSequence: 0, createdAt: time, updatedAt: time, archivedAt: null,
     mode: settings.defaultMode, targetLanguage: settings.targetLanguage, instruction: settings.defaultInstruction,
     maxInputChars: settings.maxInputChars, model: null, input: '', legacyManualText: '', legacyKey: null,

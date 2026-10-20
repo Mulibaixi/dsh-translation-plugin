@@ -1,9 +1,10 @@
 /** Explicit names keep SDK tool definitions opaque and preserve the original execution context. */
 const groups = {
-  source: { description: 'Read supplied source and published units.', tools: ['translation_read_source', 'translation_read_unit'] },
+  source: { description: 'Read supplied source and numbered units in opened translation Sessions.', tools: ['translation_read_source', 'translation_read_unit'] },
   memory_read: { description: 'Read topic terminology and entity/fact/relation memory.', tools: ['translation_list_terms', 'translation_query_terms', 'translation_list_topic_archive', 'translation_query_archive'] },
-  short: { description: 'Execute short text translation.', tools: ['translation_execute'], requires: ['source', 'memory_read'] },
-  file_jobs: { description: 'Discover saved files across reloads, read/revise completed results, or explicitly retranslate exact units without old material delivery.', tools: ['translation_file_start', 'translation_file_list', 'translation_file_read_review', 'translation_file_submit_review', 'translation_file_revise', 'translation_file_retranslate'], requires: ['source'] },
+  direct: { description: 'Translate delivered material and receive the actual result in this turn; extract assets for files and save/open real artifacts.', tools: ['translation_translate', 'translation_read_result', 'translation_extract_assets', 'translation_save_result', 'translation_open_file'], requires: ['source', 'memory_read'] },
+  short: { description: 'Legacy asynchronous short execution for an explicit existing-unit notice.', tools: ['translation_execute'], requires: ['source', 'memory_read'] },
+  file_jobs: { description: 'Discover saved files across reloads, read/revise completed results, or explicitly retranslate exact units without old material delivery.', tools: ['translation_file_list', 'translation_file_read_review', 'translation_file_submit_review', 'translation_file_revise', 'translation_file_retranslate'], requires: ['source'] },
   analysis: { description: 'Start/query independent terminology analysis.', tools: ['translation_analyze_terminology', 'translation_analysis_status', 'translation_analysis_read'] },
   document_prepare: { description: 'Legacy document preparation audit and explicit recovery; new files use file_jobs.', tools: ['translation_batch_prepare', 'translation_batch_set_preparation', 'translation_batch_preparation_status', 'translation_batch_read_preparation'], requires: ['source', 'memory_read', 'analysis'] },
   document_plan: { description: 'Legacy document plans and capacity; new files use file_jobs.', tools: ['translation_batch_suggest_plan', 'translation_batch_set_plan', 'translation_batch_plan_status', 'translation_batch_read_plan'], requires: ['document_prepare'] },
@@ -18,14 +19,14 @@ const groups = {
 } as const
 
 export type TranslationToolGroup = keyof typeof groups
-const permanentNames = new Set(['translation_list_sessions', 'translation_list_topics', 'translation_file_list'])
+const permanentNames = new Set(['translation_list_sessions', 'translation_list_topics', 'translation_list_units', 'translation_read_units', 'translation_file_list'])
 const groupForName = new Map<string, TranslationToolGroup>()
 for (const [name, group] of Object.entries(groups)) for (const tool of group.tools) {
   if (groupForName.has(tool)) throw new Error(`Duplicate translation tool group: ${tool}`)
   groupForName.set(tool, name as TranslationToolGroup)
 }
 
-export const MATERIAL_TOOL_GROUPS = { short: ['short'], file: ['file_jobs'] } as const
+export const MATERIAL_TOOL_GROUPS = { short: ['direct', 'short'], file: ['direct', 'file_jobs'] } as const
 type ToolEntry = { readonly name: string; readonly definition: unknown; dispose?: (() => void) | undefined }
 
 /** One actual Agent and one management connection own every registration in this directory. */
@@ -111,4 +112,4 @@ export class OnDemandTranslationTools {
   }
 }
 
-export const TRANSLATION_TOOL_LOADER_DESCRIPTION = 'Load translation tool groups for this Agent; {} lists the compact directory. For an existing file or a retry, use the always available translation_file_list to discover saved exact unit targets even after reload; successful discovery exposes file_jobs schemas on the next request. Use file_jobs (alias file) to read/revise saved completed results, explicitly retranslate an exact unit, or start newly delivered material. Never replay old material targets or ask the user for internal JSON. Other groups: short; sessions; memory_read/memory_write; reference_read/reference_import; source. Legacy document groups only inspect or explicitly recover original legacy tasks. Pass groups to add schemas before the next model request. select defers removal until the settled turn boundary.'
+export const TRANSLATION_TOOL_LOADER_DESCRIPTION = 'Load translation tool groups for this Agent; {} lists the compact directory. translation_list_units and translation_read_units are always available for stable numbered content in opened sidebar Sessions. For text retranslation load direct, then translation_translate with the returned exact unit target and a new operationId; no per-unit reference grant or old material requestId is needed. For an existing file or a retry, use the always available translation_file_list to discover saved exact unit targets even after reload; successful discovery exposes file_jobs schemas on the next request. Use file_jobs (alias file) to read/revise saved completed results or explicitly retranslate an exact unit. New file material goes through direct: read the cached original yourself, optionally extract assets with the native subagent, call translation_translate (whole text, one exact range, or an organized body for non-text originals), review, then translation_save_result and translation_open_file. Never replay old material targets or ask the user for internal JSON. Other groups: direct (new material or an existing text unit, waits for the actual result); short (legacy asynchronous execution for an existing-unit notice); sessions; memory_read/memory_write; reference_read/reference_import; source. Legacy document groups only inspect or explicitly recover original legacy tasks. Pass groups to add schemas before the next model request. select defers removal until the settled turn boundary.'

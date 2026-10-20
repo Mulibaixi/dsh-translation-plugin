@@ -32,22 +32,23 @@ export class ObjectAssetsClient {
     if (unit && !isTextUnit(unit)) throw new Error('文档的原件位置关联尚未接通。')
     const revision = unit?.revisions.find(revision => revision.id === target.revisionId)
     const text = target.side === 'source' && target.revisionId === null ? unit?.source : target.side === 'revision' && revision && canEditTextRevision(revision) ? revision.text : undefined
-    if (this.disposed || !session || this.sessions.isSessionDeleted(session.id) || session.ownerId !== target.ownerId || session.topicId !== target.topicId || session.archivedAt !== null || text === undefined || !Number.isSafeInteger(offset) || offset < 0 || offset > Array.from(text).length) throw new Error('记录或关联位置已不可用，请重新选择。')
+    if (this.disposed || !session || this.sessions.isSessionDeleted(session.id) || session.topicId !== target.topicId || session.archivedAt !== null || text === undefined || !Number.isSafeInteger(offset) || offset < 0 || offset > Array.from(text).length) throw new Error('记录或关联位置已不可用，请重新选择。')
   }
-  async attachFile(target: RecordObjectTarget, offset: number, kind: ObjectAssetKind, file: File, existingObjectId?: string, formulaSource?: string) {
+  async attachFile(target: RecordObjectTarget, offset: number, kind: ObjectAssetKind, file: File, existingObjectId?: string, formulaSource?: string, mainSessionId?: string) {
+    if (!mainSessionId) throw new Error('请先选择接收原件的主会话。')
     this.validate(target, offset)
     if (existingObjectId && this.references.getReferences(target).some(ref => ref.offset === offset && ref.asset.objectId === existingObjectId)) throw new Error('此位置已有该对象，请选择另一位置或译文版本。')
-    const status = this.scopeStatus(target.ownerId)
+    const status = this.scopeStatus(mainSessionId)
     if (!status.ready) throw new Error(status.reason ?? '主题连接未就绪，请重试。')
     const expectedVersion = this.references.getSnapshot(target.ownerId, target.topicId, target.sessionId).version
     const operation = new AbortController(); this.operations.add(operation)
     try {
       const capability = await this.port.capabilities()
       if (!capability.ok || !capability.value.ready || !capability.value.nativeOpen) throw new Error(capability.ok ? capability.value.reason ?? '原件服务暂不可用。' : capability.error.message)
-      const receipt = await this.upload.upload(target.ownerId, file, file.name, operation.signal, () => {})
+      const receipt = await this.upload.upload(mainSessionId, file, file.name, operation.signal, () => {})
       if (!data(receipt) || receipt.ok !== true || !data(receipt.value) || typeof receipt.value.receiptId !== 'string' || !receipt.value.receiptId) throw new Error('上传未完成，请重试。')
       this.validate(target, offset)
-      const registered = await this.port.register({ ownerId: target.ownerId, topicId: target.topicId, translationSessionId: target.sessionId,
+      const registered = await this.port.register({ namespaceId: this.sessions.getNamespaceId(), mainSessionId, topicId: target.topicId, translationSessionId: target.sessionId,
         unitId: target.unitId, side: target.side, revisionId: target.revisionId, offset, kind, receiptId: receipt.value.receiptId,
         ...(existingObjectId ? { existingObjectId } : {}) }, operation.signal)
       if (!registered.ok) throw new Error(registered.error.message)
@@ -65,7 +66,7 @@ export class ObjectAssetsClient {
     if (this.disposed) throw new Error('原件服务已关闭。')
     const operation = new AbortController(); this.operations.add(operation)
     try {
-      const result = await this.port.open({ ownerId, topicId, objectId: asset.objectId, assetId: asset.assetId, version: asset.version }, operation.signal)
+      const result = await this.port.open({ namespaceId: this.sessions.getNamespaceId(), topicId, objectId: asset.objectId, assetId: asset.assetId, version: asset.version }, operation.signal)
       if (!result.ok) throw new Error(result.error.message)
     } finally { this.operations.delete(operation) }
   }

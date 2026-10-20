@@ -1,3 +1,4 @@
+import { isTextUnit } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import { isDocumentUnit } from './translation-history.js'
 import type { TopicMemoryStore, TopicTermClearVersion } from './topic-memory-store.js'
@@ -36,7 +37,7 @@ export class ThemeMemoryClearing {
       const history = this.sessions.getTranslationHistory(session.id)
       if (this.sessions.hasDocumentLease(session.id) || this.options.isSessionBusy?.(session.id) || history?.units.some(unit => isDocumentUnit(unit)
         ? unit.tasks.some(task => ['running', 'unknown'].includes(task.status))
-        : unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
+        : isTextUnit(unit) && unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))) ||
         history?.exchanges.some(exchange => ['open', 'waiting_user', 'resuming', 'unknown'].includes(exchange.status))) {
         return '本主题仍有运行中、等待处理或结果未知的翻译，请先结束或确认任务后再清空记忆。'
       }
@@ -59,7 +60,7 @@ export class ThemeMemoryClearing {
     try {
       return await this.terms.withTopicLock(() => {
         const topic = this.sessions.getTopics(fixed.ownerId).find(topic => topic.id === fixed.topicId)
-        if (!topic || topic.name !== fixed.topicName || [fixed.terms, fixed.archive].some(version => version.ownerId !== this.sessions.getTopicAssetOwner(fixed.topicId) || version.topicId !== fixed.topicId) ||
+        if (!topic || topic.name !== fixed.topicName || [fixed.terms, fixed.archive].some(version => version.ownerId !== this.sessions.getTopicStorageScope(fixed.topicId) || version.topicId !== fixed.topicId) ||
           chosen.terms && !this.terms.isClearVersionCurrent(fixed.terms) || chosen.archive && !this.archive.isClearVersionCurrent(fixed.archive)) {
           return stopped('stale', '主题或所选记忆已变化，请重新打开清空确认；本次尚未清空任何范围。')
         }

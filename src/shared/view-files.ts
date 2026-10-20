@@ -3,7 +3,7 @@ export type ViewFileKind = 'source' | 'result'
 export type ViewFileFormat = 'html' | 'txt'
 export const MAX_VIEW_FILE_BYTES = 16 * 1024 * 1024
 export interface ViewFileOpen {
-  readonly ownerId: string
+  readonly namespaceId: string
   readonly sessionId: string
   readonly unitId: string
   readonly kind: ViewFileKind
@@ -18,7 +18,7 @@ export interface ViewFileOpen {
   readonly format?: ViewFileFormat
 }
 export interface ViewFileClear {
-  readonly ownerId: string
+  readonly namespaceId: string
   readonly sessionIds: readonly string[]
 }
 export type ViewFileErrorCode = 'invalid_input' | 'scope_mismatch' | 'unavailable' | 'storage_failed' | 'open_failed' | 'local_data_stale'
@@ -35,9 +35,9 @@ function exact(value: Data, fields: readonly string[]): void { if (Object.keys(v
 function text(value: unknown, limit = 2048): asserts value is string { if (typeof value !== 'string' || !value.trim() || value.length > limit || /[\u0000-\u001f]/u.test(value)) throw new TypeError('Invalid text') }
 function kind(value: unknown): asserts value is ViewFileKind { if (!VIEW_FILE_KINDS.includes(value as ViewFileKind)) throw new TypeError('Invalid view kind') }
 export function parseViewFileRequest(method: 'open' | 'clear', value: unknown): ViewFileOpen | ViewFileClear {
-  record(value); text(value.ownerId)
+  record(value); text(value.namespaceId)
   if (method === 'open') {
-    exact(value, ['ownerId', 'sessionId', 'unitId', 'kind', 'title', 'text', 'revisionId', 'fileName', 'format'])
+    exact(value, ['namespaceId', 'sessionId', 'unitId', 'kind', 'title', 'text', 'revisionId', 'fileName', 'format'])
     text(value.sessionId); text(value.unitId); kind(value.kind); text(value.title, 300)
     if (value.revisionId !== undefined) text(value.revisionId)
     if (value.fileName !== undefined) text(value.fileName, 255)
@@ -45,7 +45,7 @@ export function parseViewFileRequest(method: 'open' | 'clear', value: unknown): 
     // TXT is encoded exactly as supplied; HTML is escaped by the Host. Neither path normalizes newlines or BOM.
     if (typeof value.text !== 'string' || value.text.length > MAX_VIEW_FILE_BYTES || new TextEncoder().encode(value.text).byteLength > MAX_VIEW_FILE_BYTES) throw new TypeError('Invalid view text')
   } else {
-    exact(value, ['ownerId', 'sessionIds'])
+    exact(value, ['namespaceId', 'sessionIds'])
     if (!Array.isArray(value.sessionIds) || value.sessionIds.length < 1 || value.sessionIds.length > 256) throw new TypeError('Invalid session list')
     for (const id of value.sessionIds) text(id)
   }

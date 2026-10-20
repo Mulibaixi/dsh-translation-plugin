@@ -1,21 +1,26 @@
-import { parseNormalTranslationAcceptance, parseNormalTranslationUpdate, parseNormalTranslationJob, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, type NormalTranslationAcceptance,
-  type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationQuery, type NormalTranslationUnitTarget, type NormalTranslationSourceCorrection, type NormalTranslationUnitRequest } from '../shared/normal-translation.js'
+import { isDocumentUnit } from './translation-history.js'
+import { parseNormalTranslationAcceptance, parseNormalTranslationUpdate, parseNormalTranslationJob, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseDirectTranslationCommit, type NormalTranslationAcceptance,
+  type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationQuery, type NormalTranslationUnitTarget, type NormalTranslationTarget, type NormalTranslationSourceCorrection, type NormalTranslationUnitRequest,
+  type DirectTranslationCommit, type DirectTranslationReceipt, type NormalTranslationExportSegment, draftTranslationTerms } from '../shared/normal-translation.js'
+import { isDirectPromptVersion, type NormalTranslationTerm } from '../shared/translation-call.js'
+import { assetPriority } from '../memory/asset-priority.js'
+import { sameLanguage } from '../shared/language-tag.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from '../shared/translation-material.js'
-import type { TopicBridgeValue } from '../shared/topic-bridge.js'
+import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { TopicTermSnapshot } from '../memory/topic-terms.js'
 import { isNormalExchangePromptVersion, isNormalTranslationPromptVersion, type TranslationCallMetadata } from '../shared/translation-call.js'
 import { parseRequestContextInput } from '../shared/request-context.js'
 import { parseNormalTranslationV2Event, parseNormalTranslationV2Job, type NormalTranslationResolution, type NormalTranslationV2Event, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
-import { appendAdmittedTextUnit, appendTextRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation,
+import { appendAdmittedTextUnit, appendAdmittedFileUnit, appendTextRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation,
   registerTranslationExchange, registerTranslationResolution, registerTranslationResume, recordTranslationExchangeStatus, bindTranslationExchangeId,
-  recordTranslationResumeStarted, finishTranslationExchange, isTextUnit } from './translation-history.js'
+  recordTranslationResumeStarted, finishTranslationExchange, isTextUnit, currentResultRevision } from './translation-history.js'
 import type { TranslationExchangeResolution } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import type { TranslationHistory, TextRevisionStatus } from './translation-history.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import type { TopicBridgeTermsPort } from './topic-bridge.js'
 
-export type NormalTranslationReply = { readonly ok: true; readonly value: Extract<TopicBridgeValue, { kind: 'normal_operation' | 'normal_prepared' | 'normal_updated' | 'normal_v2_updated' | 'normal_exchange_resolved' | 'normal_observed' | 'normal_resolved' | 'normal_source_corrected' }> }
+export type NormalTranslationReply = { readonly ok: true; readonly value: Extract<TopicBridgeValue, { kind: 'normal_operation' | 'normal_prepared' | 'normal_committed' | 'normal_exported' | 'normal_updated' | 'normal_v2_updated' | 'normal_exchange_resolved' | 'normal_observed' | 'normal_resolved' | 'normal_source_corrected' }> }
   | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }
 export interface NormalTranslationRemotePort {
   status(request: NormalTranslationQuery): Promise<unknown>
@@ -60,9 +65,7 @@ export class NormalTranslationClient {
     readonly remoteV2?: NormalTranslationV2RemotePort | (() => Promise<NormalTranslationV2RemotePort | undefined>) | undefined;
       readonly subscribeBridge?: (listener: () => void) => () => void;
       readonly bridgeReady?: (ownerId: string) => boolean;
-      readonly canAccessUnit?: (ownerId: string, sessionId: string, unitId: string) => boolean;
       readonly canCorrectSource?: (ownerId: string, topicId: string, sessionId: string, unitId: string) => boolean;
-      readonly publishUnit?: (ownerId: string, sessionId: string, unitId: string) => boolean;
       /** Interface locale stamped onto a retranslation intent; the Host uses it only for the notice's reply-language line. */
       readonly uiLocale?: () => string | undefined } = {}) {
     this.stopBridge = options.subscribeBridge?.(() => {
@@ -87,17 +90,17 @@ export class NormalTranslationClient {
     if (target.kind !== 'unit') return failure('invalid_input', '需要明确的历史单元引用。')
     const session = this.store.getSession(target.translationSessionId), unit = this.store.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
     if (this.disposed || target.mainSessionId !== ownerId || !session || !this.store.isSessionOpen(ownerId, session.id) || this.store.isSessionDeleted(session.id) || !unit ||
-      !this.options.canAccessUnit?.(ownerId, session.id, unit.id)) return failure('reference_not_published', '此单元尚未明确提供给当前主模型。')
+      !this.store.canAccessUnit(ownerId, session.id, unit.id)) return failure('reference_not_published', '请先打开此翻译会话，并核对单元是否存在。')
     if (!isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
     if (session.mode !== 'normal' || session.archivedAt !== null) return failure('invalid_state', '请先恢复普通会话再处理历史单元。')
     if (unit.sourceVersion !== target.sourceVersion || this.store.getStatus(session.id) === 'conflict') return failure('stale_version', '原文版本已变化，请读取当前单元。')
     const key = this.key(ownerId, input.operationId), cached = this.unitSnapshots.get(key)
     if (cached) return cached.material.translationSessionId === session.id && cached.material.unitReference?.unitId === unit.id && cached.material.sourceVersion === target.sourceVersion
       ? { ok: true, value: { kind: 'normal_resolved', envelope: structuredClone(cached) } } : failure('idempotency_conflict', '此业务操作已冻结其他历史单元。')
-    if (this.store.getAvailableSessions(ownerId).some(candidate => this.store.getTranslationHistory(candidate.id)?.events.some(event => event.operationId === input.operationId))) return failure('idempotency_conflict', '此操作已有历史事实，请查询原操作。')
+    if (this.store.getAllSessions().some(candidate => this.store.getTranslationHistory(candidate.id)?.events.some(event => event.operationId === input.operationId))) return failure('idempotency_conflict', '此操作已有历史事实，请查询原操作。')
     if (!session.model) return failure('invalid_input', '请为此翻译会话选择模型。')
     if (Array.from(unit.source).length > session.maxInputChars) return failure('input_too_large', '当前原文超过此会话单次上限，未截断。')
-    const envelope = parseTranslationMaterialEnvelope({ ownerId, mainSessionId: ownerId, requestId: `unit-request:${input.operationId}`, operationId: input.operationId, kind: 'material', material: {
+    const envelope = parseTranslationMaterialEnvelope({  mainSessionId: ownerId, requestId: `unit-request:${input.operationId}`, operationId: input.operationId, kind: 'material', material: {
       materialId: unit.material?.materialId ?? unit.id, sourceVersion: target.sourceVersion, topicId: session.topicId, translationSessionId: session.id,
       draftVersion: unit.material?.draftVersion ?? 1, sourceText: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
       model: session.model, maxInputChars: session.maxInputChars, unitReference: { unitId: unit.id, sourceVersion: target.sourceVersion },
@@ -110,7 +113,7 @@ export class NormalTranslationClient {
     const request = parseNormalTranslationSourceCorrection(input), target = request.target
     const session = this.store.getSession(target.translationSessionId), history = this.store.getTranslationHistory(target.translationSessionId), unit = history?.units.find(unit => unit.id === target.unitId)
     if (this.disposed || target.mainSessionId !== ownerId || !session || !this.store.isSessionOpen(ownerId, session.id) || !unit || this.store.isSessionDeleted(session.id) ||
-      !this.options.canAccessUnit?.(ownerId, session.id, unit.id)) return failure('reference_not_published', '此单元尚未明确提供给当前主模型。')
+      !this.store.canAccessUnit(ownerId, session.id, unit.id)) return failure('reference_not_published', '请先打开此翻译会话，并核对单元是否存在。')
     if (!isTextUnit(unit)) return failure('requires_batch', '文档原稿纠错尚未接通。')
     const previous = this.store.getAvailableSessions(ownerId).flatMap(candidate => this.store.getTranslationHistory(candidate.id)?.events ?? []).find(event => event.operationId === request.operationId)
     if (previous) {
@@ -136,18 +139,18 @@ export class NormalTranslationClient {
   prepare(ownerId: string, input: NormalTranslationAcceptance): NormalTranslationReply {
     if (this.disposed) return failure('execution_unavailable', '普通翻译业务通道已关闭。')
     const request = parseNormalTranslationAcceptance(input)
-    if (request.envelope.material.sourceRef) return failure('requires_batch', 'TXT 原稿已可供准备；整篇分批翻译尚未接入。')
     const previous = this.locate(ownerId, request.operationId)
     if (previous) return previous.signature === JSON.stringify(request) ? { ok: true, value: { kind: 'normal_prepared', termSnapshot: structuredClone(previous.termSnapshot) } }
       : failure('idempotency_conflict', '此业务操作已用于其他材料或要求，未重复准备。')
     const envelope = request.envelope, material = envelope.material, session = this.store.getSession(material.translationSessionId)
-    if (envelope.mainSessionId !== ownerId || envelope.ownerId !== ownerId || !session || session.ownerId !== ownerId || session.topicId !== material.topicId ||
-      this.store.isSessionDeleted(session.id) || !this.store.getTopics(ownerId).some(topic => topic.id === material.topicId)) return failure('out_of_scope', '材料不属于当前主会话、主题或翻译会话。')
+    // A session opened from another main Session keeps its original owner for content and memory.
+    if (envelope.mainSessionId !== ownerId || !session || session.topicId !== material.topicId ||
+      this.store.isSessionDeleted(session.id) || !this.store.getTopics().some(topic => topic.id === material.topicId)) return failure('out_of_scope', '材料不属于当前主会话、主题或翻译会话。')
     if (session.mode !== 'normal' || session.archivedAt !== null) return failure('invalid_state', '普通翻译会话已不可执行，请恢复会话后重新提交材料。')
     if (this.store.getStatus(session.id) === 'conflict') return failure('stale_version', '本地历史已变化，请先核对当前副本。')
     if (material.unitReference) {
       const cached = this.unitSnapshots.get(this.key(ownerId, request.operationId)), unit = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === material.unitReference?.unitId)
-      if (!cached || JSON.stringify(cached) !== JSON.stringify(envelope) || !this.options.canAccessUnit?.(ownerId, session.id, material.unitReference.unitId)) return failure('reference_not_published', '历史处理材料未由当前Client冻结或授权。')
+      if (!cached || JSON.stringify(cached) !== JSON.stringify(envelope) || !unit || unit.deletion) return failure('out_of_scope', '历史处理材料未由当前 Client 冻结，或对应单元已删除。')
       if (unit && !isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
       if (!unit || unit.sourceVersion !== material.sourceVersion || material.unitReference.sourceVersion !== unit.sourceVersion) return failure('stale_version', '准备后原文已变化，请使用新操作重新准备。')
     } else {
@@ -156,14 +159,22 @@ export class NormalTranslationClient {
     }
     if (!material.model) return failure('invalid_input', '此材料未选择翻译模型，请重新提交已选模型的材料。')
     if (this.store.hasDocumentLease(session.id) || this.options.isSessionBusy?.(session.id) || this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit)
-      ? unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status)) : unit.tasks.some(task => ['running', 'unknown'].includes(task.status))) ||
+      ? unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status)) : isDocumentUnit(unit) && unit.tasks.some(task => ['running', 'unknown'].includes(task.status))) ||
       this.isBusy(session.id)) return failure('busy', '此翻译会话仍有执行中或结果未知的操作。')
-    if (!material.unitReference && this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit) && unit.material?.materialId === material.materialId)) return failure('already_admitted', '此材料已建立处理单元，请引用原单元重译。')
-    const snapshot = this.terms.getSnapshot(ownerId, material.topicId), selected = request.termReferences.map(ref => snapshot.entries.find(entry => entry.id === ref.id && entry.version === ref.entryVersion))
-    if (selected.some(entry => !entry || entry.status !== 'active' || entry.targetLanguage !== material.targetLanguage)) return failure('stale_terms', '所引用术语已变化、未生效或目标语言不符。')
+    const contentOwner = this.store.getTopicStorageScope(session.topicId)!, snapshot = this.terms.getSnapshot(contentOwner, material.topicId), selected = request.termReferences.map(ref => snapshot.entries.find(entry => entry.id === ref.id && entry.version === ref.entryVersion))
+    // Name the exact rejected reference: "术语不符" alone leaves a model guessing or rewriting by hand.
+    const rejected = request.termReferences.flatMap((ref, index) => {
+      const entry = selected[index]
+      if (!entry) return [`${ref.id}@v${ref.entryVersion} 未找到（可能版本已变化）`]
+      if (entry.status !== 'active') return [`${ref.id} 未生效（状态 ${entry.status}）`]
+      if (!sameLanguage(entry.targetLanguage, material.targetLanguage)) return [`${ref.id} 目标语为 ${entry.targetLanguage}，本次为 ${material.targetLanguage}`]
+      return []
+    })
+    if (rejected.length) return failure('stale_terms', `术语引用未通过：${rejected.slice(0, 5).join('；')}${rejected.length > 5 ? ` 等 ${rejected.length} 条` : ''}。请重新查询术语后只引用可用的 id/版本。`)
     for (const entry of selected) {
-      if (!entry || !this.terms.query(ownerId, material.topicId, { mode: 'normal', sourceLanguage: entry.sourceLanguage,
-        targetLanguage: material.targetLanguage, forms: entry.sourceForms }).entries.some(candidate => candidate.id === entry.id && candidate.version === entry.version)) return failure('stale_terms', '术语依据已失效，请重新查询相关术语。')
+      const usable = entry !== undefined && this.terms.query(contentOwner, material.topicId, { mode: 'normal', sourceLanguage: entry.sourceLanguage,
+        targetLanguage: entry.targetLanguage, forms: entry.sourceForms }).entries.some(candidate => candidate.id === entry.id && candidate.version === entry.version)
+      if (!usable) return failure('stale_terms', `术语 ${entry?.id ?? '未找到'} 的原文依据已失效，请重新查询后引用。`)
     }
     return { ok: true, value: { kind: 'normal_prepared', termSnapshot: structuredClone({ ...snapshot, entries: selected.filter(entry => entry !== undefined) }) } }
   }
@@ -182,7 +193,7 @@ export class NormalTranslationClient {
     const envelope = request.envelope, material = envelope.material, session = this.store.getSession(material.translationSessionId)!
     const release = this.retain(ownerId), at = new Date().toISOString()
     if (!this.store.updateTranslationHistory(session.id, history => material.unitReference
-      ? acceptUnitRetranslation(history, material.unitReference.unitId, request.operationId, material.sourceVersion, at)
+      ? acceptUnitRetranslation(history, material.unitReference.unitId, request.operationId, material.sourceVersion, at, ownerId)
       : appendAdmittedTextUnit(history, envelope, request.operationId, at))) {
       release(); return failure('history_update_failed', '材料记录未完成，草稿保留。')
     }
@@ -201,9 +212,152 @@ export class NormalTranslationClient {
     return { ok: true, value: { kind: 'normal_operation', operation: structuredClone(operation), termSnapshot: structuredClone(termSnapshot) } }
   }
 
+  /**
+   * Record one direct translation result in the same transaction that admits its unit.
+   * The model body, the actual call facts and the Client history stay one fact, never a
+   * begin/prepare/approve/finalize chain.
+   */
+  commitResult(ownerId: string, input: DirectTranslationCommit): NormalTranslationReply {
+    if (this.disposed) return failure('execution_unavailable', '普通翻译业务通道已关闭。')
+    const request = parseDirectTranslationCommit(input)
+    const envelope = request.envelope, material = envelope.material, session = this.store.getSession(material.translationSessionId)
+    if (envelope.mainSessionId !== ownerId || !session || session.topicId !== material.topicId ||
+      this.store.isSessionDeleted(session.id)) return failure('out_of_scope', '译文结果不属于当前主会话、主题或翻译会话。')
+    const coversAll = request.range !== undefined && request.range.start === 0 && request.range.end === material.sourceRef?.totalCodePoints
+    const unitId = material.unitReference?.unitId ?? (request.body ? `unit:${material.materialId}:body`
+      : request.range && !coversAll ? `unit:${material.materialId}:${request.range.start}-${request.range.end}` : `unit:${material.materialId}`)
+    const existing = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === unitId)
+    const recorded = existing && isTextUnit(existing)
+      ? existing.revisions.find(revision => revision.id === request.revisionId || revision.operationId === request.operationId) : undefined
+    if (recorded) {
+      if (recorded.operationId !== request.operationId || recorded.text !== request.text || recorded.status !== request.status) {
+        return failure('idempotency_conflict', '此业务操作已记录不同的译文，未覆盖。')
+      }
+      return { ok: true, value: { kind: 'normal_committed', receipt: { operationId: request.operationId, mainSessionId: ownerId,
+        translationSessionId: session.id, topicId: material.topicId, unitId, revisionId: recorded.id, sourceVersion: recorded.sourceVersion,
+        status: request.status, textCodePoints: Array.from(recorded.text).length,
+        persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' } } }
+    }
+    const prepared = this.prepare(ownerId, { envelope, operationId: request.operationId, organizedRequirements: request.organizedNotes,
+      termReferences: request.termReferences, ...(request.referenceContextRef ? { referenceContextRef: request.referenceContextRef } : {}) })
+    if (!prepared.ok) return prepared
+    if (prepared.value.kind !== 'normal_prepared') return failure('execution_unavailable', '普通翻译准备回执尚未就绪。')
+    const model = material.model, metadata = request.callRecord
+    if (!model) return failure('invalid_input', '此材料未选择翻译模型，请重新提交已选模型的材料。')
+    if (!isDirectPromptVersion(metadata.promptVersion)) return failure('invalid_metadata', '直接翻译结果必须携带直接提示版本，未记录。')
+    if (metadata.model.provider !== model.provider || metadata.model.model !== model.model ||
+      model.reasoningEffort !== undefined && metadata.model.reasoningEffort !== model.reasoningEffort) {
+      return failure('invalid_metadata', '实际调用路由与材料冻结模型不一致，未记录。')
+    }
+    const context = { organizedRequirements: request.organizedNotes,
+      ...(request.userRequirements ? { userRequirements: request.userRequirements } : {}),
+      ...(request.auxiliaryContext ? { auxiliaryContext: request.auxiliaryContext } : {}),
+      terms: [...prepared.value.termSnapshot.entries.map((entry): NormalTranslationTerm => {
+        const priority = assetPriority(entry)
+        return { id: entry.id, entryVersion: entry.version, sourceForms: entry.sourceForms, aliases: entry.aliases, sense: entry.sense,
+          preferred: entry.preferred, forbidden: entry.forbidden, userFixed: priority === 2, priority }
+      }), ...draftTranslationTerms(request.draftTerms)],
+      ...(request.referenceContextRef ? { referenceContextRef: request.referenceContextRef } : {}) }
+    if (JSON.stringify(metadata.context) !== JSON.stringify(context)) return failure('invalid_metadata', '实际调用的要求、语境或术语与受理事实不符，未记录。')
+    const at = new Date().toISOString()
+    const updated = this.store.updateTranslationHistory(session.id, current => {
+      const admitted = material.unitReference
+        ? acceptUnitRetranslation(current, material.unitReference.unitId, request.operationId, material.sourceVersion, at, ownerId)
+        : material.sourceText !== undefined
+          // A material resubmitted in a later turn revises its own unit instead of failing as a duplicate.
+          ? current.units.some(unit => unit.id === unitId && isTextUnit(unit))
+            ? acceptUnitRetranslation(current, unitId, request.operationId, material.sourceVersion, at, ownerId)
+            : appendAdmittedTextUnit(current, envelope, request.operationId, at)
+          : appendAdmittedFileUnit(current, envelope, unitId, request.sourceText!, request.operationId, at)
+      return appendTextRevision(admitted, unitId, { id: request.revisionId, operationId: request.operationId, model,
+        draftVersion: material.draftVersion, createdAt: at, updatedAt: at, accepted: true, status: request.status,
+        text: request.text, callRecord: metadata, message: request.message || null })
+    })
+    if (!updated) return failure('history_update_failed', '译文记录未完成，请查询当前单元。')
+    if (!material.unitReference) this.materials.consumeSubmittedMaterial(envelope)
+    else {
+      const intent = this.unitRequests.get(JSON.stringify([session.id, material.unitReference.unitId]))
+      if (intent) { intent.release?.(); intent.release = undefined; intent.message = '此单元重译已记录结果。' }
+    }
+    this.emit()
+    return { ok: true, value: { kind: 'normal_committed', receipt: { operationId: request.operationId, mainSessionId: ownerId,
+      translationSessionId: session.id, topicId: material.topicId, unitId, revisionId: request.revisionId, sourceVersion: material.sourceVersion,
+      status: request.status, textCodePoints: Array.from(request.text).length,
+      persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' } } }
+  }
+
+  exportResult(ownerId: string, request: { readonly target: NormalTranslationTarget; readonly totalCodePoints?: number }): NormalTranslationReply {
+    if (this.disposed) return failure('execution_unavailable', '普通翻译业务通道已关闭。')
+    const target = request.target, base = target.kind === 'unit' ? target.unitId : `unit:${target.materialId}`
+    // A unit target is exact; only a material aggregates its range segments and organized body.
+    const owns = (unitId: string): boolean => target.kind === 'unit' ? unitId === base : unitId === base || unitId.startsWith(`${base}:`)
+    let sessionId: string | undefined, totalCodePoints = request.totalCodePoints ?? 0
+    if (target.kind === 'unit') sessionId = target.translationSessionId
+    else {
+      const envelope = this.materials.resolveSubmittedTarget(target)
+      if (envelope) {
+        sessionId = envelope.material.translationSessionId
+        totalCodePoints = envelope.material.sourceRef?.totalCodePoints ?? Array.from(envelope.material.sourceText ?? '').length
+      } else {
+        // The submission gate disappears on reload; saved units still own the exact result.
+        const found = this.store.getAvailableSessions(ownerId).find(session =>
+          this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit) && owns(unit.id)))
+        sessionId = found?.id
+      }
+    }
+    const session = sessionId ? this.store.getSession(sessionId) : undefined
+    if (!session || this.store.isSessionDeleted(session.id) || target.kind === 'unit' && !this.store.canAccessUnit(ownerId, session.id, target.unitId)) return failure('out_of_scope', '译文结果不属于当前已打开的翻译会话或已删除。')
+    const history = this.store.getTranslationHistory(session.id)
+    if (!history) return failure('history_unavailable', '当前会话没有可导出的译文历史。')
+    const scoped = history.units.filter(isTextUnit).filter(unit => owns(unit.id))
+    // A completed whole-file unit is the exact result; segments only matter when it is absent.
+    const whole = scoped.filter(unit => unit.id === base)
+    const units = target.kind === 'material' && whole.some(unit => currentResultRevision(unit)?.status === 'completed') ? whole : scoped
+    if (!units.length) return failure('result_missing', '此材料还没有已记录的译文；请先翻译。')
+    const segments: NormalTranslationExportSegment[] = [], available: { readonly start: number; readonly end: number }[] = []
+    for (const unit of units) {
+      const suffix = unit.id.slice(base.length)
+      let range: { readonly start: number; readonly end: number } | null = null
+      if (/^:\d+-\d+$/u.test(suffix)) {
+        const parsed = suffix.slice(1).split('-').map(Number), start = parsed[0]!, end = parsed[1]!
+        range = { start, end }; available.push(range)
+      }
+      // A user-fixed final stays the delivery source; otherwise the newest reviewed result wins.
+      const revision = unit.final?.selection === 'user_fixed' ? unit.revisions.find(candidate => candidate.id === unit.final!.revisionId) : currentResultRevision(unit)
+      if (!revision || revision.status !== 'completed') continue
+      segments.push({ unitId: unit.id, range, revisionId: revision.id, status: 'completed', text: revision.text })
+    }
+    segments.sort((left, right) => (left.range?.start ?? -1) - (right.range?.start ?? -1))
+    if (totalCodePoints <= 0) totalCodePoints = available.length ? Math.max(...available.map(range => range.end)) : Array.from(units[0]!.source).length
+    const missing: { readonly start: number; readonly end: number }[] = []
+    const overlapping: { readonly start: number; readonly end: number }[] = []
+    let complete: boolean
+    if (target.kind === 'unit') complete = segments.length === 1
+    else if (units.some(unit => unit.id.endsWith(':body'))) complete = segments.some(segment => segment.unitId.endsWith(':body'))
+    else if (available.length) {
+      let cursor = 0
+      const covered: { readonly start: number; readonly end: number }[] = []
+      for (const segment of segments) if (segment.range) covered.push(segment.range)
+      for (const range of covered.sort((left, right) => left.start - right.start)) {
+        if (range.start > cursor) missing.push({ start: cursor, end: range.start })
+        else if (range.start < cursor) overlapping.push({ start: range.start, end: Math.min(cursor, range.end) })
+        cursor = Math.max(cursor, range.end)
+      }
+      if (cursor < totalCodePoints) missing.push({ start: cursor, end: totalCodePoints })
+      complete = missing.length === 0 && overlapping.length === 0
+    } else complete = segments.some(segment => segment.range === null)
+    const value: TopicBridgeValue = { kind: 'normal_exported', export: { mainSessionId: ownerId, translationSessionId: session.id,
+      topicId: session.topicId, materialId: target.kind === 'material' ? target.materialId : null, sourceVersion: target.sourceVersion,
+      totalCodePoints, complete, segments, missing, overlapping } }
+    if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) {
+      return failure('export_too_large', '本次译文总长度超过单次导出上限；请分段落保存或缩小范围。')
+    }
+    return { ok: true, value }
+  }
+
   observe(ownerId: string, request: { readonly translationSessionId: string; readonly operationId: string }): NormalTranslationReply {
     const session = this.store.getSession(request.translationSessionId)
-    if (this.disposed || !session || session.ownerId !== ownerId || this.store.isSessionDeleted(session.id)) return failure('out_of_scope', '业务操作不属于当前主会话或已删除。')
+    if (this.disposed || !session || this.store.isSessionDeleted(session.id)) return failure('out_of_scope', '业务操作不属于当前主会话或已删除。')
     const item = this.locate(ownerId, request.operationId)
     return { ok: true, value: { kind: 'normal_observed', operation: item?.operation.translationSessionId === session.id ? structuredClone(item.operation) : null } }
   }
@@ -213,7 +367,7 @@ export class NormalTranslationClient {
     if (this.disposed || !item) return failure('operation_not_found', '此业务操作未在当前会话受理，结果未采用。')
     const op = item.operation, session = this.store.getSession(op.translationSessionId)
     if (input.mainSessionId !== ownerId || input.translationSessionId !== op.translationSessionId || input.unitId !== op.unitId || input.sourceVersion !== op.sourceVersion ||
-      !session || session.ownerId !== ownerId || session.topicId !== op.topicId || this.store.isSessionDeleted(session.id)) return failure('identity_mismatch', '普通翻译 v2 结果归属或源版本不一致。')
+      !session || session.topicId !== op.topicId || this.store.isSessionDeleted(session.id)) return failure('identity_mismatch', '普通翻译 v2 结果归属或源版本不一致。')
     const signature = JSON.stringify(input), previous = item.v2Updates.get(event.sequence)
     const reply = (): NormalTranslationReply => ({ ok: true, value: { kind: 'normal_v2_updated', operation: structuredClone(item.operation), callId: event.callId, sequence: event.sequence } })
     if (event.sequence <= item.v2Sequence) return previous === undefined || previous === signature ? reply() : failure('idempotency_conflict', '同一 v2 事件不能更换内容。')
@@ -339,9 +493,9 @@ export class NormalTranslationClient {
   resolveExchange(ownerId: string, request: { readonly translationSessionId: string; readonly exchangeId: string; readonly resolution: NormalTranslationResolution }): NormalTranslationReply {
     const session = this.store.getSession(request.translationSessionId), history = this.store.getTranslationHistory(request.translationSessionId)
     const exchange = history?.exchanges.find(item => item.exchangeId === request.exchangeId)
-    if (this.disposed || !session || session.ownerId !== ownerId || !exchange || exchange.mainSessionId !== ownerId || exchange.translationSessionId !== session.id ||
+    if (this.disposed || !session || !exchange || exchange.mainSessionId !== ownerId || exchange.translationSessionId !== session.id ||
       exchange.topicId !== session.topicId || this.store.isSessionDeleted(session.id) || this.store.getStatus(session.id) === 'conflict' ||
-      !this.options.canAccessUnit?.(ownerId, session.id, exchange.unitId)) return failure('out_of_scope', '此 exchange 不属于当前已授权的主会话或翻译会话。')
+      !history?.units.some(unit => unit.id === exchange.unitId && !unit.deletion)) return failure('out_of_scope', '此 exchange 不属于准确的执行任务或对应单元已删除。')
     if (exchange.sourceVersion !== this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === exchange.unitId)?.sourceVersion) return failure('stale_version', '原文已变化，此 exchange 已失效。')
     if (request.resolution.kind === 'answer') {
       const current = this.terms.getSnapshot(ownerId, session.topicId)
@@ -367,7 +521,7 @@ export class NormalTranslationClient {
     if (this.disposed || !item) return failure('operation_not_found', '此业务操作未在当前会话受理，结果未采用。')
     const op = item.operation, session = this.store.getSession(op.translationSessionId)
     if (update.mainSessionId !== ownerId || update.translationSessionId !== op.translationSessionId || update.unitId !== op.unitId ||
-      update.sourceVersion !== op.sourceVersion || !session || session.ownerId !== ownerId || session.topicId !== op.topicId || this.store.isSessionDeleted(session.id)) return failure('identity_mismatch', '普通翻译结果归属或源版本不一致，未采用。')
+      update.sourceVersion !== op.sourceVersion || !session || session.topicId !== op.topicId || this.store.isSessionDeleted(session.id)) return failure('identity_mismatch', '普通翻译结果归属或源版本不一致，未采用。')
     const signature = JSON.stringify(update)
     const reply = (): NormalTranslationReply => ({ ok: true, value: { kind: 'normal_updated', operation: structuredClone(item.operation), callId: update.callId, sequence: update.sequence } })
     if (update.sequence <= item.sequence) return !item.updates.has(update.sequence) || item.updates.get(update.sequence) === signature ? reply() : failure('idempotency_conflict', '同一执行事件不能更换内容。')
@@ -428,7 +582,7 @@ export class NormalTranslationClient {
       if (!unit || !isTextUnit(unit)) continue
       const material = unit.material
       const accepted = history?.events.find(event => event.operationId === operationId && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null)
-      if (!unit || event?.type === 'source.corrected' || (material && material.mainSessionId !== ownerId) || this.store.isSessionDeleted(session.id)) continue
+      if (!unit || event?.type === 'source.corrected' || this.store.getOperationMainSessionId(session.id, operationId) !== ownerId || this.store.isSessionDeleted(session.id)) continue
       const revision = [...unit.revisions].reverse().find(revision => revision.operationId === operationId)
       if (!accepted && !isNormalTranslationPromptVersion((revision?.callRecord ?? revision?.deletion?.callFacts)?.promptVersion)) continue
       const receipt = [...history!.events].reverse().find(event => event.operationId === operationId && event.normalSequence !== undefined)
@@ -456,13 +610,13 @@ export class NormalTranslationClient {
   getUnitStatus(sessionId: string, unitId: string): { readonly operationId: string; readonly status: NormalTranslationV2Status; readonly message: string | undefined; readonly querying: boolean } | undefined {
     const session = this.store.getSession(sessionId), history = this.store.getTranslationHistory(sessionId)
     const event = [...history?.events ?? []].reverse().find(event => event.unitId === unitId && event.operationId !== null && event.type !== 'final.selected' && event.type !== 'revision.manual_saved' && event.type !== 'revision.deleted' && event.type !== 'source.corrected')
-    const item = session && event?.operationId ? this.locate(session.ownerId, event.operationId) : undefined
+    const item = session && event?.operationId ? this.locate(this.store.getOperationMainSessionId(session.id, event.operationId) ?? '', event.operationId) : undefined
     return item ? { operationId: item.operation.operationId, status: item.v2Status, message: item.message, querying: item.querying } : undefined
   }
   isBusy(sessionId: string): boolean {
     const session = this.store.getSession(sessionId)
     if (session) for (const event of this.store.getTranslationHistory(sessionId)?.events ?? []) if (event.operationId !== null &&
-      ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null) this.locate(session.ownerId, event.operationId)
+      ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null) this.locate(this.store.getOperationMainSessionId(sessionId, event.operationId) ?? '', event.operationId)
     return [...this.operations.values()].some(item => item.operation.translationSessionId === sessionId && ['accepted', 'running', 'unknown'].includes(item.operation.status))
   }
   private unknown(item: AcceptedOperation, message: string): void {
@@ -493,19 +647,18 @@ export class NormalTranslationClient {
     if (this.getRetranslationStatus(sessionId, unitId)?.pending) return '正在发送重译意图。'
     return undefined
   }
-  async retranslate(sessionId: string, unitId: string): Promise<void> {
-    if (this.disposed || this.retranslateBlockedReason(sessionId, unitId)) return
+  async retranslate(sessionId: string, unitId: string, executionOwner?: string): Promise<void> {
+    if (this.disposed || !executionOwner || !this.store.isSessionOpen(executionOwner, sessionId) || this.retranslateBlockedReason(sessionId, unitId)) return
     const session = this.store.getSession(sessionId)!, unit = this.store.getTranslationHistory(sessionId)!.units.find(unit => unit.id === unitId)!
     const key = JSON.stringify([sessionId, unitId]), old = this.unitRequests.get(key), operationId = old?.outcome === 'unknown' ? old.operationId : `unit-intent:${crypto.randomUUID()}`
     const locale = this.options.uiLocale?.()?.trim()
-    const request: NormalTranslationUnitRequest = { operationId, target: { kind: 'unit', mainSessionId: session.ownerId, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion },
+    const request: NormalTranslationUnitRequest = { operationId, target: { kind: 'unit', mainSessionId: executionOwner, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion },
       ...(locale ? { uiLocale: locale.slice(0, 64) } : {}) }
-    const release = this.retain(session.ownerId)
+    const release = this.retain(executionOwner)
     old?.release?.()
     const item = { operationId, pending: true, outcome: 'pending' as 'pending' | 'submitted' | 'failed' | 'unknown', message: '正在发送重译意图…', release: release as (() => void) | undefined }; this.unitRequests.set(key, item); this.emit()
     let handoff = false
     try {
-      if (!this.options.publishUnit?.(session.ownerId, session.id, unit.id)) throw new Error('历史单元未能供主模型读取。')
       const port = typeof this.options.remote === 'function' ? await this.options.remote() : this.options.remote
       if (!port?.requestUnit) throw new Error('宿主尚未提供普通重译入口。')
       handoff = true
@@ -521,9 +674,12 @@ export class NormalTranslationClient {
   private async request(sessionId: string, unitId: string, method: 'status' | 'cancel'): Promise<void> {
     const status = this.getUnitStatus(sessionId, unitId), session = this.store.getSession(sessionId)
     if (this.disposed || !status || !session) return
-    const item = this.locate(session.ownerId, status.operationId)!
+    const ownerId = this.store.getOperationMainSessionId(session.id, status.operationId)
+    if (!ownerId) return
+    const item = this.locate(ownerId, status.operationId)
+    if (!item) return
     if (item.querying) return
-    item.querying = true; item.release ??= this.retain(session.ownerId); this.emit()
+    item.querying = true; item.release ??= this.retain(ownerId); this.emit()
     let usedV2 = false
     try {
       const v2 = typeof this.options.remoteV2 === 'function' ? await this.options.remoteV2() : this.options.remoteV2
@@ -535,7 +691,7 @@ export class NormalTranslationClient {
         let more = true, action = method
         while (more && !this.disposed) {
           let timer: ReturnType<typeof setTimeout> | undefined
-          const after = item.v2Sequence, raw = await Promise.race([v2[action]({ mainSessionId: session.ownerId, translationSessionId: sessionId, operationId: status.operationId, afterSequence: after }),
+          const after = item.v2Sequence, raw = await Promise.race([v2[action]({ mainSessionId: ownerId, translationSessionId: sessionId, operationId: status.operationId, afterSequence: after }),
             new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('普通 v2 状态查询超时；未自动重发。')), 15000) })]).finally(() => clearTimeout(timer)) as {
               ok?: boolean; error?: { code?: string; message?: string; stage?: string }; value?: { ok?: boolean; error?: { code?: string; message?: string; stage?: string }; value?: unknown }
             }
@@ -545,10 +701,10 @@ export class NormalTranslationClient {
           if (raw?.ok !== true || raw.value?.ok !== true) throw new Error(error ? `${error.code ?? 'remote_error'}${error.stage ? ` (${error.stage})` : ''}: ${error.message ?? '未取得普通 v2 状态。'}` : '未取得普通 v2 状态；未自动重发。')
           const job: NormalTranslationV2Job = parseNormalTranslationV2Job(raw.value.value)
           const operation = job.operation
-          if (operation.mainSessionId !== session.ownerId || operation.operationId !== status.operationId || operation.translationSessionId !== sessionId || operation.unitId !== unitId ||
+          if (operation.mainSessionId !== ownerId || operation.operationId !== status.operationId || operation.translationSessionId !== sessionId || operation.unitId !== unitId ||
             operation.sourceVersion !== item.operation.sourceVersion) throw new Error('普通 v2 状态身份不一致；未自动重发。')
           for (const event of job.events) {
-            const result = this.updateV2(session.ownerId, { mainSessionId: session.ownerId, translationSessionId: sessionId, unitId, operationId: status.operationId,
+            const result = this.updateV2(ownerId, { mainSessionId: ownerId, translationSessionId: sessionId, unitId, operationId: status.operationId,
               sourceVersion: item.operation.sourceVersion, event })
             if (!result.ok) throw new Error(result.error.message)
           }
@@ -563,14 +719,14 @@ export class NormalTranslationClient {
       let more = true, action = method
       while (more && !this.disposed) {
         let timer: ReturnType<typeof setTimeout> | undefined
-        const after = item.sequence, raw = await Promise.race([port[action]({ mainSessionId: session.ownerId, translationSessionId: sessionId, operationId: status.operationId, afterSequence: after }),
+        const after = item.sequence, raw = await Promise.race([port[action]({ mainSessionId: ownerId, translationSessionId: sessionId, operationId: status.operationId, afterSequence: after }),
           new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('普通执行状态查询超时，请查询原操作；未自动重发。')), 15000) })]).finally(() => clearTimeout(timer)) as { ok?: boolean; value?: { ok?: boolean; value?: unknown; error?: { message?: string } } }
         if (this.disposed) return
         action = 'status'
         if (raw?.ok !== true || raw.value?.ok !== true) throw new Error(raw?.value?.error?.message ?? '未取得普通执行状态，未自动重发。')
         const job = parseNormalTranslationJob(raw.value.value)
-        if (!job.operation || job.operation.mainSessionId !== session.ownerId || job.operation.operationId !== status.operationId || job.operation.translationSessionId !== sessionId || job.operation.unitId !== unitId) throw new Error(job.error?.message ?? '普通执行状态身份不一致或已不可查询。')
-        for (const update of job.updates) { const result = this.update(session.ownerId, update); if (!result.ok) throw new Error(result.error.message) }
+        if (!job.operation || job.operation.mainSessionId !== ownerId || job.operation.operationId !== status.operationId || job.operation.translationSessionId !== sessionId || job.operation.unitId !== unitId) throw new Error(job.error?.message ?? '普通执行状态身份不一致或已不可查询。')
+        for (const update of job.updates) { const result = this.update(ownerId, update); if (!result.ok) throw new Error(result.error.message) }
         if (job.lastSequence > item.sequence && !job.more) throw new Error('执行状态仍缺少回执，请再次查询原操作。')
         more = job.more
         if (more && item.sequence <= after) throw new Error('状态分页未推进，请再次查询原操作。')

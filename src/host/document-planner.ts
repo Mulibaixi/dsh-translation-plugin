@@ -131,10 +131,10 @@ export class DocumentPlanner {
     }
     if (!envelope) throw reject('material_missing', '新规划需要确切已交付材料。')
     const material = envelope.material
-    if (!same(preparation.target, target) || envelope.ownerId !== target.mainSessionId || envelope.mainSessionId !== target.mainSessionId ||
+    if (!same(preparation.target, target) || envelope.mainSessionId !== target.mainSessionId || envelope.mainSessionId !== target.mainSessionId ||
       envelope.requestId !== target.requestId || material.materialId !== target.materialId || material.sourceVersion !== target.sourceVersion ||
       preparation.id !== preparationRef.id || preparation.version !== preparationRef.version ||
-      preparation.scope.ownerId !== envelope.ownerId || preparation.scope.mainSessionId !== envelope.mainSessionId ||
+      preparation.scope.ownerId !== envelope.mainSessionId || preparation.scope.mainSessionId !== envelope.mainSessionId ||
       preparation.scope.topicId !== material.topicId || preparation.scope.translationSessionId !== material.translationSessionId ||
       preparation.sourceVersion !== material.sourceVersion || preparation.userRequirements !== material.instruction ||
       preparation.targetLanguage !== material.targetLanguage || !same(preparation.route, material.model)) {

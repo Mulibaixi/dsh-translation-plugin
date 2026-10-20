@@ -86,7 +86,7 @@ export function emptyRecordObjects(ownerId: string, topicId: string, sessionId: 
   return { schemaVersion: 1, ownerId, topicId, sessionId, version: 0, updatedAt: at, references: [] }
 }
 export function recordObjectTargetMatches(reference: RecordObjectTarget, scope: RecordObjectTarget): boolean {
-  return reference.ownerId === scope.ownerId && reference.topicId === scope.topicId && reference.sessionId === scope.sessionId && reference.unitId === scope.unitId &&
+  return reference.topicId === scope.topicId && reference.sessionId === scope.sessionId && reference.unitId === scope.unitId &&
     reference.side === scope.side && reference.revisionId === scope.revisionId
 }
 /** Caller has checked the authoritative body and offset under its storage lock. */

@@ -64,7 +64,7 @@ export class QuickTranslationClient {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private draftStamp(session: LocalSession): number {
-    const signature = JSON.stringify([session.ownerId, session.topicId, session.mode, session.input, session.targetLanguage,
+    const signature = JSON.stringify([this.store.getNamespaceId(), session.topicId, session.mode, session.input, session.targetLanguage,
       session.instruction, session.model?.provider ?? null, session.model?.model ?? null, session.model?.reasoningEffort ?? null, session.maxInputChars])
     const prior = this.drafts.get(session.id)
     if (prior?.signature === signature) return prior.stamp
@@ -183,11 +183,11 @@ export class QuickTranslationClient {
     this.records.set(id, [...this.getRecords(id), record]); this.pending.set(operationId, pending); this.emit()
     try {
       let binding = this.bindings.get(id)
-      if (!binding || binding.ownerId !== draft.ownerId || binding.topicId !== draft.topicId || binding.max !== draft.maxInputChars) {
+      if (!binding || binding.ownerId !== this.store.getNamespaceId() || binding.topicId !== draft.topicId || binding.max !== draft.maxInputChars) {
         const opened = await this.request(this.port.open({ localSessionId: id, maxSourceCodePoints: draft.maxInputChars }))
         if (!opened.ok) { this.fail(pending, opened.error.message); return }
         if (typeof opened.value?.sessionKey !== 'string' || !opened.value.sessionKey || opened.value.localSessionId !== id || opened.value.maxSourceCodePoints !== draft.maxInputChars) { this.fail(pending, '快译会话身份无效。'); return }
-        binding = { ownerId: draft.ownerId, topicId: draft.topicId, max: draft.maxInputChars, sessionKey: opened.value.sessionKey }
+        binding = { ownerId: this.store.getNamespaceId(), topicId: draft.topicId, max: draft.maxInputChars, sessionKey: opened.value.sessionKey }
         if (!this.store.getSession(id) || pending.stopped || pending.suspended) return
         this.bindings.set(id, binding)
       }

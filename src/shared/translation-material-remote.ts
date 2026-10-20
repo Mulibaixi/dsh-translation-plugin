@@ -48,11 +48,10 @@ function fields(value: Data, required: readonly string[], optional: readonly str
 function text(value: unknown, maximum = 2048): asserts value is string {
   if (typeof value !== 'string' || !value.trim() || value.length > maximum) throw new TypeError('Invalid material bridge identity or error')
 }
-const scopeFields = ['ownerId', 'mainSessionId', 'requestId', 'operationId'] as const
+const scopeFields = ['mainSessionId', 'requestId', 'operationId'] as const
 function scope(value: Data): TranslationMaterialScope {
-  text(value.ownerId, 1000); text(value.mainSessionId, 1000); text(value.requestId); text(value.operationId)
-  if (value.ownerId !== value.mainSessionId) throw new TypeError('Material bridge requires its own main Session')
-  return { ownerId: value.ownerId, mainSessionId: value.mainSessionId, requestId: value.requestId, operationId: value.operationId }
+  text(value.mainSessionId, 1000); text(value.requestId); text(value.operationId)
+  return { mainSessionId: value.mainSessionId, requestId: value.requestId, operationId: value.operationId }
 }
 export function parseTranslationMaterialRequest(method: 'prepare' | 'query' | 'finish' | 'release' | 'submit', value: unknown): TranslationMaterialEnvelope | TranslationMaterialScope | TranslationMaterialFinish {
   if (method === 'prepare' || method === 'submit') return parseTranslationMaterialEnvelope(value)

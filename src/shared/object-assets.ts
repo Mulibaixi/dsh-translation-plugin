@@ -11,7 +11,8 @@ export interface ObjectAssetVersion {
 export interface ObjectAssetRegistration extends ObjectAssetVersion { readonly persistence: 'saved' }
 export interface ObjectAssetCapability { readonly ready: boolean; readonly nativeOpen: boolean; readonly reason?: string }
 export interface ObjectAssetRegister {
-  readonly ownerId: string
+  readonly namespaceId: string
+  readonly mainSessionId: string
   readonly topicId: string
   readonly translationSessionId: string
   readonly unitId: string
@@ -23,7 +24,7 @@ export interface ObjectAssetRegister {
   readonly receiptId: string
   readonly existingObjectId?: string
 }
-export interface ObjectAssetOpen { readonly ownerId: string; readonly topicId: string; readonly objectId: string; readonly assetId: string; readonly version: number }
+export interface ObjectAssetOpen { readonly namespaceId: string; readonly topicId: string; readonly objectId: string; readonly assetId: string; readonly version: number }
 export type ObjectAssetErrorCode = 'invalid_input' | 'scope_mismatch' | 'unavailable' | 'receipt_not_found' | 'not_found' | 'storage_failed' | 'integrity_failed' | 'open_failed'
 export type ObjectAssetResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: { readonly code: ObjectAssetErrorCode; readonly message: string } }
 export interface ObjectAssetPort {
@@ -52,15 +53,15 @@ export function parseObjectAssetVersion(value: unknown): ObjectAssetVersion {
   return structuredClone(value) as unknown as ObjectAssetVersion
 }
 export function parseObjectAssetRequest(method: 'register' | 'open', value: unknown): ObjectAssetRegister | ObjectAssetOpen {
-  record(value); text(value.ownerId); text(value.topicId)
+  record(value); text(value.namespaceId); text(value.topicId)
   if (method === 'register') {
-    exact(value, ['ownerId', 'topicId', 'translationSessionId', 'unitId', 'side', 'revisionId', 'offset', 'kind', 'receiptId', 'existingObjectId'])
-    text(value.translationSessionId); text(value.unitId); text(value.receiptId, 256); integer(value.offset); kind(value.kind)
+    exact(value, ['namespaceId', 'mainSessionId', 'topicId', 'translationSessionId', 'unitId', 'side', 'revisionId', 'offset', 'kind', 'receiptId', 'existingObjectId'])
+    text(value.mainSessionId); text(value.translationSessionId); text(value.unitId); text(value.receiptId, 256); integer(value.offset); kind(value.kind)
     if (value.side !== 'source' && value.side !== 'revision' || value.side === 'source' && value.revisionId !== null) throw new TypeError('Invalid placement')
     if (value.side === 'revision') text(value.revisionId)
     if (value.existingObjectId !== undefined) id(value.existingObjectId, 'object')
   } else {
-    exact(value, ['ownerId', 'topicId', 'objectId', 'assetId', 'version']); id(value.objectId, 'object'); id(value.assetId, 'asset'); integer(value.version)
+    exact(value, ['namespaceId', 'topicId', 'objectId', 'assetId', 'version']); id(value.objectId, 'object'); id(value.assetId, 'asset'); integer(value.version)
     if (value.version < 1) throw new TypeError('Invalid version')
   }
   return structuredClone(value) as unknown as ObjectAssetRegister | ObjectAssetOpen

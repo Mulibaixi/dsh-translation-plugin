@@ -1,3 +1,4 @@
+import { isFileJobUnit } from './translation-history.js'
 import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import { resolveTermEvidence, termEvidenceKey, type TermEvidenceRef, type TermEvidenceResolver } from '../memory/topic-terms.js'
 import type { EvidenceReadRequest, EvidenceReadResult } from '../shared/translation-evidence.js'
@@ -30,6 +31,7 @@ function sameFact(left: unknown, right: unknown): boolean {
 function referencedFacts(sessions: SessionStore, ref: TermEvidenceRef): unknown {
   if (ref.kind === 'reference') return ref
   const history = sessions.getTranslationHistory(ref.sessionId), unit = history?.units.find(unit => unit.id === ref.unitId)
+  if (unit && isFileJobUnit(unit)) return { sourceVersion: unit.sourceVersion }
   const source = unit?.sourceVersions.find(source => source.version === unit.sourceVersion)
   if (ref.kind === 'source') return { sourceVersion: unit?.sourceVersion, source }
   const revision = unit?.revisions.find(revision => revision.id === ref.revisionId)

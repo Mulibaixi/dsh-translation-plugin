@@ -1,4 +1,5 @@
 import { parseReferenceEvidence, type ReferenceEvidenceRef } from '../shared/reference-memory.js'
+import { languageMatches } from '../shared/language-tag.js'
 /** Topic terminology contains references, never a second copy of source/final bodies. */
 export type TopicTermStatus = 'proposal' | 'active' | 'conflict' | 'review_required' | 'disabled'
 export type TopicTermOrigin = 'inferred' | 'source_checked' | 'reference_derived' | 'user_explicit'
@@ -251,7 +252,15 @@ function replace(snapshot: TopicTermSnapshot, entry: TopicTerm, at: string): Top
 function result(snapshot: TopicTermSnapshot, status: TermMutationResult['status'], entry: TopicTerm | null): TermMutationResult { return { status, snapshot, entry } }
 
 /** Main-model proposals/source checks cannot rewrite a user-adopted rule. */
+/** One spelling per language inside a topic: an equivalent existing label/tag wins over the incoming one. */
+function alignLanguages<T extends { readonly sourceLanguage: string | null; readonly targetLanguage: string }>(snapshot: TopicTermSnapshot, fields: T): Pick<T, 'sourceLanguage' | 'targetLanguage'> {
+  const same = (candidates: readonly string[], value: string): string => value === '' ? value
+    : candidates.find(candidate => candidate !== '' && languageMatches(candidate, value)) ?? value
+  return { sourceLanguage: fields.sourceLanguage === null ? null : same(snapshot.entries.map(entry => entry.sourceLanguage ?? ''), fields.sourceLanguage),
+    targetLanguage: same(snapshot.entries.map(entry => entry.targetLanguage), fields.targetLanguage) }
+}
 export function putTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermPut, resolver: TermEvidenceResolver, at: string): TermMutationResult {
+  input = { ...input, ...alignLanguages(snapshot, input) }
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
   if (old?.origin === 'user_explicit' || old?.acceptance) return result(snapshot, 'requires_user_action', old)
@@ -267,6 +276,7 @@ export function putTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermPut, r
 
 /** One explicit user save, with no intermediate persisted proposal or second adoption action. */
 export function putUserTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermUserPut, action: { readonly eventId: string; readonly at: string }): TermMutationResult {
+  input = { ...input, ...alignLanguages(snapshot, input) }
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
   const submitted = { ...input, evidence: old?.evidence ?? [] }
@@ -346,6 +356,6 @@ export function reconcileTopicTerms(snapshot: TopicTermSnapshot, resolver: TermE
 /** Quick never reads terms. Normal lookup is scoped and matches explicit forms exactly. */
 export function queryTopicTerms(snapshot: TopicTermSnapshot, query: TopicTermQuery, resolver: TermEvidenceResolver): readonly TopicTerm[] {
   if (query.mode !== 'normal' || query.ownerId !== snapshot.ownerId || query.topicId !== snapshot.topicId) return []
-  return snapshot.entries.filter(entry => entry.sourceLanguage === query.sourceLanguage && entry.targetLanguage === query.targetLanguage &&
+  return snapshot.entries.filter(entry => languageMatches(entry.sourceLanguage, query.sourceLanguage) && languageMatches(entry.targetLanguage, query.targetLanguage) &&
     effective(snapshot, entry, resolver) && [...entry.sourceForms, ...entry.aliases].some(form => query.forms.includes(form)))
 }

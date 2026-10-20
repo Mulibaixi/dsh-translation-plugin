@@ -9,15 +9,71 @@ import type { MaterialSubmissionsClient } from './material-submissions.js'
 import { currentDocumentFinalRevision, isDocumentUnit } from './translation-history.js'
 import type { TranslationDocumentReader } from './source-reader.js'
 import { readDocumentText, projectDocument } from './document-export.js'
+import type { UnitReadRequest, UnitContent } from '../shared/numbered-units.js'
+import type { TermEvidenceRef } from '../memory/topic-terms.js'
 
 function fail(code: string, message: string): never { throw Object.assign(new Error(message), { code }) }
 /** Browser history is authoritative after Host reload; no runtime task or material is fabricated. */
 export class FileHistoryClient {
   constructor(private readonly sessions: SessionStore, private readonly jobs: FileJobsClient, private readonly materials: MaterialSubmissionsClient,
     private readonly namespaceId: () => string, private readonly uiLocale: () => string | undefined, private readonly reader: TranslationDocumentReader) {}
+  ensureUnitNumbers(sessionId: string): void { this.jobs.units(sessionId, true) }
+  hasEvidence(main: string, topicId: string, ref: TermEvidenceRef): boolean {
+    if (ref.kind === 'reference') return false
+    const captured = this.jobs.capture(main, topicId, ref)
+    return !('status' in captured) && this.jobs.isCurrent(captured)
+  }
+  numberedVersions(target: NormalTranslationUnitTarget) {
+    const record = this.jobs.forUnit(target.translationSessionId, target.unitId)
+    return record ? { versions: record.results.map(value => value.version), finalVersion: record.final?.version ?? null, status: record.summary.phase } : undefined
+  }
+  async readNumbered(target: NormalTranslationUnitTarget, request: UnitReadRequest): Promise<Omit<UnitContent, 'unit' | 'side'>> {
+    const facts = this.unit(target), side = request.side ?? 'translation', start = request.start ?? 0
+    const missing = (message: string) => ({ revisionNumber: request.revisionNumber ?? null, text: null, totalCodePoints: 0, start, nextStart: null, message })
+    let text: string, total: number, revisionNumber: number | null = null
+    if (facts.jobId) {
+      const record = this.jobs.forUnit(target.translationSessionId, target.unitId)!
+      const version = side === 'source' ? record.sources.find(value => value.version === target.sourceVersion)
+        : record.results.find(value => value.version === (request.revisionNumber ?? record.final?.version))
+      if (!version) return missing(side === 'source' ? '原稿内容不可用。' : '此版本不可用，或当前没有有效定稿。')
+      const points = Array.from(version.text); total = points.length
+      text = points.slice(start, start + 4000).join(''); revisionNumber = side === 'source' ? null : version.version
+    } else {
+      const session = this.sessions.getSession(target.translationSessionId)!, unit = this.sessions.getTranslationHistory(session.id)!.units.find(unit => unit.id === target.unitId)!
+      if (!isDocumentUnit(unit)) fail('invalid_unit', '此单元不是文档。')
+      const revision = request.revisionNumber === undefined ? currentDocumentFinalRevision(unit) : unit.revisions[request.revisionNumber - 1]
+      if (side === 'translation' && !revision) return missing('此版本不存在，或当前没有有效定稿。')
+      const handle = this.reader.captureDocument({ ownerId: target.mainSessionId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: target.sourceVersion, manifestRevisionId: side === 'source' ? null : revision!.id })
+      if ('status' in handle) return missing('此准确文档版本暂不可读取。')
+      if (side === 'source') {
+        total = handle.totalSourceCodePoints
+        if (!total || start === total) text = ''
+        else { const page = await readDocumentText(range => handle.readSource(range), { start, end: Math.min(total, start + 4000) }); if (!('text' in page)) fail('source_unavailable', '原稿页读取失败。'); text = page.text }
+      } else {
+        if (!handle.manifest?.eligibility.complete || handle.blocks.some(block => block.revision?.status !== 'completed')) return missing('此文档版本尚不完整。')
+        revisionNumber = unit.revisions.indexOf(revision!) + 1
+        const parts = handle.blocks.map(block => ({ length: block.revision!.content.kind === 'text' ? Array.from(block.revision!.content.text).length : block.revision!.content.range.end - block.revision!.content.range.start, revisionId: block.revisionId }))
+        total = parts.reduce((sum, part) => sum + part.length, 0)
+        const end = Math.min(total, start + 4000), body: string[] = []; let offset = 0
+        for (const part of parts) {
+          const from = Math.max(start, offset), to = Math.min(end, offset + part.length)
+          if (to > from) {
+            const page = await handle.readChunk(part.revisionId!, { start: from - offset, end: to - offset }); if (page.status !== 'ready') fail('result_unavailable', '译文页读取失败。'); body.push(page.text)
+          }
+          offset += part.length
+        }
+        text = body.join('')
+      }
+      if (handle.check()) fail('content_changed', '读取期间文档版本已变化。')
+    }
+    if (start > total) fail('range_out_of_bounds', `此内容共 ${total} 码点，读取起点超出范围。`)
+    this.unit(target)
+    const end = start + Array.from(text).length
+    return { text, totalCodePoints: total, start, nextStart: end < total ? end : null, revisionNumber }
+  }
   unit(target: NormalTranslationUnitTarget): FileHistoryUnit {
     const session = this.sessions.getSession(target.translationSessionId)
-    if (!session || session.ownerId !== target.mainSessionId && !this.sessions.isSessionOpen(target.mainSessionId, session.id) || session.mode !== 'normal' || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict') fail('scope_mismatch', '文件历史不属于此主会话或已变化。')
+    if (!session || !this.sessions.isSessionOpen(target.mainSessionId, session.id) || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict') fail('scope_mismatch', '文件历史不属于此主会话或已变化。')
     const blocked = this.materials.fileAccessBlockedReason?.(session.id, target.unitId)
     if (blocked) fail('unit_removed_or_conflicted', blocked)
     const record = this.jobs.forUnit(session.id, target.unitId)
@@ -45,8 +101,8 @@ export class FileHistoryClient {
     if (request.action === 'list') {
       if (request.request.ownerId !== ownerId) fail('scope_mismatch', '文件列表所属主会话不符。')
       const items: FileHistoryUnit[] = []
-      for (const session of this.sessions.getAvailableSessions(ownerId)) {
-        if (session.ownerId !== ownerId && !this.sessions.isSessionOpen(ownerId, session.id) || session.mode !== 'normal' || request.request.translationSessionId && session.id !== request.request.translationSessionId) continue
+      for (const session of this.sessions.getDisplaySessions(ownerId)) {
+        if (!this.sessions.isSessionOpen(ownerId, session.id) || request.request.translationSessionId && session.id !== request.request.translationSessionId) continue
         const targets = new Map<string, number>()
         for (const unit of this.sessions.getTranslationHistory(session.id)?.units ?? []) if (isDocumentUnit(unit) && !unit.deletion) targets.set(unit.id, unit.sourceVersion)
         for (const record of this.jobs.units(session.id)) targets.set(record.summary.unitId, record.summary.sourceVersion)
@@ -69,11 +125,10 @@ export class FileHistoryClient {
       if (!record) fail('not_found', '此任务尚无已保存文件记录。')
       const current = this.unit({ kind: 'unit', mainSessionId: ownerId, translationSessionId: record.summary.translationSessionId, unitId: record.summary.unitId, sourceVersion: record.summary.sourceVersion })
       if (request.action === 'revise' && (current.jobId !== request.request.jobId || current.unsettled)) fail('stale_job', '此单元已有较新的任务，请读取最新任务后修订。')
-      const scope = { ownerId, mainSessionId: ownerId, ...(record.summary.ownerId !== ownerId ? { historyOwnerId: record.summary.ownerId } : {}) }
       if (request.action === 'read') {
-        const page = this.jobs.readSaved({ ...request.request, ownerId: record.summary.ownerId })
-        value = { action: 'read', page: { ...page, summary: { ...page.summary, ...scope } } }
-      } else value = { action: 'revise', summary: { ...await this.jobs.reviseSaved({ ...request.request, ownerId: record.summary.ownerId }, ownerId), ...scope } }
+        const page = this.jobs.readSaved({ ...request.request, ownerId: record.summary.mainSessionId })
+        value = { action: 'read', page }
+      } else value = { action: 'revise', summary: await this.jobs.reviseSaved({ ...request.request, ownerId: record.summary.mainSessionId }, ownerId) }
     } else {
       if (request.target.mainSessionId !== ownerId) fail('scope_mismatch', '文件单元所属主会话不符。')
       const unit = this.unit(request.target)
@@ -81,7 +136,7 @@ export class FileHistoryClient {
       else if (request.action === 'source') {
         if (request.range.end > unit.sourceTotalCodePoints) fail('invalid_range', '范围超出准确原稿。')
         let text: string
-        if (unit.jobId) text = this.jobs.readSaved({ ownerId: this.jobs.get(unit.jobId)!.summary.ownerId, jobId: unit.jobId, section: 'source', range: request.range }).text!
+        if (unit.jobId) text = this.jobs.readSaved({ ownerId: this.jobs.get(unit.jobId)!.summary.mainSessionId, jobId: unit.jobId, section: 'source', range: request.range }).text!
         else {
           const session = this.sessions.getSession(request.target.translationSessionId)!
           const handle = this.reader.captureDocument({ ownerId, topicId: session.topicId, sessionId: session.id, unitId: request.target.unitId, sourceVersion: request.target.sourceVersion, manifestRevisionId: null })
@@ -94,14 +149,14 @@ export class FileHistoryClient {
         value = { action: 'source', target: request.target, range: request.range, totalCodePoints: unit.sourceTotalCodePoints, text }
       }
       else {
-        const existing = this.jobs.all().find(record => record.summary.ownerId === ownerId && record.summary.operationId === request.operationId)?.summary
+        const existing = this.jobs.all().find(record => record.summary.mainSessionId === ownerId && record.summary.operationId === request.operationId)?.summary
         if (existing) {
           if (existing.unitId !== request.target.unitId || existing.translationSessionId !== request.target.translationSessionId || existing.sourceVersion !== request.target.sourceVersion || request.organizedRequirements.trim() && existing.organizedRequirements !== request.organizedRequirements) fail('idempotency_conflict', '原重译操作已被记录，不能更换目标或要求。')
           value = { action: 'restart', existing }
         } else {
           if (unit.unsettled || this.sessions.hasDocumentLease(request.target.translationSessionId)) fail('prior_call_unconfirmed', '此会话有未结算或未知任务，未重新派发。')
           const session = this.sessions.getSession(request.target.translationSessionId)!
-          if (session.archivedAt !== null || !session.model) fail('configuration_required', '请恢复会话并选择本次翻译模型。')
+          if (session.mode !== 'normal' || session.archivedAt !== null || !session.model) fail('configuration_required', '请恢复普通会话并选择本次翻译模型。')
           const restart = unit.jobId ? await this.jobs.prepareRestart(unit.jobId, request.operationId, request.organizedRequirements, ownerId)
             : await this.legacyRestart(unit, request.operationId, request.organizedRequirements)
           // Check scope again after all storage awaits; never return a source for a replaced unit.
@@ -114,7 +169,7 @@ export class FileHistoryClient {
   }
   private async legacyRestart(facts: FileHistoryUnit, operationId: string, organizedRequirements: string): Promise<FileJobRestart> {
     const { target } = facts, session = this.sessions.getSession(target.translationSessionId)!
-    if (session.archivedAt !== null || !session.model) fail('configuration_required', '请恢复会话并选择本次翻译模型。')
+    if (session.mode !== 'normal' || session.archivedAt !== null || !session.model) fail('configuration_required', '请恢复普通会话并选择本次翻译模型。')
     const unit = this.sessions.getTranslationHistory(session.id)!.units.find(unit => unit.id === target.unitId)!
     if (!isDocumentUnit(unit)) fail('scope_mismatch', '此单元不是文档。')
     const source = unit.sourceVersions.find(source => source.version === target.sourceVersion)!
@@ -142,7 +197,7 @@ export class FileHistoryClient {
     const latest = this.sessions.getTranslationHistory(session.id)?.units.find(candidate => candidate.id === unit.id)
     if (JSON.stringify(latest) !== JSON.stringify(unit)) fail('stale_version', '复制旧版本期间文档已变化，未启动重译。')
     const selected = results.find(result => result.legacyRevisionId === facts.resultRevisionId), last = results.at(-1), timestamp = new Date().toISOString()
-    const summary: FileJobSummary = { ownerId: target.mainSessionId, mainSessionId: target.mainSessionId, topicId: session.topicId, translationSessionId: session.id,
+    const summary: FileJobSummary = {  mainSessionId: target.mainSessionId, topicId: session.topicId, translationSessionId: session.id,
       jobId: `saved-document:${unit.id}`, unitId: unit.id, materialId: unit.id.replace(/^unit:/u, ''), sourceVersion: unit.sourceVersion, sourceRef: current,
       sourceTotalCodePoints: facts.sourceTotalCodePoints, targetLanguage: unit.targetLanguage, instruction: unit.instruction, model: null, historyOrigin: 'legacy_document',
       operationId: `preserve-document:${unit.id}`, requestId: `saved-document:${unit.id}`, createdAt: unit.createdAt, updatedAt: timestamp, version: 1,
@@ -153,7 +208,7 @@ export class FileHistoryClient {
       final: selected ? { version: selected.version, selection: unit.final?.selection ?? 'automatic', selectedAt: timestamp } : null })
     const locale = this.uiLocale()?.trim().slice(0, 64)
     return { operationId, organizedRequirements, previousResultVersion: Math.max(0, ...results.map(result => result.version)), ...(librarySource ? { librarySource } : {}), envelope: {
-      ownerId: target.mainSessionId, mainSessionId: target.mainSessionId, requestId: `file-restart:${operationId}`, operationId,
+       mainSessionId: target.mainSessionId, requestId: `file-restart:${operationId}`, operationId,
       ...(locale ? { uiLocale: locale } : {}), kind: 'material', material: { materialId: unit.id.replace(/^unit:/u, ''), sourceVersion: target.sourceVersion,
         topicId: session.topicId, translationSessionId: session.id, draftVersion: 1, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
         model: session.model, maxInputChars: session.maxInputChars, sourceRef: current } } }

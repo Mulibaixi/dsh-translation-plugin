@@ -5,6 +5,7 @@ export const MAX_TRANSLATION_SOURCE_BYTES = 2 * 1024 * 1024
 
 /** Fixed source storage scope; it does not create a translation unit or a history row. */
 export interface TranslationSourceScope {
+  readonly namespaceId?: string
   readonly ownerId: string
   readonly mainSessionId: string
   readonly topicId: string
@@ -22,8 +23,10 @@ export interface SourceIdentity {
   readonly version: 1
   readonly name: string
   readonly bytes: number
+  /** Text sources only; a binary source keeps its exact bytes and reports zero code points. */
   readonly totalCodePoints: number
-  readonly encoding: 'utf-8'
+  /** `binary` means the bytes are not valid UTF-8; they are cached verbatim and never decoded. */
+  readonly encoding: 'utf-8' | 'binary'
   readonly bom: boolean
   readonly sha256: string
 }
@@ -43,7 +46,9 @@ export interface TranslationSourceAssetPage {
 export interface TranslationSourceCapability {
   readonly ready: boolean
   readonly storage: 'runtime_only'
+  /** The text decoding policy; raw files are cached as exact bytes regardless of format. */
   readonly encoding: 'utf-8'
+  readonly acceptsBinary?: boolean
   readonly maxBytes: number
   readonly maxPageCodePoints: number
   readonly maxPageBytes: number
@@ -51,7 +56,7 @@ export interface TranslationSourceCapability {
 }
 const errors = ['invalid_input', 'scope_mismatch', 'unavailable', 'receipt_not_found', 'idempotency_conflict', 'unsupported_file',
   'source_too_large', 'integrity_failed', 'invalid_utf8', 'empty_source', 'not_found', 'stale_version', 'invalid_range',
-  'range_out_of_bounds', 'page_too_large'] as const
+  'range_out_of_bounds', 'page_too_large', 'main_agent_busy'] as const
 export type TranslationSourceErrorCode = typeof errors[number]
 export type TranslationSourceResult<T> = { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: { readonly code: TranslationSourceErrorCode; readonly message: string; readonly stage: string } }
@@ -74,21 +79,28 @@ function integer(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTEGER)
 }
 const scopeFields = ['ownerId', 'mainSessionId', 'topicId', 'translationSessionId'] as const
 export function parseTranslationSourceScope(value: unknown): TranslationSourceScope {
-  exact(value, scopeFields)
+  exact(value, scopeFields, ['namespaceId'])
+  if (value.namespaceId !== undefined) text(value.namespaceId, 2048)
   text(value.ownerId, 1000); text(value.mainSessionId, 1000); text(value.topicId, 3000); text(value.translationSessionId, 2048)
   if (value.ownerId !== value.mainSessionId) throw new TypeError('Source requires its own main Session')
-  return { ownerId: value.ownerId, mainSessionId: value.mainSessionId, topicId: value.topicId, translationSessionId: value.translationSessionId }
+  return { ownerId: value.ownerId, mainSessionId: value.mainSessionId, topicId: value.topicId, translationSessionId: value.translationSessionId, ...(value.namespaceId === undefined ? {} : { namespaceId: value.namespaceId as string }) }
 }
 function sourceId(value: unknown): asserts value is string {
   if (typeof value !== 'string' || !/^source-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(value)) throw new TypeError('Invalid source asset identity')
 }
+function fileName(value: unknown): asserts value is string {
+  if (typeof value !== 'string' || !value.trim() || value === '.' || value === '..' || sourceCodePointLength(value) > 255 ||
+    /[\\/<>:"|?*\u0000-\u001f\u007f]/u.test(value)) throw new TypeError('Invalid source file name')
+}
 export function parseSourceIdentity(value: unknown): SourceIdentity {
   exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256'])
-  sourceId(value.sourceId); text(value.name, 255)
-  if (/[\\/<>:"|?*]/u.test(value.name) || !/\.txt$/iu.test(value.name)) throw new TypeError('Invalid TXT file name')
-  integer(value.bytes, 1, MAX_TRANSLATION_SOURCE_BYTES); integer(value.totalCodePoints, 1, value.bytes)
-  if (value.version !== 1 || value.encoding !== 'utf-8' || typeof value.bom !== 'boolean' ||
+  sourceId(value.sourceId); fileName(value.name)
+  integer(value.bytes, 1, MAX_TRANSLATION_SOURCE_BYTES)
+  if (value.version !== 1 || value.encoding !== 'utf-8' && value.encoding !== 'binary' || typeof value.bom !== 'boolean' ||
     typeof value.sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sha256)) throw new TypeError('Invalid immutable source descriptor')
+  integer(value.totalCodePoints, 0, value.bytes)
+  // A binary source is only bytes: no decoded text, no BOM fact. A text source keeps its code point count.
+  if (value.encoding === 'binary' ? value.bom !== false || value.totalCodePoints !== 0 : value.totalCodePoints < 1) throw new TypeError('Invalid source encoding facts')
   return { sourceId: value.sourceId, version: value.version, name: value.name, bytes: value.bytes, totalCodePoints: value.totalCodePoints,
     encoding: value.encoding, bom: value.bom, sha256: value.sha256 }
 }
@@ -129,10 +141,11 @@ export function parseTranslationSourceResult(method: typeof methods[number], val
     if (value.ok !== true) throw new TypeError('Invalid source result')
     exact(value, ['ok', 'value'])
     if (method === 'capabilities') {
-      exact(value.value, ['ready', 'storage', 'encoding', 'maxBytes', 'maxPageCodePoints', 'maxPageBytes'], ['reason'])
+      exact(value.value, ['ready', 'storage', 'encoding', 'maxBytes', 'maxPageCodePoints', 'maxPageBytes'], ['reason', 'acceptsBinary'])
       if (typeof value.value.ready !== 'boolean' || value.value.storage !== 'runtime_only' || value.value.encoding !== 'utf-8' ||
         value.value.maxBytes !== MAX_TRANSLATION_SOURCE_BYTES || value.value.maxPageCodePoints !== MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS ||
         value.value.maxPageBytes !== MAX_TRANSLATION_SOURCE_PAGE_BYTES) throw new TypeError('Invalid source capability')
+      if (value.value.acceptsBinary !== undefined && typeof value.value.acceptsBinary !== 'boolean') throw new TypeError('Invalid source capability')
       if (value.value.reason !== undefined) text(value.value.reason, 1000)
     } else if (method === 'importReceipt') parseTranslationSourceAsset(value.value)
     else {

@@ -24,19 +24,21 @@ export type ViewSourceOpenRequest = Omit<ViewFileOpen, 'text' | 'format'>
 export interface ViewSourceSnapshot {
   readonly scope: TranslationSourceScope
   readonly sourceRef?: TranslationSourceAsset
+  readonly librarySource?: Pick<import('../shared/library-sources.js').LibrarySourceRequest, 'stored' | 'namespaceId' | 'prepareToken'>
   readonly savedSource?: TranslationSourceStoredRead
   readonly file?: Blob
 }
-export interface ViewFilesSourceOptions { readonly sources?: TranslationSourcesPort; readonly sourceStorage?: TranslationSourceStoragePort }
+export interface ViewFilesSourceOptions { readonly library?: import('../shared/library-sources.js').LibrarySourcesPort; readonly sources?: TranslationSourcesPort; readonly sourceStorage?: TranslationSourceStoragePort }
 function same(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right) }
 /** Host opening files mirror the Client session lifetime: capture the scope before a deletion, clear after it. */
 export class ViewFilesClient {
   private readonly operations = new Set<AbortController>()
-  private readonly openingScopes = new Map<AbortController, { readonly ownerId: string; readonly sessionId: string }>()
+  private readonly openingScopes = new Map<AbortController, { readonly namespaceId: string; readonly sessionId: string }>()
   private readonly listeners = new Set<() => void>()
   private notice: string | undefined
   private disposed = false
   constructor(private readonly port: ViewFilePort, private readonly sessions: SessionStore, private readonly sourceOptions: ViewFilesSourceOptions = {}) {}
+  getNamespaceId(): string { return this.sessions.getNamespaceId() }
   dispose(): void { this.disposed = true; for (const operation of this.operations) operation.abort(); this.operations.clear(); this.openingScopes.clear(); this.listeners.clear() }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   getNotice(): string | undefined { return this.notice }
@@ -46,13 +48,14 @@ export class ViewFilesClient {
     for (const id of [...new Set(ids)]) {
       const session = this.sessions.getSession(id)
       if (!session) continue
-      const list = groups.get(session.ownerId)
+      const list = groups.get(this.sessions.getNamespaceId())
       if (list) list.push(id)
-      else groups.set(session.ownerId, [id])
+      else groups.set(this.sessions.getNamespaceId(), [id])
     }
-    return [...groups].map(([ownerId, sessionIds]) => ({ ownerId, sessionIds }))
+    return [...groups].map(([namespaceId, sessionIds]) => ({ namespaceId, sessionIds }))
   }
   async open(request: ViewFileOpen, signal?: AbortSignal): Promise<ViewOpenOutcome> {
+    request = { ...request, namespaceId: this.sessions.getNamespaceId() }
     return await this.operation(signal => this.openRequest(request, signal), request, signal)
   }
   /** Read the captured UTF-8 file without touching it; decoding retains its BOM and all newline characters. */
@@ -63,8 +66,14 @@ export class ViewFilesClient {
   async openSource(request: ViewSourceOpenRequest, snapshot: ViewSourceSnapshot, signal?: AbortSignal): Promise<ViewOpenOutcome> {
     return await this.operation(async signal => {
       const scope = parseTranslationSourceScope(snapshot.scope)
-      if (request.kind !== 'source' || request.ownerId !== scope.ownerId || request.sessionId !== scope.translationSessionId) throw new Error('原稿打开范围与文件单元不一致。')
+      if (request.kind !== 'source' || request.sessionId !== scope.translationSessionId) throw new Error('原稿打开范围与文件单元不一致。')
       const source = snapshot.sourceRef && parseTranslationSourceAsset(snapshot.sourceRef)
+      if (snapshot.librarySource) {
+        if (!this.sourceOptions.library) throw new Error('资料库原稿打开服务尚未就绪。')
+        if (snapshot.librarySource.namespaceId !== this.sessions.getNamespaceId() || snapshot.librarySource.stored.scope.translationSessionId !== request.sessionId) throw new Error('共享原稿范围不一致。')
+        const result = await this.sourceOptions.library.readLibrarySource({ ...snapshot.librarySource, action: 'open' }, signal)
+        return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+      }
       if (snapshot.savedSource) {
         const stored = parseTranslationSourceStorageRequest('openOriginal', snapshot.savedSource) as TranslationSourceStoredRead
         if (!same(stored.scope, scope) || source && !same(stored.source, toSourceIdentity(source))) throw new Error('已保存原稿与此源版本不一致。')
@@ -110,12 +119,13 @@ export class ViewFilesClient {
     catch { throw new Error('原稿不是有效 UTF-8 TXT，未替换或猜测编码。') }
   }
   private async openRequest(request: ViewFileOpen, signal: AbortSignal): Promise<ViewOpenOutcome> {
+    request = { ...request, namespaceId: this.sessions.getNamespaceId() }
     signal.throwIfAborted()
     const result = await this.port.open(request, signal)
     signal.throwIfAborted()
     return result.ok ? { ok: true } : { ok: false, message: result.error.message }
   }
-  private async operation(action: (signal: AbortSignal) => Promise<ViewOpenOutcome>, scope?: { readonly ownerId: string; readonly sessionId: string }, signal?: AbortSignal): Promise<ViewOpenOutcome> {
+  private async operation(action: (signal: AbortSignal) => Promise<ViewOpenOutcome>, scope?: { readonly namespaceId: string; readonly sessionId: string }, signal?: AbortSignal): Promise<ViewOpenOutcome> {
     if (this.disposed) return { ok: false, message: '打开服务已关闭。' }
     const operation = new AbortController(); this.operations.add(operation)
     if (scope) this.openingScopes.set(operation, scope)
@@ -133,7 +143,7 @@ export class ViewFilesClient {
     if (this.disposed || !scopes.length) return true
     let failed = false
     for (const scope of scopes) {
-      for (const [operation, opening] of this.openingScopes) if (opening.ownerId === scope.ownerId && scope.sessionIds.includes(opening.sessionId)) operation.abort()
+      for (const [operation, opening] of this.openingScopes) if (opening.namespaceId === scope.namespaceId && scope.sessionIds.includes(opening.sessionId)) operation.abort()
       const operation = new AbortController(); this.operations.add(operation)
       try {
         const result = await this.port.clear(scope, operation.signal)

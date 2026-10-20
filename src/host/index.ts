@@ -52,7 +52,7 @@ export const provide = ['translationFramework', 'translationQuick', 'translation
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
   return { eventId: JSON.stringify(['terminology_analysis', run.scope.translationSessionId, run.operationId, run.analysisId, run.version, run.status]),
-    hostGeneration: exchange.hostGeneration, scope: run.scope, operationId: run.operationId,
+    hostGeneration: exchange.hostGeneration, scope: { mainSessionId: run.scope.mainSessionId, topicId: run.scope.topicId, translationSessionId: run.scope.translationSessionId }, operationId: run.operationId,
     phase: `terminology_analysis_${run.status}` as TaskPhaseEvent['phase'],
     result: { kind: 'analysis', analysisId: run.analysisId, version: run.version, sourceVersion: run.sourceVersion,
       material: { requestId: run.target.requestId, materialId: run.target.materialId } }, coverageComplete: run.coverageComplete }
@@ -65,11 +65,11 @@ export function installTerminologyAnalysis(ctx: TopicHostContext): TerminologyAn
   const capability = () => {
     const exchange = ctx.get?.('translationExchange') as TranslationExchangeService | undefined
     if (disposed || typeof exchange?.registerTaskPhaseInspector !== 'function' || typeof exchange.notifyTaskPhase !== 'function' ||
-      typeof exchange.taskPhaseCapabilities !== 'function') return { phaseProtocol: 1 as const, ready: false, reason: 'composer_phase_notification_unavailable' }
+      typeof exchange.taskPhaseCapabilities !== 'function') return { phaseProtocol: 2 as const, ready: false, reason: 'composer_phase_notification_unavailable' }
     try {
       const result = exchange.taskPhaseCapabilities()
-      return result.phaseProtocol === 1 ? result : { phaseProtocol: 1 as const, ready: false, reason: 'composer_phase_protocol_mismatch' }
-    } catch { return { phaseProtocol: 1 as const, ready: false, reason: 'composer_phase_notification_unavailable' } }
+      return result.phaseProtocol === 2 ? result : { phaseProtocol: 2 as const, ready: false, reason: 'composer_phase_protocol_mismatch' }
+    } catch { return { phaseProtocol: 2 as const, ready: false, reason: 'composer_phase_notification_unavailable' } }
   }
   const service = new TerminologyAnalysisService(ctx, {
     phaseNotificationCapabilities: capability,
@@ -82,7 +82,7 @@ export function installTerminologyAnalysis(ctx: TopicHostContext): TerminologyAn
           inspectTaskPhase: event => {
             const live = ctx.get?.('translationExchange') as TranslationExchangeService | undefined
             if (disposed || live?.hostGeneration !== exchange.hostGeneration || event.hostGeneration !== exchange.hostGeneration || event.result.version !== 1) return null
-            const run = service.inspectPhase({ scope: event.scope, analysisId: event.result.analysisId, operationId: event.operationId,
+            const run = service.inspectPhase({ scope: { ...event.scope, ownerId: event.scope.mainSessionId }, analysisId: event.result.analysisId, operationId: event.operationId,
               version: 1, sourceVersion: event.result.sourceVersion })
             return run && phaseEvent(exchange, run)
           },

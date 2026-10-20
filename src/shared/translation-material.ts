@@ -2,7 +2,6 @@ import { parseTranslationSourceAsset, type TranslationSourceAsset } from './tran
 
 /** Frozen plugin material for one main-session submission, independent of its transport. */
 export interface TranslationMaterialScope {
-  readonly ownerId: string
   readonly mainSessionId: string
   readonly requestId: string
   readonly operationId: string
@@ -38,6 +37,8 @@ export interface TranslationMaterialConfig {
   readonly instruction: string
   readonly model: TranslationMaterialRoute | null
   readonly maxInputChars: number
+  /** Active topic term count observed by the Client; lets the notice skip an empty term round trip. */
+  readonly termCount?: number
   readonly unitReference?: TranslationMaterialUnitReference
   readonly revises?: TranslationMaterialRevisionReference
 }
@@ -82,13 +83,12 @@ function integer(value: unknown, minimum = 1, maximum = Number.MAX_SAFE_INTEGER)
 /** Validate and copy at the plugin bridge boundary; never accepts main chat content or file bytes. */
 export function parseTranslationMaterialEnvelope(value: unknown): TranslationMaterialEnvelope {
   object(value)
-  const scopeFields = ['ownerId', 'mainSessionId', 'requestId', 'operationId', 'kind']
+  const scopeFields = ['mainSessionId', 'requestId', 'operationId', 'kind']
   if (value.kind === 'material') fields(value, [...scopeFields, 'material'], ['uiLocale'])
   else if (value.kind === 'none' || value.kind === 'omit') fields(value, scopeFields, ['uiLocale'])
   else throw new TypeError('Invalid translation material decision')
-  text(value.ownerId, 1000); text(value.mainSessionId, 1000); text(value.requestId, 2048); text(value.operationId, 2048)
-  if (value.ownerId !== value.mainSessionId) throw new TypeError('Translation material requires its own main Session')
-  const scope: TranslationMaterialScope = { ownerId: value.ownerId, mainSessionId: value.mainSessionId, requestId: value.requestId, operationId: value.operationId }
+  text(value.mainSessionId, 1000); text(value.requestId, 2048); text(value.operationId, 2048)
+  const scope: TranslationMaterialScope = { mainSessionId: value.mainSessionId, requestId: value.requestId, operationId: value.operationId }
   const locale = value.uiLocale
   if (locale !== undefined) text(locale, 64)
   const uiLocale = locale === undefined ? {} : { uiLocale: locale as string }
@@ -96,9 +96,10 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
 
   const material = value.material
   object(material)
-  fields(material, ['materialId', 'sourceVersion', 'topicId', 'translationSessionId', 'draftVersion', 'targetLanguage', 'instruction', 'model', 'maxInputChars'], ['sourceText', 'sourceRef', 'unitReference', 'revises'])
+  fields(material, ['materialId', 'sourceVersion', 'topicId', 'translationSessionId', 'draftVersion', 'targetLanguage', 'instruction', 'model', 'maxInputChars'], ['sourceText', 'sourceRef', 'unitReference', 'revises', 'termCount'])
   text(material.materialId, 2048); text(material.topicId, 3000); text(material.translationSessionId, 2048)
   integer(material.sourceVersion); integer(material.draftVersion); integer(material.maxInputChars, 1, 200000)
+  if (material.termCount !== undefined) integer(material.termCount, 0, 10000)
   const inline = Object.hasOwn(material, 'sourceText'), asset = Object.hasOwn(material, 'sourceRef')
   if (inline === asset) throw new TypeError('Translation material requires exactly one source')
   let source: { sourceText: string; sourceRef?: never } | { sourceText?: never; sourceRef: TranslationSourceAsset }
@@ -134,5 +135,6 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
   return { ...scope, kind: 'material', ...uiLocale, material: { materialId: material.materialId, sourceVersion: material.sourceVersion,
     topicId: material.topicId, translationSessionId: material.translationSessionId, draftVersion: material.draftVersion,
     ...source, targetLanguage: material.targetLanguage, instruction: material.instruction, model, maxInputChars: material.maxInputChars,
+    ...(material.termCount === undefined ? {} : { termCount: material.termCount }),
     ...(unitReference === undefined ? {} : { unitReference }), ...(revises === undefined ? {} : { revises }) } }
 }

@@ -67,10 +67,10 @@ export function parseMemoryAssetsAddress(address: string, ownerId?: string): Mem
 
 /** Title and Body read the same Session-bound occurrence, including repeated navigation. */
 export function readMemoryAssetsNavigation(ownerId: string | undefined, tab: MemoryAssetsTab | undefined): MemoryAssetsNavigation | undefined {
-  const scope = ownerId && tab ? parseMemoryAssetsAddress(tab.navigation.address, ownerId) : undefined
+  const scope = tab ? parseMemoryAssetsAddress(tab.navigation.address) : undefined
   if (!scope || !tab) return undefined
   const params = tab.navigation.params
-  return { ...scope, navigationRevision: tab.navigation.revision,
+  return { ...scope, ownerId: ownerId ?? scope.ownerId, navigationRevision: tab.navigation.revision,
     requestedTopicId: params && typeof params === 'object' && 'topicId' in params && typeof params.topicId === 'string' ? params.topicId : undefined,
     associatedSessionId: params && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' ? params.sessionId : undefined,
     jobId: params && typeof params === 'object' && 'jobId' in params && typeof params.jobId === 'string' ? params.jobId : undefined }
@@ -82,7 +82,7 @@ export function resolveMemoryAssetsSelection(store: SessionStore, scope: MemoryA
   const topic = availableTopics.find(topic => topic.id === topicId)
   const requested = scope.associatedSessionId ? store.getSession(scope.associatedSessionId) : undefined
   const current = store.getActiveSession(scope.ownerId)
-  const session = requested?.ownerId === scope.ownerId && requested.topicId === topicId ? requested
+  const session = requested && requested.topicId === topicId ? requested
     : current?.topicId === topicId ? current : store.getAvailableSessions(scope.ownerId).find(session => session.topicId === topicId)
   return { availableTopics, topicId, topic, session }
 }

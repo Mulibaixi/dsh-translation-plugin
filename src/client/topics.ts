@@ -1,10 +1,8 @@
 /** 浏览器本地主题身份；不包含名称、备注或翻译正文。 */
 export interface TopicAllocation { readonly sessionId: string; readonly sequence: number }
 export interface TopicIdentity {
-  readonly schemaVersion: 1
+  readonly schemaVersion: 2
   readonly id: string
-  /** Legacy asset storage anchor (original creator); main Sessions may share this topic. */
-  readonly ownerId: string
   readonly sequenceNamespaceId: string
   readonly nextSequence: number
   readonly version: number
@@ -55,8 +53,8 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): boolean
 export function decodeTopicIdentity(raw: string): TopicIdentity | undefined {
   try {
     const value: unknown = JSON.parse(raw)
-    if (!record(value) || !exact(value, ['schemaVersion', 'id', 'ownerId', 'sequenceNamespaceId', 'nextSequence', 'version', 'allocations']) ||
-      value.schemaVersion !== 1 || !text(value.id, 3000) || !text(value.ownerId, 1000) || !text(value.sequenceNamespaceId, 3000) ||
+    if (!record(value) || !exact(value, ['schemaVersion', 'id', ...(value.schemaVersion === 1 ? ['ownerId'] : []), 'sequenceNamespaceId', 'nextSequence', 'version', 'allocations']) ||
+      ![1, 2].includes(value.schemaVersion as number) || !text(value.id, 3000) || (value.schemaVersion === 1 && !text(value.ownerId, 1000)) || !text(value.sequenceNamespaceId, 3000) ||
       !integer(value.nextSequence) || !integer(value.version) || !Array.isArray(value.allocations)) return undefined
     const ids = new Set<string>(), numbers = new Set<number>()
     const allocations: TopicAllocation[] = []
@@ -66,7 +64,8 @@ export function decodeTopicIdentity(raw: string): TopicIdentity | undefined {
       ids.add(entry.sessionId); numbers.add(entry.sequence)
       allocations.push({ sessionId: entry.sessionId, sequence: entry.sequence })
     }
-    return { ...value, allocations } as unknown as TopicIdentity
+    const { ownerId: _legacyOwner, ...content } = value
+    return { ...content, schemaVersion: 2, allocations } as unknown as TopicIdentity
   } catch { return undefined }
 }
 

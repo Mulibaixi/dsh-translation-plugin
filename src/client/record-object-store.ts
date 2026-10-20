@@ -63,7 +63,7 @@ export class RecordObjectStore {
           const raw = this.storage.getItem(key), snapshot = raw === null ? undefined : decodeRecordObjectSnapshot(JSON.parse(raw))
           if (!snapshot || key !== recordObjectsKey(snapshot.sessionId)) throw new Error('invalid object references')
           const session = this.sessions.getSession(snapshot.sessionId)
-          if (session && (session.ownerId !== snapshot.ownerId || session.topicId !== snapshot.topicId)) throw new Error('record object scope mismatch')
+          if (session && (session.topicId !== snapshot.topicId)) throw new Error('record object scope mismatch')
           this.seats.set(snapshot.sessionId, { snapshot, stored: raw, dirty: false, status: 'saved' })
         } catch { this.notice = '部分记录对象引用无法读取，原副本已保留。' }
       }
@@ -71,16 +71,18 @@ export class RecordObjectStore {
   }
   private seat(ownerId: string, topicId: string, sessionId: string): Seat {
     const session = this.sessions.getSession(sessionId)
-    if (session && (session.ownerId !== ownerId || session.topicId !== topicId)) throw new Error('Record object scope mismatch')
+    if (session && (session.topicId !== topicId)) throw new Error('Record object scope mismatch')
     const existing = this.seats.get(sessionId)
     if (existing) {
-      if (existing.snapshot.ownerId !== ownerId || existing.snapshot.topicId !== topicId) throw new Error('Record object scope mismatch')
+      if (existing.snapshot.topicId !== topicId) throw new Error('Record object scope mismatch')
       return existing
     }
     if (!session || this.sessions.isSessionDeleted(sessionId)) throw new Error('Unknown record object scope')
+    ownerId = this.scopeFor(sessionId)
     const seat: Seat = { snapshot: emptyRecordObjects(ownerId, topicId, sessionId, now()), stored: null, dirty: false, status: 'memory' }
     this.seats.set(sessionId, seat); return seat
   }
+  scopeFor(sessionId: string): string { const session = this.sessions.getSession(sessionId); return session ? this.sessions.getTopicStorageScope(session.topicId) ?? this.sessions.getNamespaceId() : this.sessions.getNamespaceId() }
   getSnapshot(ownerId: string, topicId: string, sessionId: string): RecordObjectSnapshot { return this.seat(ownerId, topicId, sessionId).snapshot }
   getReferences(scope: RecordObjectTarget): readonly RecordObjectReference[] {
     const seat = this.seat(scope.ownerId, scope.topicId, scope.sessionId)
@@ -105,7 +107,7 @@ export class RecordObjectStore {
   }
   private body(scope: RecordObjectTarget, requireEnded = false): string | undefined {
     const session = this.sessions.getSession(scope.sessionId)
-    if (!session || session.ownerId !== scope.ownerId || session.topicId !== scope.topicId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict') return undefined
+    if (!session || this.sessions.getTopicStorageScope(session.topicId)! !== scope.ownerId || session.topicId !== scope.topicId || this.sessions.isSessionDeleted(session.id) || this.sessions.getStatus(session.id) === 'conflict') return undefined
     const unit = this.sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === scope.unitId)
     if (!unit || !isTextUnit(unit) || unit.deletion) return undefined
     if (scope.side === 'source') return scope.revisionId === null ? unit.source : undefined
@@ -152,7 +154,8 @@ export class RecordObjectStore {
     this.pending.set(id, pending)
   }
   async addReference(input: RecordObjectReferenceInput, expectedVersion: number): Promise<RecordObjectMutationResult> {
-    const parsed = decodeRecordObjectReferenceInput(input), seat = this.seat(input.ownerId, input.topicId, input.sessionId)
+    const seat = this.seat(input.ownerId, input.topicId, input.sessionId)
+    const parsed = decodeRecordObjectReferenceInput({ ...input, ownerId: seat.snapshot.ownerId })
     const invalid = (): RecordObjectMutationResult => ({ status: 'invalid', snapshot: seat.snapshot, reference: null })
     if (!parsed || this.disposed) return invalid()
     const action = (): RecordObjectMutationResult => {

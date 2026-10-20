@@ -26,6 +26,7 @@ export interface FileIntakeRecord {
   readonly name: string
   readonly createdAt: string
   readonly config: FileIntakeConfig
+  /** The main Session that actually submits this file. It differs from `scope` when the Session was opened from another main Session. */
   readonly submission: TranslationMaterialScope
   readonly stage: FileIntakeStage
   readonly hostStarted: boolean
@@ -44,7 +45,7 @@ export interface FileIntakeStoreOptions {
   readonly storage?: FileIntakeStoragePort
   readonly withLock: <T>(action: () => T | Promise<T>) => Promise<T>
   readonly isEnabled: () => boolean
-  readonly isScopeCurrent: (scope: TranslationSourceScope) => boolean
+  readonly isScopeCurrent: (scope: Pick<TranslationSourceScope, 'topicId' | 'translationSessionId'>) => boolean
   readonly saveSession: (sessionId: string) => Promise<boolean>
 }
 interface Seat {
@@ -52,6 +53,8 @@ interface Seat {
   stored: string | null
   runtimeSource?: TranslationSourceAsset
   sourceConfirmed?: boolean
+  /** Exact bytes are in the managed cache, independent of optional chat history. */
+  sourceCached?: boolean
   storageError?: string
   conflict?: boolean
   pending?: Promise<void>
@@ -65,7 +68,7 @@ function parse(value: unknown): FileIntakeRecord {
     !['freezing', 'frozen', 'failed', 'unknown', 'accepted', 'removed'].includes(item.stage) || typeof item.hostStarted !== 'boolean' ||
     !config || typeof config.targetLanguage !== 'string' || typeof config.instruction !== 'string' || decodeRoute(config.model) === undefined ||
     !Number.isSafeInteger(config.maxInputChars) || config.maxInputChars < 1 || !Number.isSafeInteger(config.draftVersion) || config.draftVersion < 1 ||
-    !item.submission || item.submission.ownerId !== scope.ownerId || item.submission.mainSessionId !== scope.mainSessionId ||
+    !item.submission || typeof item.submission.mainSessionId !== 'string' || !item.submission.mainSessionId.trim() ||
     typeof item.submission.requestId !== 'string' || !item.submission.requestId.trim() || typeof item.submission.operationId !== 'string' || !item.submission.operationId.trim() ||
     item.message !== undefined && typeof item.message !== 'string' || item.documentUnitId !== undefined && item.documentUnitId !== item.unitId) throw new Error('文件记录身份或配置无效。')
   const source = item.source ? parseSourceIdentity(item.source) : undefined
@@ -79,7 +82,7 @@ function parse(value: unknown): FileIntakeRecord {
   }
   return { schemaVersion: 1, scope, unitId: item.unitId, materialId: item.materialId, name: item.name, createdAt: item.createdAt,
     config: { targetLanguage: config.targetLanguage, instruction: config.instruction, model: config.model, maxInputChars: config.maxInputChars, draftVersion: config.draftVersion },
-    submission: { ownerId: scope.ownerId, mainSessionId: scope.mainSessionId, requestId: item.submission.requestId, operationId: item.submission.operationId },
+    submission: {  mainSessionId: item.submission.mainSessionId, requestId: item.submission.requestId, operationId: item.submission.operationId },
     stage: item.stage, hostStarted: item.hostStarted, ...(item.message ? { message: item.message } : {}), ...(source ? { source } : {}),
     ...(historyCommit ? { historyCommit } : {}), ...(item.documentUnitId ? { documentUnitId: item.documentUnitId } : {}) }
 }
@@ -139,6 +142,7 @@ export class FileIntakeStore {
     const seat = this.seats.get(unitId)
     if (!seat) return
     seat.runtimeSource = structuredClone(source)
+    seat.sourceCached = false
     const { persistence: _persistence, ...identity } = source
     this.put({ ...seat.record, source: identity })
   }
@@ -230,18 +234,24 @@ export class FileIntakeStore {
   }
   async saveSource(unitId: string, client?: TranslationSourceStorageClient): Promise<void> {
     const seat = this.seats.get(unitId)
-    if (!seat || !client || !this.options.isEnabled() && !seat.record.historyCommit || !seat.runtimeSource || seat.record.stage === 'removed' || seat.sourceConfirmed) return
+    if (!seat || !client || !seat.runtimeSource || seat.record.stage === 'removed' || seat.sourceConfirmed || seat.sourceCached) return
     const pending = this.sourceJobs.get(unitId)
     if (pending) return pending
     const work = (async (): Promise<void> => {
-      const record = seat.record, outcome = record.historyCommit
+      const record = seat.record, prepare = { scope: record.scope, sourceRef: seat.runtimeSource!, referenceKey: `file-source:${record.materialId}:1`,
+        operationId: `file-source-prepare:${record.materialId}` }
+      // The exact original is cached even when optional chat history is off; only the history
+      // confirmation depends on that setting.
+      const outcome = record.historyCommit
         ? await client.confirmPersistedReference(record.historyCommit, this.callbacks(unitId))
-        : await client.save({ prepare: { scope: record.scope, sourceRef: seat.runtimeSource!, referenceKey: `file-source:${record.materialId}:1`,
-          operationId: `file-source-prepare:${record.materialId}` }, confirmOperationId: `file-source-confirm:${record.materialId}` }, this.callbacks(unitId))
+        : this.options.isEnabled()
+          ? await client.save({ prepare, confirmOperationId: `file-source-confirm:${record.materialId}` }, this.callbacks(unitId))
+          : await client.cache({ prepare })
+      seat.sourceCached = outcome.state === 'prepared' || outcome.state === 'confirmed'
       seat.sourceConfirmed = outcome.state === 'confirmed'
-      if (outcome.state !== 'confirmed') seat.storageError = '原稿保存引用尚未确认；当前运行期仍可读取。'
+      if (!seat.sourceCached) seat.storageError = '原稿缓存尚未确认；当前运行期仍可读取。'
       else if (seat.stored === JSON.stringify(seat.record)) delete seat.storageError
-    })().catch(error => { seat.storageError = storageSaveFailureMessage(error, '原稿引用', '原稿引用尚未确认；当前原稿保留。') })
+    })().catch(error => { seat.storageError = storageSaveFailureMessage(error, '原稿缓存', '原稿缓存尚未确认；当前原稿保留。') })
       .finally(() => { this.sourceJobs.delete(unitId); this.onChange() })
     this.sourceJobs.set(unitId, work); return work
   }
@@ -252,11 +262,14 @@ export class FileIntakeStore {
     if (blocked) throw new Error(blocked)
     const commit = this.readCommit(unitId)
     const savedSource = commit ? { scope: commit.reference.scope, referenceKey: commit.reference.referenceKey, source: commit.reference.source, historyToken: commit.historyToken } : undefined
-    if (!seat.runtimeSource && savedSource && storage) {
-      const restored = await storage.restore(savedSource)
-      if (!restored.ok) throw new Error(restored.error.message)
-      seat.runtimeSource = restored.value.source
-      seat.sourceConfirmed = true
+    if (commit && storage && !seat.sourceConfirmed) {
+      const result = await storage.queryReference({ scope: commit.reference.scope, referenceKey: commit.reference.referenceKey })
+      if (!result.ok) throw new Error(result.error.message)
+      const reference = result.value
+      if (reference.state !== 'confirmed' || reference.historyToken !== commit.historyToken || reference.prepareToken !== commit.reference.prepareToken ||
+        !same(reference.scope, commit.reference.scope) || !same(reference.source, commit.reference.source)) throw new Error('已保存原稿与历史凭据不一致。')
+      if (this.seats.get(unitId) !== seat || !this.options.isScopeCurrent(seat.record.scope) || !same(this.readCommit(unitId), commit)) throw new Error('文件历史在查询期间已变化。')
+      seat.sourceConfirmed = true; this.onChange()
     }
     return { scope: seat.record.scope, ...(seat.runtimeSource ? { sourceRef: seat.runtimeSource } : {}), ...(savedSource ? { savedSource } : {}) }
   }

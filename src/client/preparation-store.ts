@@ -1,3 +1,4 @@
+import { languageMatches } from '../shared/language-tag.js'
 import {
   MAX_PREPARATION_PACKET_BYTES, MAX_PREPARATION_PAGE_BYTES, MAX_PREPARATION_PAGE_ITEMS,
   parsePreparationAnalysisFacts, parsePreparationCurrentFacts, parsePreparationSnapshot, parseTranslationPreparationPrepare,
@@ -58,7 +59,7 @@ function bad<T>(code: string, message: string, stage = 'preparation'): AnalysisR
 function reject(code: string, message: string): never { throw Object.assign(new Error(message), { code }) }
 function key(ownerId: string, id: string): string { return `${PREPARATION_STORAGE_PREFIX}${encodeURIComponent(ownerId)}:${encodeURIComponent(id)}` }
 function materialScope(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): TranslationSourceScope {
-  return { ownerId: envelope.ownerId, mainSessionId: envelope.mainSessionId, topicId: envelope.material.topicId, translationSessionId: envelope.material.translationSessionId }
+  return { ownerId: envelope.mainSessionId, mainSessionId: envelope.mainSessionId, topicId: envelope.material.topicId, translationSessionId: envelope.material.translationSessionId }
 }
 function matchesTarget(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>, target: TranslationPreparationQuery['target']): boolean {
   return target.kind === 'material' && envelope.mainSessionId === target.mainSessionId && envelope.requestId === target.requestId && envelope.material.materialId === target.materialId && envelope.material.sourceVersion === target.sourceVersion
@@ -109,7 +110,7 @@ function fixed(entry: TopicTerm): boolean {
   return entry.origin === 'user_explicit' && entry.confirmation !== null && entry.confirmation.adoptedEntryVersion < entry.version
 }
 function fixedBinding(snapshot: TopicTermSnapshot, targetLanguage: string): Readonly<Record<string, number>> {
-  return Object.fromEntries(snapshot.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === targetLanguage && fixed(entry)).map(entry => [entry.id, entry.version]))
+  return Object.fromEntries(snapshot.entries.filter(entry => entry.status === 'active' && languageMatches(entry.targetLanguage, targetLanguage) && fixed(entry)).map(entry => [entry.id, entry.version]))
 }
 function analysisBusinessFacts(analysis: PreparationAnalysisFacts): unknown {
   const { notification: _notification, updatedAt: _updatedAt, ...run } = analysis.run
@@ -288,7 +289,7 @@ export class PreparationStore {
       } else {
         const ref = selected.ref, entry = facts.topicTerms.entries.find(item => item.id === ref.id)
         if (!entry || entry.version !== ref.entryVersion) return bad('stale_terms', '指定主题术语已更新或删除。')
-        if (entry.status !== 'active' || entry.targetLanguage !== latest.targetLanguage) return bad('term_unavailable', '此主题术语未启用或不适用于当前目标语言。')
+        if (entry.status !== 'active' || !languageMatches(entry.targetLanguage, latest.targetLanguage)) return bad('term_unavailable', '此主题术语未启用或不适用于当前目标语言。')
         if (selected.descriptionRef || selected.content) return bad('description_mismatch', '主题术语正文由当前条目冻结，不能在任务采用中替换。')
         terms.push({ ref, sourceForms: entry.sourceForms, aliases: entry.aliases, preferred: entry.preferred, description: entry.sense,
           sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sense: entry.sense, forbidden: entry.forbidden,
@@ -316,11 +317,11 @@ export class PreparationStore {
     for (const [original, options] of forms) {
       const selected = terms.filter(term => [...term.sourceForms, ...term.aliases].includes(original))
       if (options.length > 1 && !selected.length) conflicts.push({ code: 'candidate_scope_unresolved', original, refs: options.map(item => ({ kind: 'candidate', id: item.id, version: 1 })), ranges: options.flatMap(item => item.occurrences).slice(0, 8), message: '同原词不同译法尚未作出任务采用决定。' })
-      const relevantFixed = topic.entries.filter(entry => entry.status === 'active' && fixed(entry) && entry.targetLanguage === targetLanguage && [...entry.sourceForms, ...entry.aliases].includes(original))
+      const relevantFixed = topic.entries.filter(entry => entry.status === 'active' && fixed(entry) && languageMatches(entry.targetLanguage, targetLanguage) && [...entry.sourceForms, ...entry.aliases].includes(original))
       if (relevantFixed.length && !selected.some(term => term.userFixed)) conflicts.push({ code: 'fixed_scope_unresolved', original, refs: relevantFixed.map(entry => ({ kind: 'topic_term', id: entry.id, entryVersion: entry.version })), ranges: selected.length ? selected.flatMap(term => term.ranges) : options.flatMap(item => item.occurrences).slice(0, 8), message: '此原词存在用户固定规则，需明确采用真实固定语义及其适用范围。' })
     }
     for (const term of terms.filter(item => !item.userFixed)) {
-      const relevantFixed = topic.entries.filter(entry => entry.status === 'active' && fixed(entry) && entry.targetLanguage === targetLanguage &&
+      const relevantFixed = topic.entries.filter(entry => entry.status === 'active' && fixed(entry) && languageMatches(entry.targetLanguage, targetLanguage) &&
         (term.sourceLanguage === null || entry.sourceLanguage === term.sourceLanguage) && [...entry.sourceForms, ...entry.aliases].some(form => [...term.sourceForms, ...term.aliases].includes(form)))
       if (relevantFixed.length && !terms.some(item => item.userFixed && sharedForms(item, term).length) && !conflicts.some(item => item.code === 'fixed_scope_unresolved' && [...term.sourceForms, ...term.aliases].includes(item.original))) conflicts.push({
         code: 'fixed_scope_unresolved', original: term.sourceForms[0]!, refs: relevantFixed.map(entry => ({ kind: 'topic_term', id: entry.id, entryVersion: entry.version })),
@@ -369,7 +370,7 @@ export class PreparationStore {
           origin: selected.content ? 'main_model_adjusted' : previous.origin, ranges: selected.ranges })
       } else {
         const ref = selected.ref, entry = facts.topicTerms.entries.find(term => term.id === ref.id && term.version === ref.entryVersion)
-        if (!entry || entry.status !== 'active' || entry.targetLanguage !== latest.targetLanguage) return bad('stale_terms', '复核所选主题术语已变化或不再适用。')
+        if (!entry || entry.status !== 'active' || !languageMatches(entry.targetLanguage, latest.targetLanguage)) return bad('stale_terms', '复核所选主题术语已变化或不再适用。')
         if (selected.content || selected.descriptionRef) return bad('description_mismatch', '主题术语使用当前真实条目，任务复核不能改写固定规则。')
         terms.push({ ref, sourceForms: entry.sourceForms, aliases: entry.aliases, preferred: entry.preferred, description: entry.sense,
           sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sense: entry.sense, forbidden: entry.forbidden,
@@ -378,7 +379,7 @@ export class PreparationStore {
     }
     if (new Set(terms.map(term => JSON.stringify(term.ref))).size !== terms.length) return bad('duplicate_candidate', '同一个合并候选只能采用一次。')
     const conflicts = this.conflicts([], facts.topicTerms, terms, required, request, latest.targetLanguage)
-    const fixedEntries = facts.topicTerms.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === latest.targetLanguage && fixed(entry) && facts.relevantFixedIds.includes(entry.id))
+    const fixedEntries = facts.topicTerms.entries.filter(entry => entry.status === 'active' && languageMatches(entry.targetLanguage, latest.targetLanguage) && fixed(entry) && facts.relevantFixedIds.includes(entry.id))
     const missingFixed = fixedEntries.filter(entry => !terms.some(term => term.userFixed && term.ref.kind === 'topic_term' && term.ref.id === entry.id))
     if (missingFixed.length) return bad('preparation_incomplete', `新原稿命中的用户固定条目尚未按准确版本复核：${missingFixed.map(entry => entry.id).join(', ').slice(0, 700)}`)
     if (conflicts.some(item => item.code === 'fixed_conflict')) return bad('fixed_conflict', '纠错准备与用户固定规则冲突。')
@@ -435,7 +436,7 @@ export class PreparationStore {
         if (!ready(snapshot)) return bad('preparation_not_ready', '纠错后需完整的主模型复核准备。', 'capture_preparation')
         const baseline = snapshot.correctionReview?.fixedTermVersions ?? seat.planningBindings?.[snapshot.version]
         if (!baseline) return bad('preparation_unavailable', '准备缺少准确固定规则基线。', 'capture_preparation')
-        const currentFixed = topicTerms.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === snapshot.targetLanguage && fixed(entry))
+        const currentFixed = topicTerms.entries.filter(entry => entry.status === 'active' && languageMatches(entry.targetLanguage, snapshot.targetLanguage) && fixed(entry))
         const adopted = snapshot.terms.filter(term => term.userFixed)
         if (adopted.some(term => term.ref.kind !== 'topic_term' || !currentFixed.some(entry => entry.id === term.ref.id && entry.version === (term.ref as Extract<PreparationTermRef, { kind: 'topic_term' }>).entryVersion && same(entry.confirmation, term.confirmation) && entry.preferred === term.preferred && same(entry.forbidden, term.forbidden) && same(entry.sourceForms, term.sourceForms) && same(entry.aliases, term.aliases) && entry.sourceLanguage === term.sourceLanguage && entry.sense === term.sense && entry.origin === term.origin && same(entry.evidence, term.evidence)))) return bad('stale_fixed_terms', '采用的用户固定规则已更新或删除，请形成新复核准备。', 'capture_preparation')
         for (const entry of currentFixed.filter(entry => relevantFixedIds.includes(entry.id))) {
@@ -487,7 +488,7 @@ export class PreparationStore {
         if (!snapshot.preparationReady || !snapshot.mechanicalCoverage.complete || !snapshot.modelReview.complete || snapshot.conflicts.length || snapshot.questions.some(question => question.decision === null) || seat.planningBindings?.[snapshot.version] === undefined) return bad('preparation_not_ready', '准备扫描、主模型审阅或关键问题尚未完整解决；请形成新的准备版本。', 'capture_preparation')
         if (!this.currentTerms(facts.topicTerms)) return bad('stale_terms', '主题术语在规划捕获时已变化，请重新读取。', 'capture_preparation')
         const baseline = seat.planningBindings[snapshot.version]!, adoptedFixed = snapshot.terms.filter(term => term.userFixed), knownForms = new Set([...seat.catalog.candidates.map(candidate => candidate.original), ...snapshot.terms.flatMap(term => [...term.sourceForms, ...term.aliases])])
-        const currentFixed = facts.topicTerms.entries.filter(entry => entry.status === 'active' && entry.targetLanguage === snapshot.targetLanguage && fixed(entry))
+        const currentFixed = facts.topicTerms.entries.filter(entry => entry.status === 'active' && languageMatches(entry.targetLanguage, snapshot.targetLanguage) && fixed(entry))
         if (adoptedFixed.some(term => term.ref.kind !== 'topic_term' || !currentFixed.some(entry => entry.id === term.ref.id && entry.version === (term.ref as Extract<PreparationTermRef, { kind: 'topic_term' }>).entryVersion && same(entry.confirmation, term.confirmation) && entry.preferred === term.preferred && same(entry.forbidden, term.forbidden) && same(entry.sourceForms, term.sourceForms) && same(entry.aliases, term.aliases) && entry.sourceLanguage === term.sourceLanguage && entry.sense === term.sense && entry.sense === term.description && entry.origin === term.origin && same(entry.evidence, term.evidence)))) return bad('stale_fixed_terms', '已采用的用户固定条目已更新或删除，请重新形成准备版本。', 'capture_preparation')
         const related = currentFixed.filter(entry => relevantFixedIds.includes(entry.id) || [...entry.sourceForms, ...entry.aliases].some(form => knownForms.has(form)))
         const missing = related.filter(entry => relevantFixedIds.includes(entry.id) && !adoptedFixed.some(term => [...term.sourceForms, ...term.aliases].some(form => [...entry.sourceForms, ...entry.aliases].includes(form))))

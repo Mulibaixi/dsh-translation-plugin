@@ -3,7 +3,6 @@ import type { ThemeMemoryClearPlan, ThemeMemoryClearing } from './theme-memory-c
 import type { ReferenceStore } from './reference-store.js'
 import type { ViewFilesClient } from './view-files-client.js'
 import type { LocalDataClient } from './local-data.js'
-import type { TopicBridgeClient } from './topic-bridge.js'
 
 export interface TopicDeletionPreview {
   readonly plan: TopicDeletionPlan
@@ -19,7 +18,6 @@ export interface TopicDeletionPorts {
   readonly references: ReferenceStore
   readonly viewFiles?: ViewFilesClient | undefined
   readonly localData?: LocalDataClient | undefined
-  readonly topics?: Pick<TopicBridgeClient, 'revokeTopic'> | undefined
   readonly isSessionBusy?: ((sessionId: string) => boolean) | undefined
 }
 
@@ -64,14 +62,13 @@ export class TopicDeletionClient {
     this.ports.references.discardTopic(plan.ownerId, plan.topicId)
     if (this.ports.viewFiles) {
       const sessionIds = this.ports.sessions.getTopicDeletionIntent(plan.topicId)?.sessionIds ?? plan.sessionIds
-      await this.ports.viewFiles.clear([{ ownerId: plan.callerOwnerId, sessionIds: [...sessionIds] }])
+      await this.ports.viewFiles.clear([{ namespaceId: this.ports.sessions.getNamespaceId(), sessionIds: [...sessionIds] }])
     }
     if (this.ports.localData) {
       const purged = await this.ports.localData.purgeTopic(operationId, plan.ownerId, plan.topicId, this.ports.references.getAssetNamespaceId())
       if (!purged.ok) return result('partial', `会话与主题记忆已删除，但宿主文件未清理：${purged.message ?? '请重试。'}`, ['宿主文件'])
     }
     if (!await this.ports.sessions.commitTopicDeletionAsync(plan)) return result('failed', '主题删除未提交；请核对当前主题与会话后重试。')
-    this.ports.topics?.revokeTopic(plan.topicId)
     return result('deleted', `已删除主题「${preview.plan.topicName}」及其会话与记忆资产。`)
   }
 }

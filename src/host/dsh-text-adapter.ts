@@ -1,8 +1,8 @@
 import type { FrozenReferenceContext } from '../shared/reference-memory.js'
 import type { ModelSelection } from '../shared/contracts.js'
 import type { TextCapabilityEvidence, TextExecutionAdapter, TextExecutionEvent, TextExecutionPacket } from '../shared/domain-contracts.js'
-import { NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION,
-  reconstructTranslationContext, reconstructNormalExchangeTranslationContext, reconstructNormalTranslationContext,
+import { NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION, NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION,
+  reconstructTranslationContext, reconstructNormalExchangeTranslationContext, reconstructDirectTranslationContext, reconstructNormalTranslationContext,
   type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
 import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
 import type { NormalTranslationResolution } from '../shared/normal-translation-v2.js'
@@ -53,6 +53,8 @@ export interface NormalExecutionPacket {
   readonly targetLanguage: string
   readonly instruction: string
   readonly context: NormalTranslationContext
+  /** One real call returns the body to the main model; no control tool and no resume protocol. */
+  readonly mode?: 'direct'
   readonly referenceContext?: FrozenReferenceContext
   readonly referenceContextCurrent?: () => boolean
   readonly exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>
@@ -78,7 +80,7 @@ export interface AnalysisExecutionBudget {
   readonly contextWindow: number | null
   readonly maxOutputTokens: number | null
 }
-type PreparedNormalCall = { route: ModelSelection; call: DshPreparedCall; normalContext?: NormalTranslationContext; requestContext: boolean;
+type PreparedNormalCall = { route: ModelSelection; call: DshPreparedCall; normalContext?: NormalTranslationContext; requestContext: boolean; direct?: boolean;
   analysisContext?: { readonly systemPrompt: string; readonly userMessage: string };
   exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }> }
 const requestContextTool = Object.freeze({
@@ -284,14 +286,18 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       const bound = this.prepared.get(packet.operationId)
       if (!bound || key(bound.route) !== key(packet.model)) throw Object.assign(new Error('Normal preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
       if(packet.context.referenceContextRef && (!packet.referenceContext || JSON.stringify(packet.context.referenceContextRef)!==JSON.stringify(packet.referenceContext.manifestRef)) || packet.referenceContextCurrent?.()===false)throw Object.assign(new Error('Reference context unavailable or changed'),{code:'REFERENCE_CONTEXT_CHANGED'})
-      const requestContext = requestContextAvailable && bound.call.toolUpdate !== undefined
+      const direct = packet.mode === 'direct'
+      const requestContext = !direct && requestContextAvailable && bound.call.toolUpdate !== undefined
+      const material = { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }
       const context = requestContext
-        ? reconstructNormalExchangeTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, bound.exchangeResume, packet.referenceContext)
-        : reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, packet.context, packet.referenceContext)
+        ? reconstructNormalExchangeTranslationContext(material, packet.context, bound.exchangeResume, packet.referenceContext)
+        : direct ? reconstructDirectTranslationContext(material, packet.context, packet.referenceContext)
+        : reconstructNormalTranslationContext(material, packet.context, packet.referenceContext)
       // Model capacity is decided by the bound adapter, not by treating bytes as tokens.
       const normalContext = frozen(structuredClone(packet.context))
-      this.prepared.set(packet.operationId, { ...bound, normalContext, requestContext })
-      return { promptVersion: requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION, model: { provider: bound.call.config.provider, model: bound.call.config.model,
+      this.prepared.set(packet.operationId, { ...bound, normalContext, requestContext, direct })
+      return { promptVersion: requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : direct ? NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION,
+        model: { provider: bound.call.config.provider, model: bound.call.config.model,
         reasoningEffort: bound.call.config.reasoningEffort ?? null }, configVersion: null, maxOutputTokens: bound.call.config.maxTokens ?? null,
         usage: { inputTokens: null, outputTokens: null }, context: normalContext,
         ...(requestContext ? { exchangeContext: bound.exchangeResume
@@ -336,15 +342,19 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     this.prepared.delete(packet.operationId)
     if(packet.referenceContextCurrent?.()===false)throw Object.assign(new Error('Reference context changed before dispatch'),{code:'REFERENCE_CONTEXT_CHANGED'})
     if (!bound || key(bound.route) !== key(packet.model) || !bound.normalContext || JSON.stringify(bound.normalContext) !== JSON.stringify(packet.context)) throw new Error('Normal execution preparation does not match')
+    const material = { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }
+    const promptVersion = bound.requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : bound.direct ? NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION
     yield* this.executePrepared(packet.operationId, packet.callId, bound.call, 'normal',
-      bound.requestContext ? reconstructNormalExchangeTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, bound.exchangeResume, packet.referenceContext)
-        : reconstructNormalTranslationContext({ source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }, bound.normalContext, packet.referenceContext),
-      signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion)
+      bound.requestContext ? reconstructNormalExchangeTranslationContext(material, bound.normalContext, bound.exchangeResume, packet.referenceContext)
+        : bound.direct ? reconstructDirectTranslationContext(material, bound.normalContext, packet.referenceContext)
+        : reconstructNormalTranslationContext(material, bound.normalContext, packet.referenceContext),
+      signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion, promptVersion)
   }
   private async *executePrepared(operationId: string, attemptId: string, call: DshPreparedCall, mode: 'quick' | 'normal' | 'analysis' | 'document',
     context: { readonly systemPrompt: string; readonly userMessage: string }, signal: AbortSignal, normalContext?: NormalTranslationContext,
     onDispatch?: () => void, requestContext = false, sourceCodePointLength = 0,
-    exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>, exchangeContextVersion = 1): AsyncGenerator<NormalExecutionEvent> {
+    exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>, exchangeContextVersion = 1,
+    promptVersion?: TranslationCallMetadata['promptVersion']): AsyncGenerator<NormalExecutionEvent> {
     const helpers = this.helpers!
     const session = this.sessions!.prepare(`translation-${mode}:${attemptId}`)
     const events: unknown[] = []
@@ -375,8 +385,8 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     let settlementDone = false
     try {
       signal.throwIfAborted()
-      if (mode !== 'analysis' && mode !== 'document') this.calls.set(operationId, Object.freeze({ promptVersion: mode === 'normal'
-        ? requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION,
+      if (mode !== 'analysis' && mode !== 'document') this.calls.set(operationId, Object.freeze({ promptVersion: promptVersion
+        ?? (mode === 'normal' ? requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION),
         model: Object.freeze({ provider: call.config.provider, model: call.config.model, reasoningEffort: call.config.reasoningEffort ?? null }),
         configVersion: null, maxOutputTokens: call.config.maxTokens ?? null, ...(normalContext ? { context: normalContext } : {}),
         ...(requestContext ? { exchangeContext: exchangeResume

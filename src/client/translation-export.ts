@@ -1,3 +1,4 @@
+import { isFileJobUnit, hasUnitBody } from './translation-history.js'
 import type { LocalSession } from './sessions.js'
 import { persistedTranslationHistory, currentDocumentCandidateRevision, currentDocumentFinalRevision, currentFinalRevision, isTextUnit, type TextRevisionStatus, type TranslationHistory } from './translation-history.js'
 import { QUICK_SYSTEM_PROMPT, TRANSLATION_PROMPT_VERSION, NORMAL_SYSTEM_PROMPT, NORMAL_TRANSLATION_PROMPT_VERSION, LEGACY_NORMAL_SYSTEM_PROMPT } from '../shared/translation-call.js'
@@ -91,6 +92,7 @@ interface UnsupportedDocumentUnit {
 function finalSummary(history: TranslationHistory): { texts: string[]; units: (BilingualTextUnit | UnsupportedDocumentUnit)[]; missingUnits: MissingTextUnit[]; exportedUnitIds: string[] } {
   const texts: string[] = [], units: (BilingualTextUnit | UnsupportedDocumentUnit)[] = [], missingUnits: MissingTextUnit[] = [], exportedUnitIds: string[] = []
   for (const unit of [...history.units].sort((a, b) => a.order - b.order)) {
+    if (isFileJobUnit(unit)) { missingUnits.push({ unitId: unit.id, order: unit.order, latestStatus: null, reason: 'document_not_supported' }); continue }
     if (!isTextUnit(unit)) {
       if (unit.deletion) { missingUnits.push({ unitId: unit.id, order: unit.order, latestStatus: null, reason: 'unit_deleted' }); continue }
       units.push({ kind: 'document', unitId: unit.id, order: unit.order, sourceVersion: unit.sourceVersion,
@@ -115,7 +117,7 @@ function namedFileBase(rawName: string, exportedAt: string): string {
   return `${name}-${stamp}`
 }
 function fileBase(session: LocalSession, exportedAt: string): string { return namedFileBase(session.name, exportedAt) }
-function topicOf(session: LocalSession): TranslationExportTopic { return { ownerId: session.ownerId, topicId: session.topicId, topicName: session.topicName } }
+function topicOf(session: LocalSession): TranslationExportTopic { return { ownerId: session.topicId, topicId: session.topicId, topicName: session.topicName } }
 
 /** Check the frozen identities before combining content; names never decide scope. */
 function scopedSessions(topic: TranslationExportTopic, entries: readonly TranslationExportSession[]): TranslationExportSession[] {
@@ -154,9 +156,9 @@ export function buildTopicFinalTextExport(topic: TranslationExportTopic, entries
 function bilingualExport(topic: TranslationExportTopic, entries: readonly TranslationExportSession[], scope: 'session' | 'topic', exportedAt: string, options: FinalExportOptions): TopicTranslationExport {
   const { sessions, missingUnits, exportedUnitIds, complete } = topicSummary(topic, entries)
   const content = exportedUnitIds.length && (complete || options.allowPartial) ? JSON.stringify({
-    format: 'dsh-translation-bilingual', schemaVersion: 1, exportedAt, scope,
-    topic: { ownerId: topic.ownerId, topicId: topic.topicId, topicName: topic.topicName },
-    sessions: sessions.map(({ session, units }) => ({ id: session.id, ownerId: session.ownerId, name: session.name, remark: session.remark, sequence: session.sequence, units })),
+    format: 'dsh-translation-bilingual', schemaVersion: 5, exportedAt, scope,
+    topic: { topicId: topic.topicId, topicName: topic.topicName },
+    sessions: sessions.map(({ session, units }) => ({ id: session.id, name: session.name, remark: session.remark, sequence: session.sequence, units })),
     summary: { complete, missingUnits, exportedUnitIds },
   }, null, 2) : null
   const name = scope === 'session' ? sessions[0]!.session.name : topic.topicName
@@ -202,7 +204,7 @@ interface FrozenDocumentExportUnit {
 }
 interface FrozenFileJobExportUnit extends FileJobExportUnit { readonly kind: 'file_job'; readonly order: number }
 function objectText(text: string, session: LocalSession, unitId: string, revisionId: string, references: readonly RecordObjectReference[]): string {
-  return projectRecordObjects(text, { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId,
+  return projectRecordObjects(text, { ownerId: references.find(ref => ref.sessionId === session.id)?.ownerId ?? session.topicId, topicId: session.topicId, sessionId: session.id, unitId,
     side: 'revision', revisionId }, references).segments.map(segment => segment.kind === 'text' ? segment.text : `[${segment.label}]`).join('')
 }
 
@@ -211,7 +213,7 @@ export async function buildTranslationExportAsync(request: TranslationExportRequ
   const topic = { ...request.topic }, scope = request.scope, format = request.format, exportedAt = request.exportedAt
   if (scope === 'session' && request.entries.length !== 1) throw new Error('Session translation export requires one session')
   const references = structuredClone(request.references ?? [])
-  const sessions = scopedSessions(topic, request.entries).map(({ session, history }) => ({ session: { ...session }, units: [...history.units].filter(unit => !request.fileJobs?.some(job => job.sessionId === session.id && job.unitId === unit.id)).sort((a, b) => a.order - b.order).map((unit): FrozenTextExportUnit | FrozenDocumentExportUnit | FrozenFileJobExportUnit => {
+  const sessions = scopedSessions(topic, request.entries).map(({ session, history }) => ({ session: { ...session }, units: [...history.units].filter(hasUnitBody).filter(unit => !request.fileJobs?.some(job => job.sessionId === session.id && job.unitId === unit.id)).sort((a, b) => a.order - b.order).map((unit): FrozenTextExportUnit | FrozenDocumentExportUnit | FrozenFileJobExportUnit => {
     if (isTextUnit(unit)) {
       const final = currentFinalRevision(unit)
       return { kind: 'text', unitId: unit.id, order: unit.order, source: unit.source, targetLanguage: unit.targetLanguage,
@@ -219,18 +221,21 @@ export async function buildTranslationExportAsync(request: TranslationExportRequ
     }
     const final = currentDocumentFinalRevision(unit)
     const manifest = final ?? currentDocumentCandidateRevision(unit) ?? null
-    const target = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id,
+    const target = { ownerId: topic.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id,
       sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }
     const captured = reader?.captureDocument(target) ?? { status: 'unloaded' as const, request: null, reason: 'document_reader_unavailable' }
     const snapshot = 'status' in captured ? captured : { ...captured, finalRevisionId: final?.id ?? null }
     return { kind: 'document', unitId: unit.id, order: unit.order, targetLanguage: unit.targetLanguage,
       sourceVersion: unit.sourceVersion, source: unit.sourceVersions.find(source => source.version === unit.sourceVersion) ?? null,
       finalRevisionId: final?.id ?? null, manifest, snapshot }
-  }).concat((request.fileJobs ?? []).filter(job => job.sessionId === session.id && job.topicId === topic.topicId).map((job, index) => ({ ...job, kind: 'file_job' as const, order: history.units.length + index + 1 })))
-    .sort((left, right) => Date.parse(left.kind === 'file_job' ? left.createdAt : history.units.find(unit => unit.id === left.unitId)!.createdAt) - Date.parse(right.kind === 'file_job' ? right.createdAt : history.units.find(unit => unit.id === right.unitId)!.createdAt))
-    .map((unit, index) => ({ ...unit, order: index + 1 })) }))
+  }).concat((request.fileJobs ?? []).filter(job => job.sessionId === session.id && job.topicId === topic.topicId).map((job, index) => ({ ...job, kind: 'file_job' as const, order: history.units.find(unit => unit.id === job.unitId)?.order ?? history.units.length + index + 1 })))
+    .concat(history.units.filter(isFileJobUnit).filter(unit => !request.fileJobs?.some(job => job.sessionId === session.id && job.unitId === unit.id)).map(unit => ({
+      kind: 'file_job' as const, sessionId: session.id, topicId: session.topicId, unitId: unit.id, order: unit.order, createdAt: unit.createdAt,
+      sourceVersion: unit.sourceVersion, targetLanguage: '', source: null, translation: null, resultVersion: null, selection: null,
+    })))
+    .sort((left, right) => left.order - right.order) }))
   const missingUnits: MissingTopicTextUnit[] = [], missingRanges: MissingTranslationRange[] = [], exportedUnitIds: string[] = [], texts: string[] = []
-  const exportedSessions: { id: string; ownerId: string; name: string; remark: string; sequence: number; units: unknown[] }[] = []
+  const exportedSessions: { id: string; name: string; remark: string; sequence: number; units: unknown[] }[] = []
   const hasDocument = sessions.some(entry => entry.units.some(unit => unit.kind === 'document'))
   for (const { session, units } of sessions) {
     const exportedUnits: unknown[] = []
@@ -263,7 +268,7 @@ export async function buildTranslationExportAsync(request: TranslationExportRequ
       if (!projection.complete) missingUnits.push({ ...location, latestStatus: null, reason: 'document_incomplete' })
       if (projection.hasTranslation && projection.text !== null) {
         exportedUnitIds.push(unit.unitId)
-        const refs = references.filter(ref => ref.ownerId === session.ownerId && ref.topicId === session.topicId && ref.sessionId === session.id && ref.unitId === unit.unitId && ref.side === 'revision' && ref.revisionId === unit.manifest?.id)
+        const refs = references.filter(ref => ref.topicId === session.topicId && ref.sessionId === session.id && ref.unitId === unit.unitId && ref.side === 'revision' && ref.revisionId === unit.manifest?.id)
         texts.push(unit.manifest && projection.complete ? objectText(projection.text, session, unit.unitId, unit.manifest.id, refs)
           : projection.text + refs.map(ref => `\n[${recordObjectLabel(ref)}：关联位置不可用]`).join(''))
       }
@@ -274,16 +279,16 @@ export async function buildTranslationExportAsync(request: TranslationExportRequ
         finalRevisionId: unit.finalRevisionId, manifestRevisionId: unit.manifest?.id ?? null, manifest: unit.manifest,
         blocks: projection.blocks, missingRanges: ranges })
     }
-    exportedSessions.push({ id: session.id, ownerId: session.ownerId, name: session.name, remark: session.remark, sequence: session.sequence, units: exportedUnits })
+    exportedSessions.push({ id: session.id, name: session.name, remark: session.remark, sequence: session.sequence, units: exportedUnits })
   }
   const complete = missingUnits.length === 0
   const check = (): boolean => sessions.every(entry => entry.units.every(unit => unit.kind !== 'document' || 'status' in unit.snapshot || unit.snapshot.check() === null))
   if (!check()) throw new Error('导出范围在读取期间已不可访问，请重新导出。')
-  const includedObjects = references.filter(ref => sessions.some(({ session, units }) => session.ownerId === ref.ownerId && session.topicId === ref.topicId && session.id === ref.sessionId && units.some(unit => unit.unitId === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : (unit.kind === 'text' ? unit.finalRevisionId : unit.kind === 'document' ? unit.manifest?.id : null) === ref.revisionId))))
+  const includedObjects = references.filter(ref => sessions.some(({ session, units }) => session.topicId === ref.topicId && session.id === ref.sessionId && units.some(unit => unit.unitId === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : (unit.kind === 'text' ? unit.finalRevisionId : unit.kind === 'document' ? unit.manifest?.id : null) === ref.revisionId))))
   const partialContent = exportedUnitIds.length ? format === 'txt' ? texts.join('\n\n') : JSON.stringify({
-    format: 'dsh-translation-bilingual', schemaVersion: sessions.some(entry => entry.units.some(unit => unit.kind === 'file_job')) ? 4 : hasDocument ? 3 : includedObjects.length ? 2 : 1, exportedAt, scope,
-    topic, sessions: exportedSessions, summary: { complete, missingUnits, exportedUnitIds, ...(hasDocument ? { missingRanges } : {}) },
-    ...(includedObjects.length ? { objectReferences: includedObjects } : {}),
+    format: 'dsh-translation-bilingual', schemaVersion: 5, exportedAt, scope,
+    topic: { topicId: topic.topicId, topicName: topic.topicName }, sessions: exportedSessions, summary: { complete, missingUnits, exportedUnitIds, ...(hasDocument ? { missingRanges } : {}) },
+    ...(includedObjects.length ? { objectReferences: includedObjects.map(({ ownerId: _storageScope, ...reference }) => reference) } : {}),
   }, null, 2) : null
   const name = scope === 'session' ? sessions[0]!.session.name : topic.topicName
   const result: AsyncTranslationExport = { content: complete || options.allowPartial ? partialContent : null, fileName: `${namedFileBase(name, exportedAt)}${scope === 'topic' ? '-topic' : ''}${format === 'json' ? '-bilingual' : ''}${complete ? '' : '-partial'}.${format}`,

@@ -33,14 +33,14 @@ export interface FileJobInputEstimate {
   readonly sourceTargetBytes: number; readonly provider: string | null; readonly model: string | null
 }
 export interface FileJobMechanicalIssue { readonly code: string; readonly message: string; readonly range: TranslationSourceRange | null; readonly inputEstimate?: FileJobInputEstimate }
-export interface FileJobSummary extends FileJobScope {
+export interface FileJobSummary extends Omit<FileJobScope, 'ownerId'> {
+  readonly namespaceId?: string
   readonly operationId: string; readonly requestId: string; readonly materialId: string; readonly unitId: string; readonly sourceVersion: number
   readonly sourceRef?: TranslationSourceAsset; readonly sourceTotalCodePoints: number; readonly targetLanguage: string; readonly instruction: string; readonly model: TranslationMaterialRoute | null
   /** Frozen chat requirements; absent on records created before this field existed. */
   readonly organizedRequirements?: string
   readonly historyOrigin?: 'legacy_document'
-  /** Original saved owner when a history view is authorized by another open main session. */
-  readonly historyOwnerId?: string
+  /** Exact stored source credentials; unrelated to the current execution main Session. */
   readonly sourceOrigin?: { readonly scope: TranslationSourceScope; readonly source: SourceIdentity; readonly referenceKey: string }
   readonly createdAt: string; readonly updatedAt: string; readonly version: number; readonly phase: FileJobPhase
   readonly progress: { readonly completed: number; readonly total: number }; readonly baselineVersion: number | null

@@ -12,6 +12,7 @@ import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore } from './topic-memory-store.js'
 import { TopicArchiveStore } from './topic-archive-store.js'
+import { isTextUnit } from './translation-history.js'
 import { ThemeMemoryClearing } from './theme-memory-clearing.js'
 import { RecordObjectStore } from './record-object-store.js'
 import { ObjectAssetsClient, adaptObjectAssetsRemote, type ObjectAssetsRemotePort, type NativeFileUploadPort } from './object-assets-client.js'
@@ -161,7 +162,7 @@ export function apply(ctx: ClientPluginContext): void {
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationSources')
     } : ctx.remote.translationSources
     const sources = adaptTranslationSourcesRemote(sourcesRemote)
-    const storage = adaptTranslationSourceStorageRemote(sourcesRemote)
+    const storage = adaptTranslationSourceStorageRemote(sourcesRemote, () => store.getNamespaceId())
     const sourceStorage = new TranslationSourceStorageClient(storage)
     const integrity = adaptTranslationSourceIntegrityRemote(sourcesRemote)
     const evidence = new TranslationSourceReader({ sessions: store, sources, storage, integrity, library: adaptLibrarySourcesRemote(sourcesRemote), assetNamespaceId: () => references.getAssetNamespaceId() })
@@ -173,7 +174,7 @@ export function apply(ctx: ClientPluginContext): void {
     const quick = new QuickTranslationClient(adaptQuickRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationQuick')
-    } : ctx.remote.translationQuick), store, models, { canManualEdit: (session, unitId, revisionId) => !objects.hasRevisionObjects(session.ownerId, session.topicId, session.id, unitId, revisionId) })
+    } : ctx.remote.translationQuick), store, models, { canManualEdit: (session, unitId, revisionId) => !objects.hasRevisionObjects(store.getTopicStorageScope(session.topicId)!,  session.topicId, session.id, unitId, revisionId) })
     const terms = new TopicMemoryStore(store, undefined, undefined, undefined, (sessionId, unitId) => fileJobs.readEvidence(sessionId, unitId))
     const archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
     terms.setEvidenceReader(fileJobs)
@@ -186,18 +187,14 @@ export function apply(ctx: ClientPluginContext): void {
     const references = new ReferenceStore(store, async () => {
       if (ctx.remote.$mount) await mountedRemote
       return remoteDisposed ? undefined : ctx.get ? ctx.get('remote.translationReferences') : ctx.remote.translationReferences
-    }, undefined, {withOwner:async <T>(ownerId:string,action:()=>Promise<T>):Promise<T>=>{
-      ownerId = topics.getLibraryOwner() ?? ownerId
-      const release=topics.retain(ownerId)
-      try{
-        if(!topics.getStatus(ownerId).ready)await new Promise<void>((resolve,reject)=>{
-          let stop:()=>void=()=>{}
-          const timer=setTimeout(()=>{stop();reject(new Error('参考资料保存连接尚未就绪。'))},15000)
-          const check=():void=>{if(topics.getStatus(ownerId).ready){clearTimeout(timer);stop();resolve()}}
-          stop=topics.subscribe(check);check()
-        })
-        return await action()
-      }finally{release()}
+    }, undefined, {withOwner:async <T>(_storageScope:string,action:()=>Promise<T>):Promise<T>=>{
+      if(!topics.getLibraryStatus().ready)await new Promise<void>((resolve,reject)=>{
+        let stop:()=>void=()=>{}
+        const timer=setTimeout(()=>{stop();reject(new Error(topics.getLibraryStatus().reason ?? '资料库连接尚未就绪。'))},15000)
+        const check=():void=>{if(topics.getLibraryStatus().ready){clearTimeout(timer);stop();resolve()}}
+        stop=topics.subscribe(check);check()
+      })
+      return await action()
     }})
     topics.setReferences(references)
     terms.setReferenceEvidence(references)
@@ -217,7 +214,6 @@ export function apply(ctx: ClientPluginContext): void {
     // Cordis re-runs this scope when the optional service is loaded or replaced.
     fileJobs.setMaterials(materials, () => references.getAssetNamespaceId())
     topics.setFileHistory(new FileHistoryClient(store, fileJobs, materials, () => references.getAssetNamespaceId(), () => activeUiLocale(ctx), evidence))
-    fileJobs.setReferenceControl(topics)
     // Keep drafts and submission receipts in the root client across those changes.
     ctx.inject(['composerExtension'], scope => {
       const bridge = materialSubmissionBridge(ctx, scope.get('composerExtension'))
@@ -237,11 +233,9 @@ export function apply(ctx: ClientPluginContext): void {
     const viewFiles = new ViewFilesClient(adaptViewFilesRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationViews')
-    } : ctx.remote.translationViews), store, { sources, sourceStorage: storage })
+    } : ctx.remote.translationViews), store, { sources, sourceStorage: storage, library: adaptLibrarySourcesRemote(sourcesRemote) })
     const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), {
       isSessionBusy: sessionId => quick.isBusy(sessionId), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
-      canAccessUnit: (ownerId, sessionId, unitId) => topics.isPublished(ownerId, sessionId, unitId),
-      publishUnit: (ownerId, sessionId, unitId) => topics.publishUnit(ownerId, sessionId, unitId),
       uiLocale: () => activeUiLocale(ctx),
       canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
       remote: ctx.remote.$mount ? async () => {
@@ -263,7 +257,6 @@ export function apply(ctx: ClientPluginContext): void {
       canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId), reader: evidence,
       sourceStorage, subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
-      publishUnit: (ownerId, sessionId, unitId, sourceVersion) => topics.publishDocumentUnit(ownerId, sessionId, unitId, sourceVersion),
       uiLocale: () => activeUiLocale(ctx),
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
@@ -317,7 +310,7 @@ export function apply(ctx: ClientPluginContext): void {
     ctx.effect(() => () => localData.dispose(), 'translation local data')
 
     const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
-    const topicDeletion = new TopicDeletionClient({ sessions: store, clearing: memoryClearing, references, viewFiles, localData, topics,
+    const topicDeletion = new TopicDeletionClient({ sessions: store, clearing: memoryClearing, references, viewFiles, localData,
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId) || store.hasDocumentLease(sessionId) })
     const TranslationPanel: ClientComponent = (props = {}) => {
       const frozen = useLocalDataFrozen(localData)
@@ -325,7 +318,7 @@ export function apply(ctx: ClientPluginContext): void {
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       if (frozen) return h(ClearedDataView, null)
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, terms, archive, references, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string, jobId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId, jobId },
@@ -338,10 +331,10 @@ export function apply(ctx: ClientPluginContext): void {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       if (frozen) return h(ClearedDataView, null)
-      const scope = readMemoryAssetsNavigation(sessionId, tabInfo?.tab)
+      const scope = readMemoryAssetsNavigation(sessionId ?? store.getNamespaceId(), tabInfo?.tab)
       const onClose = tabInfo ? () => tabInfo.tab.actions.close() : undefined
       if (!scope) return h('section', { className: 'dsh-translation' },
-        h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效或不属于此主会话。'),
+        h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
       return h(MemoryAssetsView, { store, quick, topics, terms, archive, references, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
@@ -354,7 +347,7 @@ export function apply(ctx: ClientPluginContext): void {
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       if (frozen) return null
-      const scope = readMemoryAssetsNavigation(sessionId, tabInfo?.tab)
+      const scope = readMemoryAssetsNavigation(sessionId ?? store.getNamespaceId(), tabInfo?.tab)
       return h(MemoryAssetsTitle, { store, scope,
         onSelectTopic: scope && tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return

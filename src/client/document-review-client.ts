@@ -32,7 +32,7 @@ export class DocumentReviewClient {
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private locate(ownerId: string, target: DocumentReviewTarget): { unit: DocumentUnit; manifest: DocumentRevision; handle: DocumentReadHandle } {
     const scope = target.scope, session = this.store.getSession(scope.translationSessionId), unit = this.store.getTranslationHistory(scope.translationSessionId)?.units.find(unit => unit.id === target.unitId)
-    if (this.disposed || ownerId !== scope.ownerId || ownerId !== scope.mainSessionId || !session || session.ownerId !== ownerId || session.topicId !== scope.topicId || session.mode !== 'normal' || this.store.isSessionDeleted(session.id) || !unit || !isDocumentUnit(unit)) throw error('scope_mismatch', '复核不属于此准确文档范围。')
+    if (this.disposed || ownerId !== scope.ownerId || ownerId !== scope.mainSessionId || !session || session.topicId !== scope.topicId || session.mode !== 'normal' || this.store.isSessionDeleted(session.id) || !unit || !isDocumentUnit(unit)) throw error('scope_mismatch', '复核不属于此准确文档范围。')
     if (this.store.getStatus(session.id) === 'conflict') throw error('history_conflict', '历史副本已变化，请先处理冲突。')
     if (unit.sourceVersion !== target.sourceVersion) throw error('stale_source_version', '复核原稿已被新版本取代。')
     const manifest = unit.revisions.find(revision => revision.id === target.manifestRevisionId)

@@ -20,7 +20,7 @@ Translating stories, game scripts, or academic material often involves copying p
 | --- | --- |
 | Quick translation | Translate plain text directly, for standalone passages and occasional lookups. |
 | Normal translation | Let the main model organize requirements and background for the translation model, with discussion, retranslation, and source correction. |
-| File translation | Process UTF-8 TXT sources, prepare terminology and context, translate in batches, and present results and asset proposals for review. |
+| File translation | Read text or recognize file content, translate with the current requirements, review and save the result, and suggest reusable memory assets. |
 | Topics and sessions | Create topics and child sessions, add remarks, reorder or archive sessions, and reuse topics across main chats in the same local library. |
 | Memory assets | Read and edit terms, entities, facts, and relations; inspect evidence, organize reference material, and review file proposals. |
 | Versions and export | Read source and translation together, retain old versions, choose final results, and export translated TXT or bilingual JSON by session or topic. |
@@ -28,15 +28,19 @@ Translating stories, game scripts, or academic material often involves copying p
 
 The project is still in development. Normal file translation performance and interaction are being improved; there is no guaranteed completion time.
 
-Translation files currently must be UTF-8 TXT, up to 2 MiB each. Direct PDF, Word, or image translation and PDF generation are not supported. Reading reference material depends on DSH and the main model. The memory asset window floats or docks inside DSH; it is not a separate native Windows window.
+Translation files can use any format, up to 2 MiB each. UTF-8 text can be translated directly while retaining its format; other sources must first be read or OCR'd by the main model. TXT, Markdown, JSON, and HTML results can be saved directly. Generating PDF, Word, or image results depends on the main model's capabilities.
+
+Reading reference material depends on DSH and the main model. The memory asset window floats or docks inside DSH; it is not a separate native Windows window.
 
 ## Requirements
 
 - DSH with local plugin support and a configured model. The currently targeted environment is based on DSH `0.2.0-rc.2`; other versions are not guaranteed to work unchanged.
 - **Quick mode** does not require the Composer extension.
-- **Normal mode** requires a matching `dsh-composer-extension` (currently `0.3.0`) and its companion DSH build. Installing the extension alone does not add linked material submission to the official, unmodified `0.2.0-rc.2` application.
-- **File translation** also requires DSH support for one-shot subagents. Missing capabilities are reported in the workspace.
+- **Normal mode** requires companion builds of `dsh-composer-extension` and DSH. Installing the extension alone does not add linked material submission to the official, unmodified `0.2.0-rc.2` application.
+- **File translation** also requires DSH support for one-shot subagents, used for candidate asset extraction. Missing capabilities are reported, and the main model can still read a text source and translate it directly.
 - Building from source requires Node.js 22 or later, pnpm, and the `dsh-composer-extension` source directory alongside this repository.
+
+The current companion builds use content protocol 3 and task-phase protocol 2. Update and build the translation plugin and Composer extension together; incompatible protocols make the affected features unavailable.
 
 The plugin uses model services configured in DSH, which may charge for requests. Saving data locally does not make translation offline.
 
@@ -56,8 +60,8 @@ The plugin uses model services configured in DSH, which may charge for requests.
 
 ### Update
 
-1. Save history you want to retain, and export important translations and memory assets.
-2. Update the source in the same directory, then run the dependency installation and build commands above again.
+1. Save history you want to retain and back up local data. You can also export important translations and memory assets separately.
+2. Update both source directories and reinstall dependencies. Build the Composer extension first, then the translation plugin.
 3. Refresh or reload the local plugin in the plugin manager and restart DSH. If there is no refresh action, uninstall and reinstall the same directory.
 
 Keep the translation plugin, Composer extension, and companion DSH build compatible. Older builds may not read newly saved data; do not run old and new versions against the same data. Exports are for reading and delivery, cannot currently be imported for recovery, and do not replace a full data backup.
@@ -71,6 +75,8 @@ See [CHANGELOG](CHANGELOG.md) for version changes.
 ### 1. Create a topic and translation session
 
 On first opening the workspace, choose **新建主题及首会话 (New topic and first session)** or **选择已有主题 (Choose an existing topic)**. A topic groups knowledge for one story, project, or research area; translation sessions separate individual pieces of work.
+
+Open, edit, archive, and export topics, translation sessions, and saved material from different main chats. You can also browse and manage the local library without a current main chat.
 
 - **+** in the title dropdown creates a new topic and its first session.
 - Right-click a session and choose **新建子会话 (New child session)** to continue in the same topic. Session numbers increase without filling deleted gaps.
@@ -92,24 +98,28 @@ Quick mode does not use main-chat context, topic memory, or reference material, 
 
 **Put the source in the translation input; put instructions and discussion in the main chat.**
 
-- **Send with instructions**: place text or a TXT file in the translation workspace, then write the current requirements in the main chat and send. The material accompanies that message, and the main model arranges processing according to the request.
-- **Send material directly**: press Send in the translation workspace. Short text goes to the main model. Files begin background preparation and translation, with main-model involvement for key context decisions and acceptance when needed.
+Open the translation session in the main chat you want to use. Its main model can then read units on demand. Normal translation and retranslation use the current main chat. After switching chats, tasks already under way stay with their original main model.
 
-Sending a file directly does not automatically include separate, temporary instructions typed in the main chat. For task-specific requirements, prefer sending the material with the main-chat message. Instructions added after submission should not be assumed to have reached the background task; explicitly request an adjustment or retranslation in the main chat.
+- **Send with instructions**: place text or a file in the translation workspace, then write the current requirements in the main chat and send. The material accompanies that message, and the main model arranges processing according to the request.
+- **Send material directly**: press Send in the translation workspace. Both text and files go to the current main model for processing.
 
-When sending a file with a main-chat message, the main model must explicitly pass the current requirements and corrections to the background job; acknowledging them in a reply is insufficient. If a preparation or review subtask does not submit a usable structured result, the task reports the failure and retains the available material without automatically continuing or retrying.
+Sending material directly does not include unsent instructions in the main chat input. For task-specific requirements, send the material with the main-chat message. If you add instructions after submission, identify which translation should change.
 
-A submitted file appears with its source filename and processing status. Click the filename to open the source. Once a result exists, its translated-file row provides details, previous versions, and asset proposals. Reviewed results can be selected as final. Longer Normal-mode text is automatically handled as a file, without manually splitting it into separate short submissions.
+If reading, asset extraction, or translation lacks a required capability, the workspace explains why and retains the available material.
 
-To correct a completed file, identify it and the requested changes in the main chat. The main model can find saved jobs, read the exact translation, and save a version using literal matches, including fully saved file results from before a plugin reload. This does not require the old submission or another translation call. Positional edits must also match the old text. Ambiguous matches, mismatched content, changed versions, and failed writes do not report a successful revision.
+Click a submitted file's source filename to open the original. Once processing finishes, you can inspect the result, previous versions, and memory proposals. TXT and Markdown results keep the source format; for JSON, HTML, and similar formats, the main model asks when the output form is unspecified. Longer Normal-mode text is also handled as a file and may be translated in contiguous ranges covering the whole source.
 
-A file's **参考 (Reference)** control grants access to its exact metadata and paged source, can be withdrawn, and sends no translation command. Select it again after reloading. An explicit retranslation request or **重译 (Retranslate)** first asks the main model to organize the current requirements, then restores the saved original into a new task. Legacy documents use the same file workflow, retaining complete old translations and the final selection. Intent delivery and actual task acceptance are reported separately; no internal material notification needs to be copied. New jobs save the organized chat requirements; temporary instructions absent from older records still need checking against the original conversation.
+To correct a completed file, identify it and the requested changes in the main chat. The main model appends a new version and saves the result again. Missing or overlapping segments are reported, and existing content is retained.
 
-File tasks use input-size estimates to schedule partitions. Missing model capacity or output defaults does not by itself block a task, and estimates do not establish context overflow; the host and provider validate actual calls. Real capacity errors or incomplete results retain the available source and results and report the failure without automatically repeating calls.
+Text and files share explicit **unit numbers**. Ask in the main chat, for example, “Use the wording from units 2 and 4 to retranslate unit 5.” The main model reads the requested content without per-unit grants. Numbers default to the selected sidebar session; identify the session by name or number for requests across sessions. You can request the source, current final, or “unit 3, version 2.” Retranslation adds a version, and deletion preserves the unit number. The **重译 (Retranslate)** button also starts processing. Legacy documents retain their existing versions and final selections.
+
+An explicitly user-fixed final is delivered first; otherwise the newest reviewed result is used. Real limit errors or incomplete results retain what was produced and report the failure without automatically repeating calls.
 
 Submitted material is separate from the next input draft. Editing the input does not rewrite the submitted source. To correct submitted content, identify the material and the required change in the main chat.
 
 Use **重新发送 (Resend)**, **移除 (Remove)**, or status checking when offered on a failed record. An unknown outcome establishes neither failure nor a safe retry; check it first. Restarting does not automatically resume model requests.
+
+If a task's main chat becomes unavailable, results already obtained remain available. The task is not automatically transferred to another main model.
 
 ### 4. Memory assets: maintain shared topic knowledge
 
@@ -141,7 +151,7 @@ To use external references, attach them in the main chat and identify the target
 ### 5. Revise, finalize, and export
 
 - **重译 (Retranslate)** adds a translation version and retains earlier ones. Changing the model does not rewrite existing results.
-- Use **编辑 (Edit)** on short text to add a manual version without overwriting the source. To discuss an existing record with the main model, select **参考 (Reference)** and then ask in the main chat.
+- Use **编辑 (Edit)** on short text to add a manual version without overwriting the source. To discuss an existing record, specify its unit number and your request in the main chat.
 - File rows do not provide direct editing. Request changes in the main chat and process the file again. External changes to an opened file are not imported automatically.
 - **设为最终 (Set as final)** fixes the translation to retain. Short text may also be finalized automatically when subsequent material is accepted or when exporting, subject to completeness checks. An explicitly fixed choice is not automatically replaced. File results must pass acceptance before final selection.
 - Right-click a session, choose **导出译文 TXT (Export translated TXT)** or **导出对照 JSON (Export bilingual JSON)**, then select the session or whole topic. Translation records in the asset window also provide export actions.
@@ -159,6 +169,8 @@ In **DSH Settings → 翻译 (Translation)**, set the default mode, target langu
 - Turning it off retains saved copies and stops subsequent saving. Unsaved work may be lost on restart.
 - Model and reasoning-effort preferences save independently of this switch.
 - Saved content is unencrypted on this device. The switch does not control DSH's own main-chat history, model-request records, or attachments.
+
+Deleting the main chat that first created the material does not delete saved translation data. Saved source and original-file copies remain accessible from the library; the plugin cannot recover missing saved copies.
 
 Use **存储与空间 (Storage and space)** to inspect usage or manually **回收未引用原稿 (Reclaim unreferenced sources)**. Cleanup actions have different scopes:
 

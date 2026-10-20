@@ -8,8 +8,10 @@
 
 已有测试应通过 `git rm --cached` 停止跟踪并提交索引删除，保留本地文件；不删除本地测试，也不重写历史。`.gitignore` 只阻止未跟踪文件入库，不能代替已有测试的停止跟踪操作。
 
+`pnpm test` 构建后只运行 `tests/*.test.mjs`；需要外部 DSH 运行环境的检查使用 `*.integration.mjs`，由 `pnpm test:native` 运行。测试优先检查可观察的操作结果与实际回归，不锁定 CSS 文本、像素值或 JSON 字段顺序，也不复制第三方组件实现来验证其内部行为。组件桩只能验证插件与组件的交互，不能证明真实布局或桌面运行正确。
+
 `README.md` 使用英文，`README.zh-CN.md` 使用中文，两者保持同步；CHANGELOG 和提交说明使用中文。提交采用 Conventional Commits，描述简洁，正文说明主要变化与验证结果；不要绕过仓库 Git hooks。
 
 开发中的变更可先记入 CHANGELOG 的 `Unreleased`；每次本地版本提交时，更新版本号并将对应变化整理到带版本号与日期的章节。本地提交及版本记录不代表 npm 或远程发行页发布；远程发布仍需用户明确授权。
 
-本地 Native 验证运行 `pnpm test:native`，需先准备相应的本地测试脚本，并将 `DSH_RUNTIME_ROOT` 指向含 `dsh/node_modules` 的外部 DSH rc.2 组件目录。Composer 联动还需匹配的 protocol 1 宿主补丁和扩展。测试用临时会话与合成 provider，不能据此宣称真实提供商或桌面安装已验证。
+本地 Native 验证运行 `pnpm test:native`，需先准备相应的本地测试脚本，并将 `DSH_RUNTIME_ROOT` 指向含 `dsh/node_modules` 的外部 DSH rc.2 组件目录。Composer 联动还需匹配的 submissions protocol 1 宿主补丁，以及任务阶段协议 2 的配套扩展源码构建。测试用临时会话与合成 provider，不能据此宣称真实提供商或桌面安装已验证。

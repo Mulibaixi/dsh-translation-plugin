@@ -23,7 +23,7 @@ export class TranslationMaterialStore {
   /** The capture must be synchronous at the chosen submission seam, before any preparation awaits. */
   freeze(scope: TranslationMaterialScope, capture: () => TranslationMaterialDecision): DomainResult<TranslationMaterialEnvelope> {
     if (this.disposed) return failure('invalid_state', '材料快照存储已关闭。')
-    const prior = this.owners.get(scope.ownerId)?.get(scope.requestId)
+    const prior = this.owners.get(scope.mainSessionId)?.get(scope.requestId)
     if (prior) {
       if (prior.mainSessionId !== scope.mainSessionId || prior.operationId !== scope.operationId) {
         return failure('idempotency_conflict', '此提交 ID 已绑定另一材料操作。')
@@ -40,13 +40,13 @@ export class TranslationMaterialStore {
   }
 
   private insert(snapshot: TranslationMaterialEnvelope): DomainResult<TranslationMaterialEnvelope> {
-    const prior = this.owners.get(snapshot.ownerId)?.get(snapshot.requestId)
+    const prior = this.owners.get(snapshot.mainSessionId)?.get(snapshot.requestId)
     if (prior) {
       return JSON.stringify(prior) === JSON.stringify(snapshot) ? success(prior)
         : failure('idempotency_conflict', '此提交 ID 的材料快照与原记录不一致。')
     }
-    let requests = this.owners.get(snapshot.ownerId)
-    if (!requests) { requests = new Map(); this.owners.set(snapshot.ownerId, requests) }
+    let requests = this.owners.get(snapshot.mainSessionId)
+    if (!requests) { requests = new Map(); this.owners.set(snapshot.mainSessionId, requests) }
     requests.set(snapshot.requestId, snapshot)
     return success(snapshot)
   }

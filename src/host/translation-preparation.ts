@@ -71,7 +71,7 @@ export class TranslationPreparationService {
       try {
         const references = this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined
         if (!references) return failure('reference_unavailable', '参考资料服务尚未就绪。', 'set_preparation')
-        await references.resolveContext(material.value.ownerId, material.value.material.topicId, request.referenceContextRef, exec)
+        await references.resolveContext(material.value.mainSessionId, material.value.material.topicId, request.referenceContextRef, exec)
       } catch(error) { return failure((error as {code?:string}).code ?? 'reference_unavailable', (error as Error).message, 'set_preparation') }
     }
     return this.request(request.target.mainSessionId, { kind: 'preparation_set', request, envelope: material.value }, 'preparation_receipt', exec)

@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "private": true,
   "license": "MIT",
   "description": "A DeepSeek Harness translation plugin framework (early development).",
@@ -28,7 +28,7 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "dsh-composer-extension": "0.3.0"
+    "dsh-composer-extension": "^0.4.0"
   },
   "peerDependenciesMeta": {
     "dsh-composer-extension": {
@@ -40,8 +40,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",
-    "test": "npm run build && node --test",
-    "test:native": "npm run build && node --expose-internals --test scripts/quick-host-native.integration.mjs scripts/quick-client-native.integration.mjs scripts/quick-client-mount-native.integration.mjs scripts/topic-tools-native.integration.mjs scripts/object-assets-native.integration.mjs scripts/translation-materials-native.integration.mjs scripts/normal-translation-native.integration.mjs scripts/translation-sources-native.integration.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "test:native": "npm run build && node --expose-internals --test tests/*.integration.mjs scripts/*.integration.mjs",
     "hooks:install": "node scripts/install-git-hooks.mjs",
     "check:commit": "node scripts/check-commit-message.mjs",
     "check:policy": "node scripts/check-staged-files.mjs"

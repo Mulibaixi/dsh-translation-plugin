@@ -12,10 +12,11 @@ const phases = { accepted: '已受理', preparing: '准备中', awaiting_baselin
 const kinds = { term: '术语', entity: '实体', fact: '事实', relation: '关系' } as const
 
 /** A compact delivery row owns version controls; proposal bodies live in the existing asset window. */
-export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, ownerId }: {
+export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, ownerId, unitNumber }: {
   readonly jobs: FileJobsClient; readonly record: FileJobRecord; readonly viewFiles?: ViewFilesClient | undefined
   readonly materials?: MaterialSubmissionsClient | undefined
   readonly ownerId?: string | undefined
+  readonly unitNumber?: number | undefined
   readonly onOpenAssets?: ((ownerId: string, topicId: string, sessionId?: string, jobId?: string) => void) | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
@@ -31,6 +32,7 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
   const name = job.sourceRef?.name ?? '原稿.txt', resultName = `${name.replace(/\.txt$/iu, '')}-${job.targetLanguage}-v${resultVersion ?? 1}.txt`
   const terminal = ['completed', 'failed', 'cancelled'].includes(job.phase) || jobs.hostUnavailable(job.jobId)
   const failedWithoutResult = ['failed', 'cancelled'].includes(job.phase) && !current.results.length
+  const canExecute = jobs.canExecute(ownerId)
   const retranslation = jobs.getRetranslationStatus(job.jobId)
   const awaitingRetranslation = retranslation && retranslation.status !== 'failed'
   const openSource = (): void => { if (viewFiles) void jobs.open(job.jobId, 'source', sourceVersion, viewFiles) }
@@ -38,14 +40,13 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
   const detailsControl = h('button', { type: 'button', 'aria-expanded': expanded, onClick: () => setExpanded(!expanded) }, expanded ? '收起详情' : '详情')
   const versionsControl = current.results.length > 1 || current.sources.length > 1 ? h('button', { type: 'button', 'aria-expanded': versionsExpanded, onClick: () => setVersionsExpanded(!versionsExpanded) }, `旧版本（${Math.max(0, current.results.length - 1)}）`) : null
   const assetsControl = batches.length ? h('button', { type: 'button', disabled: !onOpenAssets,
-    onClick: () => onOpenAssets?.(ownerId ?? job.ownerId, job.topicId, job.translationSessionId, batches.find(value => jobs.pendingCount(value) > 0)?.summary.jobId ?? job.jobId) }, `资产提案${count ? ` · ${count} 条待审` : ' · 已处理'}`) : null
+    onClick: () => onOpenAssets?.(ownerId ?? jobs.getNamespaceId(), job.topicId, job.translationSessionId, batches.find(value => jobs.pendingCount(value) > 0)?.summary.jobId ?? job.jobId) }, `资产提案${count ? ` · ${count} 条待审` : ' · 已处理'}`) : null
   return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit dsh-tp-file-job', 'data-unit-id': job.unitId, 'data-file-job-id': job.jobId, 'data-file-job-phase': job.phase },
     h('div', { className: 'dsh-tp-unit-header' },
-      h('span', { role: 'status', className: 'dsh-tp-muted' }, `原文 · ${phases[job.phase]}${job.progress.total ? ` · ${job.progress.completed}/${job.progress.total}` : ''}`),
-      h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: busy || !terminal || Boolean(awaitingRetranslation), onClick: () => { void jobs.retranslate(job.jobId, ownerId) } }, '重译'),
+      h('span', { role: 'status', className: 'dsh-tp-muted' }, `${unitNumber ? `单元 ${unitNumber} · 文件` : '文件材料'} · ${phases[job.phase]}${job.progress.total ? ` · ${job.progress.completed}/${job.progress.total}` : ''}`),
+      h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: !canExecute || busy || !terminal || Boolean(awaitingRetranslation), title: canExecute ? undefined : '请选择本次任务使用的主会话。', onClick: () => { void jobs.retranslate(job.jobId, ownerId) } }, '重译'),
         awaitingRetranslation ? h('button', { type: 'button', disabled: busy, onClick: () => { void jobs.queryRetranslation(job.jobId) } }, '检查重译状态') : null,
-        h('button', { type: 'button', 'aria-pressed': jobs.isReferenced(job.jobId, ownerId), onClick: () => jobs.toggleReference(job.jobId, ownerId) }, jobs.isReferenced(job.jobId, ownerId) ? '取消参考' : '参考'),
-        failedWithoutResult ? h('button', { type: 'button', disabled: busy || Boolean(awaitingRetranslation), title: '沿此原稿与翻译要求，使用当前会话所选模型开始新的翻译。', onClick: () => { void jobs.retranslate(job.jobId, ownerId) } }, '重新发送') : null,
+        failedWithoutResult ? h('button', { type: 'button', disabled: !canExecute || busy || Boolean(awaitingRetranslation), title: '沿此原稿与翻译要求，使用当前会话所选模型开始新的翻译。', onClick: () => { void jobs.retranslate(job.jobId, ownerId) } }, '重新发送') : null,
         failedWithoutResult ? h('button', { type: 'button', disabled: busy, onClick: () => setRemoveRequested(true) }, '移除') : null,
         !result ? detailsControl : null, !result ? versionsControl : null,
         h('button', { type: 'button', disabled: busy || !viewFiles || !source, onClick: openSource }, '打开'))),
@@ -106,7 +107,7 @@ function ProposalCard({ jobs, record, proposal, reviews, selected, onSelect }: {
     setEvidence(await Promise.all(current.evidence.map(async value => {
       const ref: import('../memory/topic-terms.js').TermEvidenceRef = { kind: 'source', sessionId: record.summary.translationSessionId, unitId: record.summary.unitId,
         sourceVersion: record.summary.sourceVersion, revisionId: null, selectionEventId: null, range: value.range, role: 'basis' }
-      const captured = jobs.capture(record.summary.ownerId, record.summary.topicId, ref)
+      const captured = jobs.capture(record.summary.mainSessionId, record.summary.topicId, ref)
       return 'status' in captured ? captured : jobs.read(captured)
     })))
   }

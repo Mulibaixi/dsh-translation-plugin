@@ -92,6 +92,7 @@ export interface DocumentSupplementFact extends VersionReference {
 }
 export interface DocumentTaskRecord {
   readonly taskId: string
+  readonly mainSessionId?: string
   readonly operationId: string
   readonly sourceVersion: number
   readonly planRef: VersionReference
@@ -293,10 +294,12 @@ export function parseDocumentChunkPlan(value: unknown, sourceLength: number): Do
   return result
 }
 export function parseDocumentTaskRecord(value: unknown): DocumentTaskRecord {
-  exact(value, ['taskId', 'operationId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'status'], ['executionFacts'])
+  exact(value, ['taskId', 'operationId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'status'], ['executionFacts', 'mainSessionId'])
   string(value.taskId); string(value.operationId); integer(value.sourceVersion); time(value.createdAt); taskStatus(value.status)
+  if (value.mainSessionId !== undefined) string(value.mainSessionId)
   return { taskId: value.taskId, operationId: value.operationId, sourceVersion: value.sourceVersion,
     planRef: ref(value.planRef), preparationRef: ref(value.preparationRef), createdAt: value.createdAt, status: value.status,
+    ...(value.mainSessionId === undefined ? {} : { mainSessionId: value.mainSessionId as string }),
     ...(value.executionFacts === undefined ? {} : { executionFacts: parseDocumentExecutionFacts(value.executionFacts) }) }
 }
 export function parseDocumentExecutionBaseline(value: unknown): DocumentExecutionBaseline {

@@ -10,7 +10,7 @@ import { canEditTextRevision, type TextUnit } from './translation-history.js'
 import type { LocalSession } from './sessions.js'
 import { MarkdownText } from './native-ui.js'
 
-export interface RecordObjectsProps { readonly objects?: RecordObjectStore | undefined; readonly objectAssets?: ObjectAssetsClient | undefined; readonly viewFiles?: ViewFilesClient | undefined }
+export interface RecordObjectsProps { readonly executionOwner?: string | undefined; readonly objects?: RecordObjectStore | undefined; readonly objectAssets?: ObjectAssetsClient | undefined; readonly viewFiles?: ViewFilesClient | undefined }
 function RecordObjectFormula({ source }: { readonly source: string }): unknown {
   return h('span', { className: 'dsh-tp-object-formula' },
     h('span', { className: 'dsh-tp-object-formula-preview' }, h(MarkdownText, { text: `$$\n${source}\n$$`, variant: 'compact' })),
@@ -42,7 +42,7 @@ export function RecordObjectText({ text, target, objects, objectAssets, referenc
     !hideUnavailable && projected.unavailableRefs.length ? h('div', { className: 'dsh-tp-object-unavailable', 'aria-label': '关联位置不可用' }, ...projected.unavailableRefs.map(reference => object(reference, true))) : null)
 }
 
-export function RecordObjectEditor({ session, unit, objects, objectAssets }: RecordObjectsProps & { readonly session: LocalSession; readonly unit: TextUnit }): unknown {
+export function RecordObjectEditor({ session, unit, objects, objectAssets, executionOwner }: RecordObjectsProps & { readonly session: LocalSession; readonly unit: TextUnit }): unknown {
   const [targetId, setTargetId] = react.useState('source')
   const [kind, setKind] = react.useState<ObjectAssetKind>('image')
   const [offset, setOffset] = react.useState<string>('')
@@ -56,7 +56,7 @@ export function RecordObjectEditor({ session, unit, objects, objectAssets }: Rec
   const fileInput = react.useRef<{ value: string } | null>(null)
   const lifetime = react.useRef({ mounted: true, busy: false })
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false } }, [])
-  const sourceTarget: RecordObjectTarget = { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }
+  const sourceTarget: RecordObjectTarget = { ownerId: objects?.scopeFor(session.id) ?? session.topicId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }
   const sourceRefs = objects?.getReferences(sourceTarget) ?? []
   const selectedRef = sourceRefs.find(ref => ref.refId === sourceRefId)
   const revision = unit.revisions.find(revision => revision.id === targetId)
@@ -77,7 +77,7 @@ export function RecordObjectEditor({ session, unit, objects, objectAssets }: Rec
         input = { ...target, offset: position, asset: selectedRef.asset, ...(selectedRef.formulaSource ? { formulaSource: selectedRef.formulaSource } : {}) }; result = await objectAssets.bind(input)
       } else {
         if (!file || action === 'result' && (!selectedRef || target.side !== 'revision')) throw new Error('请选择文件、原件及译文版本。')
-        const attached = await objectAssets.attachFile(target, position, action === 'result' ? selectedRef!.asset.kind : kind, file, action === 'result' ? selectedRef!.asset.objectId : undefined, formulaSource)
+        const attached = await objectAssets.attachFile(target, position, action === 'result' ? selectedRef!.asset.kind : kind, file, action === 'result' ? selectedRef!.asset.objectId : undefined, formulaSource, executionOwner)
         input = attached.input; result = attached.result
       }
       if (!lifetime.current.mounted) return

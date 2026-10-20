@@ -1,3 +1,4 @@
+import { isFileJobUnit } from './translation-history.js'
 import { ReferenceEvidenceView } from './reference-view.js'
 import { h, react } from './react.js'
 import { resolveTermEvidence, type TopicTermSnapshot, type TopicTerm, type TopicTermUserInput, type TermMutationResult, type TermEvidenceRef, type UnitEvidenceRef, type TermEvidenceFact } from '../memory/topic-terms.js'
@@ -43,8 +44,8 @@ function UnitEvidenceView({ sessions, terms, snapshot, reference, active = true,
   const body = resolveTermEvidence(snapshot, reference, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
   const unloaded = isDocumentEvidenceUnloaded(sessions, snapshot, reference)
   const selection = sessions.getTranslationHistory(reference.sessionId)?.events.filter(event => event.type === 'final.selected' && event.unitId === reference.unitId).at(-1)
-  const identity = JSON.stringify([snapshot.ownerId, snapshot.topicId, reference, candidate?.ownerId, candidate?.topicId,
-    sessions.isSessionDeleted(reference.sessionId), sessions.getStatus(reference.sessionId), unit?.sourceVersion, unit?.final, selection?.id, active, contextKey])
+  const identity = JSON.stringify([snapshot.ownerId, snapshot.topicId, reference,  candidate?.topicId,
+    sessions.isSessionDeleted(reference.sessionId), sessions.getStatus(reference.sessionId), unit?.sourceVersion, (unit && !isFileJobUnit(unit) ? unit.final : null), selection?.id, active, contextKey])
   const currentIdentity = react.useRef(identity)
   currentIdentity.current = identity
   react.useEffect(() => {

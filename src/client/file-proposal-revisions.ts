@@ -1,3 +1,4 @@
+import { languageMatches } from '../shared/language-tag.js'
 import type { FileJobProposal } from '../shared/file-jobs.js'
 import type { TopicTerm, TermEvidenceRef } from '../memory/topic-terms.js'
 import type { TopicArchiveEntry } from '../memory/topic-archive.js'
@@ -26,7 +27,7 @@ export function reviewFileProposals(record: FileJobRecord, terms: readonly Topic
   for (const proposal of current) {
     if (proposal.kind === 'term') reviews[proposal.candidateId] = namesEntity(proposal.sourceForms, proposal.preferred, entities)
       ? { kind: 'blocked', message: '此名称已有对应实体，人物等实体名称不重复采纳为术语档案。请审阅实体条目。' }
-      : choose(terms.filter(entry => entry.targetLanguage === record.summary.targetLanguage && overlap([...entry.sourceForms, ...entry.aliases], proposal.sourceForms)))
+      : choose(terms.filter(entry => languageMatches(entry.targetLanguage, record.summary.targetLanguage) && overlap([...entry.sourceForms, ...entry.aliases], proposal.sourceForms)))
     else if (proposal.kind === 'entity') reviews[proposal.candidateId] = choose(archive.filter(entry => entry.kind === 'entity' &&
       overlap([entry.name, ...entry.aliases], [proposal.name, ...proposal.aliases])))
   }

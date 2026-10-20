@@ -1,3 +1,4 @@
+import { isFileJobUnit, hasUnitBody } from './translation-history.js'
 import { h, react } from './react.js'
 import { downloadExport } from './browser-download.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
@@ -53,7 +54,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     setExportRequest(request => request?.entries.some(entry => revisionDeletionChanged(entry.history, store.getTranslationHistory(entry.session.id))) ? undefined : request)
     setDrafts(current => new Map([...current].filter(([key, draft]) => {
       const [id, unitId] = JSON.parse(key) as [string, string]
-      return !store.isSessionDeleted(id) && Boolean(store.getTranslationHistory(id)?.units.find(unit => unit.id === unitId)?.revisions.some(revision => revision.id === draft.baseRevisionId && (!('status' in revision) || revision.status !== 'deleted')))
+      return !store.isSessionDeleted(id) && Boolean(store.getTranslationHistory(id)?.units.filter(hasUnitBody).find(unit => unit.id === unitId)?.revisions.some(revision => revision.id === draft.baseRevisionId && (!('status' in revision) || revision.status !== 'deleted')))
     })))
   }), [store])
   react.useEffect(() => objects?.subscribe(() => refresh(value => value + 1)), [objects])
@@ -76,7 +77,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   function deliverExport(result: TopicTranslationExport, request: Omit<PendingRecordsExport, 'result'>): void {
     if (request.entries.some(({ session, history }) => {
       const current = store.getSession(session.id)
-      return !current || store.isSessionDeleted(session.id) || current.ownerId !== session.ownerId || current.topicId !== request.topic.topicId || revisionDeletionChanged(history, store.getTranslationHistory(session.id))
+      return !current || store.isSessionDeleted(session.id) || current.topicId !== request.topic.topicId || revisionDeletionChanged(history, store.getTranslationHistory(session.id))
     })) { setMessage('导出范围已不可用，请重新导出。'); return }
     try {
       const download = allowPartialTranslationExport(result)
@@ -102,8 +103,8 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
         if (!history) throw new Error('Session no longer available')
         return { session, history }
       })
-      const references = targets.flatMap(session => objects?.getSnapshot(session.ownerId, topicId, session.id).references ?? [])
-      const frozen = { ...structuredClone({ topic: { ownerId: store.getTopicAssetOwner(topicId) ?? ownerId, topicId, topicName: topic.name }, references, fileJobs: fileJobs?.exportUnits(targets.map(session => session.id)), scope, format, exportedAt: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
+      const references = targets.flatMap(session => objects?.getSnapshot(store.getTopicStorageScope(session.topicId)!, topicId, session.id).references ?? [])
+      const frozen = { ...structuredClone({ topic: { ownerId: store.getTopicStorageScope(topicId) ?? ownerId, topicId, topicName: topic.name }, references, fileJobs: fileJobs?.exportUnits(targets.map(session => session.id)), scope, format, exportedAt: new Date().toISOString() }), entries: entries.map(({ session, history }) => ({ session: structuredClone(session), history })) }
       setExportLabel(scope === 'topic' ? `主题「${topic.name}」` : `会话「${selectedSession!.remark || selectedSession!.name}」`)
       const result = await projectExport(frozen, documents)
       if (!active()) return
@@ -159,7 +160,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
           const latest = unit.revisions.at(-1)
           const candidate = latest?.accepted && latest.status === 'completed' && latest.text.trim() && latest.id !== final?.id ? latest : undefined
           const archived = session.archivedAt !== null
-          const target = { ownerId: session.ownerId, topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
+          const target = { ownerId: store.getTopicStorageScope(session.topicId)!, topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
           function startEditing(revision: TextRevision): void {
             setDrafts(current => {
               const existing = current.get(key)
@@ -185,7 +186,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
             return h('div', { className: 'dsh-tp-record-revision', 'data-revision-kind': kind, 'data-revision-id': revision.id },
               h('small', { className: 'dsh-tp-muted' }, isCandidate
                 ? `候选 · 版本 ${revision.order}${stale ? ` · 已过时（原文版本 ${revision.sourceVersion}）` : ''}`
-                : `版本 ${revision.order} · ${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`),
+                : `版本 ${revision.order} · ${!isFileJobUnit(unit) && unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`),
               h(RecordObjectText, { text: revision.text, target: revisionTarget, objects, objectAssets }),
               h('div', { className: 'dsh-tp-actions dsh-tp-record-version-actions' },
                 h('button', { type: 'button', 'aria-label': `${isCandidate ? '复制候选版本' : '复制最终译文'} ${revision.order}`, onClick: () => { void copy(recordObjectPlainText(revision.text, revisionTarget, objects?.getReferences(revisionTarget) ?? [])) } }, '复制'),
@@ -224,7 +225,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
                 !final && !candidate ? h('p', { className: 'dsh-tp-muted' }, '尚无最终译文。') : null,
                 h('div', { className: 'dsh-tp-record-actions', hidden: !open },
                   pointed && !final ? h('p', { className: 'dsh-tp-muted' }, pointed.sourceVersion !== unit.sourceVersion ? `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中`) : null))),
-            h('div', { className: 'dsh-tp-record-actions', hidden: !open }, h(RecordObjectEditor, { session, unit, objects, objectAssets }))
+            h('div', { className: 'dsh-tp-record-actions', hidden: !open }, h(RecordObjectEditor, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, session, unit, objects, objectAssets }))
           )
         })))))
 }

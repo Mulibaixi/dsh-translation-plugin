@@ -2,7 +2,7 @@ import { parseReferenceAssetSelection, parseReferenceContextAsset, type Referenc
 import { parseReferenceFacts, parseReferenceIndex, type ReferenceFacts, type ReferenceIndex } from './reference-memory.js'
 import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
-import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, parseNormalTranslationUpdate, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseNormalTranslationCorrectionReceipt, type NormalTranslationAcceptance, type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationUnitTarget, type NormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt } from './normal-translation.js'
+import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, parseNormalTranslationUpdate, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseNormalTranslationCorrectionReceipt, parseDirectTranslationCommit, parseDirectTranslationReceipt, parseDirectTranslationExport, type NormalTranslationAcceptance, type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationUnitTarget, type NormalTranslationTarget, type NormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt, type DirectTranslationCommit, type DirectTranslationReceipt, type NormalTranslationExport } from './normal-translation.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { parseNormalTranslationV2Event, type NormalTranslationResolution, type NormalTranslationV2Event } from './normal-translation-v2.js'
 import { parseDocumentAcceptRequest, parseDocumentBlockRegistration, parseDocumentTaskEvent, parseDocumentTaskFinish, parseDocumentTaskScope,
@@ -28,10 +28,16 @@ import { parseDocumentReviewPageRequest, parseDocumentReviewPage, parseDocumentR
   parseDocumentTaskTermsRequest, parseDocumentTaskTermsReply, type DocumentTaskTermsRequest, type DocumentTaskTermsReply } from './document-review-bridge.js'
 
 import { parseFileHistoryRequest, parseFileHistoryValue, parseFileHistoryUnit, type FileHistoryRequest, type FileHistoryValue, type FileHistoryUnit } from './file-history.js'
+import { parseUnitRequest, parseUnitDirectory, parseUnitContent, type UnitDirectoryRequest, type UnitReadRequest, type UnitDirectory, type UnitContent } from './numbered-units.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
-export interface TopicBridgeOpen { readonly ownerId: string; readonly mainSessionId: string; readonly assetNamespaceId?: string }
+export interface LibraryConnectionIdentity { readonly namespaceId: string }
+export function parseLibraryConnection(value: unknown): LibraryConnectionIdentity {
+  object(value); exact(value, ['namespaceId']); text(value.namespaceId)
+  return { namespaceId: value.namespaceId as string }
+}
+export interface TopicBridgeOpen { readonly mainSessionId: string; readonly namespaceId: string }
 export interface TopicBridgeCapability { readonly ready: boolean; readonly reason?: string }
 export interface TopicBridgeV2Capability extends TopicBridgeCapability { readonly normalProtocol: 2 }
 export type TopicPersistence = 'saved' | 'runtime_only'
@@ -46,7 +52,7 @@ export interface TopicSessionSummary {
   readonly topicId: string
   readonly name: string
   readonly mode: 'quick' | 'normal'
-  readonly publishedUnitIds: readonly string[]
+  readonly active: boolean
   readonly topicName: string
   readonly sequence: number
   readonly remark: string
@@ -71,6 +77,8 @@ export interface TopicUnitFact {
   readonly final: { readonly revisionId: string; readonly selection: 'automatic' | 'user_fixed'; readonly selectionEventId: string } | null
 }
 export type TopicBridgeCommand =
+  | ({ readonly kind: 'list_units' } & UnitDirectoryRequest)
+  | ({ readonly kind: 'read_units' } & UnitReadRequest)
   | { readonly kind: 'file_history'; readonly request: FileHistoryRequest }
   | { readonly kind: 'reference_assets'; readonly topicId: string; readonly selections: readonly ReferenceAssetSelection[] }
   | { readonly kind: 'reference_bind'; readonly operationId: string; readonly start: TopicSessionStart }
@@ -105,6 +113,8 @@ export type TopicBridgeCommand =
   | ({ readonly kind: 'normal_correct_source' } & NormalTranslationSourceCorrection)
   | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
   | ({ readonly kind: 'normal_prepare' } & NormalTranslationAcceptance)
+  | ({ readonly kind: 'normal_commit' } & DirectTranslationCommit)
+  | { readonly kind: 'normal_export'; readonly target: NormalTranslationTarget; readonly totalCodePoints?: number }
   | ({ readonly kind: 'normal_update' } & NormalTranslationUpdate)
   | { readonly kind: 'normal_v2_update'; readonly mainSessionId: string; readonly translationSessionId: string; readonly unitId: string; readonly operationId: string; readonly sourceVersion: number; readonly event: NormalTranslationV2Event }
   | { readonly kind: 'normal_exchange_resolve'; readonly translationSessionId: string; readonly exchangeId: string; readonly resolution: NormalTranslationResolution }
@@ -124,6 +134,8 @@ export type TopicBridgeCommand =
   | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
+  | { readonly kind: 'unit_directory'; readonly directory: UnitDirectory }
+  | { readonly kind: 'unit_contents'; readonly contents: readonly UnitContent[] }
   | { readonly kind: 'file_history'; readonly value: FileHistoryValue }
   | { readonly kind: 'file_unit'; readonly unit: FileHistoryUnit }
   | { readonly kind: 'reference_assets'; readonly assets: readonly ReferenceContextAsset[] }
@@ -147,6 +159,8 @@ export type TopicBridgeValue =
   | { readonly kind: 'normal_source_corrected'; readonly correction: NormalTranslationCorrectionReceipt }
   | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
   | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot }
+  | { readonly kind: 'normal_committed'; readonly receipt: DirectTranslationReceipt }
+  | { readonly kind: 'normal_exported'; readonly export: NormalTranslationExport }
   | { readonly kind: 'normal_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
   | { readonly kind: 'normal_v2_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
   | { readonly kind: 'normal_exchange_resolved'; readonly exchangeId: string; readonly version: number; readonly status: 'waiting_user' | 'resuming' | 'cancelled' }
@@ -196,17 +210,17 @@ function strings(value: unknown, maximum = 2048, count = 1000): asserts value is
   value.forEach(item => text(item, maximum))
 }
 export function parseTopicBridgeOpen(value: unknown): TopicBridgeOpen {
-  object(value); exact(value, ['ownerId', 'mainSessionId', ...(value.assetNamespaceId === undefined ? [] : ['assetNamespaceId'])]); text(value.ownerId); text(value.mainSessionId)
-  if (value.assetNamespaceId !== undefined) text(value.assetNamespaceId)
-  if (value.ownerId !== value.mainSessionId) throw new TypeError('Topic bridge requires its own main Session')
-  return { ownerId: value.ownerId, mainSessionId: value.mainSessionId, ...(value.assetNamespaceId === undefined ? {} : { assetNamespaceId: value.assetNamespaceId }) }
+  object(value); exact(value, ['mainSessionId', 'namespaceId']); text(value.mainSessionId); text(value.namespaceId)
+  return { mainSessionId: value.mainSessionId, namespaceId: value.namespaceId }
 }
-export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 = 1): TopicBridgeCommand {
+export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 = 1): TopicBridgeCommand {
   object(value)
   if (protocol === 1 && String(value.kind).startsWith('document_review_')) throw new TypeError('Document review requires topic bridge v2')
-  if (protocol === 1 && ['normal_v2_update', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe', 'document_control', 'document_restore', 'document_capture', 'document_correct', 'document_accept_unit', 'preparation_review_correction', 'document_correct_observe', 'document_task_terms'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
-  if (String(value.kind).startsWith('reference_') && protocol !== 3) throw new TypeError('Reference memory requires topic bridge v3')
+  if (protocol === 1 && ['normal_v2_update', 'normal_commit', 'normal_export', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe', 'document_control', 'document_restore', 'document_capture', 'document_correct', 'document_accept_unit', 'preparation_review_correction', 'document_correct_observe', 'document_task_terms'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
+  if (String(value.kind).startsWith('reference_') && protocol < 3) throw new TypeError('Reference memory requires topic bridge v3')
   switch (value.kind) {
+    case 'list_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, false) } }
+    case 'read_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, true) } }
       case 'reference_assets': {
         exact(value, ['kind','topicId','selections']); text(value.topicId)
         if (!Array.isArray(value.selections) || value.selections.length > 100) throw new TypeError('Invalid asset selections')
@@ -269,6 +283,16 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 = 1)
         exact(value, ['kind', 'envelope', 'operationId', 'organizedRequirements', 'termReferences', ...(Object.hasOwn(value,'referenceContextRef') ? ['referenceContextRef'] : [])])
         return { kind: value.kind, ...parseNormalTranslationAcceptance({ envelope: value.envelope, operationId: value.operationId,
           organizedRequirements: value.organizedRequirements, termReferences: value.termReferences, ...(value.referenceContextRef === undefined ? {} : {referenceContextRef:value.referenceContextRef}) }) }
+      }
+      case 'normal_commit': {
+        const { kind, ...commit } = value
+        return { kind: 'normal_commit', ...parseDirectTranslationCommit(commit) }
+      }
+      case 'normal_export': {
+        exact(value, ['kind', 'target', ...(value.totalCodePoints === undefined ? [] : ['totalCodePoints'])])
+        if (value.totalCodePoints !== undefined) integer(value.totalCodePoints, 1)
+        return { kind: 'normal_export', target: parseNormalTranslationTarget(value.target),
+          ...(value.totalCodePoints === undefined ? {} : { totalCodePoints: value.totalCodePoints as number }) }
       }
       case 'normal_update': {
         const { kind, ...update } = value
@@ -346,18 +370,18 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 = 1)
   if (['read_unit', 'list_terms', 'query_terms'].includes(value.kind as string)) text(value.translationSessionId)
   return structuredClone(value) as unknown as TopicBridgeCommand
 }
-export function parseTopicBridgeDown(value: unknown, protocol: 1 | 2 | 3 = 1): TopicBridgeDown {
+export function parseTopicBridgeDown(value: unknown, protocol: 1 | 2 | 3 | 4 = 1): TopicBridgeDown {
   object(value)
   if (value.kind === 'ready') {
-    exact(value, ['kind', 'ownerId', 'mainSessionId', ...(value.assetNamespaceId === undefined ? [] : ['assetNamespaceId'])])
-    return { kind: 'ready', ...parseTopicBridgeOpen({ ownerId: value.ownerId, mainSessionId: value.mainSessionId, ...(value.assetNamespaceId === undefined ? {} : { assetNamespaceId: value.assetNamespaceId }) }) }
+    exact(value, ['kind', 'mainSessionId', 'namespaceId'])
+    return { kind: 'ready', ...parseTopicBridgeOpen({ mainSessionId: value.mainSessionId, namespaceId: value.namespaceId }) }
   }
   exact(value, ['kind', 'requestId', 'mainSessionId', 'callId', 'command'])
   if (value.kind !== 'request') throw new TypeError('Invalid topic bridge frame')
   text(value.requestId); text(value.mainSessionId); text(value.callId)
   return { kind: 'request', requestId: value.requestId, mainSessionId: value.mainSessionId, callId: value.callId, command: parseTopicBridgeCommand(value.command, protocol) }
 }
-function parseUnit(value: unknown, protocol: 1 | 2 | 3): TopicUnitFact {
+function parseUnit(value: unknown, protocol: 1 | 2 | 3 | 4): TopicUnitFact {
   object(value); exact(value, ['id', 'order', 'source', 'targetLanguage', 'instruction', 'revisions', 'final', ...(value.sourceVersion === undefined ? [] : ['sourceVersion'])])
   const sourceVersion = value.sourceVersion ?? 1; integer(sourceVersion, 1)
   text(value.id); integer(value.order, 1); text(value.source, 2_000_000); text(value.targetLanguage, 200); text(value.instruction, 20_000, true)
@@ -376,24 +400,29 @@ function parseUnit(value: unknown, protocol: 1 | 2 | 3): TopicUnitFact {
   return { ...structuredClone(value), sourceVersion, revisions: value.revisions.map(revision => ({ ...structuredClone(revision), sourceVersion: revision.sourceVersion ?? 1 })) } as unknown as TopicUnitFact
 }
 function sessionSummary(value: unknown): void {
-  object(value); exact(value, ['id', 'topicId', 'name', 'mode', 'publishedUnitIds', 'topicName', 'sequence', 'remark', 'archived'])
+  object(value); exact(value, ['id', 'topicId', 'name', 'mode', 'active', 'topicName', 'sequence', 'remark', 'archived'])
   text(value.id); text(value.topicId); content(value.name, 200); content(value.topicName, 120); integer(value.sequence); content(value.remark, 1000, true); boolean(value.archived)
   if (value.mode !== 'quick' && value.mode !== 'normal') throw new TypeError('Invalid translation Session mode')
-  strings(value.publishedUnitIds)
+  boolean(value.active)
 }
-function parseValue(value: unknown, protocol: 1 | 2 | 3): TopicBridgeValue {
+function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
   if (value && typeof value === 'object' && 'kind' in value && value.kind === 'reference_assets') {
     object(value); exact(value,['kind','assets'])
-    if (protocol !== 3 || !Array.isArray((value as Record<string,unknown>).assets) || ((value as Record<string,unknown>).assets as unknown[]).length > 100) throw new TypeError('Invalid reference asset reply')
+    if (protocol < 3 || !Array.isArray((value as Record<string,unknown>).assets) || ((value as Record<string,unknown>).assets as unknown[]).length > 100) throw new TypeError('Invalid reference asset reply')
     return {kind:'reference_assets', assets:((value as Record<string,unknown>).assets as unknown[]).map(parseReferenceContextAsset)}
   }
   if (value && typeof value === 'object' && 'kind' in value && value.kind === 'reference_facts') {
-    if (protocol !== 3) throw new TypeError('Reference memory requires topic bridge v3')
+    if (protocol < 3) throw new TypeError('Reference memory requires topic bridge v3')
     object(value); exact(value, ['kind', 'facts']); return { kind: 'reference_facts', facts: parseReferenceFacts((value as Record<string, unknown>).facts) }
   }
   object(value)
-  if (protocol === 1 && (String(value.kind).startsWith('document_review_') || ['normal_v2_updated', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string))) throw new TypeError('Reply requires topic bridge v2')
+  if (protocol === 1 && (String(value.kind).startsWith('document_review_') || ['normal_v2_updated', 'normal_committed', 'normal_exported', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string))) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
+    case 'unit_directory': exact(value, ['kind', 'directory']); return { kind: 'unit_directory', directory: parseUnitDirectory(value.directory) }
+    case 'unit_contents':
+      exact(value, ['kind', 'contents'])
+      if (!Array.isArray(value.contents) || !value.contents.length || value.contents.length > 8) throw new TypeError('Invalid unit content list')
+      return { kind: 'unit_contents', contents: value.contents.map(parseUnitContent) }
     case 'document_review_page': exact(value, ['kind', 'page']); return { kind: 'document_review_page', page: parseDocumentReviewPage(value.page) }
     case 'document_review_text': exact(value, ['kind', 'page']); return { kind: 'document_review_text', page: parseDocumentReviewTextPage(value.page) }
     case 'document_task_terms': { exact(value, ['kind', 'terms', 'added', 'skipped', 'message']); return { kind: 'document_task_terms', ...parseDocumentTaskTermsReply(value) } }
@@ -421,6 +450,14 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3): TopicBridgeValue {
       const termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)
       if (!termSnapshot || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation preparation')
       return { kind: 'normal_prepared', termSnapshot }
+    }
+    case 'normal_committed': {
+      exact(value, ['kind', 'receipt'])
+      return { kind: 'normal_committed', receipt: parseDirectTranslationReceipt(value.receipt) }
+    }
+    case 'normal_exported': {
+      exact(value, ['kind', 'export'])
+      return { kind: 'normal_exported', export: parseDirectTranslationExport(value.export) }
     }
     case 'normal_updated': {
       exact(value, ['kind', 'operation', 'callId', 'sequence']); if (value.callId !== null) text(value.callId); integer(value.sequence, 1)
@@ -478,7 +515,7 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3): TopicBridgeValue {
   return structuredClone(value) as unknown as TopicBridgeValue
 }
 /** Untrusted uplink parsing happens once at the Gateway boundary. */
-export function parseTopicBridgeReply(value: unknown, protocol: 1 | 2 | 3 = 1): TopicBridgeReply {
+export function parseTopicBridgeReply(value: unknown, protocol: 1 | 2 | 3 | 4 = 1): TopicBridgeReply {
   object(value); text(value.requestId)
   if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) throw new TypeError('Topic reply exceeds Gateway budget')
   if (value.ok === true) {
@@ -505,6 +542,12 @@ export function parseTopicBridgeV2Capability(value: unknown): TopicBridgeV2Capab
 }
 /** Public InvocationDescriptor fields from the installed Gateway's stream/uplink contract. */
 export const TOPIC_BRIDGE_REMOTE = { package: packageName, descriptors: [
+  { id: packageName+'#translationTopics/capabilitiesV4', service: 'translationTopics', namespace: 'translationTopics', method: 'capabilitiesV4', invocation: { kind: 'direct' as const }, parameters: [],
+    result: codec('capabilityV4', value => { object(value); exact(value, ['ready', 'contentProtocol', ...(value.reason === undefined ? [] : ['reason'])]); if (typeof value.ready !== 'boolean' || value.contentProtocol !== 3 || value.reason !== undefined && typeof value.reason !== 'string') throw new TypeError('Content protocol mismatch'); return structuredClone(value) as unknown as { ready: boolean; contentProtocol: 3; reason?: string } }) },
+  { id: packageName+'#translationTopics/connectV4', service: 'translationTopics', namespace: 'translationTopics', method: 'connectV4', mode: 'stream' as const, invocation: { kind: 'direct' as const },
+    parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: codec('openV4', parseTopicBridgeOpen) }], cancellation: { parameter: 'signal' }, result: codec('downV4', value => parseTopicBridgeDown(value, 4)), uplink: { codec: codec('replyV4', value => parseTopicBridgeReply(value, 4)) } },
+  { id: packageName+'#translationTopics/connectLibrary', service: 'translationTopics', namespace: 'translationTopics', method: 'connectLibrary', mode: 'stream' as const,
+    invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: codec('libraryConnection', parseLibraryConnection) }], cancellation: { parameter: 'signal' }, result: codec('libraryReady', parseLibraryConnection) },
   { id: `${packageName}#translationTopics/capabilities`, service: 'translationTopics', namespace: 'translationTopics', method: 'capabilities',
     invocation: { kind: 'direct' as const }, parameters: [], result: codec('capability', parseTopicBridgeCapability) },
   { id: `${packageName}#translationTopics/connect`, service: 'translationTopics', namespace: 'translationTopics', method: 'connect', mode: 'stream' as const,

@@ -38,7 +38,7 @@ interface AnalysisJob {
 }
 export interface TerminologyAnalysisOptions {
   readonly loadModule?: LlmModuleLoader
-  readonly phaseNotificationCapabilities?: () => { readonly phaseProtocol: 1; readonly ready: boolean; readonly reason: string | null }
+  readonly phaseNotificationCapabilities?: () => { readonly phaseProtocol: 2; readonly ready: boolean; readonly reason: string | null }
   readonly phaseNotifier?: () => ((run: AnalysisRun) => Promise<AnalysisNotification>) | undefined
 }
 function ok<T>(value: T): AnalysisResult<T> { return { ok: true, value: structuredClone(value) } }
@@ -159,7 +159,7 @@ export class TerminologyAnalysisService {
     const notification: AnalysisNotification = capability?.ready && phaseNotifier ? { state: 'pending', reason: null }
       : { state: 'unavailable', reason: capability?.reason ?? '自动阶段通知接口尚未就绪，可查询原分析结果。' }
     const run: AnalysisRun = { analysisId: request.analysisId, version: 1, operationId: request.operationId, target: request.target,
-      scope: { ownerId: envelope.ownerId, mainSessionId: envelope.mainSessionId, topicId: envelope.material.topicId, translationSessionId: envelope.material.translationSessionId },
+      scope: { ownerId: envelope.mainSessionId, mainSessionId: envelope.mainSessionId, topicId: envelope.material.topicId, translationSessionId: envelope.material.translationSessionId },
       sourceVersion: envelope.material.sourceVersion, route, status: 'frozen', totalCodePoints: total,
       requestedRanges: selected.ranges, excludedRanges: selected.excluded, coverageComplete: false, coverageMeaning: 'mechanical_source_scan', completedCodePoints: 0,
       candidateCount: 0, plannedCalls: scanRanges.length, actualCalls: 0, error: null, notification, storage: 'runtime_only', createdAt: at, updatedAt: at }

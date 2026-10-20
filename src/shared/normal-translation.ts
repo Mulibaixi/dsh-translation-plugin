@@ -1,7 +1,6 @@
 import { parseReferenceContextRef, type ReferenceContextRef } from './reference-memory.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
-import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type TranslationCallMetadata } from './translation-call.js'
-
+import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type NormalTranslationTerm, type TranslationCallMetadata } from './translation-call.js'
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
 export interface NormalTranslationMaterialTarget {
   readonly kind: 'material'
@@ -51,6 +50,77 @@ export interface NormalTranslationAcceptance {
   readonly organizedRequirements: string
   readonly termReferences: readonly NormalTranslationTermReference[]
   readonly referenceContextRef?: ReferenceContextRef
+}
+export interface DirectTranslationDraftTerm {
+  readonly sourceForms: readonly string[]
+  readonly preferred: string
+  readonly forbidden: readonly string[]
+  readonly sense: string
+}
+/** Draft candidates share the worker payload shape but never carry user authority. */
+export function draftTranslationTerms(draft: readonly DirectTranslationDraftTerm[] | undefined): readonly NormalTranslationTerm[] {
+  return (draft ?? []).map((term, index) => ({ id: `draft:${index + 1}`, entryVersion: 1, sourceForms: [...term.sourceForms], aliases: [],
+    sense: term.sense, preferred: term.preferred, forbidden: [...term.forbidden], userFixed: false, priority: 0 }))
+}
+/**
+ * One direct short-text call: the translation model runs once and the main model must review the
+ * returned body. Requirements, the model's own notes and auxiliary context stay distinct.
+ * `range` asks the Host to read that exact frozen source interval of a text file; `body` supplies
+ * a main-model-organized body for a non-text original (for example extracted PDF or image text).
+ */
+export interface DirectTranslationRequest {
+  readonly target: NormalTranslationTarget
+  readonly operationId: string
+  /** Verbatim user requirements for this task; never a model paraphrase. */
+  readonly userRequirements: string
+  /** The main model's own organization for this call only. */
+  readonly organizedNotes: string
+  /** Background that helps understanding and must not be translated; never empty when present. */
+  readonly auxiliaryContext: string
+  readonly termReferences: readonly NormalTranslationTermReference[]
+  readonly referenceContextRef?: ReferenceContextRef
+  readonly range?: DirectTranslationRange
+  readonly body?: string
+  /** Main-model integrated candidates for this call; authority 0, never formal memory. */
+  readonly draftTerms?: readonly DirectTranslationDraftTerm[]
+}
+export interface DirectTranslationRange { readonly start: number; readonly end: number }
+/** The Client writes the admitted unit and its completed body in one transaction. */
+export interface DirectTranslationCommit {
+  readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>
+  readonly operationId: string
+  readonly userRequirements: string
+  readonly organizedNotes: string
+  readonly auxiliaryContext: string
+  readonly termReferences: readonly NormalTranslationTermReference[]
+  readonly revisionId: string
+  readonly status: 'completed' | 'failed' | 'cancelled'
+  readonly text: string
+  readonly message: string
+  readonly callRecord: TranslationCallMetadata
+  readonly referenceContextRef?: ReferenceContextRef
+  /** The exact source body this call translated when the material has no inline short text. */
+  readonly sourceText?: string
+  readonly range?: DirectTranslationRange
+  /** The body was extracted and organized by the main model, not read from the frozen original. */
+  readonly body?: boolean
+  readonly draftTerms?: readonly DirectTranslationDraftTerm[]
+}
+export interface DirectTranslationReceipt {
+  readonly operationId: string
+  readonly mainSessionId: string
+  readonly translationSessionId: string
+  readonly topicId: string
+  readonly unitId: string
+  readonly revisionId: string
+  readonly sourceVersion: number
+  readonly status: 'completed' | 'failed' | 'cancelled'
+  readonly textCodePoints: number
+  readonly persistence: 'saved' | 'runtime_only'
+}
+export interface NormalTranslationResultRead {
+  readonly operationId: string
+  readonly range: { readonly start: number; readonly end: number }
 }
 export interface NormalTranslationOperation {
   readonly operationId: string
@@ -154,6 +224,153 @@ export function parseNormalTranslationExecute(value: unknown): NormalTranslation
   const target = parseNormalTranslationTarget(value.target)
   text(value.operationId); text(value.organizedRequirements, 4000, true); references(value.termReferences)
   return { target, operationId: value.operationId, organizedRequirements: value.organizedRequirements, termReferences: structuredClone(value.termReferences), ...(value.referenceContextRef === undefined ? {} : {referenceContextRef: parseReferenceContextRef(value.referenceContextRef)}) }
+}
+function parseDraftTerms(value: unknown): readonly DirectTranslationDraftTerm[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length > 50) throw new TypeError('Invalid draft terminology')
+  return value.map((term): DirectTranslationDraftTerm => {
+    object(term)
+    const optional = ['forbidden', 'sense'].filter(field => Object.hasOwn(term, field))
+    exact(term, ['sourceForms', 'preferred', ...optional])
+    if (!Array.isArray(term.sourceForms) || term.sourceForms.length === 0 || term.sourceForms.length > 5) throw new TypeError('Invalid draft terminology source forms')
+    const sourceForms = term.sourceForms.map(form => { text(form, 200); return form as string })
+    text(term.preferred, 200)
+    const forbidden = term.forbidden ?? []
+    if (!Array.isArray(forbidden) || forbidden.length > 10) throw new TypeError('Invalid draft terminology forbidden forms')
+    forbidden.forEach(form => text(form, 200))
+    const sense = term.sense ?? ''
+    text(sense, 1000, true)
+    return { sourceForms, preferred: term.preferred, forbidden: forbidden as string[], sense: sense as string }
+  })
+}
+export function parseDirectTranslationRequest(value: unknown): DirectTranslationRequest {
+  object(value)
+  // Omitted optional inputs mean "none"; a model never has to serialize an empty string or array.
+  const optional = ['organizedNotes', 'auxiliaryContext', 'userRequirements', 'termReferences', 'range', 'body', 'draftTerms'].filter(field => Object.hasOwn(value, field))
+  exact(value, ['target', 'operationId', ...optional,
+    ...(Object.hasOwn(value, 'referenceContextRef') ? ['referenceContextRef'] : [])])
+  const target = parseNormalTranslationTarget(value.target)
+  text(value.operationId)
+  const organizedNotes = value.organizedNotes ?? '', auxiliaryContext = value.auxiliaryContext ?? ''
+  const userRequirements = value.userRequirements ?? '', termReferences = value.termReferences ?? []
+  text(userRequirements, 4000, true); text(organizedNotes, 4000, true); text(auxiliaryContext, 8000, true)
+  references(termReferences)
+  const range = value.range === undefined ? undefined : parseDirectRange(value.range)
+  if (value.body !== undefined) text(value.body, 2_000_000)
+  const draftTerms = parseDraftTerms(value.draftTerms)
+  if (range && value.body !== undefined) throw new TypeError('A direct call takes either a frozen range or an organized body, not both')
+  if (target.kind === 'unit' && (range || value.body !== undefined)) throw new TypeError('Unit calls have no range or replacement body')
+  return { target, operationId: value.operationId, userRequirements, organizedNotes, auxiliaryContext,
+    termReferences: structuredClone(termReferences), ...(range ? { range } : {}), ...(value.body === undefined ? {} : { body: value.body as string }),
+    ...(draftTerms === undefined ? {} : { draftTerms }),
+    ...(value.referenceContextRef === undefined ? {} : { referenceContextRef: parseReferenceContextRef(value.referenceContextRef) }) }
+}
+function parseDirectRange(value: unknown): DirectTranslationRange {
+  object(value); exact(value, ['start', 'end'])
+  const { start, end } = value
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || (start as number) < 0 || (end as number) <= (start as number) || (end as number) - (start as number) > 2_000_000) {
+    throw new TypeError('A source range must be a nonempty Unicode code point interval [start, end)')
+  }
+  return { start: start as number, end: end as number }
+}
+export function parseDirectTranslationCommit(value: unknown): DirectTranslationCommit {
+  object(value)
+  const optional = ['organizedNotes', 'auxiliaryContext', 'range', 'sourceText', 'body', 'draftTerms'].filter(field => Object.hasOwn(value, field))
+  exact(value, ['envelope', 'operationId', 'userRequirements', 'termReferences', 'revisionId', 'status', 'text', 'message', 'callRecord', ...optional,
+    ...(Object.hasOwn(value, 'referenceContextRef') ? ['referenceContextRef'] : [])])
+  const envelope = parseTranslationMaterialEnvelope(value.envelope)
+  if (envelope.kind !== 'material') throw new TypeError('Direct translation requires material')
+  text(value.operationId); text(value.userRequirements, 4000, true); text(value.revisionId); text(value.message, 1000, true)
+  references(value.termReferences)
+  if (!['completed', 'failed', 'cancelled'].includes(value.status as string)) throw new TypeError('Invalid direct translation status')
+  text(value.text, 2_000_000, true)
+  if (value.status === 'completed' && !(value.text as string).trim()) throw new TypeError('Completed translation requires a body')
+  const organizedNotes = value.organizedNotes ?? '', auxiliaryContext = value.auxiliaryContext ?? ''
+  text(organizedNotes, 4000, true); text(auxiliaryContext, 8000, true)
+  const range = value.range === undefined ? undefined : parseDirectRange(value.range)
+  const body = value.body === true
+  if (value.body !== undefined && typeof value.body !== 'boolean') throw new TypeError('Invalid organized body flag')
+  const draftTerms = parseDraftTerms(value.draftTerms)
+  if (body && range) throw new TypeError('An organized body has no frozen source range')
+  if (range) {
+    const total = envelope.material.sourceRef?.totalCodePoints
+    if (!total || range.end > total) throw new TypeError('A source range must stay inside the frozen original')
+  }
+  if (value.sourceText !== undefined) {
+    text(value.sourceText, 2_000_000)
+    if (range && Array.from(value.sourceText as string).length !== range.end - range.start) throw new TypeError('Source batch length does not match its range')
+  }
+  // A file material has no inline text: the Client can only admit the unit when it receives the exact body.
+  if (envelope.material.sourceText === undefined && value.sourceText === undefined) throw new TypeError('File results require the exact source body')
+  if (envelope.material.sourceText === undefined && !range && !body) throw new TypeError('File results require a source range or an organized body flag')
+  return { envelope, operationId: value.operationId, userRequirements: value.userRequirements, organizedNotes, auxiliaryContext,
+    termReferences: structuredClone(value.termReferences), revisionId: value.revisionId,
+    status: value.status as DirectTranslationCommit['status'], text: value.text, message: value.message,
+    callRecord: parseTranslationCallMetadata(value.callRecord), ...(range ? { range } : {}), ...(body ? { body: true } : {}),
+    ...(draftTerms === undefined ? {} : { draftTerms }),
+    ...(value.sourceText === undefined ? {} : { sourceText: value.sourceText as string }),
+    ...(value.referenceContextRef === undefined ? {} : { referenceContextRef: parseReferenceContextRef(value.referenceContextRef) }) }
+}
+export function parseDirectTranslationReceipt(value: unknown): DirectTranslationReceipt {
+  object(value)
+  exact(value, ['operationId', 'mainSessionId', 'translationSessionId', 'topicId', 'unitId', 'revisionId', 'sourceVersion', 'status', 'textCodePoints', 'persistence'])
+  for (const field of ['operationId', 'mainSessionId', 'translationSessionId', 'topicId', 'unitId', 'revisionId']) text(value[field])
+  version(value.sourceVersion)
+  if (!Number.isSafeInteger(value.textCodePoints) || (value.textCodePoints as number) < 0) throw new TypeError('Invalid direct translation length')
+  if (!['completed', 'failed', 'cancelled'].includes(value.status as string) || !['saved', 'runtime_only'].includes(value.persistence as string)) throw new TypeError('Invalid direct translation receipt')
+  return structuredClone(value) as unknown as DirectTranslationReceipt
+}
+/** Exact current result of one material: one full unit, or contiguous range segments in source order. */
+export interface NormalTranslationExportSegment {
+  readonly unitId: string
+  readonly range: DirectTranslationRange | null
+  readonly revisionId: string
+  readonly status: 'completed' | 'failed' | 'cancelled'
+  readonly text: string
+}
+export interface NormalTranslationExport {
+  readonly mainSessionId: string
+  readonly translationSessionId: string
+  readonly topicId: string
+  readonly materialId: string | null
+  readonly sourceVersion: number
+  readonly totalCodePoints: number
+  readonly complete: boolean
+  readonly segments: readonly NormalTranslationExportSegment[]
+  readonly missing: readonly DirectTranslationRange[]
+  readonly overlapping: readonly DirectTranslationRange[]
+}
+export function parseDirectTranslationExport(value: unknown): NormalTranslationExport {
+  object(value)
+  exact(value, ['mainSessionId', 'translationSessionId', 'topicId', 'materialId', 'sourceVersion', 'totalCodePoints', 'complete', 'segments', 'missing', 'overlapping'])
+  const mainSessionId = value.mainSessionId, translationSessionId = value.translationSessionId
+  const topicId = value.topicId, materialId = value.materialId, sourceVersion = value.sourceVersion
+  const totalCodePoints = value.totalCodePoints, complete = value.complete
+  text(mainSessionId); text(translationSessionId); text(topicId)
+  if (materialId !== null) text(materialId)
+  if (!Number.isSafeInteger(sourceVersion) || (sourceVersion as number) < 1) throw new TypeError('Invalid export source version')
+  if (!Number.isSafeInteger(totalCodePoints) || (totalCodePoints as number) < 0) throw new TypeError('Invalid export length')
+  if (typeof complete !== 'boolean') throw new TypeError('Invalid export completeness')
+  if (!Array.isArray(value.segments) || value.segments.length > 200 || !Array.isArray(value.missing) || value.missing.length > 200 || !Array.isArray(value.overlapping) || value.overlapping.length > 200) throw new TypeError('Invalid export segments')
+  const segments = value.segments.map((segment): NormalTranslationExportSegment => {
+    object(segment); exact(segment, ['unitId', 'range', 'revisionId', 'status', 'text'])
+    text(segment.unitId); text(segment.revisionId); text(segment.text, 2_000_000, true)
+    if (!['completed', 'failed', 'cancelled'].includes(segment.status as string)) throw new TypeError('Invalid export revision status')
+    return { unitId: segment.unitId, range: segment.range === null ? null : parseDirectRange(segment.range), revisionId: segment.revisionId,
+      status: segment.status as NormalTranslationExportSegment['status'], text: segment.text }
+  })
+  return { mainSessionId, translationSessionId, topicId, materialId, sourceVersion: sourceVersion as number,
+    totalCodePoints: totalCodePoints as number, complete, segments, missing: value.missing.map(range => parseDirectRange(range)),
+    overlapping: value.overlapping.map(range => parseDirectRange(range)) }
+}
+export function parseNormalTranslationResultRead(value: unknown): NormalTranslationResultRead {
+  object(value); exact(value, ['operationId', 'range']); text(value.operationId)
+  object(value.range); exact(value.range, ['start', 'end'])
+  const { start, end } = value.range
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || (start as number) < 0 || (end as number) <= (start as number)) {
+    throw Object.assign(new TypeError('Result range must be a nonempty Unicode code point interval [start, end).'), { code: 'invalid_range' })
+  }
+  return { operationId: value.operationId, range: { start: start as number, end: end as number } }
 }
 export function parseNormalTranslationAcceptance(value: unknown): NormalTranslationAcceptance {
   object(value); exact(value, ['envelope', 'operationId', 'organizedRequirements', 'termReferences', ...(Object.hasOwn(value,'referenceContextRef') ? ['referenceContextRef'] : [])])

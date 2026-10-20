@@ -30,10 +30,10 @@ export function buildRecordObjectExport(request: RecordObjectExportRequest, allo
   if (request.format === 'txt') {
     const texts = [...entries].sort((a, b) => a.session.sequence - b.session.sequence || a.session.id.localeCompare(b.session.id)).flatMap(({ session, history }) => [...history.units].sort((a, b) => a.order - b.order).flatMap(unit => {
       const final = currentFinalRevision(unit)
-      return final ? [recordObjectPlainText(final.text, { ownerId: session.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: final.id }, refs)] : []
+      return final ? [recordObjectPlainText(final.text, { ownerId: refs.find(ref => ref.sessionId === session.id)?.ownerId ?? request.topic.ownerId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: final.id }, refs)] : []
     }))
     return { ...result, content: texts.join('\n\n') }
   }
-  const included = refs.filter(ref => entries.some(({ session, history }) => session.ownerId === ref.ownerId && session.topicId === ref.topicId && session.id === ref.sessionId && history.units.some(unit => isTextUnit(unit) && unit.id === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : currentFinalRevision(unit)?.id === ref.revisionId))))
-  return included.length ? { ...result, content: JSON.stringify({ ...JSON.parse(result.content), schemaVersion: 2, objectReferences: included }, null, 2) } : result
+  const included = refs.filter(ref => entries.some(({ session, history }) => session.topicId === ref.topicId && session.id === ref.sessionId && history.units.some(unit => isTextUnit(unit) && unit.id === ref.unitId && (ref.side === 'source' ? ref.revisionId === null : currentFinalRevision(unit)?.id === ref.revisionId))))
+  return included.length ? { ...result, content: JSON.stringify({ ...JSON.parse(result.content), objectReferences: included.map(({ ownerId: _storageScope, ...reference }) => reference) }, null, 2) } : result
 }
