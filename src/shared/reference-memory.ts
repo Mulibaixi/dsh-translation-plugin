@@ -55,6 +55,66 @@ export interface FrozenReferenceContext {
   readonly manifestRef: ReferenceContextRef
   readonly assets: readonly ReferenceContextAsset[]
   readonly excerpts: readonly ReferenceText[]
+  readonly files?: readonly ReferenceFileExcerpt[]
+  readonly records?: readonly TranslationRecordExcerpt[]
+}
+export interface TranslationRecordSelection {
+  readonly sessionId: string; readonly unitId: string; readonly sourceVersion: number; readonly finalId: string
+  readonly sourceRange: { readonly start: number; readonly end: number } | null
+  readonly translationRange: { readonly start: number; readonly end: number } | null
+  readonly sha256: string
+}
+export interface TranslationRecordExcerpt {
+  readonly selection: TranslationRecordSelection; readonly targetLanguage: string
+  readonly source: string | null; readonly translation: string | null
+  readonly sourceTotalCodePoints: number; readonly translationTotalCodePoints: number
+}
+export function parseTranslationRecordSelection(value: unknown): TranslationRecordSelection {
+  referenceObject(value); referenceExact(value, ['sessionId', 'unitId', 'sourceVersion', 'finalId', 'sourceRange', 'translationRange', 'sha256'])
+  referenceString(value.sessionId, 3000); referenceString(value.unitId); referenceString(value.finalId); referenceInteger(value.sourceVersion, 1)
+  if (typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.sha256)) throw new TypeError('Invalid translation record digest')
+  let size = 0
+  for (const range of [value.sourceRange, value.translationRange]) if (range !== null) {
+    referenceObject(range); referenceExact(range, ['start', 'end']); referenceInteger(range.start); referenceInteger(range.end, 1)
+    if (range.end <= range.start) throw new TypeError('Invalid translation record range')
+    size += range.end - range.start
+  }
+  if (size < 1 || size > REFERENCE_PAGE_POINTS) throw new RangeError('译例片段总计须为 1～4000 个 Unicode 码点。')
+  return structuredClone(value) as unknown as TranslationRecordSelection
+}
+export function parseTranslationRecordExcerpt(value: unknown): TranslationRecordExcerpt {
+  referenceObject(value); referenceExact(value, ['selection', 'targetLanguage', 'source', 'translation', 'sourceTotalCodePoints', 'translationTotalCodePoints'])
+  const selection = parseTranslationRecordSelection(value.selection); referenceString(value.targetLanguage, 80)
+  referenceInteger(value.sourceTotalCodePoints); referenceInteger(value.translationTotalCodePoints)
+  for (const [text, range, total] of [[value.source, selection.sourceRange, value.sourceTotalCodePoints], [value.translation, selection.translationRange, value.translationTotalCodePoints]] as const) {
+    if (range === null ? text !== null : typeof text !== 'string' || Array.from(text).length !== range.end - range.start || range.end > (total as number)) throw new TypeError('Invalid translation record excerpt')
+  }
+  return structuredClone(value) as unknown as TranslationRecordExcerpt
+}
+/** Exact immutable original and Unicode code-point coordinates, never a guessed bilingual alignment. */
+export interface ReferenceFileSelection {
+  readonly id: string; readonly version: number; readonly sha256: string
+  readonly range: { readonly start: number; readonly end: number }
+}
+export interface ReferenceFileExcerpt {
+  readonly selection: ReferenceFileSelection; readonly name: string; readonly category: 'full_text' | 'reference'
+  readonly totalCodePoints: number; readonly text: string
+}
+export function parseReferenceFileSelection(value: unknown): ReferenceFileSelection {
+  referenceObject(value); referenceExact(value, ['id', 'version', 'sha256', 'range'])
+  referenceString(value.id); referenceInteger(value.version, 1)
+  if (typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)) throw new TypeError('Invalid reference original digest')
+  referenceObject(value.range); referenceExact(value.range, ['start', 'end']); referenceInteger(value.range.start); referenceInteger(value.range.end, 1)
+  if (value.range.end <= value.range.start || value.range.end - value.range.start > REFERENCE_PAGE_POINTS) throw new RangeError('参考文件范围须为 1～4000 个 Unicode 码点。')
+  return structuredClone(value) as unknown as ReferenceFileSelection
+}
+export function parseReferenceFileExcerpt(value: unknown): ReferenceFileExcerpt {
+  referenceObject(value); referenceExact(value, ['selection', 'name', 'category', 'totalCodePoints', 'text'])
+  const selection = parseReferenceFileSelection(value.selection)
+  referenceString(value.name, 255); referenceInteger(value.totalCodePoints); referenceString(value.text, REFERENCE_PAGE_POINTS, true)
+  if (!['full_text', 'reference'].includes(String(value.category)) || selection.range.end > value.totalCodePoints || Array.from(value.text).length !== selection.range.end - selection.range.start)
+    throw new TypeError('Invalid reference file excerpt')
+  return structuredClone(value) as unknown as ReferenceFileExcerpt
 }
 export interface ReferenceContextRef { readonly id: string; readonly version: 1 }
 export interface ReferenceAssetSelection { readonly kind: 'entity' | 'fact' | 'relation'; readonly id: string; readonly version: number; readonly purpose: 'background' | 'translation_guidance' }
@@ -62,6 +122,8 @@ export interface ReferenceContextAsset extends ReferenceAssetSelection { readonl
 export interface ReferenceManifest {
   readonly id: string; readonly version: 1; readonly scope: ReferenceScope
   readonly assets: readonly ReferenceContextAsset[]; readonly references: readonly ReferenceEvidenceRef[]
+  readonly files?: readonly ReferenceFileExcerpt[]
+  readonly records?: readonly TranslationRecordExcerpt[]
 }
 export function parseReferenceContextRef(value: unknown): ReferenceContextRef {
   referenceObject(value); referenceExact(value, ['id', 'version']); referenceString(value.id)
@@ -79,17 +141,27 @@ export function parseReferenceContextAsset(value: unknown): ReferenceContextAsse
   return structuredClone(value) as unknown as ReferenceContextAsset
 }
 export function parseReferenceManifest(value: unknown): ReferenceManifest {
-  referenceObject(value); referenceExact(value, ['id', 'version', 'scope', 'assets', 'references'])
+  referenceObject(value); referenceExact(value, ['id', 'version', 'scope', 'assets', 'references'], ['files', 'records'])
   parseReferenceContextRef({ id: value.id, version: value.version }); parseReferenceScope(value.scope)
   if (!Array.isArray(value.assets) || value.assets.length > 100 || !Array.isArray(value.references) || value.references.length > 100) throw new TypeError('Reference selection exceeds budget')
   value.assets.forEach(parseReferenceContextAsset); value.references.forEach(parseReferenceEvidence)
+  if (value.files !== undefined) {
+    if (!Array.isArray(value.files) || value.files.length > 8) throw new TypeError('Reference file selection exceeds budget')
+    value.files.forEach(parseReferenceFileExcerpt)
+    if (new Set(value.files.map(item => JSON.stringify((item as ReferenceFileExcerpt).selection))).size !== value.files.length) throw new TypeError('Duplicate reference file selection')
+  }
+  if (value.records !== undefined) {
+    if (!Array.isArray(value.records) || value.records.length > 8) throw new TypeError('Translation record selection exceeds budget')
+    value.records.forEach(parseTranslationRecordExcerpt)
+    if (new Set(value.records.map(item => JSON.stringify((item as TranslationRecordExcerpt).selection))).size !== value.records.length) throw new TypeError('Duplicate translation record selection')
+  }
   return structuredClone(value) as unknown as ReferenceManifest
 }
 /** Only Host-resolved, bounded selections enter an isolated model request. */
 export function referencePayload(context: FrozenReferenceContext | undefined): Record<string, unknown> {
   return context ? { background_assets: context.assets, reference_excerpts: context.excerpts.map(excerpt => ({
     reference: excerpt.request, locator: excerpt.locator, interpretation: excerpt.interpretation, text: excerpt.text,
-  })) } : {}
+  })), ...(context.files?.length ? { reference_file_excerpts: context.files } : {}), ...(context.records?.length ? { translation_record_excerpts: context.records } : {}) } : {}
 }
 export interface ReferenceEvidencePort {
   cached?(scope: { readonly ownerId: string; readonly topicId: string }, ref: ReferenceEvidenceRef): string | undefined

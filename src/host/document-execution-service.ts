@@ -1,3 +1,5 @@
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import type { ReferenceFilesService } from './reference-files.js'
 import { fileRetranslationNotice } from './file-retranslation-notice.js'
 import type { FileJobsService } from './file-jobs.js'
@@ -279,6 +281,7 @@ export class DocumentExecutionService {
     if (!captured.ok) return captured
     const scope = captured.value.capture.scope, taskId = `document-task:${crypto.randomUUID()}`
     if (captured.value.capture.currentSourceVersion !== request.target.sourceVersion) return failure('stale_source_version', '此原稿已经被新版本取代。', 'accept_document')
+    if ((this.ctx.get?.('translationHistory') as { unitBlocked(sessionId: string, unitId: string): boolean } | undefined)?.unitBlocked(scope.translationSessionId, request.target.unitId)) return failure('unit_deleted', '此单元已删除或正在删除。', 'accept_document')
     if (!this.normal.claimDocumentSession(scope.ownerId, scope.translationSessionId, taskId)) return failure('busy', '此翻译会话仍有未结算任务。', 'accept_document')
     const job: Job = { request, scope, taskId, unitId: request.target.unitId, agent: exec.agent!, exchangeOwner, controller: new AbortController(), delivery: new AbortController(), facts: [],
       createdAt: new Date().toISOString(), acceptance: undefined!, input: null, snapshot: null, receipt: null, status: 'running', taskSequence: 0, actualCalls: 0, outputBytes: 0, completedChunks: 0,
@@ -933,6 +936,18 @@ export class DocumentExecutionService {
     return { ok: true, value: structuredClone(view()) }
   }
   hasActiveJobs(ownerId?: string): boolean { return [...this.jobs.values()].some(job => (ownerId === undefined || job.scope.ownerId === ownerId) && (!!job.running || job.uncertain || ['running', 'waiting_context', 'waiting_user', 'unknown'].includes(job.status))) }
+  historyUnitBusy(scope: HistoryScope, unitId: string): boolean {
+    return [...this.jobs.values()].some(job => historyTargetMatches(scope, unitId, { ...job.scope, unitId: job.unitId }) && (!!job.running || job.uncertain || ['running', 'waiting_context', 'waiting_user', 'unknown', 'paused'].includes(job.status)))
+  }
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void {
+    const owned = new Set([...this.jobs.values()].filter(job => historyTargetMatches(scope, unitId, { ...job.scope, unitId: job.unitId, sourceVersion: job.request.target.sourceVersion }, sourceVersion)))
+    for (const job of owned) { job.controller.abort(); job.delivery.abort() }
+    for (const map of [this.jobs, this.operations, this.children]) for (const [id, job] of map) if (owned.has(job)) map.delete(id)
+    for (const [id, entry] of this.controls) { const request = JSON.parse(entry.signature)[1]; if (sourceVersion === undefined ? historyTargetMatches(scope, unitId, request) : [...owned].some(job => job.taskId === request.taskId)) this.controls.delete(id) }
+    for (const [id, entry] of this.unitIntents) if (historyTargetMatches(scope, unitId, JSON.parse(entry.signature).target, sourceVersion)) this.unitIntents.delete(id)
+    for (const [id, entry] of this.resumeTokens) if (owned.has(entry.job)) this.resumeTokens.delete(id)
+    for (const [id, entry] of this.reviewPhaseFacts) if (historyTargetMatches(scope, unitId, { ...entry.target.scope, unitId: entry.target.unitId, sourceVersion: entry.target.sourceVersion }, sourceVersion)) this.reviewPhaseFacts.delete(id)
+  }
   dispose(): void {
     this.disposed = true
     this.unitIntents.clear()

@@ -74,7 +74,7 @@ function validateChunk(unit: DocumentUnit, revision: ChunkRevision): void {
   if (revision.manualBase) {
     const base = unit.revisions.find(manifest => manifest.id === revision.manualBase!.manifestRevisionId)
     const entry = base?.entries.find(entry => entry.chunkId === revision.manualBase!.chunkId && entry.revisionId === revision.manualBase!.revisionId)
-    if (!base || !entry || revision.chunkId !== entry.chunkId || base.taskId !== revision.taskId || base.sourceVersion !== revision.sourceVersion ||
+    if (!base || !entry || !revision.deletion && base.deletion || revision.chunkId !== entry.chunkId || base.taskId !== revision.taskId || base.sourceVersion !== revision.sourceVersion ||
       !sameVersionReference(base.planRef, revision.planRef) || !sameVersionReference(base.preparationRef, revision.preparationRef)) throw new TypeError('Manual revision baseline changed')
   }
   // Actual contexts include preparation background and exclude output overlap. Admission
@@ -82,6 +82,7 @@ function validateChunk(unit: DocumentUnit, revision: ChunkRevision): void {
 }
 /** Invalid references are rejected; an ended but incomplete chunk remains a visible candidate. */
 export function documentManifestEligibility(unit: DocumentUnit, revision: Omit<DocumentRevision, 'eligibility'>): DocumentEligibility {
+  if (revision.deletion) return { complete: false, finalEligible: false }
   taskOf(unit, revision)
   const plan = binding(unit, revision)
   if (revision.entries.length !== plan.items.length) throw new TypeError('Document manifest must cover the fixed plan once')
@@ -90,7 +91,7 @@ export function documentManifestEligibility(unit: DocumentUnit, revision: Omit<D
   for (let index = 0; index < plan.items.length; index++) {
     const item = plan.items[index]!, entry = revision.entries[index]!
     const chunk = unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId)
-    if (!chunk || revisionIds.has(entry.revisionId) || entry.chunkId !== item.chunkId ||
+    if (!chunk || chunk.deletion || revisionIds.has(entry.revisionId) || entry.chunkId !== item.chunkId ||
       !same(entry.outputRange, item.outputRange)) throw new TypeError('Document manifest reference or output range changed')
     revisionIds.add(entry.revisionId)
     if (entry.reuseRef) {
@@ -117,7 +118,7 @@ function passedDocumentAudit(unit: DocumentUnit, revision: Omit<DocumentRevision
 }
 function validateDocumentAudit(unit: DocumentUnit, audit: DocumentReviewAudit): void {
   const manifest = unit.revisions.find(revision => revision.id === audit.manifestRevisionId)
-  if (!manifest || manifest.sourceVersion !== audit.sourceVersion || !sameVersionReference(manifest.planRef, audit.planRef) ||
+  if (!manifest || manifest.deletion || manifest.sourceVersion !== audit.sourceVersion || !sameVersionReference(manifest.planRef, audit.planRef) ||
     !sameVersionReference(manifest.preparationRef, audit.preparationRef)) throw new TypeError('Review audit references another fixed manifest')
   const source = sourceOf(unit, audit.sourceVersion)
   if (source.body.kind === 'asset' && source.body.reference.sha256 !== audit.mechanical.sourceSha256) throw new TypeError('Review source hash changed')
@@ -128,7 +129,7 @@ function validateDocumentAudit(unit: DocumentUnit, audit: DocumentReviewAudit): 
   if (audit.mechanical.criticalIssues.some(issue => !actualCritical.some(actual => same(issue, actual)))) throw new TypeError('Review invented a critical execution issue')
   if (audit.semantic.status === 'pending') return
   const parent = unit.reviewAudits?.find(item => item.id === audit.parentAuditId)
-  if (!parent || parent.version >= audit.version || parent.semantic.status !== 'pending' || parent.reviewId !== audit.reviewId || parent.manifestRevisionId !== audit.manifestRevisionId ||
+  if (!parent || parent.deletion || parent.version >= audit.version || parent.semantic.status !== 'pending' || parent.reviewId !== audit.reviewId || parent.manifestRevisionId !== audit.manifestRevisionId ||
     !same(parent.mechanical, audit.mechanical) || unit.reviewAudits?.some(item => item.parentAuditId === parent.id && item.id !== audit.id)) throw new TypeError('Semantic audit does not complete its exact mechanical check once')
   if (!same(audit.semantic.reviewedEntries, manifest.entries.map(({ chunkId, revisionId }) => ({ chunkId, revisionId }))) ||
     !audit.semantic.preparationRef || !sameVersionReference(audit.semantic.preparationRef, manifest.preparationRef)) throw new TypeError('Main model did not review the exact manifest and preparation')
@@ -137,7 +138,7 @@ function validateDocumentAudit(unit: DocumentUnit, audit: DocumentReviewAudit): 
   const reviewed = unit.revisions.find(revision => revision.id === audit.reviewedRevisionId)
   const issues = [...audit.mechanical.issues, ...audit.semantic.issues]
   const passed = audit.mechanical.status === 'passed' && audit.semantic.status === 'passed'
-  if (!reviewed || reviewed.parentRevisionId !== manifest.id || reviewed.reviewAuditId !== audit.id || reviewed.taskId !== manifest.taskId || reviewed.sourceVersion !== manifest.sourceVersion ||
+  if (!reviewed || reviewed.deletion || reviewed.parentRevisionId !== manifest.id || reviewed.reviewAuditId !== audit.id || reviewed.taskId !== manifest.taskId || reviewed.sourceVersion !== manifest.sourceVersion ||
     !same(reviewed.entries, manifest.entries) || !sameVersionReference(reviewed.planRef, manifest.planRef) || !sameVersionReference(reviewed.preparationRef, manifest.preparationRef) ||
     reviewed.review.status !== (passed ? 'passed' : 'failed') || reviewed.review.checkedAt !== audit.checkedAt || !same(reviewed.review.issues, issues)) throw new TypeError('Reviewed manifest disagrees with its immutable audit')
 }
@@ -174,7 +175,7 @@ export function parseDocumentUnit(value: unknown): DocumentUnit {
   unique(unit.reviewAudits ?? [], audit => audit.operationId)
   for (const [index, audit] of (unit.reviewAudits ?? []).entries()) {
     if (audit.version !== index + 1) throw new TypeError('Document review audit versions must increase once')
-    validateDocumentAudit(unit, audit)
+    if (!audit.deletion) validateDocumentAudit(unit, audit)
   }
   for (const fact of unit.corrections ?? []) validateDocumentCorrectionFact(unit, fact)
   for (const approval of unit.reuseApprovals ?? []) validateDocumentReuseApproval(unit, approval)
@@ -199,6 +200,7 @@ export function parseDocumentUnit(value: unknown): DocumentUnit {
       unit.sourceVersions.some(source => source.operationId === chunk.childOperationId)) throw new TypeError('Child operation collides with a parent operation')
   }
   for (const revision of unit.revisions) {
+    if (revision.deletion) continue
     if (revision.parentRevisionId && !unit.revisions.some(parent => parent.id === revision.parentRevisionId && parent.sourceVersion === revision.sourceVersion)) throw new TypeError('Document candidate baseline unavailable')
     if (revision.reviewAuditId && !unit.reviewAudits?.some(audit => audit.id === revision.reviewAuditId && audit.reviewedRevisionId === revision.id)) throw new TypeError('Document reviewed candidate lacks its audit')
     if (!same(revision.eligibility, documentManifestEligibility(unit, revision))) throw new TypeError('Stored document qualification does not match its facts')
@@ -338,7 +340,7 @@ export function currentDocumentFinal(unit: DocumentUnit): DocumentRevision | und
 function latestDocumentAttemptEligible(unit: DocumentUnit, revision: DocumentRevision): boolean {
   const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion)
   const latest = [...unit.revisions].reverse().find(item => item.sourceVersion === unit.sourceVersion)
-  const pendingAudit = [...(unit.reviewAudits ?? [])].reverse().find(audit => audit.sourceVersion === unit.sourceVersion)
+  const pendingAudit = [...(unit.reviewAudits ?? [])].reverse().find(audit => !audit.deletion && audit.sourceVersion === unit.sourceVersion)
   if (!task || latest?.id !== revision.id || revision.taskId !== task.taskId || ['running', 'paused', 'waiting_context', 'waiting_user', 'unknown', 'interrupted'].includes(task.status)) return false
   if (pendingAudit && pendingAudit.version > (unit.reviewAudits?.find(audit => audit.id === revision.reviewAuditId)?.version ?? 0) && pendingAudit.semantic.status !== 'passed') return false
   // A reviewed manual candidate can finish an ended failed attempt without changing its call facts.
@@ -346,6 +348,7 @@ function latestDocumentAttemptEligible(unit: DocumentUnit, revision: DocumentRev
 }
 export function documentManifestFinalEligibility(unit: DocumentUnit, manifestId: string): { readonly eligible: boolean; readonly issues: readonly DocumentReviewIssue[] } {
   const revision = unit.revisions.find(item => item.id === manifestId)
+  if (revision?.deletion) return { eligible: false, issues: [] }
   if (!revision || revision.sourceVersion !== unit.sourceVersion) return { eligible: false, issues: [{ code: 'source_changed', range: { start: 0, end: documentSourceLength(sourceOf(unit, unit.sourceVersion)) }, message: '当前原稿版本已变化。' }] }
   let eligible: boolean
   try { eligible = documentManifestEligibility(unit, revision).finalEligible }
@@ -403,7 +406,7 @@ export function appendDocumentManualRevision(unit: DocumentUnit, edit: DocumentM
   const entry = base?.entries.find(entry => entry.chunkId === edit.chunkId && entry.revisionId === edit.baseRevisionId)
   const chunk = unit.chunkRevisions.find(chunk => chunk.id === edit.baseRevisionId)
   const item = base && planOf(unit, base.planRef).items.find(item => item.chunkId === edit.chunkId)
-  if (!base || base.sourceVersion !== unit.sourceVersion || !entry || !chunk || item?.mode !== 'translate' || chunk.content.kind !== 'text' || chunk.content.text === edit.text) throw new TypeError('Manual edit requires a changed text and exact current-source manifest block')
+  if (!base || base.deletion || base.sourceVersion !== unit.sourceVersion || !entry || !chunk || chunk.deletion || item?.mode !== 'translate' || chunk.content.kind !== 'text' || chunk.content.text === edit.text) throw new TypeError('Manual edit requires a changed text and exact current-source manifest block')
   const revision = parseChunkRevision({ id: edit.revisionId, taskId: base.taskId, childOperationId: edit.operationId, attemptId: null, callId: null,
     sourceVersion: base.sourceVersion, chunkId: edit.chunkId, planRef: base.planRef, preparationRef: base.preparationRef, kind: 'manual', status: 'completed',
     content: { kind: 'text', text: edit.text }, callRecord: null, createdAt: edit.at, updatedAt: edit.at,

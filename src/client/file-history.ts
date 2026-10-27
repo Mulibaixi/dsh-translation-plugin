@@ -11,6 +11,7 @@ import type { TranslationDocumentReader } from './source-reader.js'
 import { readDocumentText, projectDocument } from './document-export.js'
 import type { UnitReadRequest, UnitContent } from '../shared/numbered-units.js'
 import type { TermEvidenceRef } from '../memory/topic-terms.js'
+import type { DirectProposalSubmission, DirectProposalReceipt } from '../shared/direct-proposals.js'
 
 function fail(code: string, message: string): never { throw Object.assign(new Error(message), { code }) }
 /** Browser history is authoritative after Host reload; no runtime task or material is fabricated. */
@@ -18,6 +19,7 @@ export class FileHistoryClient {
   constructor(private readonly sessions: SessionStore, private readonly jobs: FileJobsClient, private readonly materials: MaterialSubmissionsClient,
     private readonly namespaceId: () => string, private readonly uiLocale: () => string | undefined, private readonly reader: TranslationDocumentReader) {}
   ensureUnitNumbers(sessionId: string): void { this.jobs.units(sessionId, true) }
+  submitProposals(ownerId: string, request: DirectProposalSubmission): Promise<DirectProposalReceipt> { return this.jobs.submitDirectProposals(ownerId, request) }
   hasEvidence(main: string, topicId: string, ref: TermEvidenceRef): boolean {
     if (ref.kind === 'reference') return false
     const captured = this.jobs.capture(main, topicId, ref)
@@ -35,7 +37,7 @@ export class FileHistoryClient {
       const record = this.jobs.forUnit(target.translationSessionId, target.unitId)!
       const version = side === 'source' ? record.sources.find(value => value.version === target.sourceVersion)
         : record.results.find(value => value.version === (request.revisionNumber ?? record.final?.version))
-      if (!version) return missing(side === 'source' ? '原稿内容不可用。' : '此版本不可用，或当前没有有效定稿。')
+      if (!version || version.deletion) return missing(side === 'source' ? '原稿内容不可用。' : '此版本已删除或不可用，或当前没有有效定稿。')
       const points = Array.from(version.text); total = points.length
       text = points.slice(start, start + 4000).join(''); revisionNumber = side === 'source' ? null : version.version
     } else {
@@ -122,7 +124,9 @@ export class FileHistoryClient {
     } else if (request.action === 'read' || request.action === 'revise') {
       if (request.request.ownerId !== ownerId) fail('scope_mismatch', '文件记录所属主会话不符。')
       const record = this.jobs.get(request.request.jobId)
-      if (!record) fail('not_found', '此任务尚无已保存文件记录。')
+      if (!record) fail('not_found', request.request.jobId.startsWith('unit:')
+        ? '这是单元 ID，不是旧文件任务 jobId。直译结果请用 translation_translate 返回的 unit target 和新 operationId 修订，再用 translation_save_result 保存；runtime_only 不表示没有单元历史。'
+        : '此任务尚无已保存文件记录。请先核对准确 jobId；普通直译结果使用 unit target 调用 translation_translate 修订。')
       const current = this.unit({ kind: 'unit', mainSessionId: ownerId, translationSessionId: record.summary.translationSessionId, unitId: record.summary.unitId, sourceVersion: record.summary.sourceVersion })
       if (request.action === 'revise' && (current.jobId !== request.request.jobId || current.unsettled)) fail('stale_job', '此单元已有较新的任务，请读取最新任务后修订。')
       if (request.action === 'read') {
@@ -191,7 +195,7 @@ export class FileHistoryClient {
       if ('status' in handle) fail('result_unavailable', '旧译文版本暂不可读取，未启动重译。')
       const projection = await projectDocument(handle, false, 'candidate')
       if (!projection.complete || projection.text === null) fail('result_incomplete', '旧译文版本未完整读取，未启动重译。')
-      results.push({ version: index + 1, text: projection.text, createdAt: revision.createdAt, legacyRevisionId: revision.id, semanticStatus: revision.review.status === 'passed' ? 'passed' : 'pending' })
+      results.push({ version: index + 1, sourceVersion: revision.sourceVersion, text: projection.text, createdAt: revision.createdAt, legacyRevisionId: revision.id, semanticStatus: revision.review.status === 'passed' ? 'passed' : 'pending' })
     }
     // Recheck the exact immutable history before making the file view own these copied versions.
     const latest = this.sessions.getTranslationHistory(session.id)?.units.find(candidate => candidate.id === unit.id)

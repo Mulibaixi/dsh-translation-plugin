@@ -1,3 +1,4 @@
+import { parsePreparationRecord, type StoredPreparation, type Operation } from '../shared/preparation-record.js'
 import { languageMatches } from '../shared/language-tag.js'
 import {
   MAX_PREPARATION_PACKET_BYTES, MAX_PREPARATION_PAGE_BYTES, MAX_PREPARATION_PAGE_ITEMS,
@@ -21,23 +22,16 @@ export const PREPARATION_STORAGE_PREFIX = 'dsh-translation-plugin:preparation:v1
 export interface PreparationStoragePort {
   keys(): readonly string[]
   getItem(key: string): string | null
-  setItem(key: string, value: string): void
+  setItem(key: string, value: string): void | Promise<void>
 }
 export interface PreparationStoreOptions {
+  readonly registerHistory?: (current: () => readonly string[], restore: (records: readonly string[]) => void) => void
   readonly storage?: PreparationStoragePort
   readonly withLock?: <T>(action: () => T | Promise<T>) => Promise<T>
   readonly isEnabled?: () => boolean
   readonly isScopeCurrent?: (scope: TranslationSourceScope) => boolean
   readonly isTopicTermsCurrent?: (snapshot: TopicTermSnapshot) => boolean
-}
-interface Operation { readonly signature: string; readonly version: number }
-interface StoredPreparation {
-  readonly schemaVersion: 1 | 2
-  readonly cursorToken: string
-  readonly prepareSignature: string
-  readonly candidateCount: number
-  readonly versions: readonly PreparationSnapshot[]
-  readonly operations: Readonly<Record<string, Operation>>
+  readonly isTopicTermsCurrentAsync?: (snapshot: TopicTermSnapshot) => Promise<boolean>
 }
 interface Catalog {
   readonly analysis: PreparationAnalysisFacts
@@ -159,11 +153,22 @@ export class PreparationStore {
         } catch { /* Preserve an invalid audit without hiding independent valid records. */ }
       }
     } catch { /* An unreadable audit is preserved in storage and cannot be edited. */ }
+    options.registerHistory?.(() => [...this.seats.values()].map(seat => JSON.stringify(seat.audit)), records => {
+      const previous = new Map(this.seats)
+      this.seats.clear()
+      for (const raw of records) {
+        const audit = immutable(parsePreparationRecord(raw, true)), first = audit.versions[0]!, storageKey = key(first.scope.ownerId, first.id), old = previous.get(storageKey)
+        this.seats.set(storageKey, { ...(old?.audit.prepareSignature === audit.prepareSignature ? old : {}), audit, stored: options.storage?.getItem(storageKey) ?? null })
+      }
+    })
   }
   dispose(): void { this.disposed = true; this.seats.clear() }
   private locked<T>(action: () => T | Promise<T>): Promise<T> { return this.options.withLock ? this.options.withLock(action) : Promise.resolve().then(action) }
   private current(scope: TranslationSourceScope): boolean { return !this.disposed && (this.options.isScopeCurrent?.(scope) ?? true) }
   private currentTerms(snapshot: TopicTermSnapshot): boolean { return this.options.isTopicTermsCurrent?.(snapshot) ?? true }
+  private async currentHostTerms(snapshot: TopicTermSnapshot): Promise<boolean> {
+    return this.options.isTopicTermsCurrentAsync ? await this.options.isTopicTermsCurrentAsync(snapshot) : this.currentTerms(snapshot)
+  }
   private fresh(storageKey: string): Seat | undefined {
     const local = this.seats.get(storageKey)
     if (!this.options.storage) return local
@@ -190,10 +195,10 @@ export class PreparationStore {
       termCount: snapshot.terms.length, candidateCount: seat.audit.candidateCount, storage: snapshot.storage, storageError: snapshot.storageError,
       editable, restartExecutable: false, createdAt: snapshot.createdAt, updatedAt: snapshot.updatedAt }
   }
-  private commit(storageKey: string, seat: Seat, snapshot: PreparationSnapshot, signature: string, prepareSignature: string, candidateCount: number): Seat {
+  private async commit(storageKey: string, seat: Seat, snapshot: PreparationSnapshot, signature: string, prepareSignature: string, candidateCount: number): Promise<Seat> {
     const operationKey = snapshot.operationId, operations = { ...seat.audit.operations, [operationKey]: { signature, version: snapshot.version } }
     const versions = [...seat.audit.versions, snapshot]
-    let audit: StoredPreparation = { schemaVersion: 2, cursorToken: seat.audit.cursorToken, prepareSignature, candidateCount, versions, operations }, stored = seat.stored
+    let audit: StoredPreparation = { schemaVersion: 3, cursorToken: seat.audit.cursorToken, prepareSignature, candidateCount, versions, operations }, stored = seat.stored
     const enabled = this.options.isEnabled?.() ?? true
     if (enabled && this.options.storage && this.options.withLock) {
       try {
@@ -201,7 +206,7 @@ export class PreparationStore {
         const saved = { ...snapshot, storage: 'saved' as const, storageError: null }
         audit = { ...audit, versions: [...seat.audit.versions, saved].map(item => ({ ...item, storage: 'saved', storageError: null })) }
         const encoded = JSON.stringify(audit)
-        this.options.storage.setItem(storageKey, encoded)
+        await this.options.storage.setItem(storageKey, encoded)
         if (this.options.storage.getItem(storageKey) !== encoded) reject('storage_unconfirmed', '准备记录写入结果未确认。')
         stored = encoded
       } catch (error) {
@@ -216,10 +221,13 @@ export class PreparationStore {
     try {
       const request = parseTranslationPreparationPrepare(args), facts = parsePreparationCurrentFacts({ envelope: rawFacts.envelope, topicTerms: rawFacts.topicTerms }), analysis = parsePreparationAnalysisFacts(rawFacts.analysis)
       const hash = await sourceHash(facts.envelope)
-      return await this.locked(() => this.prepareLocked(request, facts, analysis, hash, measurePage))
+      return await this.locked(async () => {
+        if (!await this.currentHostTerms(facts.topicTerms)) return bad('stale_terms', '主题术语已变化，请重新读取当前条目。')
+        return this.prepareLocked(request, facts, analysis, hash, measurePage)
+      })
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '准备材料、分析事实或参数无效。', 'prepare_preparation') }
   }
-  private prepareLocked(request: TranslationPreparationPrepare, facts: PreparationCurrentFacts, analysis: PreparationAnalysisFacts, hash: string, measurePage?: (page: PreparationPage) => number): AnalysisResult<PreparationReceipt> {
+  private async prepareLocked(request: TranslationPreparationPrepare, facts: PreparationCurrentFacts, analysis: PreparationAnalysisFacts, hash: string, measurePage?: (page: PreparationPage) => number): Promise<AnalysisResult<PreparationReceipt>> {
     const scope = materialScope(facts.envelope), run = analysis.run, total = facts.envelope.material.sourceRef?.totalCodePoints ?? sourceCodePointLength(facts.envelope.material.sourceText!)
     if (!this.current(scope) || !matchesTarget(facts.envelope, request.target) || !same(scope, run.scope) || !same(request.target, run.target) || run.sourceVersion !== request.target.sourceVersion || run.totalCodePoints !== total || request.analysisId !== run.analysisId || request.analysisVersion !== run.version || !same(run.route, facts.envelope.material.model)) return bad('source_mismatch', '分析、准备与固定原稿或实际模型路由不一致。')
     if (!this.currentTerms(facts.topicTerms)) return bad('stale_terms', '主题术语已变化，请重新读取当前条目。')
@@ -231,7 +239,7 @@ export class PreparationStore {
       // Replaying a prepare may reattach the still-authorized runtime catalog; it never fabricates one after restart.
       if (!old.catalog) return bad('analysis_unavailable', '此快照来自已保存审计，不能重新附会运行期分析或原稿。')
       if (!same(analysisBusinessFacts(old.catalog.analysis), analysisBusinessFacts(analysis))) return bad('analysis_changed', '原分析事实发生变化；请创建新的准备包。')
-      const snapshot = old.audit.versions[old.audit.operations[request.operationId]!.version - 1]!
+      const snapshot = old.audit.versions.find(snapshot => snapshot.version === old.audit.operations[request.operationId]!.version)!
       return ok(this.receipt(old, snapshot, true))
     }
     if ([...this.seats.values()].some(seat => seat.audit.versions[0]?.scope.ownerId === scope.ownerId && Object.hasOwn(seat.audit.operations, request.operationId))) return bad('idempotency_conflict', '此操作标识已绑定另一准备包。')
@@ -244,24 +252,27 @@ export class PreparationStore {
       preparationReady: false, executionReady: false, executionGate: 'plan_and_budget_pending', storage: 'runtime_only', storageError: null, createdAt: at, updatedAt: at, operationId: request.operationId }
     const empty: Seat = { stored: null, audit: { schemaVersion: 1, cursorToken: crypto.randomUUID(), prepareSignature: signature, candidateCount: catalog.candidates.length, versions: [], operations: {} }, catalog }
     this.readable(empty, snapshot, measurePage)
-    const next = this.commit(storageKey, empty, snapshot, signature, signature, catalog.candidates.length)
+    const next = await this.commit(storageKey, empty, snapshot, signature, signature, catalog.candidates.length)
     return ok(this.receipt(next, next.audit.versions[0]!, true))
   }
   async set(args: unknown, rawFacts: PreparationCurrentFacts, measurePage?: (page: PreparationPage) => number): Promise<AnalysisResult<PreparationReceipt>> {
     try {
       const request = parseTranslationPreparationSet(args), facts = parsePreparationCurrentFacts(rawFacts)
       const [hash, signature] = await Promise.all([sourceHash(facts.envelope), textHash(JSON.stringify(request))])
-      return await this.locked(() => this.setLocked(request, facts, hash, signature, measurePage))
+      return await this.locked(async () => {
+        if (!await this.currentHostTerms(facts.topicTerms)) return bad('stale_terms', '主题术语已变化，请重新读取当前条目。')
+        return this.setLocked(request, facts, hash, signature, measurePage)
+      })
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '准备采用参数或当前事实无效。', 'set_preparation') }
   }
-  private setLocked(request: TranslationPreparationSet, facts: PreparationCurrentFacts, hash: string, signature: string, measurePage?: (page: PreparationPage) => number): AnalysisResult<PreparationReceipt> {
+  private async setLocked(request: TranslationPreparationSet, facts: PreparationCurrentFacts, hash: string, signature: string, measurePage?: (page: PreparationPage) => number): Promise<AnalysisResult<PreparationReceipt>> {
     const storageKey = key(request.target.mainSessionId, request.preparationId), seat = this.fresh(storageKey), latest = seat?.audit.versions.at(-1)
     if (!seat || !latest) return bad('preparation_not_found', '准备包不存在。')
     if (!this.current(latest.scope) || !same(latest.target, request.target) || !matchesTarget(facts.envelope, request.target) || !same(materialScope(facts.envelope), latest.scope) || hash !== latest.sourceSha256) return bad('source_mismatch', '准备包与当前固定原稿不一致。')
     if (!seat.catalog || seat.catalog.binding !== binding(facts.envelope, hash)) return bad('analysis_unavailable', '原稿或分析仅在原运行期有效；保存快照只可查阅。')
     if (!this.currentTerms(facts.topicTerms)) return bad('stale_terms', '主题术语已变化，请重新读取当前条目。')
     const repeated = Object.hasOwn(seat.audit.operations, request.operationId) ? seat.audit.operations[request.operationId] : undefined
-    if (repeated) return repeated.signature === signature ? ok(this.receipt(seat, seat.audit.versions[repeated.version - 1]!, true)) : bad('idempotency_conflict', '此操作标识已绑定不同准备内容。')
+    if (repeated) return repeated.signature === signature ? ok(this.receipt(seat, seat.audit.versions.find(snapshot => snapshot.version === repeated.version)!, true)) : bad('idempotency_conflict', '此操作标识已绑定不同准备内容。')
     if ([...this.seats.values()].some(other => other !== seat && other.audit.versions[0]?.scope.ownerId === latest.scope.ownerId && Object.hasOwn(other.audit.operations, request.operationId))) return bad('idempotency_conflict', '此操作标识已绑定另一准备包。')
     if (request.expectedVersion !== latest.version) return bad('stale_preparation', '准备包已更新，请使用当前版本。')
     if (request.referenceRefs?.length) return bad('reference_unavailable', '外部参考资料尚无受权登记与范围读取；不能把原稿或推断伪装成参考查证。')
@@ -308,7 +319,7 @@ export class PreparationStore {
     if (preparationPacketBytes(snapshot) > MAX_PREPARATION_PACKET_BYTES) return bad('preparation_too_large', '固定准备快照超过单包预算；未截字段或静默漏选。')
     this.readable(seat, snapshot, measurePage)
     const bound: Seat = { ...seat, planningBindings: { ...seat.planningBindings, [snapshot.version]: fixedBinding(facts.topicTerms, snapshot.targetLanguage) } }
-    const next = this.commit(storageKey, bound, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
+    const next = await this.commit(storageKey, bound, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
     return ok(this.receipt(next, next.audit.versions.at(-1)!, true))
   }
   private conflicts(candidates: readonly PreparationCandidate[], topic: TopicTermSnapshot, terms: readonly PreparationFrozenTerm[], required: readonly TranslationSourceRange[], request: Pick<TranslationPreparationSet, 'questions'>, targetLanguage: string): readonly PreparationConflict[] {
@@ -341,16 +352,19 @@ export class PreparationStore {
   async reviewCorrection(args: unknown, rawFacts: PreparationCorrectionReviewFacts, measurePage?: (page: PreparationPage) => number): Promise<AnalysisResult<PreparationReceipt>> {
     try {
       const request = parseTranslationPreparationCorrectionReview(args), facts = parsePreparationCorrectionReviewFacts(rawFacts), signature = await textHash(JSON.stringify(request))
-      return await this.locked(() => this.reviewCorrectionLocked(request, facts, signature, measurePage))
+      return await this.locked(async () => {
+        if (!await this.currentHostTerms(facts.topicTerms)) return bad('stale_terms', '复核期间主题术语已变化，请重新读取。')
+        return this.reviewCorrectionLocked(request, facts, signature, measurePage)
+      })
     } catch (error) { return bad((error as { code?: string }).code ?? 'invalid_input', (error as { code?: string }).code ? (error as Error).message : '纠错准备复核参数或准确源事实无效。', 'review_correction_preparation') }
   }
-  private reviewCorrectionLocked(request: TranslationPreparationCorrectionReview, facts: PreparationCorrectionReviewFacts, signature: string, measurePage?: (page: PreparationPage) => number): AnalysisResult<PreparationReceipt> {
+  private async reviewCorrectionLocked(request: TranslationPreparationCorrectionReview, facts: PreparationCorrectionReviewFacts, signature: string, measurePage?: (page: PreparationPage) => number): Promise<AnalysisResult<PreparationReceipt>> {
     const storageKey = key(request.target.mainSessionId, request.preparationId), seat = this.fresh(storageKey), latest = seat?.audit.versions.at(-1)
     if (!seat || !latest) return bad('preparation_not_found', '原准备包不存在。')
     if (!this.current(facts.scope) || !same(latest.scope, facts.scope) || request.target.unitId !== facts.unitId || request.target.translationSessionId !== facts.scope.translationSessionId || request.target.mainSessionId !== facts.scope.mainSessionId || request.target.sourceVersion !== facts.sourceVersion) return bad('source_mismatch', '复核不属于此确切单元和当前纠错原稿。')
     if (!this.currentTerms(facts.topicTerms)) return bad('stale_terms', '复核期间主题术语已变化，请重新读取。')
     const repeated = seat.audit.operations[request.operationId]
-    if (repeated) return repeated.signature === signature ? ok(this.receipt(seat, seat.audit.versions[repeated.version - 1]!, true)) : bad('idempotency_conflict', '此复核标识已绑定不同内容。')
+    if (repeated) return repeated.signature === signature ? ok(this.receipt(seat, seat.audit.versions.find(snapshot => snapshot.version === repeated.version)!, true)) : bad('idempotency_conflict', '此复核标识已绑定不同内容。')
     if ([...this.seats.values()].some(other => other !== seat && other.audit.versions[0]?.scope.ownerId === facts.scope.ownerId && Object.hasOwn(other.audit.operations, request.operationId))) return bad('idempotency_conflict', '此操作标识已绑定另一准备包。')
     if (request.expectedVersion !== latest.version) return bad('stale_preparation', '准备版本已变化，请先读取准确版本。')
     if (facts.sourceVersion < latest.sourceVersion || facts.sourceVersion === latest.sourceVersion && (!latest.correctionReview || !same(latest.target, request.target) || latest.sourceSha256 !== facts.sourceSha256)) return bad('source_mismatch', '此操作必须复核新纠错原稿或调整该源已有的纠错准备。')
@@ -395,7 +409,7 @@ export class PreparationStore {
       preparationReady: complete, storage: 'runtime_only', storageError: null, updatedAt: now(), operationId: request.operationId }
     parsePreparationSnapshot(snapshot)
     this.readable(seat, snapshot, measurePage)
-    const next = this.commit(storageKey, seat, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
+    const next = await this.commit(storageKey, seat, snapshot, signature, seat.audit.prepareSignature, seat.audit.candidateCount)
     return ok(this.receipt(next, next.audit.versions.at(-1)!, true))
   }
   status(args: unknown, envelope?: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): AnalysisResult<PreparationReceipt> {
@@ -430,7 +444,8 @@ export class PreparationStore {
     try {
       const query = parseTranslationPreparationQuery(args)
       if (query.target.kind !== 'unit') return bad('invalid_input', '纠错准备捕获需要准确单元。', 'capture_preparation')
-      return await this.locked(() => {
+      return await this.locked(async () => {
+        if (!await this.currentHostTerms(topicTerms)) return bad('stale_terms', '主题术语已变化，请重新读取。', 'capture_preparation')
         const { seat, snapshot } = this.lookup(query)
         if (snapshot.sourceSha256 !== sourceSha256 || !this.currentTerms(topicTerms) || topicTerms.topicId !== snapshot.scope.topicId) return bad('source_mismatch', '纠错准备、当前原稿或主题术语已变化。', 'capture_preparation')
         if (!ready(snapshot)) return bad('preparation_not_ready', '纠错后需完整的主模型复核准备。', 'capture_preparation')
@@ -452,7 +467,7 @@ export class PreparationStore {
   async documentPreparation(args: unknown, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): Promise<AnalysisResult<PreparationSnapshot>> {
     try {
       const query = parseTranslationPreparationQuery(args), hash = await sourceHash(envelope)
-      return await this.locked(() => {
+      return await this.locked(async () => {
         const { seat, snapshot } = this.lookup(query)
         if (!matchesTarget(envelope, query.target) || !same(materialScope(envelope), snapshot.scope) || hash !== snapshot.sourceSha256 ||
           !seat.catalog || seat.catalog.binding !== binding(envelope, hash) || !seat.planningBindings?.[snapshot.version]) return bad('analysis_unavailable', '受理需要原运行期确切原稿、准备与真实分析事实。', 'accept_document')
@@ -464,7 +479,7 @@ export class PreparationStore {
           if (this.options.storage.getItem(storageKey) !== seat.stored) return bad('stale_preparation', '准备记录在受理前变化，请重新查询。', 'accept_document')
           const audit: StoredPreparation = { ...seat.audit, versions: seat.audit.versions.map(item => ({ ...item, storage: 'saved', storageError: null })) }
           const encoded = JSON.stringify(audit)
-          this.options.storage.setItem(storageKey, encoded)
+          await this.options.storage.setItem(storageKey, encoded)
           if (this.options.storage.getItem(storageKey) !== encoded) throw new Error('Preparation save acknowledgment unavailable')
           const next: Seat = { ...seat, stored: encoded, audit: immutable(audit) }
           this.seats.set(storageKey, next)
@@ -481,7 +496,8 @@ export class PreparationStore {
   async capture(args: unknown, rawFacts: PreparationCurrentFacts, relevantFixedIds: readonly string[], measureReply: (snapshot: PreparationSnapshot) => number): Promise<AnalysisResult<PreparationSnapshot>> {
     try {
       const query = parseTranslationPreparationQuery(args), facts = parsePreparationCurrentFacts(rawFacts), hash = await sourceHash(facts.envelope)
-      return await this.locked(() => {
+      return await this.locked(async () => {
+        if (!await this.currentHostTerms(facts.topicTerms)) return bad('stale_terms', '主题术语在规划捕获时已变化，请重新读取。', 'capture_preparation')
         const { seat, snapshot } = this.lookup(query)
         if (!matchesTarget(facts.envelope, query.target) || !same(materialScope(facts.envelope), snapshot.scope) || hash !== snapshot.sourceSha256) return bad('source_mismatch', '规划准备与当前固定原稿不一致。', 'capture_preparation')
         if (!seat.catalog || seat.catalog.binding !== binding(facts.envelope, hash)) return bad('analysis_unavailable', '已保存准备仅供审计；规划需要原运行期的真实材料与分析。', 'capture_preparation')
@@ -563,24 +579,5 @@ export class PreparationStore {
       }
     }
   }
-  private decode(raw: string): StoredPreparation {
-    const input = JSON.parse(raw) as StoredPreparation
-    if (!input || typeof input !== 'object' || Object.keys(input).length !== 6 || !['schemaVersion', 'cursorToken', 'prepareSignature', 'candidateCount', 'versions', 'operations'].every(field => Object.hasOwn(input, field))) throw new TypeError('Unexpected preparation audit fields')
-    const audit = { ...input, versions: input.versions.map(parsePreparationSnapshot) }
-    if (!audit || ![1, 2].includes(audit.schemaVersion) || typeof audit.cursorToken !== 'string' || !/^[0-9a-f-]{36}$/u.test(audit.cursorToken) || typeof audit.prepareSignature !== 'string' || !Number.isSafeInteger(audit.candidateCount) || audit.candidateCount < 0 || !Array.isArray(audit.versions) || !audit.versions.length || !audit.operations || typeof audit.operations !== 'object' || Array.isArray(audit.operations)) throw new TypeError('Invalid preparation audit')
-    if (audit.schemaVersion === 1 && audit.versions.some(version => version.referenceContextRef)) throw new TypeError('Reference context requires preparation audit version 2')
-    const first = audit.versions[0]!
-    for (const [index, snapshot] of audit.versions.entries()) {
-      if (snapshot.version !== index + 1 || snapshot.id !== first.id || !same(snapshot.scope, first.scope) || !same(snapshot.route, first.route) || snapshot.targetLanguage !== first.targetLanguage || snapshot.userRequirements !== first.userRequirements || !same(snapshot.mechanicalCoverage, first.mechanicalCoverage) || snapshot.storage !== 'saved') throw new TypeError('Invalid preparation audit version')
-      if (snapshot.correctionReview) {
-        const previous = audit.versions[index - 1], basis = snapshot.correctionReview.analysisBasis
-        if (!previous || snapshot.sourceVersion < previous.sourceVersion || snapshot.sourceVersion === previous.sourceVersion && (!previous.correctionReview || !same(snapshot.target, previous.target) || snapshot.sourceSha256 !== previous.sourceSha256) || basis.sourceVersion !== first.sourceVersion || basis.sourceSha256 !== first.sourceSha256 || basis.totalCodePoints !== first.totalCodePoints || previous.target.kind === 'unit' && snapshot.target.kind === 'unit' && previous.target.unitId !== snapshot.target.unitId) throw new TypeError('Invalid correction preparation lineage')
-      } else if (!same(snapshot.target, first.target) || snapshot.sourceSha256 !== first.sourceSha256) throw new TypeError('Invalid original preparation source')
-      const calculated = snapshot.correctionReview?.complete ?? (snapshot.mechanicalCoverage.complete && snapshot.modelReview.complete && snapshot.conflicts.length === 0)
-      if (snapshot.version > 1 && snapshot.preparationReady !== calculated) throw new TypeError('Invalid preparation eligibility')
-      if (!Array.isArray(snapshot.terms) || !Array.isArray(snapshot.questions) || !Array.isArray(snapshot.conflicts) || !Array.isArray(snapshot.backgroundRanges) || snapshot.referenceRefs.length) throw new TypeError('Invalid preparation audit content')
-    }
-    for (const [operationId, operation] of Object.entries(audit.operations)) if (!operationId || typeof operation.signature !== 'string' || !Number.isSafeInteger(operation.version) || !audit.versions[operation.version - 1] || audit.versions[operation.version - 1]!.operationId !== operationId) throw new TypeError('Invalid preparation audit operation')
-    return immutable(audit)
-  }
+  private decode(raw: string): StoredPreparation { return immutable(parsePreparationRecord(raw)) }
 }

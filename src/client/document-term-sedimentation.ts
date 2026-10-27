@@ -1,5 +1,6 @@
 import type { TopicTerm, TopicTermPut } from '../memory/topic-terms.js'
 import type { PreparationFrozenTerm } from '../shared/translation-preparation.js'
+import { newTermId } from '../shared/term-id.js'
 
 export interface DocumentTermSedimentInput {
   /** Terms actually frozen in the task preparation version. */
@@ -26,7 +27,7 @@ function sameMeaning(entry: TopicTerm, term: PreparationFrozenTerm): boolean {
  * Existing topic entries are never edited, and an already present meaning is skipped instead of duplicated.
  */
 export function planDocumentTermSedimentation(input: DocumentTermSedimentInput,
-  idFactory: () => string = () => `term:${crypto.randomUUID()}`): DocumentTermSedimentPlan {
+  idFactory: () => string = newTermId): DocumentTermSedimentPlan {
   const entries: TopicTermPut[] = [], seen = new Set<string>()
   let skipped = 0
   for (const term of input.terms) {

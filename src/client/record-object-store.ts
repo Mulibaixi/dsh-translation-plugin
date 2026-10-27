@@ -39,7 +39,7 @@ export class RecordObjectStore {
       const enabled = sessions.getSettings().rememberHistory, justEnabled = enabled && !this.enabled
       this.enabled = enabled
       if (justEnabled) for (const seat of this.seats.values()) if (seat.dirty && seat.status !== 'conflict') this.queuePersist(seat)
-      // Deletion or revision changes only availability; never retarget or rewrite an old reference.
+      for (const seat of this.seats.values()) this.pruneDeletedUnits(seat)
       this.emit()
     })
     if (listen) this.stopStorage = listen(key => this.externalChange(key))
@@ -51,6 +51,32 @@ export class RecordObjectStore {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   getNotice(): string | undefined { return this.notice }
+  private pruneDeletedUnits(seat: Seat): void {
+    const deleted = new Set(this.sessions.getTranslationHistory(seat.snapshot.sessionId)?.units.filter(unit => !!unit.deletion).map(unit => unit.id))
+    if (!deleted.size) return
+    const prune = (snapshot: RecordObjectSnapshot): RecordObjectSnapshot => {
+      const references = snapshot.references.filter(ref => !deleted.has(ref.unitId))
+      return references.length === snapshot.references.length ? snapshot : { ...snapshot, references, version: snapshot.version + 1, updatedAt: now() }
+    }
+    const next = prune(seat.snapshot)
+    if (next !== seat.snapshot) { seat.snapshot = next; seat.dirty = true }
+    const id = `deleted:${seat.snapshot.sessionId}`
+    if (!this.storage || !this.locks || this.pending.has(id)) return
+    const work = this.locks.request(TOPIC_LOCK_NAME, () => {
+      if (this.disposed) return false
+      const raw = this.storage!.getItem(recordObjectsKey(seat.snapshot.sessionId)), saved = raw && decodeRecordObjectSnapshot(JSON.parse(raw))
+      if (!raw) return true
+      if (!saved) throw new Error('Invalid position references')
+      const cleaned = prune(saved)
+      if (cleaned === saved) return true
+      const output = JSON.stringify(cleaned); this.storage!.setItem(recordObjectsKey(seat.snapshot.sessionId), output)
+      if (seat.stored === raw) seat.stored = output
+      else { seat.status = 'conflict'; this.notice = '已清理已删单元的位置引用；其他位置引用在另一窗口变化，请读取最新副本。' }
+      return true
+    }).catch(() => { this.notice = '已删单元的位置引用清理未完成，请读取最新副本后重试。'; return false })
+      .finally(() => { this.pending.delete(id); this.emit() })
+    this.pending.set(id, work)
+  }
   getStatus(ownerId: string, topicId: string, sessionId: string): HistoryStatus { return this.seat(ownerId, topicId, sessionId).status }
   dispose(): void { this.disposed = true; this.stopSession(); this.stopStorage?.(); this.listeners.clear(); this.seats.clear() }
   private load(): void {

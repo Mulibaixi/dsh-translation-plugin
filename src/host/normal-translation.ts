@@ -1,13 +1,22 @@
+import { parseTranslationLogRead, type TranslationLogRead, type TranslationLogPage } from '../shared/translation-log.js'
+import { SOURCE_LAYOUT_GUIDANCE } from '../shared/translation-call.js'
+import { STYLE_SETTINGS_GUIDANCE } from '../shared/style-settings.js'
+import { historyContextRefs, type DirectHistoryRefs } from '../shared/direct-history-context.js'
+import { diagnosticSpan } from '../shared/diagnostics.js'
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import { languageMatches } from '../shared/language-tag.js'
 import type { ReferenceFilesService } from './reference-files.js'
+import type { OtherMemoryService } from './other-memory.js'
 import { NORMAL_TRANSLATION_REMOTE, parseNormalTranslationExecute, parseNormalTranslationQuery, type NormalTranslationExecute,
   type NormalTranslationOperation, type NormalTranslationQuery, type NormalTranslationJob, type NormalTranslationResult,
   type NormalTranslationUpdate, type NormalTranslationError, type NormalTranslationCapability,
   parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt,
   parseNormalTranslationUnitRequest, type NormalTranslationUnitRequest, type NormalTranslationUnitReceipt,
-  parseDirectTranslationRequest, type DirectTranslationRequest, type DirectTranslationCommit, type DirectTranslationReceipt,
+  parseDirectTranslationRequest, type DirectTranslationRequest, type DirectTranslationCommit, type DirectTranslationReceipt, type RawDirectTranslationRequest,
   parseNormalTranslationResultRead, type NormalTranslationTermReference, type DirectTranslationRange, draftTranslationTerms,
-  type NormalTranslationExport, type NormalTranslationMaterialTarget, type NormalTranslationUnitTarget } from '../shared/normal-translation.js'
+  type NormalTranslationExport, type NormalTranslationMaterialTarget, type NormalTranslationUnitTarget, type NormalTranslationTarget } from '../shared/normal-translation.js'
+import type { TermHandleRegistry } from './term-handles.js'
 import { NORMAL_TRANSLATION_V2_REMOTE, NormalTranslationAttemptJournal, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import { sourceAnnotationChecks, type TranslationCheck } from '../shared/translation-quality.js'
@@ -26,6 +35,7 @@ import type { NormalTranslationResolution } from '../shared/normal-translation-v
 import type { FileJobConflict, FileJobMechanicalIssue, FileJobProposal, FileJobTerm, FileJobWorker } from '../shared/file-jobs.js'
 import { FileWorkerRuntime } from './file-worker-runtime.js'
 import { artifactExtension, parseArtifactOpen, parseArtifactSave, type TranslationArtifactCheck, type TranslationArtifactSaved } from '../shared/translation-artifact.js'
+import { TRANSLATION_SELF_REVIEW, DIRECT_REVISION_GUIDANCE, FILE_MEMORY_REVIEW_GUIDANCE } from '../shared/translation-review.js'
 import { loadArtifactStorage, type ArtifactStorage } from './translation-delivery.js'
 import { assetPriority } from '../memory/asset-priority.js'
 import type { ModelSelection } from '../shared/contracts.js'
@@ -75,8 +85,13 @@ interface ResumeToken {
   dispatched: boolean
 }
 function rejected(code: string, message: string, stage: string): Error { return Object.assign(new Error(message), { code, stage }) }
+/** Per-attempt facts used to decide whether a failed direct call may release its operationId placeholder. */
+interface DispatchAttempt { dispatched: boolean; resolved: boolean }
 /** What one direct call returns to the main model: the body, the real terminal facts and the recorded revision. */
 export interface DirectTranslationView {
+  readonly target?: NormalTranslationUnitTarget
+  readonly nextStep?: string
+  readonly assetReview?: { readonly tool: 'translation_submit_proposals'; readonly target: import('../shared/normal-translation.js').NormalTranslationUnitTarget; readonly revisionId: string; readonly nextStep: string }
   readonly operationId: string
   readonly mainSessionId: string
   readonly translationSessionId: string
@@ -98,6 +113,7 @@ export interface DirectTranslationView {
   readonly message?: string
   readonly resultRef?: { readonly operationId: string; readonly totalCodePoints: number; readonly tool: 'translation_read_result' }
   readonly persistence: 'saved' | 'runtime_only' | 'unconfirmed'
+  readonly contextUsage?: { readonly terms: number; readonly nearbyUnits: number; readonly revisionBaseId: string | null; readonly referenceStatus: string; readonly referenceFiles: number }
 }
 function ok<T>(value: T): NormalTranslationResult<T> { return { ok: true, value: structuredClone(value) } }
 function bad<T>(code: string, message: string, stage: string): NormalTranslationResult<T> { return { ok: false, error: { code, message, stage } } }
@@ -134,9 +150,10 @@ export class NormalTranslationService {
   private readonly documentSessions = new Map<string, string>()
   private readonly resumeTokens = new Map<string, ResumeToken>()
   private readonly resumesByResolution = new Map<string, ResumeToken>()
-  private readonly direct = new Map<string, { readonly signature: string; readonly promise: Promise<DirectTranslationView> }>()
+  private readonly direct = new Map<string, { readonly signature: string; readonly promise: Promise<DirectTranslationView>; settled: boolean;
+    callId?: string; historyContext?: { readonly translationSessionId: string; readonly topicId: string; readonly refs: DirectHistoryRefs } }>()
   private readonly directResults = new Map<string, { readonly ownerId: string; readonly text: string; readonly status: string }>()
-  private readonly extractions = new Map<string, { readonly signature: string; readonly promise: Promise<TranslationExtractionView> }>()
+  private readonly extractions = new Map<string, { readonly signature: string; readonly promise: Promise<TranslationExtractionView>; settled: boolean }>()
   private readonly savedArtifacts = new Map<string, string>()
   private readonly workers: FileWorkerRuntime
   private artifacts: Promise<ArtifactStorage> | undefined
@@ -174,6 +191,18 @@ export class NormalTranslationService {
   }
   private get topics(): TopicToolsService { return this.ctx.get?.('translationTopics') as TopicToolsService }
   private get materials(): TranslationMaterialsService { return this.ctx.get?.('translationMaterials') as TranslationMaterialsService }
+  private async savedRequirements(mainSessionId: string, topicId: string): Promise<Pick<NormalTranslationContext, 'memoryRequirements'>> {
+    const memory = this.ctx.get?.('translationOtherMemory') as OtherMemoryService | undefined
+    if (!memory) return {}
+    const namespaceId = this.topics.namespaceForAgent(mainSessionId)
+    if (!namespaceId) throw rejected('memory_scope_unavailable', '尚未确认当前资料库，无法读取已保存的翻译设定。', 'prepare')
+    const entries = await memory.effectiveSettings(namespaceId, topicId)
+    const memoryRequirements = entries.map(({ id, version, topicId, title, body }) => ({ id, version, topicId, title, body }))
+    if (new TextEncoder().encode(JSON.stringify(memoryRequirements)).byteLength > 32768) {
+      throw rejected('memory_requirements_limit', `适用翻译设定超过本次调用 32768 字节预算，请精简或停用后重试：${entries.map(entry => entry.title).join('、')}`, 'prepare')
+    }
+    return memoryRequirements.length ? { memoryRequirements } : {}
+  }
   /** One parent reservation shares the short-text occupancy rule; its children do not reacquire it. */
   claimDocumentSession(ownerId: string, translationSessionId: string, taskId: string): boolean {
     const sessionId = translationSessionId, current = this.documentSessions.get(sessionId)
@@ -311,6 +340,8 @@ export class NormalTranslationService {
   authorizePeer(mainSessionId: string, peerId: string): boolean { return this.topics.ownsConnection(mainSessionId, peerId) }
   private owned(target: { readonly mainSessionId: string }, exec: ToolExecution): void {
     if (this.disposed || !this.topics?.ownsAgent(target.mainSessionId, exec.agent)) throw rejected('scope_mismatch', '普通翻译操作不属于已连接的主 Agent。', 'authorize')
+    const unit = target as NormalTranslationTarget
+    if (unit.kind === 'unit' && (this.ctx.get?.('translationHistory') as { unitBlocked(sessionId: string, unitId: string): boolean } | undefined)?.unitBlocked(unit.translationSessionId, unit.unitId)) throw rejected('unit_deleted', '此单元已删除或正在删除。', 'authorize')
     exec.signal.throwIfAborted()
   }
   /** Resolve one historical unit's authoritative snapshot through the Client exactly once per operation. */
@@ -388,11 +419,12 @@ export class NormalTranslationService {
         operationId: request.operationId, organizedRequirements: request.organizedRequirements, termReferences: request.termReferences, ...(request.referenceContextRef ? {referenceContextRef: request.referenceContextRef} : {}) }, exec)
       if (terms.kind !== 'normal_prepared') throw rejected('invalid_reply', '未取得普通翻译准备回执。', 'prepare')
       this.validateTerms(request.termReferences, envelope, terms.termSnapshot)
+      const savedRequirements = await this.savedRequirements(envelope.mainSessionId, envelope.material.topicId)
       const route = envelope.material.model!, model = { providerId: route.provider, modelId: route.model, configVersion: 0,
         ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) }
       await this.adapter.prepareOperation(job.internalId, model, job.controller.signal)
       const referenceContext = request.referenceContextRef ? await (this.ctx.get?.('translationReferences') as ReferenceFilesService).resolveContext(envelope.mainSessionId, envelope.material.topicId, request.referenceContextRef, exec) : undefined
-      const context: NormalTranslationContext = { organizedRequirements: request.organizedRequirements, ...(request.referenceContextRef ? {referenceContextRef: request.referenceContextRef} : {}), terms: terms.termSnapshot.entries.map(entry => ({
+      const context: NormalTranslationContext = { ...savedRequirements, organizedRequirements: request.organizedRequirements, ...(request.referenceContextRef ? {referenceContextRef: request.referenceContextRef} : {}), terms: terms.termSnapshot.entries.map(entry => ({
         id: entry.id, entryVersion: entry.version, sourceForms: entry.sourceForms, aliases: entry.aliases, sense: entry.sense,
         preferred: entry.preferred, forbidden: entry.forbidden, userFixed: entry.origin === 'user_explicit',
       })) }
@@ -415,9 +447,10 @@ export class NormalTranslationService {
       return structuredClone(job.operation)
     } catch (error) {
       const unknown = job.acceptRequested && ['outcome_unknown', 'invalid_reply'].includes((error as { code?: string }).code ?? '')
+      const memoryError = (error as { code?: string }).code?.startsWith('memory_') ? (error as Error).message : undefined
       job.status = unknown ? 'unknown' : job.controller.signal.aborted ? 'cancelled' : 'failed'
       job.error = this.adapter.diagnostic(job.internalId) ?? { code: unknown ? 'OUTCOME_UNKNOWN' : (error as { code?: string }).code ?? 'PREPARE_FAILED',
-        message: unknown ? '业务受理回执尚未确认；保留此操作并查询，未派发翻译模型。' : job.status === 'cancelled' ? '普通翻译已在模型调用前取消。' : request.target.kind === 'unit' ? '重译准备未完成，原文及已完成的纠错保留。' : '普通翻译准备未完成，材料保留。', stage: (error as { stage?: string }).stage ?? 'prepare' }
+        message: unknown ? '业务受理回执尚未确认；保留此操作并查询，未派发翻译模型。' : memoryError ?? (job.status === 'cancelled' ? '普通翻译已在模型调用前取消。' : request.target.kind === 'unit' ? '重译准备未完成，原文及已完成的纠错保留。' : '普通翻译准备未完成，材料保留。'), stage: (error as { stage?: string }).stage ?? 'prepare' }
       this.adapter.discard(job.packet?.operationId ?? job.internalId)
       if (job.operation && unknown) this.emit(job, 'unknown', '', null, job.error)
       if (!unknown) this.activeSessions.delete(job.sessionId)
@@ -435,6 +468,7 @@ export class NormalTranslationService {
       return previous.result.then(result => structuredClone(result))
     }
     const envelope = resolved ?? this.source(request, exec)
+    if ((this.ctx.get?.('translationHistory') as { unitBlocked(sessionId: string, unitId: string): boolean } | undefined)?.unitBlocked(envelope.material.translationSessionId, envelope.material.unitReference?.unitId ?? `unit:${envelope.material.materialId}`)) throw rejected('unit_deleted', '此单元已删除或正在删除。', 'accept')
     requireInline(envelope)
     const sessionId = envelope.material.translationSessionId
     if (!reserved && this.activeSessions.has(sessionId)) throw rejected('busy', '此普通翻译会话仍有未结算操作。', 'accept')
@@ -456,30 +490,60 @@ export class NormalTranslationService {
     this.admissions.set(key, { signature, sessionId, result })
     return result.then(value => structuredClone(value))
   }
+  /** Query-issued handles are short model-facing references; resolve them to an exact id/version before any business request. */
+  private resolveTermHandles(request: RawDirectTranslationRequest): DirectTranslationRequest {
+    if (request.termReferences.every(ref => !('termRef' in ref))) return request as DirectTranslationRequest
+    const handles = this.ctx.get?.('translationTermHandles') as TermHandleRegistry | undefined
+    const resolved = request.termReferences.map(ref => {
+      if (!('termRef' in ref)) return ref
+      const target = handles?.resolve(request.target.mainSessionId, ref.termRef)
+      if (!target) throw rejected('term_ref_invalid', '术语引用句柄无效或已过期，请重新查询术语并使用返回的 ref 或 termRef。', 'resolve_terms')
+      return { id: target.id, entryVersion: target.entryVersion }
+    })
+    const ids = new Set<string>()
+    for (const ref of resolved) {
+      if (ids.has(ref.id)) throw rejected('invalid_input', '术语引用重复，请只保留一条。', 'resolve_terms')
+      ids.add(ref.id)
+    }
+    return { ...request, termReferences: resolved }
+  }
   /**
    * One real translation call whose result is awaited. The main model receives the body (or a
    * readable reference) and records it in one Client transaction; no exchange, request_context or
    * asynchronous acceptance handoff is involved.
    */
   translate(input: unknown, exec: ToolExecution): Promise<DirectTranslationView> {
-    const request = parseDirectTranslationRequest(input)
+    const request = this.resolveTermHandles(parseDirectTranslationRequest(input))
     this.owned(request.target, exec)
+    // A correction usually arrives as a later user turn with no notice; keep the direct toolset for that turn.
+    if (exec.agent) this.topics.retainToolsForNextTurn(exec.agent, ['direct'])
     const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify(request)
     const previous = this.direct.get(key)
     if (previous) {
-      if (previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、要求或术语。', 'prepare')
+      if (previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、要求或术语；该 ID 已用于另一次请求，请修正参数后改用新的 operationId 重试。', 'prepare')
       return previous.promise.then(view => structuredClone(view))
     }
     if (this.corrections.has(key)) throw rejected('idempotency_conflict', '原文纠错与翻译须使用独立的操作 ID。', 'prepare')
-    const promise = this.runDirect(request, exec)
-    this.direct.set(key, { signature, promise })
-    return promise.then(view => structuredClone(view))
+    const attempt: DispatchAttempt = { dispatched: false, resolved: false }
+    const promise = this.runDirect(request, exec, attempt)
+    const entry = { signature, promise, settled: false }; this.direct.set(key, entry)
+    void promise.then(() => { entry.settled = true }, () => { entry.settled = true })
+    return promise.then(view => structuredClone(view), error => {
+      // Nothing was dispatched and no business fact exists, so the placeholder only blocks the corrected retry.
+      // A dispatched, unknown or recorded attempt keeps its reservation so the same ID replays its real outcome.
+      if (!attempt.dispatched && this.direct.get(key)?.promise === promise) {
+        this.direct.delete(key)
+        if (attempt.resolved) this.resolved.delete(key)
+      }
+      throw error
+    })
   }
-  private async runDirect(request: DirectTranslationRequest, exec: ToolExecution): Promise<DirectTranslationView> {
+  private async runDirect(request: DirectTranslationRequest, exec: ToolExecution, attempt: DispatchAttempt): Promise<DirectTranslationView> {
     const startedAt = Date.now()
     let prepareDone = startedAt, firstTextAt = 0
     let envelope: Envelope, sourceText: string, range: DirectTranslationRange | undefined, bodyMode = false
     if (request.target.kind === 'unit') {
+      attempt.resolved = true
       envelope = await this.unitEnvelope(request.target, request.operationId, JSON.stringify(request), exec)
       requireInline(envelope)
       if (request.range || request.body !== undefined) throw rejected('unsupported_input', '历史单元重译不接受范围或替换正文。', 'prepare')
@@ -518,16 +582,31 @@ export class NormalTranslationService {
       ...(request.referenceContextRef ? { referenceContextRef: request.referenceContextRef } : {}) }, exec)
     if (terms.kind !== 'normal_prepared') throw rejected('invalid_reply', '未取得普通翻译准备回执。', 'prepare')
     this.validateTerms(request.termReferences, envelope, terms.termSnapshot)
+    const savedRequirements = await this.savedRequirements(envelope.mainSessionId, material.topicId)
     const model: ModelSelection = { providerId: route.provider, modelId: route.model, configVersion: 0,
       ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) }
     const internalId = `normal-direct:${crypto.randomUUID()}`, callId = `normal-direct-call:${crypto.randomUUID()}`
     this.activeSessions.add(sessionId)
     try {
+      // Crossing this line may start real provider work; failures after it keep the operation reservation.
+      attempt.dispatched = true
       await this.adapter.prepareOperation(internalId, model, exec.signal)
       prepareDone = Date.now()
-      const referenceContext = request.referenceContextRef
-        ? await (this.ctx.get?.('translationReferences') as ReferenceFilesService).resolveContext(envelope.mainSessionId, material.topicId, request.referenceContextRef, exec) : undefined
-      const context: NormalTranslationContext = { organizedRequirements: request.organizedNotes,
+      const referenceService = this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined
+      let contextRef = request.referenceContextRef, referenceStatus = contextRef ? 'explicit' : 'no_match'
+      const contextLog = diagnosticSpan(this.ctx, 'translation.context', {}, request.operationId)
+      if (!contextRef && referenceService?.prepareExactExample) {
+        try {
+          const prepared = await referenceService.prepareExactExample(material.topicId, sourceText, request.operationId, exec)
+          contextRef = prepared.ref; referenceStatus = prepared.status === 'skipped' && length > 300 ? 'long_source_needs_selection' : prepared.status
+        } catch (error) {
+          exec.signal.throwIfAborted(); referenceStatus = 'unavailable'
+          contextLog('degraded', { referenceStatus }, error)
+        }
+      }
+      const referenceContext = contextRef ? await referenceService!.resolveContext(envelope.mainSessionId, material.topicId, contextRef, exec) : undefined
+      const context: NormalTranslationContext = { ...savedRequirements, organizedRequirements: request.organizedNotes,
+        ...(terms.historyContext ? { historyContext: historyContextRefs(terms.historyContext) } : {}),
         ...(request.userRequirements ? { userRequirements: request.userRequirements } : {}),
         ...(request.auxiliaryContext ? { auxiliaryContext: request.auxiliaryContext } : {}),
         terms: [...terms.termSnapshot.entries.map(entry => {
@@ -535,10 +614,19 @@ export class NormalTranslationService {
           return { id: entry.id, entryVersion: entry.version, sourceForms: entry.sourceForms, aliases: entry.aliases, sense: entry.sense,
             preferred: entry.preferred, forbidden: entry.forbidden, userFixed: priority === 2, priority }
         }), ...draftTranslationTerms(request.draftTerms)],
-        ...(request.referenceContextRef ? { referenceContextRef: request.referenceContextRef } : {}) }
+        ...(contextRef ? { referenceContextRef: contextRef } : {}) }
       const packet: NormalExecutionPacket = { operationId: internalId, callId, model, sourceText,
         targetLanguage: material.targetLanguage, instruction: material.instruction, context, mode: 'direct',
+        ...(terms.historyContext ? { historyContext: terms.historyContext } : {}),
         ...(referenceContext ? { referenceContext, referenceContextCurrent: () => (this.ctx.get?.('translationReferences') as ReferenceFilesService).contextCurrent(referenceContext) } : {}) }
+      const entry = this.direct.get(identity(request.target.mainSessionId, request.operationId))
+      if (entry) {
+        entry.callId = callId
+        if (context.historyContext) entry.historyContext = { translationSessionId: sessionId, topicId: material.topicId, refs: context.historyContext }
+      }
+      const contextUsage = { terms: context.terms.length, nearbyUnits: terms.historyContext?.nearby.length ?? 0,
+        revisionBaseId: terms.historyContext?.base?.revisionId ?? null, referenceStatus, referenceFiles: referenceContext?.files?.length ?? 0 }
+      contextLog('completed', contextUsage)
       let metadata = this.adapter.preflightNormal(packet, false), text = '', points = 0
       let terminal: { readonly reason: string; readonly completeness: string; readonly checks_passed: boolean; readonly provider_state: string } | undefined
       for await (const event of this.adapter.executeNormal(packet, exec.signal)) {
@@ -558,6 +646,12 @@ export class NormalTranslationService {
         terminal.checks_passed && text.trim().length > 0
       const status: DirectTranslationView['status'] = terminal.provider_state === 'unknown' ? 'unknown' : terminal.reason === 'aborted' ? 'cancelled'
         : complete ? 'completed' : 'failed'
+      // Keep source file transport formatting in the recorded result, not just in an exported copy.
+      if (status === 'completed') {
+        if (sourceText.startsWith('\uFEFF') && !text.startsWith('\uFEFF')) text = '\uFEFF' + text
+        if (sourceText.includes('\r\n') && !/(?<!\r)\n/u.test(sourceText)) text = text.replace(/\r?\n/gu, '\r\n')
+        points = sourceCodePointLength(text)
+      }
       const reason = status === 'completed' ? undefined : status === 'cancelled' ? '翻译已取消，已生成的部分保留。'
         : status === 'unknown' ? '模型调用结束状态尚未确认，结果尚未记录。' : this.adapter.diagnostic(internalId)?.message ?? '译文未完整完成，已生成的部分保留。'
       this.directResults.set(identity(request.target.mainSessionId, request.operationId), { ownerId: request.target.mainSessionId, text, status })
@@ -567,7 +661,7 @@ export class NormalTranslationService {
         catch (error) { recordError = `译文已生成，但结果记录未确认：${error instanceof Error ? error.message : '请重新读取当前单元。'}` }
       }
       const recordDone = Date.now()
-      return this.directView(request, envelope, callId, status, text, points, metadata, receipt,
+      return { ...this.directView(request, envelope, callId, status, text, points, metadata, receipt,
         [reason, recordError].filter(item => item !== undefined).join(' ') || undefined,
         { prepareMs: prepareDone - startedAt, firstTextMs: firstTextAt ? firstTextAt - startedAt : null,
           streamMs: streamDone - prepareDone, recordMs: recordDone - streamDone, totalMs: recordDone - startedAt },
@@ -576,7 +670,7 @@ export class NormalTranslationService {
             : range!.start === 0 && range!.end === material.sourceRef?.totalCodePoints ? `unit:${material.materialId}`
             : `unit:${material.materialId}:${range!.start}-${range!.end}`
           : `unit:${material.materialId}`,
-        status === 'completed' ? sourceAnnotationChecks(text, context.terms, sourceText) : [])
+        status === 'completed' ? sourceAnnotationChecks(text, context.terms, sourceText) : []), contextUsage }
     } catch (error) {
       const code = (error as { code?: unknown }).code
       if (typeof code === 'string' && code !== 'ABORT_ERR') throw error
@@ -595,9 +689,16 @@ export class NormalTranslationService {
       revisionId: receipt?.revisionId ?? callId, sourceVersion: material.sourceVersion, status, recorded: receipt !== undefined,
       totalCodePoints, metadata: translationCallFacts(metadata), timing, ...(checks.length ? { checks } : {}),
       ...(message ? { message } : {}), persistence: receipt?.persistence ?? 'unconfirmed' as const }
-    const withText = { ...base, text, truncated: false }
+    const assetReview = material.sourceText === undefined && status === 'completed' && receipt ? { assetReview: {
+      tool: 'translation_submit_proposals' as const, target: { kind: 'unit' as const, mainSessionId: request.target.mainSessionId,
+        translationSessionId: material.translationSessionId, unitId: receipt.unitId, sourceVersion: receipt.sourceVersion }, revisionId: receipt.revisionId,
+      nextStep: 'Review this result, then submit reusable entity/term/fact/relation proposals consistent with it using exact unique source quotes. draftTerms were only translation input, not saved proposals. Submit [] if no new assets. The translation Session already owns this recorded file result; point the user to its file entry. Do not create a separate delivery copy unless the user explicitly asks for an export.' } } : {}
+    const handoff = receipt ? { target: { kind: 'unit' as const, mainSessionId: request.target.mainSessionId,
+      translationSessionId: receipt.translationSessionId, unitId: receipt.unitId, sourceVersion: receipt.sourceVersion },
+      nextStep: TRANSLATION_SELF_REVIEW + ' ' + DIRECT_REVISION_GUIDANCE } : {}
+    const withText = { ...base, ...assetReview, ...handoff, text, truncated: false }
     if (new TextEncoder().encode(JSON.stringify(withText)).byteLength <= 60_000) return withText
-    return { ...base, textPreview: Array.from(text).slice(0, 4000).join(''), truncated: true,
+    return { ...base, ...assetReview, ...handoff, textPreview: Array.from(text).slice(0, 4000).join(''), truncated: true,
       resultRef: { operationId: request.operationId, totalCodePoints, tool: 'translation_read_result' as const } }
   }
   private async commitDirect(request: DirectTranslationRequest, envelope: Envelope, callId: string, status: DirectTranslationCommit['status'],
@@ -608,7 +709,7 @@ export class NormalTranslationService {
       revisionId: callId, status, text, message, callRecord: metadata,
       ...(envelope.material.sourceText === undefined ? { sourceText } : {}), ...(range ? { range } : {}), ...(bodyMode ? { body: true } : {}),
       ...(request.draftTerms?.length ? { draftTerms: request.draftTerms } : {}),
-      ...(request.referenceContextRef ? { referenceContextRef: request.referenceContextRef } : {}) }
+      ...(metadata.context?.referenceContextRef ? { referenceContextRef: metadata.context.referenceContextRef } : {}) }
     const value = await this.topics.requestOwned(request.target.mainSessionId, { kind: 'normal_commit', ...commit }, exec)
     if (value.kind !== 'normal_committed') throw rejected('invalid_reply', '译文提交回执类型不一致。', 'record_result')
     const receipt = value.receipt
@@ -638,18 +739,26 @@ export class NormalTranslationService {
    * never writes formal memory; the main model integrates them and passes draft terms to a call.
    */
   extractAssets(input: unknown, exec: ToolExecution): Promise<TranslationExtractionView> {
-    const request = parseDirectTranslationRequest(input)
+    const request = this.resolveTermHandles(parseDirectTranslationRequest(input))
     if (request.target.kind !== 'material') throw rejected('unsupported_target', '资产提取只接受已交付文件材料。', 'extract_assets')
     const target = request.target
     if (this.disposed || !this.topics?.ownsAgent(target.mainSessionId, exec.agent)) throw rejected('scope_mismatch', '资产提取工具不属于此实际主 Agent。', 'authorize')
     exec.signal.throwIfAborted()
+    if (exec.agent) this.topics.retainToolsForNextTurn(exec.agent, ['direct'])
     const key = identity(target.mainSessionId, request.operationId), signature = JSON.stringify(request), previous = this.extractions.get(key)
-    if (previous && previous.signature !== signature) throw rejected('idempotency_conflict', '同一提取操作 ID 不能更换材料、范围或要求。', 'extract_assets')
-    if (!previous) this.extractions.set(key, { signature, promise: this.runExtraction(request, target, exec) })
+    if (previous && previous.signature !== signature) throw rejected('idempotency_conflict', '同一提取操作 ID 不能更换材料、范围或要求；该 ID 已用于另一次请求，请修正参数后改用新的 operationId 重试。', 'extract_assets')
+    if (!previous) {
+      const attempt: DispatchAttempt = { dispatched: false, resolved: false }
+      const promise = this.runExtraction(request, target, exec, attempt)
+      const entry = { signature, promise, settled: false }; this.extractions.set(key, entry)
+      void promise.then(() => { entry.settled = true }, () => { entry.settled = true })
+      // Same rule as the direct call: a rejection before the extraction worker starts leaves nothing to replay.
+      void promise.catch(() => { if (!attempt.dispatched && this.extractions.get(key)?.promise === promise) this.extractions.delete(key) })
+    }
     return this.extractions.get(key)!.promise
   }
   private async runExtraction(request: DirectTranslationRequest, target: NormalTranslationMaterialTarget,
-    exec: ToolExecution): Promise<TranslationExtractionView> {
+    exec: ToolExecution, attempt: DispatchAttempt): Promise<TranslationExtractionView> {
     const delivered = this.materials?.deliveredForAgent(target, exec.agent!, { historical: true })
     if (!delivered) throw rejected('execution_unavailable', '材料服务尚未就绪。', 'resolve_material')
     if (!delivered.ok) throw rejected(delivered.error.code, delivered.error.message, delivered.error.stage)
@@ -670,6 +779,7 @@ export class NormalTranslationService {
     const existingAssets = snapshot.snapshot.entries.filter(entry => entry.status === 'active' && languageMatches(entry.targetLanguage, material.targetLanguage))
       .map(entry => ({ sourceForms: entry.sourceForms, aliases: entry.aliases, preferred: entry.preferred, forbidden: entry.forbidden,
         sense: entry.sense, authority: assetPriority(entry) }))
+    attempt.dispatched = true
     const output = await this.workers.prepare({ ownerId: target.mainSessionId, jobId: `extraction:${request.operationId}`,
       mainSessionId: target.mainSessionId, topicId: material.topicId, translationSessionId: material.translationSessionId,
       source: { materialId: material.materialId, version: material.sourceVersion, text },
@@ -792,12 +902,18 @@ export class NormalTranslationService {
       if (value.kind !== 'unit' || value.unit.id !== request.target.unitId || value.unit.sourceVersion !== request.target.sourceVersion) return bad('stale_version', '原文版本已变化，请读取当前单元再重译。', 'resolve_unit')
       if (!this.topics.ownsConnection(request.target.mainSessionId, peerId)) return bad('scope_mismatch', '所属主会话连接已变化。', 'main_admission')
       const directive = uiLanguageDirective(request.uiLocale)
-      this.topics.activateForMaterial(agent, 'short')
+      this.topics.activateForMaterial(agent, request.fileName ? 'file' : 'short')
       agent.followup(helpers.createUserMessage({ content: [{ type: 'text', text: [
-        'The user requests retranslation of this explicitly provided translation unit. Call translation_execute with this exact target and operationId; organize relevant requirements/term references first if needed. The program reads authoritative source, original target language and requirements, and the translation session current model. Do not translate in main chat or copy the translation back. No extra confirmation or user action is needed. The editable draft is unrelated and remains unchanged.',
-        'The JSON below is a complete translation_execute argument example. Keep target as a nested JSON object, never a JSON-encoded string or the result of JSON.stringify. Fill organizedRequirements and termReferences with relevant requirements and prepared terminology when needed; the empty example values do not skip that preparation.',
-        JSON.stringify({ target: request.target, operationId: request.operationId, organizedRequirements: '', termReferences: [] }),
-        ...(directive === undefined ? [] : [directive]),
+        'The user explicitly requests a new translation of this exact unit. Call translation_translate with the target and operationId below, wait for its actual complete result, review it and deliver it in this turn. This is not an asynchronous acceptance/handoff. Do not call retired execution or file-job tools. The program reads the authoritative source and current Session model; do not change the editable draft.',
+        'This is a full user-requested retranslation, not an automatic retry or a request to preserve every old wording. The previous translation is reference data. Read current applicable settings and query the relevant active terms, including disputed expressions. Do not copy earlier model-authored notes or obsolete interpretations as current user requirements. Use organizedNotes for your organization; userRequirements contains only actual current user wording, empty when none.',
+        SOURCE_LAYOUT_GUIDANCE,
+        request.fileName ? `Original file: ${request.fileName}. After review, submit reusable candidates with translation_submit_proposals using the returned target/revisionId (or [] if none). Keep delivery in this file unit and its version entry; briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation. Save a file only when the user explicitly requests a separate export.',
+        STYLE_SETTINGS_GUIDANCE,
+        ...(request.fileName ? [FILE_MEMORY_REVIEW_GUIDANCE] : []),
+        TRANSLATION_SELF_REVIEW,
+        DIRECT_REVISION_GUIDANCE,
+        JSON.stringify({ target: request.target, operationId: request.operationId, userRequirements: '', organizedNotes: '', termReferences: [] }),
+        ...(directive ? [directive] : []),
       ].join('\n') }], source: { kind: 'translation-unit', form: 'notice', summary: '重译单元', plugin: 'dsh-translation-plugin', mainSessionId: request.target.mainSessionId,
         translationSessionId: request.target.translationSessionId, unitId: request.target.unitId, sourceVersion: request.target.sourceVersion, operationId: request.operationId } }))
       return ok({ ...request, status: 'submitted' })
@@ -1017,6 +1133,17 @@ export class NormalTranslationService {
     const request = parseNormalTranslationQuery(input), found = this.scoped(request), peerId = this.ctx.invocation?.peer.id
     if (!found.ok) return found
     const job = found.value
+    // A lost Client acknowledgement is not an unknown provider outcome. Return its recorded
+    // terminal events for replay and release execution occupancy; never dispatch another call here.
+    await job.writing
+    const settled = job.attempts.snapshot().attempts.at(-1)
+    if (job.deliveryFailed && settled?.endSequence != null && ['completed', 'failed', 'cancelled'].includes(settled.status)) {
+      job.status = settled.status as 'completed' | 'failed' | 'cancelled'
+      job.v2Status = job.status
+      if (job.operation) job.operation = { ...job.operation, status: job.status }
+      this.activeSessions.delete(job.sessionId)
+    }
+
     if (job.acceptRequested && job.operation === null && job.status === 'unknown' && peerId) {
       try {
         const value = await this.topics.observeOperation(request.mainSessionId, peerId, { kind: 'normal_observe',
@@ -1032,6 +1159,29 @@ export class NormalTranslationService {
       } catch { /* No additional evidence: retain the original unknown operation without dispatch. */ }
     }
     return this.view(job, request.afterSequence)
+  }
+  async readLog(raw: TranslationLogRead): Promise<NormalTranslationResult<TranslationLogPage>> {
+    const input = parseTranslationLogRead(raw), peer = this.ctx.invocation?.peer.id
+    const found = this.scoped(input)
+    let ownsCall = found.ok && (found.value.callId === input.callId || found.value.attempts.snapshot().attempts.some(attempt => attempt.callId === input.callId))
+    if (!ownsCall) {
+      const direct = this.direct.get(identity(input.mainSessionId, input.operationId))
+      if (!peer || !this.topics.ownsConnection(input.mainSessionId, peer) || !direct?.settled) return bad('not_found', '该调用日志当前不可读取，请在原宿主运行期间导出。', 'observe')
+      const receipt = await direct.promise
+      ownsCall = this.direct.get(identity(input.mainSessionId, input.operationId)) === direct && receipt.translationSessionId === input.translationSessionId && receipt.revisionId === input.callId
+    }
+    if (!ownsCall) return bad('scope_mismatch', '调用日志与所选版本不匹配。', 'authorize')
+    const events = this.adapter.inspectCallLog(input.callId)
+    if (!events) return bad('not_found', '该调用没有可导出的执行日志；可能尚未派发或宿主已重启。', 'observe')
+    // Export only the public route in request headers, never adapter defaults or credentials.
+    const text = JSON.stringify({ schemaVersion: 1, callId: input.callId, events }, (key, value) => {
+      if (key === 'adapterDefaults' || /^(?:apiKey|api_key|authorization|password|secret|access_token|refresh_token|headers)$/iu.test(key)) return undefined
+      if (key === 'config' && value && typeof value === 'object') return { provider: value.provider, model: value.model, reasoningEffort: value.reasoningEffort, maxTokens: value.maxTokens }
+      return value
+    }, 2)
+    if (input.start > text.length) return bad('stale_cursor', '日志读取位置无效。', 'observe')
+    const end = Math.min(text.length, input.start + 4000)
+    return ok({ text: text.slice(input.start, end), next: end < text.length ? end : null, total: text.length })
   }
   private viewV2(job: Job, after: number): NormalTranslationResult<NormalTranslationV2Job> {
     const { attempts, events } = job.attempts.snapshot()
@@ -1095,6 +1245,32 @@ export class NormalTranslationService {
   hasActiveJobs(ownerId?: string): boolean {
     if (ownerId === undefined) return this.activeSessions.size > 0 || this.documentSessions.size > 0 || [...this.jobs.values()].some(job => ['accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status))
     return [...this.jobs.values()].some(job => job.envelope.mainSessionId === ownerId && (['preparing', 'accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status)))
+  }
+  historyUnitBusy(scope: HistoryScope, unitId: string): boolean {
+    return [...this.jobs.values()].some(job => historyTargetMatches(scope, unitId, job.operation ?? job.envelope.material) && (['preparing', 'accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user', 'resuming'].includes(job.v2Status))) ||
+      [...this.direct.values(), ...this.extractions.values()].some(entry => { const target = JSON.parse(entry.signature).target; return !entry.settled && (historyTargetMatches(scope, unitId, target) || target.kind === 'material' && `unit:${target.materialId}` === unitId) }) ||
+      [...this.direct.values()].some(entry => !entry.settled && entry.historyContext && [entry.historyContext.refs.base, ...entry.historyContext.refs.nearby].some(ref => ref && historyTargetMatches(scope, unitId, { ...entry.historyContext, ...ref })))
+  }
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void {
+    const owned = new Set([...this.jobs.values()].filter(job => historyTargetMatches(scope, unitId, job.operation ?? job.envelope.material, sourceVersion)))
+    for (const [id, job] of this.jobs) if (owned.has(job)) {
+      job.controller.abort(); job.delivery.abort(); this.adapter.discard(job.packet?.operationId ?? job.internalId)
+      for (const attempt of job.attempts.snapshot().attempts) this.adapter.forgetCallLog(attempt.callId)
+      this.jobs.delete(id)
+    }
+    for (const [id, entry] of this.resumeTokens) if (owned.has(entry.job)) this.resumeTokens.delete(id)
+    for (const [id, entry] of this.resumesByResolution) if (owned.has(entry.job)) this.resumesByResolution.delete(id)
+    const matches = (target: NormalTranslationTarget): boolean => historyTargetMatches(scope, unitId, target, sourceVersion) || target?.kind === 'material' && `unit:${target.materialId}` === unitId && (sourceVersion === undefined || target.sourceVersion === sourceVersion)
+    for (const [id, entry] of this.direct) if (matches(JSON.parse(entry.signature).target) || entry.historyContext &&
+      [entry.historyContext.refs.base, ...entry.historyContext.refs.nearby].some(ref => ref && historyTargetMatches(scope, unitId, { ...entry.historyContext, ...ref }, sourceVersion))) {
+      if (entry.callId) this.adapter.forgetCallLog(entry.callId)
+      this.direct.delete(id); this.directResults.delete(id); this.savedArtifacts.delete(id)
+    }
+    for (const [id, entry] of this.admissions) if (matches(JSON.parse(entry.signature).target)) this.admissions.delete(id)
+    for (const map of [this.resolved, this.corrections, this.unitRequests, this.direct, this.extractions]) for (const [id, entry] of map) {
+      const request = JSON.parse(entry.signature)
+      if (matches(request.target)) { map.delete(id); this.directResults.delete(id); this.savedArtifacts.delete(id) }
+    }
   }
   dispose(): void {
     this.disposed = true

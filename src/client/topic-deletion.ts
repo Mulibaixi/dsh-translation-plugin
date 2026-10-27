@@ -32,6 +32,11 @@ export class TopicDeletionClient {
     return { plan, memory, termsCount: memory.terms.currentCount, archiveCount: memory.archive.currentCount,
       referenceCount: this.ports.references.getTopicDocumentCount(plan.ownerId, topicId) }
   }
+  async captureAsync(callerOwnerId: string, topicId: string): Promise<TopicDeletionPreview | undefined> {
+    const memory = await this.ports.clearing.captureAsync(callerOwnerId, topicId)
+    const preview = this.capture(callerOwnerId, topicId)
+    return preview ? { ...preview, memory, termsCount: memory.terms.currentCount, archiveCount: memory.archive.currentCount } : undefined
+  }
 
   getBlockedReason(preview: TopicDeletionPreview): string | undefined {
     const plan = preview.plan
@@ -60,15 +65,17 @@ export class TopicDeletionClient {
     if (preview.referenceCount > 0 && !await this.ports.references.clearTopic(plan.ownerId, plan.topicId))
       return result('partial', '会话与主题记忆已删除，但参考资料未清理；请重试。', ['参考资料'])
     this.ports.references.discardTopic(plan.ownerId, plan.topicId)
-    if (this.ports.viewFiles) {
+    if (this.ports.viewFiles && !this.ports.localData) {
       const sessionIds = this.ports.sessions.getTopicDeletionIntent(plan.topicId)?.sessionIds ?? plan.sessionIds
       await this.ports.viewFiles.clear([{ namespaceId: this.ports.sessions.getNamespaceId(), sessionIds: [...sessionIds] }])
     }
+    let cleanup: TopicDeletionResult['resourceCleanup']
     if (this.ports.localData) {
       const purged = await this.ports.localData.purgeTopic(operationId, plan.ownerId, plan.topicId, this.ports.references.getAssetNamespaceId())
       if (!purged.ok) return result('partial', `会话与主题记忆已删除，但宿主文件未清理：${purged.message ?? '请重试。'}`, ['宿主文件'])
+      cleanup = purged.resourceCleanup
     }
     if (!await this.ports.sessions.commitTopicDeletionAsync(plan)) return result('failed', '主题删除未提交；请核对当前主题与会话后重试。')
-    return result('deleted', `已删除主题「${preview.plan.topicName}」及其会话与记忆资产。`)
+    return { ...result('deleted', `已删除主题「${preview.plan.topicName}」及其会话与记忆资产。${cleanup ? `本次宿主清理 ${cleanup.removed} 个文件${cleanup.retained ? `，共享保留 ${cleanup.retained} 个文件` : ''}。${cleanup.complete ? '' : '仍有残留文件未释放，请在存储与空间重试回收；正文不会恢复。'}` : ''}`), ...(cleanup ? {resourceCleanup:cleanup} : {}) }
   }
 }

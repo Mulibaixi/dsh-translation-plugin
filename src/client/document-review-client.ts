@@ -26,8 +26,22 @@ export class DocumentReviewClient {
   private readonly listeners = new Set<() => void>()
   private readonly operations = new Map<string, { signature: string; result: Promise<AnalysisResult<DocumentReviewReceipt>> }>()
   private readonly notices = new Map<string, Promise<void>>()
+  private readonly stopStore: () => void
   constructor(private readonly store: SessionStore, private readonly preparations: PreparationStore, private readonly reader: TranslationDocumentReader,
-    private readonly retain: (ownerId: string) => () => void, private readonly options: DocumentReviewClientOptions = {}) {}
+    private readonly retain: (ownerId: string) => () => void, private readonly options: DocumentReviewClientOptions = {}) {
+    this.stopStore = store.subscribe(() => {
+      for (const entry of this.operations.values()) if (entry.signature) {
+        const [, request] = JSON.parse(entry.signature), target = request.target
+        const unit = store.getTranslationHistory(target.scope.translationSessionId)?.units.find(unit => unit.id === target.unitId)
+        if (!unit || !isDocumentUnit(unit)) continue
+        void entry.result.then(result => {
+          if (unit.deletion || unit.sourceVersions.some(source => source.version === target.sourceVersion && source.deletion) || unit.revisions.some(revision => revision.deletion && (revision.id === target.manifestRevisionId || result.ok && revision.id === result.value.manifestRevisionId))) {
+            entry.signature = ''; entry.result = Promise.resolve(bad('revision_deleted', '此操作的文档版本已删除。'))
+          }
+        })
+      }
+    })
+  }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private locate(ownerId: string, target: DocumentReviewTarget): { unit: DocumentUnit; manifest: DocumentRevision; handle: DocumentReadHandle } {
@@ -36,7 +50,7 @@ export class DocumentReviewClient {
     if (this.store.getStatus(session.id) === 'conflict') throw error('history_conflict', '历史副本已变化，请先处理冲突。')
     if (unit.sourceVersion !== target.sourceVersion) throw error('stale_source_version', '复核原稿已被新版本取代。')
     const manifest = unit.revisions.find(revision => revision.id === target.manifestRevisionId)
-    if (!manifest || manifest.sourceVersion !== target.sourceVersion) throw error('manifest_missing', '此精确整篇候选不存在。')
+    if (!manifest || manifest.deletion || manifest.sourceVersion !== target.sourceVersion) throw error('manifest_missing', '此精确整篇候选已删除或不存在。')
     const handle = this.reader.captureDocument({ ownerId, topicId: scope.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: target.sourceVersion, manifestRevisionId: manifest.id })
     if ('status' in handle) throw error(handle.status, `候选读取不可用：${handle.reason}`)
     return { unit, manifest, handle }
@@ -79,7 +93,7 @@ export class DocumentReviewClient {
       const target = { scope: request.scope, unitId: request.unitId, sourceVersion: request.sourceVersion, manifestRevisionId: selected.id }, located = this.locate(ownerId, target)
       const { manifest, handle } = located, preparation = await this.preparation(target, unit, manifest), task = unit.tasks.find(task => task.taskId === manifest.taskId)
       if (!task) throw error('task_missing', '整篇候选的真实任务不存在。')
-      const audits = (unit.reviewAudits ?? []).filter(item => item.manifestRevisionId === manifest.id || item.reviewedRevisionId === manifest.id), audit = audits.at(-1), section = request.section ?? 'summary'
+      const audits = (unit.reviewAudits ?? []).filter(item => !item.deletion && (item.manifestRevisionId === manifest.id || item.reviewedRevisionId === manifest.id)), audit = audits.at(-1), section = request.section ?? 'summary'
       const records: readonly unknown[] = section === 'entries' ? handle.blocks.map(block => ({ chunkId: block.chunkId, revisionId: block.revisionId, outputRange: block.outputRange, mode: block.mode,
         status: block.revision?.status ?? 'missing', sourceVersion: block.revision?.sourceVersion ?? null, totalCodePoints: block.revision ? block.revision.content.kind === 'text' ? sourceCodePointLength(block.revision.content.text) : block.revision.content.range.end - block.revision.content.range.start : 0,
         preparationRef: block.revision?.preparationRef ?? null, actualContextRef: (() => {
@@ -116,6 +130,7 @@ export class DocumentReviewClient {
       const audit = request.operationId ? (unit.reviewAudits ?? []).find(item => item.operationId === request.operationId) : null
       const manual = request.operationId ? unit.chunkRevisions.find(item => item.childOperationId === request.operationId && item.manualBase?.manifestRevisionId === request.target.manifestRevisionId) : null
       const edited = manual && unit.revisions.find(item => item.parentRevisionId === request.target.manifestRevisionId && item.entries.some(entry => entry.revisionId === manual.id))
+      if (audit?.deletion || manual?.deletion || edited?.deletion) return bad('revision_deleted', '原操作的文档版本已删除。')
       if (request.operationId && !audit && !edited && unit.final?.selectionEventId !== request.operationId) return good(null)
       if (audit && audit.manifestRevisionId !== request.target.manifestRevisionId) return bad('scope_mismatch', '原操作属于另一个明确候选。')
       return good(this.receipt(request.target, request.operationId ?? 'document-review-query', audit?.reviewedRevisionId ?? edited?.id ?? request.target.manifestRevisionId))
@@ -123,7 +138,7 @@ export class DocumentReviewClient {
   }
   private operation(ownerId: string, kind: 'begin' | 'submit' | 'manual' | 'final', request: DocumentReviewBeginRequest, execute: () => Promise<AnalysisResult<DocumentReviewReceipt>>): Promise<AnalysisResult<DocumentReviewReceipt>> {
     const key = JSON.stringify([ownerId, request.operationId]), signature = JSON.stringify([kind, request]), previous = this.operations.get(key)
-    if (previous) return previous.signature === signature ? previous.result : Promise.resolve(bad('idempotency_conflict', '同一操作标识已经绑定另一复核意图。'))
+    if (previous) return previous.signature === '' ? Promise.resolve(bad('revision_deleted', '此操作的文档版本已删除。')) : previous.signature === signature ? previous.result : Promise.resolve(bad('idempotency_conflict', '同一操作标识已经绑定另一复核意图。'))
     const result = execute(); this.operations.set(key, { signature, result }); return result
   }
   private async locked(ownerId: string, request: DocumentReviewBeginRequest, action: (unit: DocumentUnit, manifest: DocumentRevision, handle: DocumentReadHandle) => Promise<string>, requireLatest = true): Promise<AnalysisResult<DocumentReviewReceipt>> {
@@ -220,5 +235,5 @@ export class DocumentReviewClient {
       }
     }
   }
-  dispose(): void { this.disposed = true; this.listeners.clear(); this.operations.clear() }
+  dispose(): void { this.disposed = true; this.stopStore(); this.listeners.clear(); this.operations.clear() }
 }

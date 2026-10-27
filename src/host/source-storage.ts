@@ -67,6 +67,10 @@ export async function sourceSha256(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes).buffer))
   return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('')
 }
+/** Matches exactly the digest/extension names written by this storage, including legacy TXT copies. */
+export function sourceContentDigest(name: string): string | undefined {
+  return /^([a-f0-9]{64})\.[a-z0-9]{1,16}$/u.exec(name)?.[1]
+}
 /** Private plugin byte copies and independent scoped mappings. No attachment paths, TTL or GC. */
 export async function loadTranslationSourceStorage(ctx: QuickHostContext): Promise<TranslationSourceStorage> {
   const loader = ctx.get?.('loader') as QuickHostContext['loader']

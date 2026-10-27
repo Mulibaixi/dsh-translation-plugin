@@ -1,4 +1,5 @@
 import type { LocalDataRemotePort, HostStorageUsage } from '../shared/local-data.js'
+import type { HistoryCleanupResult } from '../shared/history-cleanup.js'
 import { LOCAL_DATA_GENERATION } from './storage-fence.js'
 import { PLUGIN_STORAGE_PREFIX } from './storage-usage.js'
 import { h, react } from './react.js'
@@ -35,25 +36,25 @@ export class LocalDataClient {
   async usage():Promise<HostStorageUsage|undefined>{
     try{const reply=await(await this.remote())?.usageRemote() as {ok?:boolean;value?:HostStorageUsage}|undefined;return reply?.ok===true?reply.value:undefined}catch{return undefined}
   }
-  /** Scoped Host cleanup used by topic deletion; shared source bodies are not removed here. */
-  async purgeTopic(operationId:string,ownerId:string,topicId:string,namespaceId?:string):Promise<{readonly ok:boolean;readonly message?:string}>{
+  /** Scoped Host retirement and file cleanup; incomplete physical cleanup remains retryable. */
+  async purgeTopic(operationId:string,ownerId:string,topicId:string,namespaceId?:string):Promise<{readonly ok:boolean;readonly message?:string;readonly resourceCleanup?:HistoryCleanupResult|undefined}>{
     try{
       const remote=await this.remote();if(!remote)return {ok:false,message:'宿主清理服务尚未就绪。'}
       const reply=await remote.purgeTopicRemote({operationId,ownerId,topicId,...(namespaceId?{namespaceId}:{})}) as
-        {ok?:boolean;value?:{cleared?:boolean;error?:{message?:string}};error?:{message?:string}}
-      if(reply.ok===true&&reply.value?.cleared===true)return {ok:true}
+        {ok?:boolean;value?:{cleared?:boolean;resourceCleanup?:HistoryCleanupResult;error?:{message?:string}};error?:{message?:string}}
+      if(reply.ok===true&&reply.value?.cleared===true)return {ok:true,resourceCleanup:reply.value.resourceCleanup}
       return {ok:false,message:reply.value?.error?.message??reply.error?.message??'宿主主题文件清理未完成。'}
     }catch{return {ok:false,message:'宿主主题文件清理未完成，请重试。'}}
   }
-  /** Manual reachability reclaim: only source bodies with no saved mapping are removed. */
-  async reclaim():Promise<{readonly ok:boolean;readonly removed?:number;readonly bytes?:number;readonly message?:string}>{
+  /** Manual reachability reclaim: released references no longer retain source bodies. */
+  async reclaim():Promise<{readonly ok:boolean;readonly removed?:number;readonly bytes?:number;readonly resourceCleanup?:HistoryCleanupResult|undefined;readonly message?:string}>{
     try{
       const remote=await this.remote();if(!remote)return {ok:false,message:'宿主清理服务尚未就绪。'}
       this.reclaimOperationId??=`source-reclaim:${crypto.randomUUID()}`
       const reply=await remote.reclaimRemote({operationId:this.reclaimOperationId}) as
-        {ok?:boolean;value?:{reclaimed?:boolean;removed?:number;bytes?:number;error?:{message?:string}};error?:{message?:string}}
-      if(reply.ok===true&&reply.value?.reclaimed===true)return {ok:true,removed:reply.value.removed??0,bytes:reply.value.bytes??0}
-      return {ok:false,message:reply.value?.error?.message??reply.error?.message??'原稿回收未完成。'}
+        {ok?:boolean;value?:{reclaimed?:boolean;removed?:number;bytes?:number;resourceCleanup?:HistoryCleanupResult;error?:{message?:string}};error?:{message?:string}}
+      if(reply.ok===true&&reply.value?.reclaimed===true)return {ok:true,removed:reply.value.removed??0,bytes:reply.value.bytes??0,resourceCleanup:reply.value.resourceCleanup}
+      return {ok:false,resourceCleanup:reply.value?.resourceCleanup,message:reply.value?.error?.message??reply.error?.message??'原稿回收未完成。'}
     }catch{return {ok:false,message:'原稿回收未完成，请重试。'}}
   }
   async clear():Promise<void>{
@@ -100,7 +101,7 @@ export function LocalDataClearView({data}:{readonly data:LocalDataClient}):unkno
   useLocalDataFrozen(data)
   const [confirm,setConfirm]=react.useState(false)
   return h('section',{className:'dsh-tp dsh-tp-settings-section'},h('style',null,styles),h('h3',null,'本地数据'),
-    h('p',{className:'dsh-tp-muted'},'清除当前浏览器来源中的本插件数据，以及当前 DSH 数据目录中的插件自有原稿和参考片段。包含会话、记忆资产、准备记录、偏好和设置。用户原文件、主聊天附件与聊天历史保留。清除后需重新启用插件。'),
+    h('p',{className:'dsh-tp-muted'},'清除当前浏览器来源中的本插件数据，以及当前 DSH 数据目录中的插件自有原稿和参考资料。包含会话、记忆资产、准备记录、偏好、设置，以及本插件的嵌入 API 配置和密钥。用户原文件、主聊天附件与聊天历史保留。清除后需重新启用插件。'),
     data.isCleared()?null:h('button',{type:'button',disabled:data.isClearing(),onClick:()=>setConfirm(true)},data.isFrozen()?'重试清除本地数据':'清除本地数据'),
     confirm?h('div',{role:'alertdialog','aria-label':'清除本地数据确认'},h('p',null,'确定永久清除上述本地数据？此操作无法撤销。'),
       h('button',{type:'button',disabled:data.isClearing(),onClick:()=>{setConfirm(false);void data.clear()}},'确认清除'),

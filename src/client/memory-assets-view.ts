@@ -1,5 +1,7 @@
 import type { ReferenceStore } from './reference-store.js'
 import { ReferenceFilesView } from './reference-view.js'
+import { OtherMemoryView } from './other-memory-view.js'
+import type { OtherMemoryClient } from './other-memory-client.js'
 import { h, react } from './react.js'
 import { styles } from './view-styles.js'
 import { downloadExport } from './browser-download.js'
@@ -18,14 +20,28 @@ import { TopicArchiveView } from './topic-archive-view.js'
 import { resolveMemoryAssetsSelection } from './memory-assets-window.js'
 import { Menu, IconChevronDownOutlineRegular } from './native-ui.js'
 import type { RecordObjectsProps } from './record-object-view.js'
+
+/** One row of peer choices: the archive kind is picked directly instead of through a dropdown. */
+const archiveKinds = [
+  { value: 'terms', label: '术语' },
+  { value: 'entity', label: '实体' },
+  { value: 'fact', label: '事实' },
+  { value: 'relation', label: '关系' },
+] as const
 import type { DocumentViewProps } from './document-unit-view.js'
 import type { ThemeMemoryClearing } from './theme-memory-clearing.js'
 import { useThemeMemoryClearing } from './theme-memory-clearing-view.js'
-import { FileJobAssetsView, type FileJobViewProps } from './file-job-view.js'
+import type { FileJobViewProps } from './file-job-view.js'
+import { adoptTopicAssets, type TopicAssetKind } from './topic-asset-actions.js'
+import { MemoryIndexView } from './memory-index-view.js'
+import type { MemoryIndexClient } from './memory-index-client.js'
 
 interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps {
+  readonly memoryIndex?: MemoryIndexClient | undefined
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
   readonly references?: ReferenceStore | undefined
+  readonly otherMemory?: OtherMemoryClient | undefined
+  readonly mainSessionId?: string | undefined
   readonly archive: TopicArchiveStore
   readonly memoryClearing?: ThemeMemoryClearing | undefined
   readonly topics?: TopicBridgeClient | undefined; readonly ownerId: string; readonly topicId: string
@@ -33,7 +49,7 @@ interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps, FileJ
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, references, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, jobId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, references, otherMemory, memoryIndex, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, jobId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly jobId?: string | undefined
   readonly onSelectTopic?: ((topicId: string) => void) | undefined
@@ -70,12 +86,11 @@ export function MemoryAssetsView({ store, terms, archive, references, quick, top
         type: 'button', role: 'menuitem', className: 'dsh-tp-session-choice', key: topic.id, 'data-topic-id': topic.id, 'aria-current': topic.id === selectedTopicId,
         onClick: () => { onSelectTopic(topic.id); setPickerOpen(false); setQuery('') },
       }, topic.name))))) : null,
-    references && topic ? h(ReferenceFilesView,{references,ownerId,topicId:selectedTopicId}) : null,
     store.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null,
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: `${ownerId}:${id}`, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
-        h(MemoryAssetsTopicView, { store, terms, archive, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm, jobId: id === selectedTopicId ? jobId : undefined,
+        h(MemoryAssetsTopicView, { store, terms, archive, references, otherMemory, memoryIndex, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm, jobId: id === selectedTopicId ? jobId : undefined,
           active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
           navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
     }),
@@ -83,26 +98,70 @@ export function MemoryAssetsView({ store, terms, archive, references, quick, top
   )
 }
 
-function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, jobId, navigationRevision }: MemoryAssetsProps & {
+function AssetAdoptionControl({ terms, archive, ownerId, topicId, kind, active, memoryIndex }: {
+  readonly terms: TopicTermsViewPort; readonly archive: TopicArchiveStore; readonly ownerId: string; readonly topicId: string
+  readonly kind: TopicAssetKind; readonly active: boolean; readonly memoryIndex?: MemoryIndexClient | undefined
+}): unknown {
+  const assets = kind === 'terms' ? terms : archive
+  const [, refresh] = react.useState(0), [adopting, setAdopting] = react.useState(false), [notice, setNotice] = react.useState<string | undefined>(undefined)
+  const busy = react.useRef(false), alive = react.useRef(true)
+  react.useEffect(() => assets.subscribe(() => refresh(value => value + 1)), [assets])
+  react.useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  const state = assets.getReadState(ownerId, topicId), ready = state.status === 'ready' && !state.retired
+  const count = ready ? state.snapshot!.entries.filter(e => ['proposal', 'review_required'].includes(e.status) && (kind === 'terms' || ('kind' in e && e.kind === kind))).length : 0
+  async function adopt(): Promise<void> {
+    if (busy.current || !active || !ready || !count) return
+    busy.current = true; setAdopting(true); setNotice(undefined)
+    // A page switch may release its view, but must not evict a batch still being saved.
+    const release = assets.retain(ownerId, topicId)
+    try {
+      const result = await adoptTopicAssets(terms, archive, ownerId, topicId, kind)
+      if (alive.current) setNotice(`已采用 ${result.adopted} 条${result.remaining ? `，${result.remaining} 条仍待处理${kind === 'fact' || kind === 'relation' ? '，请核对条目及关联实体状态' : ''}` : ''}。`)
+      void memoryIndex?.refresh()
+    } catch (error) { if (alive.current) setNotice((error as Error).message) }
+    finally { release(); busy.current = false; if (alive.current) setAdopting(false) }
+  }
+  if (!active) return null
+  return h('div', { className: 'dsh-tp-actions' },
+    h('button', { type: 'button', disabled: adopting || !ready || !count,
+      title: '仅采用当前主题本类别的全部待确认和待复核条目，不受页内筛选影响；其他类别不变。事实和关系的关联实体须先采用。已停用和冲突条目保留。',
+      onClick: () => { void adopt() } }, adopting ? '正在采用…' : `一键采用${count ? `（${count}）` : ''}`),
+    notice ? h('span', { role: 'status', className: 'dsh-tp-message' }, notice) : null)
+}
+
+function MemoryAssetsTopicView({ store, terms, archive, references, otherMemory, memoryIndex, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, jobId, navigationRevision }: MemoryAssetsProps & {
   readonly topicName: string; readonly active: boolean
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly jobId?: string | undefined
 }): unknown {
-  const [category, setCategory] = react.useState<'terms' | 'translations' | 'proposals'>(jobId ? 'proposals' : 'terms')
-  const [focusedJobId, setFocusedJobId] = react.useState(jobId)
+  const [category, setCategory] = react.useState<'terms' | 'translations' | 'other'>('terms')
+  const [otherVisited, setOtherVisited] = react.useState(false)
   const [, refreshJobs] = react.useState(0)
   react.useEffect(() => fileJobs?.subscribe(() => refreshJobs(value => value + 1)), [fileJobs])
-  react.useEffect(() => { setFocusedJobId(jobId); if (jobId) setCategory('proposals') }, [jobId, navigationRevision])
-  const proposalCount = fileJobs?.all(undefined, topicId).reduce((sum, record) => sum + fileJobs.pendingCount(record), 0) ?? 0
+  react.useEffect(() => { if (jobId) setCategory('terms') }, [jobId, navigationRevision])
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
+  react.useEffect(() => {
+    if (!active) return
+    // The four pages share this topic window's lifetime, rather than evicting each other on tab changes.
+    const releaseTerms = terms.retain(ownerId, topicId), releaseArchive = archive.retain(ownerId, topicId)
+    return () => { releaseTerms(); releaseArchive() }
+  }, [terms, archive, ownerId, topicId, active])
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
   const exportFeedback = useExportDownloadFeedback(active && category === 'terms')
   const memoryClear = useThemeMemoryClearing({ clearing: memoryClearing, ownerId, topicId, visible: active && category === 'terms' })
   const evidenceContextKey = JSON.stringify([ownerId, topicId, associatedSessionId, navigationRevision])
-  function exportArchive(format: 'json' | 'markdown'): void {
+  async function exportArchive(format: 'json' | 'markdown'): Promise<void> {
     exportFeedback.clear(); setExportNotice(undefined)
     try {
-      const frozen = structuredClone({ terms: terms.getSnapshot(ownerId, topicId), archive: archive.getSnapshot(ownerId, topicId) })
+      const termState = terms.getReadState(ownerId, topicId)
+      const archiveState = archive.getReadState(ownerId, topicId)
+      // Freeze each already loaded category before awaiting the other category.
+      const termRead = termState.status === 'ready' && termState.snapshot
+        ? structuredClone(termState.snapshot) : terms.ensureLoaded(ownerId, topicId).then(value => structuredClone(value))
+      const archiveRead = archiveState.status === 'ready' && archiveState.snapshot
+        ? structuredClone(archiveState.snapshot) : archive.ensureLoaded(ownerId, topicId).then(value => structuredClone(value))
+      const [frozenTerms, frozenArchive] = await Promise.all([termRead, archiveRead])
+      const frozen = { terms: frozenTerms, archive: frozenArchive }
       function availability(snapshot: { readonly ownerId: string; readonly topicId: string; readonly entries: readonly { readonly id: string; readonly evidence: readonly TermEvidenceRef[] }[] }) {
         return snapshot.entries.flatMap(entry => entry.evidence.map((ref, evidenceIndex) => {
           if (ref.kind === 'reference') return {entryId: entry.id, evidenceIndex, sessionName: null, unitOrder: null, revisionOrder: null, readable: false, sourceLabel:'参考资料：'+ref.referenceId+' / '+ref.segmentId, readability:'not_loaded' as const}
@@ -120,15 +179,14 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
         termEvidenceAvailability: availability(frozen.terms), archiveEvidenceAvailability: availability(frozen.archive) }
       const download = format === 'json' ? buildTopicArchiveJsonExport(input) : buildTopicArchiveMarkdownExport(input)
       downloadExport(download); exportFeedback.downloadStarted(download.fileName)
-    } catch { setExportNotice({ message: '无法启动下载，请重试。', failure: true }) }
+    } catch (error) { setExportNotice({ message: `档案导出未完成：${error instanceof Error ? error.message : '请重试。'}`, failure: true }) }
   }
   return h('div', { className: 'dsh-tp-assets-body' },
       exportFeedback.toast,
       h('nav', { className: 'dsh-tp-assets-nav', 'aria-label': '资产分类' },
         h('button', { type: 'button', 'aria-current': category === 'translations', onClick: () => setCategory('translations') }, '译文记录'),
         h('button', { type: 'button', 'aria-current': category === 'terms', onClick: () => setCategory('terms') }, '结构化档案'),
-        fileJobs ? h('button', { type: 'button', 'aria-current': category === 'proposals', onClick: () => setCategory('proposals') }, `文件提案${proposalCount ? ` · ${proposalCount}` : ''}`) : null,
-        h('button', { type: 'button', disabled: true }, '其他记忆 · 暂未开放'),
+        h('button', { type: 'button', 'aria-current': category === 'other', onClick: () => { setOtherVisited(true); setCategory('other') } }, '其他记忆'),
         h('button', { type: 'button', disabled: true }, '临时文件 · 暂未开放')),
       h('div', { className: 'dsh-tp-assets-content' },
         // Visited topics and both categories stay mounted to retain local edit drafts.
@@ -136,13 +194,13 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
           h('div', { className: 'dsh-tp-structured' },
             h('div', { className: 'dsh-tp-archive-toolbar' },
               h('div', { className: 'dsh-tp-unit-header' },
-                h('select', { 'aria-label': '档案类型', value: kind, onChange: (event: { currentTarget: { value: string } }) => {
-                  const value = event.currentTarget.value
-                  if (value === 'terms' || value === 'entity' || value === 'fact' || value === 'relation') setKind(value)
-                } }, h('option', { value: 'terms' }, '术语'), h('option', { value: 'entity' }, '实体'), h('option', { value: 'fact' }, '事实'), h('option', { value: 'relation' }, '关系')),
-                h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('json') }, '导出 JSON'),
+                h('div', { className: 'dsh-tp-segmented', role: 'radiogroup', 'aria-label': '档案类型' },
+                  ...archiveKinds.map(option => h('button', { key: option.value, type: 'button', role: 'radio', 'aria-label': option.label,
+                    'aria-checked': kind === option.value, onClick: () => setKind(option.value) }, option.label))),
+                h('div', { className: 'dsh-tp-actions' }, ...archiveKinds.map(option => h(AssetAdoptionControl, { key: option.value, terms, archive, ownerId, topicId, kind: option.value, active: active && category === 'terms' && kind === option.value, memoryIndex })), h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('json') }, '导出 JSON'),
                   h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('markdown') }, '导出 Markdown'), memoryClear.menu)),
               exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null,
+              active && memoryIndex ? h('details', { 'aria-label': '语义索引' }, h('summary', null, '语义索引'), h(MemoryIndexView, { client: memoryIndex, compact: true })) : null,
               memoryClear.feedback, memoryClear.dialog),
             h('div', { className: 'dsh-tp-assets-module', hidden: kind !== 'terms' },
               h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName, hideExport: true,
@@ -153,8 +211,11 @@ function MemoryAssetsTopicView({ store, terms, archive, quick, topics, objects, 
             ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
               h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type,
                 active: active && category === 'terms' && kind === type, evidenceContextKey }))))),
-        fileJobs ? h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'proposals' }, h(FileJobAssetsView, { jobs: fileJobs, topicId, sessionId: associatedSessionId, jobId: focusedJobId, navigationRevision })) : null,
+        otherVisited ? h('div', { className: 'dsh-tp-assets-module dsh-tp-other-memory-module', hidden: category !== 'other' },
+          otherMemory ? h(OtherMemoryView, { client: otherMemory, store, topicId, mainSessionId, active: active && category === 'other' }) : h('p', { className: 'dsh-tp-message', role: 'status' }, '其他记忆服务暂不可用。'),
+          references ? h('section', { className: 'dsh-tp-other-memory-legacy', 'aria-label': '旧版参考资料' },
+            h('h3', null, '旧版参考资料'), h('p', { className: 'dsh-tp-muted' }, '此处保留旧版登记；尚未迁入主题参考文件。'), h(ReferenceFilesView, { references, ownerId, topicId })) : null) : null,
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
           h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations',
-            onOpenAssets: fileJobs ? (_ownerId: string, _topicId: string, _sessionId?: string, selectedJobId?: string) => { setFocusedJobId(selectedJobId); setCategory('proposals') } : undefined }))))
+            onOpenAssets: fileJobs ? () => { setCategory('terms') } : undefined }))))
 }

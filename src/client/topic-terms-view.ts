@@ -7,17 +7,21 @@ import { isTextUnit } from './translation-history.js'
 import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 import { buildTopicTermsJsonExport, buildTopicTermsMarkdownExport, type TopicTermsExport, type TopicTermsExportSnapshot } from './topic-terms-export.js'
 import type { EvidenceReadResult } from '../shared/translation-evidence.js'
+import type { TopicTermReadState } from './topic-memory-store.js'
 
 /** User editing and adoption record real browser actions, separate from model commands. */
 export interface TopicTermsViewPort {
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot
+  ensureLoaded(ownerId: string, topicId: string): Promise<TopicTermSnapshot>
+  getReadState(ownerId: string, topicId: string): TopicTermReadState
+  retain(ownerId: string, topicId: string): () => void
   subscribe(listener: () => void): () => void
   readReferenceAsync?(ownerId:string,topicId:string,ref:import('../shared/reference-memory.js').ReferenceEvidenceRef):Promise<import('../shared/reference-memory.js').ReferenceText|undefined>
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined
   readEvidenceAsync?(ownerId: string, topicId: string, reference: TermEvidenceRef): Promise<EvidenceReadResult>
   getNotice(): string | undefined
   getStatus(ownerId: string, topicId: string): HistoryStatus
-  reload(ownerId: string, topicId: string): boolean
+  reload(ownerId: string, topicId: string): Promise<boolean>
   saveUserTerm(ownerId: string, topicId: string, expectedVersion: number, input: TopicTermUserInput): Promise<TermMutationResult>
   apply(ownerId: string, topicId: string, expectedVersion: number,
     command: { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }): Promise<TermMutationResult>
@@ -93,13 +97,24 @@ function TermRow({ entry, selected, pending, onAction, onDelete, onDetails }: {
   readonly onAction: (kind: 'adopt' | 'disable', entry: TopicTerm) => void
   readonly onDelete: (entry: TopicTerm) => void; readonly onDetails: () => void
 }): unknown {
-  return h('article', { className: 'dsh-tp-term', 'aria-label': `术语 ${entry.sourceForms.join('、')}`, 'aria-current': selected },
+  return h('article', { className: 'dsh-tp-term', 'aria-label': `术语 ${entry.sourceForms.join('、')}`, 'aria-current': selected,
+    // 条目本身即详情入口：点击或回车展开右侧详情，条目内的操作按钮不触发。
+    role: 'button', tabIndex: 0, 'aria-expanded': selected,
+    onClick: onDetails,
+    onKeyDown: (event: { readonly key: string; readonly target?: unknown; readonly currentTarget?: unknown; preventDefault(): void }) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      // 焦点在条目内的操作按钮上时，按键交给按钮本身。
+      if (event.target !== undefined && event.target !== event.currentTarget) return
+      event.preventDefault(); onDetails()
+    } },
     h('div', { className: 'dsh-tp-unit-header' }, h('span', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`), h('span', { className: 'dsh-tp-muted', role: 'status' }, labels[entry.status])),
-    h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
+    h('div', { className: 'dsh-tp-actions dsh-tp-version-actions', onClick: (event: { readonly target?: unknown; readonly currentTarget?: unknown; stopPropagation(): void }) => {
+      // 只拦下操作按钮自身的事件；操作行的空白区域仍属于条目本身。
+      if (event.target !== event.currentTarget) event.stopPropagation()
+    } },
       entry.status !== 'active' ? h('button', { type: 'button', disabled: pending, onClick: () => onAction('adopt', entry) }, entry.status === 'disabled' ? '重新采用' : '采用') : null,
       entry.status === 'active' ? h('button', { type: 'button', disabled: pending, onClick: () => onAction('disable', entry) }, '停用') : null,
       h('button', { type: 'button', disabled: pending, onClick: () => onDelete(entry) }, '删除'),
-      h('button', { type: 'button', disabled: pending, 'aria-expanded': selected, onClick: onDetails }, '详情'),
     ),
   )
 }
@@ -115,6 +130,7 @@ function formFrom(snapshot: TopicTermSnapshot, entry?: TopicTerm, targetLanguage
 }
 function splitLines(value: string): string[] { return value.split(/\r?\n/).map(line => line.trim()).filter(Boolean) }
 function mutationMessage(result: TermMutationResult): true | string {
+  if (result.status === 'save_failed') return '术语修改已在本次运行中生效，但尚未保存；输入仍保留，可重试保存。'
   if (result.status === 'conflict') return '请先停用或处理同范围的冲突条目，再保存或采用此术语。'
   if (result.status === 'stale') return '术语已变化，输入仍保留；请核对最新条目后重试。'
   if (result.status === 'invalid') return '术语内容或来源无效，未修改此条目。'
@@ -138,12 +154,20 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
   const [original, setOriginal] = react.useState<TermForm | undefined>(undefined)
   const [descriptionOpen, setDescriptionOpen] = react.useState(false)
   const drafts = react.useRef(new Map<string | null, { form: TermForm; original: TermForm }>())
-  const [pending, setPending] = react.useState(false)
+  const [actionPending, setPending] = react.useState(false)
   const [failure, setFailure] = react.useState<string | undefined>(undefined)
+  const [retry, setRetry] = react.useState<{ readonly kind: 'adopt' | 'disable'; readonly id: string } | undefined>(undefined)
   const [deletion, setDeletion] = react.useState<{ readonly snapshot: TopicTermSnapshot; readonly entry: TopicTerm } | undefined>(undefined)
   const alive = react.useRef(true), busy = react.useRef(false)
   react.useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
-  const snapshot = terms.getSnapshot(ownerId, topicId)
+  react.useEffect(() => active ? terms.retain(ownerId, topicId) : undefined, [terms, ownerId, topicId, active])
+  const readState = terms.getReadState(ownerId, topicId)
+  if (readState.retired) return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题术语：${topicName}` },
+    h('p', { role: 'status', className: 'dsh-tp-message' }, '此主题术语已删除，无法继续编辑。若主题删除尚未完成，请重试删除主题。'))
+  if (!readState.snapshot) return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题术语：${topicName}` },
+    h('p', { role: readState.status === 'error' ? 'alert' : 'status', className: 'dsh-tp-message' }, readState.error ?? '正在读取主题术语…'),
+    readState.status === 'error' ? h('button', { type: 'button', onClick: () => { void terms.reload(ownerId, topicId) } }, '重试读取术语') : null)
+  const snapshot = readState.snapshot, pending = actionPending || readState.status !== 'ready'
   const scopedSession = sessions.getActiveSession(ownerId)
   const scopedLanguage = targetLanguage ?? (scopedSession?.topicId === topicId ? scopedSession.targetLanguage :
     sessions.getAvailableSessions(ownerId).find(session => session.topicId === topicId)?.targetLanguage) ?? sessions.getSettings().targetLanguage
@@ -156,6 +180,8 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
   const entries = snapshot.entries.filter(entry => (status === 'all' || status === entry.status) &&
     [entry.preferred, entry.sense, ...entry.sourceForms, ...entry.aliases, ...entry.forbidden].some(value => value.toLocaleLowerCase().includes(needle)))
   const entry = snapshot.entries.find(entry => entry.id === selected)
+  const deletedForm = Boolean(form?.id && !snapshot.entries.some(entry => entry.id === form.id))
+  const deletedDrafts = [...drafts.current.values()].filter(draft => draft.form.id !== null && !snapshot.entries.some(entry => entry.id === draft.form.id) && JSON.stringify(draft.form) !== JSON.stringify(draft.original))
   const dirty = form !== undefined && JSON.stringify(form) !== JSON.stringify(original)
   const validForm = form && splitLines(form.sourceForms).length > 0 && form.preferred.trim() && form.targetLanguage.trim()
   function preserveForm(): void { if (form && original) drafts.current.set(form.id, { form, original }) }
@@ -167,11 +193,6 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
     preserveForm(); const draft = drafts.current.get(entry?.id ?? null), value = draft?.form ?? formFrom(snapshot, entry, scopedLanguage)
     setForm(value); setOriginal(draft?.original ?? value); setDescriptionOpen(!!value.sense.trim()); setSelected(entry?.id); setFailure(undefined)
   }
-  react.useEffect(() => terms.subscribe(() => {
-    const current = terms.getSnapshot(ownerId, topicId)
-    for (const id of drafts.current.keys()) if (id !== null && !current.entries.some(entry => entry.id === id)) drafts.current.delete(id)
-    setForm(form => form?.id && !current.entries.some(entry => entry.id === form.id) ? undefined : form)
-  }), [terms, ownerId, topicId])
   function formField(label: string, key: 'sourceLanguage' | 'targetLanguage' | 'sourceForms' | 'aliases' | 'sense' | 'preferred' | 'forbidden', multiline = false): unknown {
     return h('label', { className: 'dsh-tp-field' }, h('span', null, label), h(multiline ? 'textarea' : 'input', {
       value: form?.[key] ?? '', disabled: pending, rows: multiline ? 2 : undefined, 'aria-label': label,
@@ -206,6 +227,11 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
     catch { if (alive.current) setFailure('操作未完成，请重试。') }
     finally { busy.current = false; if (alive.current) setPending(false) }
   }
+  async function act(kind: 'adopt' | 'disable', entry: TopicTerm): Promise<true | string> {
+    const result = await terms.apply(ownerId, topicId, snapshot.version, { kind, id: entry.id, expectedEntryVersion: entry.version })
+    if (alive.current) setRetry(result.status === 'save_failed' ? { kind, id: entry.id } : undefined)
+    return mutationMessage(result)
+  }
   return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题术语：${topicName}` },
     h('div', { className: 'dsh-tp-asset-toolbar' },
       h('div', { className: 'dsh-tp-unit-header' },
@@ -220,20 +246,27 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
       bridgeReason ? h('small', { role: 'status', className: 'dsh-tp-muted' }, bridgeReason) : null,
       bridgeReason && onReconnect ? h('button', { type: 'button', onClick: onReconnect }, '重新连接主会话') : null,
       terms.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, terms.getNotice()) : null,
-      terms.getStatus(ownerId, topicId) === 'conflict' ? h('button', { type: 'button', disabled: pending, onClick: () => { if (!terms.reload(ownerId, topicId)) setFailure('最新主题术语无法读取，当前内容保留。') } }, '读取最新术语') : null,
+      readState.status !== 'ready' ? h('p', { role: readState.status === 'error' ? 'alert' : 'status', className: 'dsh-tp-muted' }, readState.error ?? '正在刷新主题术语，编辑稿保留。') : null,
+      h('button', { type: 'button', disabled: actionPending || readState.status === 'loading', onClick: () => { void terms.reload(ownerId, topicId).then(loaded => { if (!loaded && alive.current) setFailure('最新主题术语无法读取，编辑稿保留。') }) } }, '读取最新术语'),
       failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, failure) : null,
+      retry && snapshot.entries.some(entry => entry.id === retry.id) ? h('button', { type: 'button', disabled: pending, onClick: () => {
+        const entry = snapshot.entries.find(entry => entry.id === retry.id)
+        if (entry) void run(() => act(retry.kind, entry))
+      } }, '重试保存术语') : null,
     ),
     h('div', { className: 'dsh-tp-asset-columns' },
       h('div', { className: 'dsh-tp-asset-list', 'aria-label': '术语条目列表' },
+        ...deletedDrafts.map(draft => h('button', { key: `draft:${draft.form.id}`, type: 'button', onClick: () => { preserveForm(); setForm(draft.form); setOriginal(draft.original); setSelected(undefined) } }, '查看已删除术语的编辑稿')),
         entries.length === 0 ? h('p', { className: 'dsh-tp-muted' }, snapshot.entries.length === 0 ? '暂无术语。' : '没有匹配的术语。') : null,
         ...entries.map(entry => h(TermRow, { key: entry.id, entry, selected: selected === entry.id, pending,
-          onAction: (kind: 'adopt' | 'disable', entry: TopicTerm) => { void run(async () => mutationMessage(await terms.apply(ownerId, topicId, snapshot.version, { kind, id: entry.id, expectedEntryVersion: entry.version }))) },
+          onAction: (kind: 'adopt' | 'disable', entry: TopicTerm) => { void run(() => act(kind, entry)) },
           onDelete: (entry: TopicTerm) => setDeletion(structuredClone({ snapshot, entry })),
           onDetails: () => showEntry(entry),
         }))),
       h('div', { className: 'dsh-tp-asset-details', 'aria-label': '术语详情' },
         form ? h('div', { className: 'dsh-tp-term-form', 'aria-label': form.id ? '编辑术语' : '新增术语表单' },
           h('h3', null, form.id ? '编辑术语' : '新增术语'),
+          deletedForm ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '此术语已删除，编辑稿保留供复制，不能覆盖已删除的条目。') : null,
           formField('原词', 'sourceForms', true), formField('译法', 'preferred'),
           h('small', { className: 'dsh-tp-muted' }, `目标语言：${form.targetLanguage}`),
           h('button', { type: 'button', disabled: pending, 'aria-expanded': descriptionOpen, onClick: () => setDescriptionOpen(value => !value) }, descriptionOpen ? '收起说明' : '添加说明（可选）'),
@@ -243,11 +276,14 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
             const baseline = formFrom(snapshot, current, scopedLanguage)
             setForm({ ...form, snapshotVersion: snapshot.version, expectedEntryVersion: current?.version ?? null }); setOriginal(baseline); setFailure(undefined)
           } }, '继续基于最新版本编辑') : null,
-          h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || !dirty || !validForm, onClick: () => { if (!form) return; const captured = form; void run(async () => {
+          h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || deletedForm || !dirty || !validForm, onClick: () => { if (!form) return; const captured = form; void run(async () => {
             const result = await terms.saveUserTerm(ownerId, topicId, captured.snapshotVersion, { id: captured.id, expectedEntryVersion: captured.expectedEntryVersion,
               sourceLanguage: captured.sourceLanguage.trim() || null, targetLanguage: captured.targetLanguage.trim(), sourceForms: splitLines(captured.sourceForms),
               aliases: splitLines(captured.aliases), sense: captured.sense, preferred: captured.preferred.trim(), forbidden: splitLines(captured.forbidden) })
             const message = mutationMessage(result)
+            if (result.status === 'save_failed' && alive.current) {
+              setForm(current => current === captured ? { ...current, id: result.entry?.id ?? current.id, expectedEntryVersion: result.entry?.version ?? current.expectedEntryVersion, snapshotVersion: result.snapshot.version } : current)
+            }
             if (message === true && alive.current) { drafts.current.delete(captured.id); setForm(undefined); setOriginal(undefined); setSelected(result.entry?.id ?? captured.id ?? undefined) }
             return message
           }) } }, pending ? '正在保存…' : '保存并采用'), h('button', { type: 'button', disabled: pending, onClick: () => { drafts.current.delete(form.id); setForm(undefined); setOriginal(undefined) } }, '取消')),
@@ -257,14 +293,20 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
           entry.sense ? h('div', null, `说明：${entry.sense}`) : null, entry.aliases.length ? h('div', null, `别名：${entry.aliases.join('、')}`) : null,
           entry.forbidden.length ? h('div', null, `避免：${entry.forbidden.join('、')}`) : null,
           ...entry.evidence.map((reference, index) => h(TopicEvidenceView, { key: `${ownerId}:${topicId}:${entry.id}:${entry.version}:${index}`, sessions, terms, snapshot, reference, active, contextKey: evidenceContextKey })),
-        ) : h('p', { className: 'dsh-tp-muted' }, '选择术语查看详情。'),
+        ) : h('p', { className: 'dsh-tp-muted' }, '点击左侧术语条目查看详情。'),
       ),
     ),
     deletion ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除主题术语确认' },
       h('p', null, `删除“${deletion.entry.sourceForms.join('、')} → ${deletion.entry.preferred}”？同主题全部会话共用此条目。`),
       h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending, onClick: () => { void run(async () => {
         const removed = await onDelete(deletion.snapshot, deletion.entry)
-        if (removed && alive.current) setDeletion(current => current === deletion ? undefined : current)
+        if (removed && alive.current) {
+          drafts.current.delete(deletion.entry.id)
+          setForm(current => current?.id === deletion.entry.id ? undefined : current)
+          setOriginal(current => current?.id === deletion.entry.id ? undefined : current)
+          setSelected(current => current === deletion.entry.id ? undefined : current)
+          setDeletion(current => current === deletion ? undefined : current)
+        }
         return removed
       }) } }, pending ? '正在删除…' : '确认删除术语'), h('button', { type: 'button', disabled: pending, onClick: () => setDeletion(undefined) }, '取消')),
     ) : null,

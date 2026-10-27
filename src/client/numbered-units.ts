@@ -24,7 +24,8 @@ export class NumberedUnits {
     return { target: { kind: 'unit', mainSessionId: main, translationSessionId: sessionId, unitId: unit.id, sourceVersion: unit.sourceVersion },
       number: unit.order, kind: text ? 'text' : 'file', status: unit.deletion ? 'deleted' : text ? unit.revisions.at(-1)?.status ?? 'no_result' : file?.status ?? unit.tasks.at(-1)?.status ?? 'no_result',
       versions: text ? unit.revisions.filter(revision => revision.status !== 'deleted').map(revision => revision.order) : file?.versions ?? unit.revisions.map((_, index) => index + 1),
-      finalVersion: text ? currentFinalRevision(unit)?.order ?? null : file?.finalVersion ?? (final ? unit.revisions.findIndex(revision => revision.id === final.id) + 1 : null) }
+      finalVersion: text ? currentFinalRevision(unit)?.order ?? null : file?.finalVersion ?? (final ? unit.revisions.findIndex(revision => revision.id === final.id) + 1 : null),
+      ...(final && unit.final ? { finalSelection: unit.final.selection } : {}) }
   }
   list(main: string, raw: unknown): UnitDirectory {
     const request = parseUnitRequest(raw, false), session = this.session(main, request.translationSessionId)

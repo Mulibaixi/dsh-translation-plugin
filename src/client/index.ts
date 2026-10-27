@@ -2,16 +2,23 @@ import { adaptLibrarySourcesRemote, type LibrarySourcesRemotePort } from './libr
 import { LocalDataClient, LocalDataClearView, useLocalDataFrozen, ClearedDataView } from './local-data.js'
 import type { LocalDataRemotePort } from '../shared/local-data.js'
 import { ReferenceStore } from './reference-store.js'
+import { OtherMemoryClient, type OtherMemoryRemotePort, type OtherMemoryFilesRemotePort } from './other-memory-client.js'
 import { h, react } from './react.js'
 import { PanelRouter, SettingsView, MemoryAssetsView } from './views.js'
 import { createSessionStore } from './session-store.js'
+import { HistoryPersistenceClient } from './history-persistence.js'
+import type { HistoryRemoteClientPort } from '../shared/history-remote.js'
 import { ModelCatalog, type ModelCatalogPort } from './models.js'
 import { QuickTranslationClient } from './quick-translation.js'
 import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
-import { TopicMemoryStore } from './topic-memory-store.js'
-import { TopicArchiveStore } from './topic-archive-store.js'
+import { TopicMemoryStore, type TopicTermsRemotePort } from './topic-memory-store.js'
+import { EmbeddingClient } from './embedding-client.js'
+import type { EmbeddingRemotePort } from '../shared/embedding.js'
+import { MemoryIndexClient } from './memory-index-client.js'
+import type { MemorySearchRemotePort } from '../shared/memory-search.js'
+import { TopicArchiveStore, type TopicArchiveRemotePort } from './topic-archive-store.js'
 import { isTextUnit } from './translation-history.js'
 import { ThemeMemoryClearing } from './theme-memory-clearing.js'
 import { RecordObjectStore } from './record-object-store.js'
@@ -59,6 +66,13 @@ interface SidebarRightTabDefinition {
 }
 
 type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] & {
+  get(name: 'remote.translationHistory'): HistoryRemoteClientPort | undefined
+  get(name: 'remote.translationMemorySearch'): MemorySearchRemotePort | undefined
+  get(name: 'remote.translationEmbedding'): EmbeddingRemotePort | undefined
+  get(name: 'remote.translationTerms'): TopicTermsRemotePort | undefined
+  get(name: 'remote.translationArchive'): TopicArchiveRemotePort | undefined
+  get(name: 'remote.translationOtherMemory'): OtherMemoryRemotePort | undefined
+  get(name: 'remote.translationOtherMemoryFiles'): OtherMemoryFilesRemotePort | undefined
   get(name: 'remote.translationReferences'): { persistRemote?(request: import('../shared/reference-memory.js').ReferenceScope):Promise<unknown>; readRemote(request: import('../shared/reference-memory.js').ReferenceReadRequest): Promise<unknown>; clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> } | undefined
   get(name: 'remote.translationLocalData'): LocalDataRemotePort | undefined
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
@@ -77,6 +91,13 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   readonly composerExtension?: ComposerExtensionService
   readonly fileUpload: NativeFileUploadPort
   readonly remote: {
+    readonly translationHistory?: HistoryRemoteClientPort
+    readonly translationMemorySearch?: MemorySearchRemotePort
+    readonly translationEmbedding?: EmbeddingRemotePort
+    readonly translationTerms?: TopicTermsRemotePort
+    readonly translationArchive?: TopicArchiveRemotePort
+    readonly translationOtherMemory?: OtherMemoryRemotePort
+    readonly translationOtherMemoryFiles?: OtherMemoryFilesRemotePort
     readonly session: ModelCatalogPort
     readonly translationReferences?: { persistRemote?(request: import('../shared/reference-memory.js').ReferenceScope):Promise<unknown>; readRemote(request: import('../shared/reference-memory.js').ReferenceReadRequest): Promise<unknown>; clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> }
     readonly translationLocalData?: LocalDataRemotePort
@@ -148,8 +169,19 @@ function activeUiLocale(ctx: ClientPluginContext): string | undefined {
 
 export function apply(ctx: ClientPluginContext): void {
   withClientDiagnostics('apply', () => {
-    const store = createSessionStore()
+    const store = createSessionStore(true)
+    const history = new HistoryPersistenceClient(store, async () => {
+      await memoryRemoteReady()
+      return ctx.get?.('remote.translationHistory') ?? ctx.remote.translationHistory
+    })
+    store.setHistoryBackend(history)
+    ctx.effect(() => () => history.dispose(), 'translation history persistence')
     const models = new ModelCatalog(ctx.remote.session)
+    const embedding = new EmbeddingClient(async () => {
+      const mounted = await mountedRemote
+      return remoteDisposed || ctx.remote.$mount && !mounted ? undefined : ctx.get?.('remote.translationEmbedding') ?? ctx.remote.translationEmbedding
+    })
+    ctx.effect(() => () => embedding.dispose(), 'translation embedding settings')
     let remoteDisposed = false
     // One DSH contribution owns the namespaces; mounting the package twice replaces its face.
     const mountedRemote = (async () => ctx.remote.$mount?.(PLUGIN_REMOTE))().catch(error => {
@@ -175,8 +207,18 @@ export function apply(ctx: ClientPluginContext): void {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationQuick')
     } : ctx.remote.translationQuick), store, models, { canManualEdit: (session, unitId, revisionId) => !objects.hasRevisionObjects(store.getTopicStorageScope(session.topicId)!,  session.topicId, session.id, unitId, revisionId) })
-    const terms = new TopicMemoryStore(store, undefined, undefined, undefined, (sessionId, unitId) => fileJobs.readEvidence(sessionId, unitId))
-    const archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
+    const terms = new TopicMemoryStore(store, undefined, undefined, undefined, (sessionId, unitId) => fileJobs.readEvidence(sessionId, unitId), {
+      remote: async () => {
+        await memoryRemoteReady()
+        return ctx.get?.('remote.translationTerms') ?? ctx.remote.translationTerms
+      },
+    })
+    const archive = new TopicArchiveStore(store, (sessionId, unitId) => terms.readEvidence(sessionId, unitId), undefined, undefined, undefined, {
+      remote: async () => {
+        await memoryRemoteReady()
+        return ctx.get?.('remote.translationArchive') ?? ctx.remote.translationArchive
+      },
+    })
     terms.setEvidenceReader(fileJobs)
     archive.setEvidenceReader(fileJobs)
     const topics = new TopicBridgeClient(ctx.remote.$mount ? async () => {
@@ -200,6 +242,30 @@ export function apply(ctx: ClientPluginContext): void {
     terms.setReferenceEvidence(references)
     archive.setReferenceEvidence(references)
     ctx.effect(() => () => references.dispose(), 'translation references')
+    async function memoryRemoteReady(): Promise<void> {
+      if (ctx.remote.$mount && !await mountedRemote) throw new Error('插件连接失败，请检查宿主服务后重试。')
+      if (remoteDisposed) throw new Error('记忆资产连接已关闭。')
+      if (!topics.getLibraryStatus().ready) await new Promise<void>((resolve, reject) => {
+        let stop: () => void = () => {}
+        const timer = setTimeout(() => { stop(); reject(new Error(topics.getLibraryStatus().reason ?? '资料库连接尚未就绪。')) }, 15000)
+        const check = (): void => { if (topics.getLibraryStatus().ready) { clearTimeout(timer); stop(); resolve() } }
+        stop = topics.subscribe(check); check()
+      })
+      if (remoteDisposed) throw new Error('记忆资产连接已关闭。')
+    }
+    const memoryIndex = new MemoryIndexClient(() => store.getNamespaceId(), async () => {
+      await memoryRemoteReady()
+      return ctx.get?.('remote.translationMemorySearch') ?? ctx.remote.translationMemorySearch
+    })
+    ctx.effect(() => () => memoryIndex.dispose(), 'translation memory index')
+    const otherMemory = new OtherMemoryClient(store, async () => {
+      await memoryRemoteReady()
+      return ctx.get?.('remote.translationOtherMemory') ?? ctx.remote.translationOtherMemory
+    }, { uploads: ctx.fileUpload, filesRemote: async () => {
+      await memoryRemoteReady()
+      return ctx.get?.('remote.translationOtherMemoryFiles') ?? ctx.remote.translationOtherMemoryFiles
+    } })
+    ctx.effect(() => () => otherMemory.dispose(), 'translation other memory')
     const submissionBridge = materialSubmissionBridge(ctx)
     const materials = new MaterialSubmissionsClient({ store, topics, owner: ctx, ...submissionBridge,
       upload: ctx.fileUpload,
@@ -224,7 +290,9 @@ export function apply(ctx: ClientPluginContext): void {
         materials.setComposerBridge(fallback.registry, fallback.composerReason)
       })
     })
-    const preparations = new PreparationStore({ ...store.createPreparationStoreOptions(), isTopicTermsCurrent: snapshot => terms.isSnapshotCurrent(snapshot) })
+    const preparations = new PreparationStore({ ...store.createPreparationStoreOptions(), isTopicTermsCurrent: snapshot => terms.isSnapshotCurrent(snapshot),
+      isTopicTermsCurrentAsync: snapshot => terms.isSnapshotCurrentAsync(snapshot) })
+    void history.start()
     topics.setPreparation(preparations, envelope => materials.resolveSubmittedMaterial(envelope), target => materials.resolveSubmittedTarget(target))
     const objectAssets = new ObjectAssetsClient(adaptObjectAssetsRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
@@ -296,14 +364,15 @@ export function apply(ctx: ClientPluginContext): void {
     }, 'translation remote clients')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
-    ctx.effect(() => ctx.on('connection/reset', () => { evidence.clearCache(); models.invalidate(true); quick.reset(); normal.reset(); materials.reset(); void topics.reset() }), 'translation catalog connection')
+    ctx.effect(() => ctx.on('connection/reset', () => { evidence.clearCache(); models.invalidate(true); quick.reset(); normal.reset(); materials.reset(); otherMemory.reset(); embedding.reset(); memoryIndex.reset(); terms.reset(); archive.reset(); void topics.reset() }), 'translation catalog connection')
 
     const localData = new LocalDataClient(async () => {
       if (ctx.remote.$mount) await mountedRemote
       return ctx.get?.('remote.translationLocalData') ?? ctx.remote.translationLocalData
     }, async () => {
+      history.dispose()
       materials.dispose(); documents.dispose(); fileJobs.dispose(); documentReviews.dispose(); preparations.dispose()
-      normal.dispose(); quick.dispose(); references.dispose(); terms.dispose(); archive.dispose()
+      normal.dispose(); quick.dispose(); references.dispose(); otherMemory.dispose(); embedding.dispose(); memoryIndex.dispose(); terms.dispose(); archive.dispose()
       evidence.dispose(); objects.dispose(); objectAssets.dispose(); viewFiles.dispose(); models.dispose(); store.dispose()
       await topics.dispose()
     }, () => store.hasUnsettledWork() || store.getAllSessions().some(session => quick.isBusy(session.id) || normal.isBusy(session.id)))
@@ -312,13 +381,18 @@ export function apply(ctx: ClientPluginContext): void {
     const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
     const topicDeletion = new TopicDeletionClient({ sessions: store, clearing: memoryClearing, references, viewFiles, localData,
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId) || store.hasDocumentLease(sessionId) })
+    const historyLoading = (): unknown => h('section', { className: 'dsh-translation' }, h('p', null, store.getNotice() ?? '正在读取会话历史…'),
+      h('button', { type: 'button', onClick: () => void history.start() }, '重试读取'))
     const TranslationPanel: ClientComponent = (props = {}) => {
       const frozen = useLocalDataFrozen(localData)
+      const [, historyChanged] = react.useState(0)
+      react.useEffect(() => store.subscribe(() => historyChanged(value => value + 1)), [])
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       if (frozen) return h(ClearedDataView, null)
+      if (!store.isHistoryReady()) return historyLoading()
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, archive, references, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, terms, archive, references, otherMemory, memoryIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string, jobId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId, jobId },
@@ -328,15 +402,18 @@ export function apply(ctx: ClientPluginContext): void {
     }
     const MemoryAssetsPanel: ClientComponent = (props = {}) => {
       const frozen = useLocalDataFrozen(localData)
+      const [, historyChanged] = react.useState(0)
+      react.useEffect(() => store.subscribe(() => historyChanged(value => value + 1)), [])
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
       if (frozen) return h(ClearedDataView, null)
+      if (!store.isHistoryReady()) return historyLoading()
       const scope = readMemoryAssetsNavigation(sessionId ?? store.getNamespaceId(), tabInfo?.tab)
       const onClose = tabInfo ? () => tabInfo.tab.actions.close() : undefined
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, references, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, references, otherMemory, memoryIndex, mainSessionId: scope.ownerId === store.getNamespaceId() ? undefined : scope.ownerId, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })
@@ -357,7 +434,7 @@ export function apply(ctx: ClientPluginContext): void {
     const TranslationSettings: ClientComponent = (props = {}) => {
       const frozen = useLocalDataFrozen(localData)
       return frozen ? h(LocalDataClearView, {data:localData}) : h(SettingsView, {
-        store, terms, localData, onClose: typeof props.close === 'function' ? props.close : undefined,
+        store, terms, localData, embedding, memoryIndex, onClose: typeof props.close === 'function' ? props.close : undefined,
       })
     }
     const MaterialAttachmentMarker: ClientComponent = (props = {}) => {

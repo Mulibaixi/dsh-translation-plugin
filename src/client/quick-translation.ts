@@ -76,7 +76,7 @@ export class QuickTranslationClient {
   getReadiness(): { readonly status: 'idle' | 'loading' | 'ready' | 'unavailable'; readonly reason: string } { return { status: this.readiness, reason: this.reason } }
   isBusy(id: string): boolean { return this.getRecords(id).some(record => active(record.status) || record.status === 'unknown') }
   blockedReason(session: LocalSession): string | undefined {
-    if (session.mode !== 'quick') return '普通模式需主模型协作，尚未接入。'
+    if (session.mode !== 'quick') return '普通模式请通过当前主聊天的主模型协作翻译。'
     if (session.archivedAt !== null) return '归档会话需恢复后才能翻译。'
     if (this.store.hasDocumentLease(session.id) || this.isBusy(session.id)) return '当前会话仍有未结束或结果未知的翻译，请先查询或取消。'
     if (this.readiness !== 'ready') return this.reason

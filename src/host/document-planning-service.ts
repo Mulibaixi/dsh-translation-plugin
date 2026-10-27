@@ -1,3 +1,5 @@
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import { languageMatches } from '../shared/language-tag.js'
 import type { ReferenceFilesService } from './reference-files.js'
 import {
@@ -25,6 +27,7 @@ function rejection(code: string, message: string, stage: string): Error { return
 export class DocumentPlanningService {
   readonly planner: DocumentPlanner
   private disposed = false
+  private readonly pending = new Set<NormalTranslationTarget>()
   constructor(readonly ctx: TopicHostContext) { this.planner = new DocumentPlanner(new DshTextExecutionAdapter(ctx)) }
   private get topics(): TopicToolsService | undefined { return this.ctx.get?.('translationTopics') as TopicToolsService | undefined }
   private get materials(): TranslationMaterialsService | undefined { return this.ctx.get?.('translationMaterials') as TranslationMaterialsService | undefined }
@@ -134,14 +137,16 @@ export class DocumentPlanningService {
   async suggest(args: unknown, exec: ToolExecution): Promise<AnalysisResult<unknown>> {
     let request: TranslationPlanSuggest
     try { request = parseTranslationPlanSuggest(args) } catch { return failure('invalid_input', '分块建议参数无效。', 'suggest_plan') }
-    const input = await this.input(request, exec)
-    return input.ok ? this.bounded(await this.planner.suggest(input.value, request, exec.signal)) : input
+    this.pending.add(request.target)
+    try { const input = await this.input(request, exec); return input.ok ? this.bounded(await this.planner.suggest(input.value, request, exec.signal)) : input }
+    finally { this.pending.delete(request.target) }
   }
   async set(args: unknown, exec: ToolExecution): Promise<AnalysisResult<unknown>> {
     let request: TranslationPlanSet
     try { request = parseTranslationPlanSet(args) } catch { return failure('invalid_input', '分块计划参数无效。', 'set_plan') }
-    const input = await this.input(request, exec)
-    return input.ok ? this.bounded(await this.planner.set(input.value, request, exec.signal)) : input
+    this.pending.add(request.target)
+    try { const input = await this.input(request, exec); return input.ok ? this.bounded(await this.planner.set(input.value, request, exec.signal)) : input }
+    finally { this.pending.delete(request.target) }
   }
   status(args: unknown, exec: ToolExecution): AnalysisResult<unknown> {
     let request: TranslationPlanQuery
@@ -167,7 +172,9 @@ export class DocumentPlanningService {
     const snapshot = await this.planner.freezeExecution(input.value, { target, planId: planRef.id, version: planRef.version }, preparationRef, exec.signal)
     return snapshot.ok ? { ok: true, value: { input: input.value, snapshot: snapshot.value } } : snapshot
   }
-  dispose(): void { this.disposed = true; this.planner.dispose() }
+  historyUnitBusy(scope: HistoryScope, unitId: string): boolean { return [...this.pending].some(target => historyTargetMatches(scope, unitId, target) || target.kind === 'material' && `unit:${target.materialId}` === unitId) }
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void { this.planner.forgetHistoryUnit(scope, unitId, sourceVersion) }
+  dispose(): void { this.disposed = true; this.planner.dispose(); this.pending.clear() }
 }
 
 export function installDocumentPlanning(ctx: TopicHostContext): DocumentPlanningService {

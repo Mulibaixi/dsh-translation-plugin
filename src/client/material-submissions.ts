@@ -7,7 +7,7 @@ import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
 import { MAX_TRANSLATION_SOURCE_BYTES, type TranslationSourcesPort, type TranslationSourceCapability, type TranslationSourceScope, type TranslationSourceAsset } from '../shared/translation-sources.js'
-import type { TranslationSourceStoragePort, TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
+import { parseTranslationSourceReference, type TranslationSourceStoragePort, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
 import { FileIntakeStore, type FileIntakeRecord } from './file-intake-store.js'
 import type { TranslationSourceHistoryCommit, TranslationSourceStorageClient } from './source-storage-client.js'
 import { isDocumentUnit } from './translation-history.js'
@@ -90,6 +90,7 @@ export interface MaterialSubmissionStatus {
 }
 export interface LongDraftSource { readonly name: string; readonly bytes: number; readonly totalCodePoints: number }
 export interface FileUnitView {
+  readonly sourceRef?: TranslationSourceAsset | undefined
   readonly unitId: string; readonly materialId: string; readonly name: string; readonly createdAt: string
   readonly status: 'freezing' | 'frozen' | 'failed' | 'unknown' | 'accepted'
   readonly message: string | undefined; readonly busy: boolean; readonly unknown: boolean; readonly sourceFrozen: boolean
@@ -170,6 +171,7 @@ export class MaterialSubmissionsClient {
     this.fileIntakes = new FileIntakeStore(options.store.createFileIntakeStoreOptions(), () => this.emitListeners())
     this.restoreFileSubmissions()
     this.stopStore = options.store.subscribe(() => {
+      if (options.store.isHistoryReady()) this.restoreFileSubmissions()
       const enabled = options.store.getSettings().rememberHistory, becameEnabled = enabled && !this.rememberHistory
       this.rememberHistory = enabled
       this.fileIntakes.reconcile(); this.reconcile(); this.emit()
@@ -199,6 +201,7 @@ export class MaterialSubmissionsClient {
   private restoreFileSubmissions(): void {
     for (const record of this.fileIntakes.all()) {
       if (record.stage === 'accepted' || record.stage === 'removed') continue
+      if (this.submissions.has(JSON.stringify([record.submission.mainSessionId, record.submission.requestId]))) continue
       const session = this.options.store.getSession(record.scope.translationSessionId)
       if (!session) continue
       const draft: FrozenDraft = { session: { ...session, ...record.config, input: '' }, materialId: record.materialId,
@@ -218,6 +221,7 @@ export class MaterialSubmissionsClient {
       if (old?.stage === 'removed') continue
       const session = draft.session
       if (!this.options.store.getSession(session.id) || this.options.store.isSessionDeleted(session.id)) continue
+      if (this.options.store.getTranslationHistory(session.id)?.units.some(unit => unit.id === unitId && unit.deletion)) continue
       const stage = item.consumed ? 'accepted' : item.stage === 'unknown' || item.workflow?.phase === 'unknown' ? 'unknown'
         : ['failed', 'released'].includes(item.stage) || item.workflow?.phase === 'failed' ? 'failed' : ['frozen', 'preparing', 'prepared'].includes(item.stage) ? 'freezing' : 'frozen'
       // The saved scope is part of the original source proof, independent of this submission's entry.
@@ -243,6 +247,13 @@ export class MaterialSubmissionsClient {
   }
   private reconcile(): void {
     if (this.disposed) return
+    for (const [id, item] of this.submissions) {
+      const materialId = item.envelope?.kind === 'material' ? item.envelope.material.materialId : item.draft?.materialId
+      const history = item.sessionId ? this.options.store.getTranslationHistory(item.sessionId) : undefined
+      const unit = materialId ? history?.units.find(unit => unit.id === `unit:${materialId}`) : undefined
+      const sourceVersion = item.envelope?.kind === 'material' ? item.envelope.material.sourceVersion : 1
+      if (unit?.deletion || unit && (isDocumentUnit(unit) && unit.sourceVersions.some(source => source.version === sourceVersion && source.deletion) || history?.events.some(event => event.type === 'source.deleted' && event.unitId === unit.id && event.sourceVersion === sourceVersion))) { item.controller?.abort(); clearTimeout(item.stallTimer); clearTimeout(item.handoffTimer); this.submissions.delete(id) }
+    }
     const needed = new Set<string>()
     for (const owner of this.options.store.getOwnerIds()) for (const session of this.options.store.getAvailableSessions(owner)) {
       this.draftVersion(session)
@@ -324,6 +335,7 @@ export class MaterialSubmissionsClient {
       const item = this.fileSubmission(sessionId, record.unitId), source = this.fileIntakes.runtimeSource(record.unitId), storage = this.fileIntakes.storageState(record.unitId)
       const document = this.options.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === record.unitId && isDocumentUnit(unit))
       return { unitId: record.unitId, materialId: record.materialId, name: record.name, createdAt: record.createdAt,
+        ...(source ? { sourceRef: source } : record.source ? { sourceRef: { ...record.source, persistence: 'runtime_only' as const } } : {}),
         status: document ? 'accepted' : record.stage === 'removed' ? 'failed' : record.stage,
         message: this.fileNotices.get(record.unitId) ?? item?.reason ?? item?.workflow?.message ?? record.message, busy: this.fileActions.has(record.unitId) || !!item && (!!item.fileAction || !!item.queryingFile || item.settling || ['frozen', 'preparing', 'prepared'].includes(item.stage) || !!item.workflow && ['frozen', 'preparing', 'running'].includes(item.workflow.phase)),
         querying: !!item?.queryingFile,
@@ -351,6 +363,15 @@ export class MaterialSubmissionsClient {
   getFileHistoryCommit(sessionId: string, unitId: string): TranslationSourceHistoryCommit | undefined {
     const record = this.fileIntakes.get(unitId)
     return record?.scope.translationSessionId === sessionId ? this.fileIntakes.historyCommit(unitId) : undefined
+  }
+  async readFileSourceOrigin(origin: NonNullable<import('../shared/file-jobs.js').FileJobSummary['sourceOrigin']>): Promise<import('../shared/file-jobs.js').FileJobRestart['librarySource']> {
+    if (this.disposed || !this.options.sourceStoragePort) return undefined
+    const result = await this.options.sourceStoragePort.queryReference({ namespaceId: this.options.store.getNamespaceId(), scope: origin.scope, referenceKey: origin.referenceKey })
+    if (this.disposed) throw new Error('原稿读取已停止。')
+    if (!result.ok) throw new Error(result.error.message)
+    const reference = parseTranslationSourceReference(result.value)
+    if (reference.state !== 'confirmed' || !reference.historyToken || reference.referenceKey !== origin.referenceKey || JSON.stringify(reference.scope) !== JSON.stringify(origin.scope) || JSON.stringify(reference.source) !== JSON.stringify(origin.source)) throw new Error('当前原稿的保存引用不一致，未恢复。')
+    return { namespaceId: this.options.store.getNamespaceId(), prepareToken: reference.prepareToken, stored: { scope: reference.scope, referenceKey: reference.referenceKey, source: reference.source, historyToken: reference.historyToken } }
   }
   getFileCreatedAt(sessionId: string, unitId: string): string | undefined {
     const record = this.fileIntakes.get(unitId)

@@ -1,3 +1,4 @@
+import { TRANSLATION_LOG_REMOTE } from './translation-log.js'
 import { parseReferenceContextRef, type ReferenceContextRef } from './reference-memory.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type NormalTranslationTerm, type TranslationCallMetadata } from './translation-call.js'
@@ -24,7 +25,7 @@ export interface NormalTranslationSourceCorrection {
   readonly reason: string
 }
 /** `uiLocale` is the submitting Client's interface locale; the Host uses it only for the notice's reply-language line. */
-export interface NormalTranslationUnitRequest { readonly target: NormalTranslationUnitTarget; readonly operationId: string; readonly uiLocale?: string }
+export interface NormalTranslationUnitRequest { readonly target: NormalTranslationUnitTarget; readonly operationId: string; readonly uiLocale?: string; readonly fileName?: string }
 export interface NormalTranslationUnitReceipt extends NormalTranslationUnitRequest { readonly status: 'submitted' }
 export interface NormalTranslationCorrectionReceipt {
   readonly operationId: string
@@ -36,6 +37,13 @@ export interface NormalTranslationCorrectionReceipt {
   readonly persistence: 'saved' | 'runtime_only'
 }
 export interface NormalTranslationTermReference { readonly id: string; readonly entryVersion: number }
+/** A short handle returned by a term query; only the direct path resolves it, and never beyond the issuing main Session. */
+export interface DirectTermHandleReference { readonly termRef: string }
+export type DirectTermReference = NormalTranslationTermReference | DirectTermHandleReference
+/** Parsed direct request: term references may still be handles until the Host resolves them. */
+export interface RawDirectTranslationRequest extends Omit<DirectTranslationRequest, 'termReferences'> {
+  readonly termReferences: readonly DirectTermReference[]
+}
 export interface NormalTranslationExecute {
   readonly target: NormalTranslationTarget
   /** Independent of the submission id and of each eventual model call id. */
@@ -197,11 +205,12 @@ export function parseNormalTranslationSourceCorrection(value: unknown): NormalTr
   return { target, operationId: value.operationId, sourceText: value.sourceText, reason: value.reason }
 }
 export function parseNormalTranslationUnitRequest(value: unknown): NormalTranslationUnitRequest {
-  object(value); exact(value, ['target', 'operationId', ...(Object.hasOwn(value, 'uiLocale') ? ['uiLocale'] : [])]); text(value.operationId)
+  object(value); exact(value, ['target', 'operationId', ...(Object.hasOwn(value, 'uiLocale') ? ['uiLocale'] : []), ...(Object.hasOwn(value, 'fileName') ? ['fileName'] : [])]); text(value.operationId)
   if (value.uiLocale !== undefined) text(value.uiLocale, 64)
+  if (value.fileName !== undefined) text(value.fileName, 512)
   const target = parseNormalTranslationTarget(value.target)
   if (target.kind !== 'unit') throw new TypeError('Retranslation requires a unit')
-  return { target, operationId: value.operationId, ...(value.uiLocale === undefined ? {} : { uiLocale: value.uiLocale }) }
+  return { target, operationId: value.operationId, ...(value.uiLocale === undefined ? {} : { uiLocale: value.uiLocale }), ...(value.fileName === undefined ? {} : { fileName: value.fileName }) }
 }
 export function parseNormalTranslationCorrectionReceipt(value: unknown): NormalTranslationCorrectionReceipt {
   object(value); exact(value, ['operationId', 'mainSessionId', 'translationSessionId', 'unitId', 'previousSourceVersion', 'sourceVersion', 'persistence'])
@@ -217,6 +226,23 @@ function references(value: unknown): asserts value is readonly NormalTranslation
     object(ref); exact(ref, ['id', 'entryVersion']); text(ref.id); version(ref.entryVersion)
     if (ids.has(ref.id)) throw new TypeError('Duplicate normal translation term reference')
     ids.add(ref.id)
+  }
+}
+/** The direct path also accepts a query-issued handle; ids stay unique once the Host resolves handles. */
+function directReferences(value: unknown): asserts value is readonly DirectTermReference[] {
+  if (!Array.isArray(value) || value.length > 100) throw new TypeError('Invalid normal translation term references')
+  const keys = new Set<string>()
+  for (const ref of value) {
+    object(ref)
+    if (Object.hasOwn(ref, 'termRef')) {
+      exact(ref, ['termRef']); text(ref.termRef)
+      if (keys.has(`term:${ref.termRef}`)) throw new TypeError('Duplicate normal translation term reference')
+      keys.add(`term:${ref.termRef}`)
+      continue
+    }
+    exact(ref, ['id', 'entryVersion']); text(ref.id); version(ref.entryVersion)
+    if (keys.has(`id:${ref.id}`)) throw new TypeError('Duplicate normal translation term reference')
+    keys.add(`id:${ref.id}`)
   }
 }
 export function parseNormalTranslationExecute(value: unknown): NormalTranslationExecute {
@@ -243,7 +269,7 @@ function parseDraftTerms(value: unknown): readonly DirectTranslationDraftTerm[] 
     return { sourceForms, preferred: term.preferred, forbidden: forbidden as string[], sense: sense as string }
   })
 }
-export function parseDirectTranslationRequest(value: unknown): DirectTranslationRequest {
+export function parseDirectTranslationRequest(value: unknown): RawDirectTranslationRequest {
   object(value)
   // Omitted optional inputs mean "none"; a model never has to serialize an empty string or array.
   const optional = ['organizedNotes', 'auxiliaryContext', 'userRequirements', 'termReferences', 'range', 'body', 'draftTerms'].filter(field => Object.hasOwn(value, field))
@@ -254,7 +280,7 @@ export function parseDirectTranslationRequest(value: unknown): DirectTranslation
   const organizedNotes = value.organizedNotes ?? '', auxiliaryContext = value.auxiliaryContext ?? ''
   const userRequirements = value.userRequirements ?? '', termReferences = value.termReferences ?? []
   text(userRequirements, 4000, true); text(organizedNotes, 4000, true); text(auxiliaryContext, 8000, true)
-  references(termReferences)
+  directReferences(termReferences)
   const range = value.range === undefined ? undefined : parseDirectRange(value.range)
   if (value.body !== undefined) text(value.body, 2_000_000)
   const draftTerms = parseDraftTerms(value.draftTerms)
@@ -438,9 +464,9 @@ function parseResult(method: 'capabilities' | 'status' | 'cancel' | 'requestUnit
   return structuredClone(value)
 }
 const packageName = 'dsh-translation-plugin'
-export const NORMAL_TRANSLATION_REMOTE = { package: packageName, descriptors: (['capabilities', 'status', 'cancel', 'requestUnit'] as const).map(method => ({
+export const NORMAL_TRANSLATION_REMOTE = { package: packageName, descriptors: [...(['capabilities', 'status', 'cancel', 'requestUnit'] as const).map(method => ({
   id: `${packageName}#translationNormal/${method}`, service: 'translationNormal', namespace: 'translationNormal', method,
   invocation: { kind: 'direct' as const }, parameters: method === 'capabilities' ? [] : [{ name: 'request', wire: 'request', source: 'json' as const,
     codec: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Request`, create: () => ({ parse: (value: unknown) => method === 'requestUnit' ? parseNormalTranslationUnitRequest(value) : parseNormalTranslationQuery(value) }) } }],
   result: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Result`, create: () => ({ parse: (value: unknown) => parseResult(method, value) }) },
-})) }
+})), ...TRANSLATION_LOG_REMOTE.descriptors] }

@@ -1,5 +1,6 @@
 import { h, react } from './react.js'
-import { currentDocumentFinalRevision, currentResultRevision, type DocumentUnit, type TextUnit } from './translation-history.js'
+import { documentRevisionDeletionBlockedReason, documentSourceDeletionBlockedReason, documentOrphanChunks, documentChunkCleanupBlockedReason } from '../memory/document-deletion.js'
+import { currentDocumentFinalRevision, currentResultRevision, isDocumentUnit, type DocumentUnit, type TextUnit } from './translation-history.js'
 import type { LocalSession } from './sessions.js'
 import type { TranslationDocumentReader, DocumentReadHandle, DocumentReadBlock } from './source-reader.js'
 import type { EvidenceReadResult, EvidenceUnavailableResult } from '../shared/translation-evidence.js'
@@ -62,7 +63,7 @@ function RecordOpenLink({ action, slot, viewFiles, identity, visible = true, nav
 }
 
 function recordOpenSlot(session: LocalSession, unit: TextUnit, kind: 'source' | 'result', label: string): OpenSlot {
-  return { namespaceId: session.topicId, sessionId: session.id, unitId: unit.id, kind, title: `${session.name} · 文本 ${unit.order} · ${label}` }
+  return { namespaceId: session.topicId, sessionId: session.id, unitId: unit.id, kind, title: `${session.name} · 单元 ${unit.order} · ${label}` }
 }
 /** Quiet link for the unit source; it renders on the source row. */
 export function SourceOpenLink({ unit, session, objects, viewFiles, visible = true, navigationRevision }: RecordObjectsProps & {
@@ -196,6 +197,44 @@ function DocumentUnitDeletionControl({ store, unit, session, documentTasks, mate
     message ? h('p', { className: 'dsh-tp-muted', role: 'status' }, message) : null)
 }
 
+function DocumentChunkCleanupControl({ store, unit, session, busy }: { readonly store: SessionStore; readonly unit: DocumentUnit; readonly session: LocalSession; readonly busy: boolean }): unknown {
+  const [plan, setPlan] = react.useState<TextUnitDeletionPlan | undefined>(undefined)
+  const [pending, setPending] = react.useState(false), [message, setMessage] = react.useState<string | undefined>(undefined)
+  const count = documentOrphanChunks(unit).length
+  const blocked = busy ? '请先结束当前编辑或操作。' : documentChunkCleanupBlockedReason(unit) ?? store.getTextUnitDeletionBlockedReason(session.id, unit.id)
+  return h('div', null,
+    count ? h('button', { type: 'button', disabled: pending || !!blocked, title: blocked, onClick: () => { setMessage(undefined); setPlan(store.captureTextUnitDeletion(session.id, unit.id)) } }, '清理未采用翻译块') : null,
+    plan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '清理未采用翻译块确认' },
+      h('p', null, `清理 ${count} 个未采用翻译块的正文？原稿、保留版本、人工修订基础、已批准复用和调用统计保留。已清理块所属的旧任务不能恢复，请开始新任务。`),
+      h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || !!blocked, onClick: () => {
+        setPending(true); void store.deleteDocumentChunksAsync(plan, () => {
+          const current = store.getTranslationHistory(session.id)?.units.find(value => value.id === unit.id)
+          return current && isDocumentUnit(current) ? documentChunkCleanupBlockedReason(current) : '文档已不可用。'
+        }).then(result => { setMessage(result.message); setPlan(undefined) }).finally(() => setPending(false))
+      } }, pending ? '正在清理…' : '确认清理翻译块'), h('button', { type: 'button', disabled: pending, onClick: () => setPlan(undefined) }, '取消'))) : null,
+    message ? h('p', { role: 'status' }, message) : null)
+}
+function DocumentSourceDeletionControl({ store, unit, session, busy }: { readonly store: SessionStore; readonly unit: DocumentUnit; readonly session: LocalSession; readonly busy: boolean }): unknown {
+  const [selected, setSelected] = react.useState<number | undefined>(undefined)
+  const [plan, setPlan] = react.useState<(TextUnitDeletionPlan & { readonly sourceVersion: number }) | undefined>(undefined)
+  const [pending, setPending] = react.useState(false), [message, setMessage] = react.useState<string | undefined>(undefined)
+  const sources = unit.sourceVersions.filter(source => source.version !== unit.sourceVersion && !source.deletion), version = sources.find(source => source.version === selected)?.version ?? sources[0]?.version
+  const blocked = busy ? '请先结束当前编辑或操作。' : version === undefined ? '没有可删除的旧原稿。' : documentSourceDeletionBlockedReason(unit, version) ?? store.getTextUnitDeletionBlockedReason(session.id, unit.id)
+  return h('div', null,
+    sources.length ? h('button', { type: 'button', disabled: pending || busy, onClick: () => { const captured = store.captureTextUnitDeletion(session.id, unit.id); if (captured && version !== undefined) setPlan({ ...captured, sourceVersion: version }) } }, '删除旧原稿') : null,
+    plan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除旧原稿确认' },
+      h('label', null, '旧原稿版本 ', h('select', { 'aria-label': '待删除旧原稿版本', value: version, disabled: pending, onChange: (event: { currentTarget: { value: string } }) => { const sourceVersion = Number(event.currentTarget.value); setSelected(sourceVersion); setPlan({ ...plan, sourceVersion }) } }, ...sources.map(source => h('option', { key: source.version, value: source.version }, `原稿版本 ${source.version}`)))),
+      h('p', null, `删除原稿版本 ${version} 及其所属译文、未采用块、准备和请求正文？保留当前原稿、其他版本和调用统计；仍被其他资料使用的共享文件保留。`),
+      blocked ? h('p', { role: 'status' }, blocked) : null,
+      h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || !!blocked, onClick: () => {
+        setPending(true); void store.deleteDocumentSourceAsync(plan, () => {
+          const current = store.getTranslationHistory(session.id)?.units.find(value => value.id === unit.id)
+          return current && isDocumentUnit(current) ? documentSourceDeletionBlockedReason(current, plan.sourceVersion) : '文档已不可用。'
+        }).then(result => { setMessage(result.message); setPlan(undefined) }).finally(() => setPending(false))
+      } }, pending ? '正在删除…' : '确认删除旧原稿'), h('button', { type: 'button', disabled: pending, onClick: () => setPlan(undefined) }, '取消'))) : null,
+    message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null)
+}
+
 export function DocumentUnitView({ unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, topics, materials, visible = true, navigationRevision, executionOwner }: RecordObjectsProps & DocumentViewProps & {
   readonly unit: DocumentUnit; readonly session: LocalSession; readonly store?: SessionStore | undefined; readonly topics?: TopicBridgeClient | undefined; readonly materials?: MaterialSubmissionsClient | undefined; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
@@ -208,11 +247,12 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
   const followReview = react.useRef<string | undefined>(undefined)
   const [draft, setDraft] = react.useState<ManualDraft | undefined>(undefined)
   const [pending, setPending] = react.useState(false), [message, setMessage] = react.useState<string | undefined>(undefined)
+  const [revisionDeletePlan, setRevisionDeletePlan] = react.useState<(import('./session-store.js').TextUnitDeletionPlan & { readonly revisionId: string }) | undefined>(undefined)
   const lifetime = react.useRef({ mounted: true, visible, navigationRevision, identity: '' })
   lifetime.current.visible = visible; lifetime.current.navigationRevision = navigationRevision
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false } }, [])
   react.useEffect(() => {
-    const reviewed = unit.reviewAudits?.find(audit => audit.manifestRevisionId === followReview.current && audit.reviewedRevisionId)
+    const reviewed = unit.reviewAudits?.find(audit => !audit.deletion && audit.manifestRevisionId === followReview.current && audit.reviewedRevisionId)
     if (!reviewed?.reviewedRevisionId) return
     if (selectedManifestId === followReview.current) setSelectedManifestId(reviewed.reviewedRevisionId)
     followReview.current = undefined
@@ -221,7 +261,7 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
   const task = [...unit.tasks].reverse().find(task => task.sourceVersion === unit.sourceVersion), actualStatus = task?.status
   react.useEffect(() => { if (!draft) setSelectedManifestId(undefined) }, [task?.taskId, unit.sourceVersion])
   const manifests = unit.revisions.filter(revision => revision.sourceVersion === unit.sourceVersion)
-  const currentCandidate = task ? [...manifests].reverse().find(revision => revision.taskId === task.taskId) : manifests.at(-1)
+  const currentCandidate = task ? [...manifests].reverse().find(revision => !revision.deletion && revision.taskId === task.taskId) : [...manifests].reverse().find(revision => !revision.deletion)
   const manifest = selectedManifestId === '' ? undefined : selectedManifestId ? manifests.find(revision => revision.id === selectedManifestId) : currentCandidate
   const handle = react.useMemo(() => unit.deletion ? undefined : documents?.captureDocument({ ownerId: session.topicId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion, manifestRevisionId: manifest?.id ?? null }), [documents, session.topicId, session.topicId, session.id, unit, manifest?.id])
   if (unit.deletion) return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'aria-label': `文件 ${unit.order}` },
@@ -242,6 +282,18 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
   const retranslationBlocked = !executionOwner ? '请选择本次任务使用的主会话。' : documentTasks?.retranslationBlockedReason(session.id, unit.id) ?? (documentTasks ? undefined : '整篇重译服务尚未就绪。')
   const status = actualStatus === 'unknown' ? '执行状态未知' : actualStatus === 'running' ? '正在翻译' : actualStatus === 'paused' ? '已暂停' : actualStatus === 'waiting_context' ? '等待补充' : actualStatus === 'waiting_user' ? '等待讨论' : final?.id === manifest?.id && final ? '已定稿' : actualStatus === 'interrupted' ? '已中断' : actualStatus === 'failed' ? '翻译失败' : actualStatus === 'cancelled' ? '已取消' : manifest && documentManifestFinalEligibility(unit, manifest.id).eligible ? '待定稿' : manifest ? '待复核' : '原稿已冻结'
   const versionNumber = manifest ? manifests.findIndex(revision => revision.id === manifest.id) + 1 : 0
+  const revisionDeletionBlocked = manifest && (documentRevisionDeletionBlockedReason(unit, manifest.id) ?? store?.getTextUnitDeletionBlockedReason(session.id, unit.id) ?? (draft ? '请先结束当前编辑。' : undefined))
+  const deleteRevision = async (): Promise<void> => {
+    if (!store || !revisionDeletePlan || pending) return
+    setPending(true)
+    try {
+      const result = await store.deleteDocumentRevisionAsync(revisionDeletePlan, () => {
+        const current = store.getTranslationHistory(session.id)?.units.find(value => value.id === unit.id)
+        return current && isDocumentUnit(current) ? documentRevisionDeletionBlockedReason(current, revisionDeletePlan.revisionId) : '文档已不可用。'
+      })
+      if (lifetime.current.mounted) { setMessage(result.message); setRevisionDeletePlan(undefined) }
+    } finally { if (lifetime.current.mounted) setPending(false) }
+  }
   const resultFileName = `${name.replace(/\.[^./\\]+$/u, '')}.${unit.targetLanguage.replace(/[<>:"/\\|?*\u0000-\u001f]/gu, '_') || '译文'}.v${versionNumber}${manifest && !manifest.eligibility.complete ? '.部分结果' : ''}.txt`
   const namespaceId = store?.getNamespaceId() ?? viewFiles?.getNamespaceId() ?? ''
   const originalSlot: OpenSlot = { namespaceId, sessionId: session.id, unitId: unit.id, kind: 'source', title: `${name} · 文档 ${unit.order} · 原稿`, revisionId: `source:${unit.sourceVersion}`, fileName: name, format: 'txt' }
@@ -274,7 +326,7 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
   const qualification = manifest ? documentManifestFinalEligibility(unit, manifest.id) : undefined
   const canMutate = Boolean(documentReviews && manifest && session.archivedAt === null && task && !['running', 'unknown', 'waiting_context', 'waiting_user'].includes(task.status))
   const editable = canMutate && manifest?.id === currentCandidate?.id
-  const audit = manifest && [...(unit.reviewAudits ?? [])].reverse().find(audit => audit.manifestRevisionId === manifest.id || audit.reviewedRevisionId === manifest.id)
+  const audit = manifest && [...(unit.reviewAudits ?? [])].reverse().find(audit => !audit.deletion && (audit.manifestRevisionId === manifest.id || audit.reviewedRevisionId === manifest.id))
   const reviewIssues = audit ? [...audit.mechanical.issues, ...audit.semantic.issues, ...(audit.semantic.status === 'pending' ? audit.mechanical.suspicions : [])] : manifest?.review.issues ?? []
   const viewedTask = manifest ? unit.tasks.find(task => task.taskId === manifest.taskId) : task
   const unresolvedDependencies = (viewedTask?.executionFacts?.reviewIssues ?? []).filter(issue => !audit?.semantic.resolvedIssues.some(resolved =>
@@ -328,27 +380,34 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
       h('span', { role: 'status', className: 'dsh-tp-muted' }, `单元 ${unit.order} · 文件 · ${status}`),
       h('div', { className: 'dsh-tp-actions' },
         store ? h(DocumentUnitDeletionControl, { store, unit, session, documentTasks, materials, topics }) : null,
+        store ? h(DocumentSourceDeletionControl, { store, unit, session, busy: pending || !!draft }) : null,
+        store ? h(DocumentChunkCleanupControl, { store, unit, session, busy: pending || !!draft }) : null,
         h('button', { type: 'button', disabled: Boolean(retranslationBlocked) || Boolean(draft) || pending, title: retranslationBlocked ?? '沿用此原稿、目标语言与翻译要求，交由主模型准备新的整篇任务。', onClick: () => { void documentTasks?.requestRetranslation(session.id, unit.id, executionOwner) } }, '重译'),
         retranslation?.unknown ? h('button', { type: 'button', disabled: retranslation.pending, onClick: () => { void documentTasks?.queryRetranslation(session.id, unit.id) } }, '检查重译状态') : null,
         task && controls && ['failed', 'cancelled', 'interrupted', 'unknown'].includes(actualStatus ?? '') ?
           actualStatus === 'unknown' ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'status') }, '检查状态')
-            : h('button', { type: 'button', disabled: controls.pending || !controls.canResume, title: controls.recoverability ?? '保留已完成块，只继续尚未完成的部分。', onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'resume') }, '重新发送') : null,
+            : h('button', { type: 'button', disabled: true, title: '旧文档不再派发新调用；请重新发送原稿，使用当前翻译流程。', onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'resume') }, '重新发送') : null,
         task && controls && ['failed', 'cancelled', 'interrupted'].includes(actualStatus ?? '') && materials && !final ? h('button', { type: 'button', disabled: controls.pending || pending || Boolean(draft), onClick: () => setRemoveRequested(true) }, '移除') : null,
         !manifest ? detailsControl : null,
         !manifest ? versionsControl : null,
         h(RecordOpenLink, { identity: `${identity}:source`, visible, navigationRevision, viewFiles, slot: originalSlot, action: { ...originalAction, display: '打开' } }))),
     h('div', { className: 'dsh-tp-file-name' }, h(RecordOpenLink, { identity: `${identity}:source-name`, visible, navigationRevision, viewFiles, slot: originalSlot, action: { ...originalAction, display: name } })),
     manifest ? h('div', { className: 'dsh-tp-version-header' },
-      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${versionNumber} · ${manifest.eligibility.complete ? '译文' : '部分结果 · 存在缺项'} · ${unit.targetLanguage}${final?.id === manifest.id ? ' · 已定稿' : qualification?.eligible ? ' · 待定稿' : ' · 待复核'}`),
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${versionNumber} · ${manifest.deletion ? '已删除' : manifest.eligibility.complete ? '译文' : '部分结果 · 存在缺项'} · ${unit.targetLanguage}${manifest.deletion ? '' : final?.id === manifest.id ? ' · 已定稿' : qualification?.eligible ? ' · 待定稿' : ' · 待复核'}`),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
         manifest ? h('button', { type: 'button', disabled: !canMutate || pending || Boolean(draft) || !qualification?.eligible || final?.id === manifest.id, title: !qualification?.eligible ? '须完成机械检查和主模型整篇复核，且无未解决问题。' : undefined, onClick: () => { void selectFinal() } }, final?.id === manifest.id ? '已定稿' : '设为最终') : null,
+        store ? h('button', { type: 'button', disabled: pending || !!revisionDeletionBlocked, title: revisionDeletionBlocked, onClick: () => { const plan = store.captureTextUnitDeletion(session.id, unit.id); if (plan) setRevisionDeletePlan({ ...plan, revisionId: manifest.id }) } }, '删除此译文版本') : null,
         detailsControl, versionsControl,
-        h(RecordOpenLink, { identity: `${identity}:result`, visible, navigationRevision, viewFiles, slot: resultSlot, action: { ...resultAction, display: '打开' } }))) : null,
-    manifest ? h('div', { className: 'dsh-tp-file-name' }, h(RecordOpenLink, { identity: `${identity}:result-name`, visible, navigationRevision, viewFiles, slot: resultSlot, action: { ...resultAction, display: resultFileName } })) : null,
+        !manifest.deletion ? h(RecordOpenLink, { identity: `${identity}:result`, visible, navigationRevision, viewFiles, slot: resultSlot, action: { ...resultAction, display: '打开' } }) : null)) : null,
+    manifest && !manifest.deletion ? h('div', { className: 'dsh-tp-file-name' }, h(RecordOpenLink, { identity: `${identity}:result-name`, visible, navigationRevision, viewFiles, slot: resultSlot, action: { ...resultAction, display: resultFileName } })) : null,
     final && final.id !== manifest?.id ? h('p', { className: 'dsh-tp-muted', role: 'status' }, `原最终保留：版本 ${manifests.findIndex(revision => revision.id === final.id) + 1}；当前候选尚未替换最终。`) : null,
     versionsExpanded ? h('div', { className: 'dsh-tp-actions dsh-tp-file-versions' },
       h('select', { 'aria-label': `文档 ${unit.order} 清单版本`, value: manifest?.id ?? '', disabled: pending || Boolean(draft), onChange: (event: { currentTarget: { value: string } }) => { setSelectedManifestId(event.currentTarget.value); setMessage(undefined) } },
-        h('option', { value: '' }, '当前任务进度'), ...manifests.map((revision, index) => h('option', { key: revision.id, value: revision.id }, `版本 ${index + 1}${final?.id === revision.id ? ' · 最终' : ''}${revision.eligibility.complete ? '' : ' · 部分结果'}${revision.review.status === 'pending' ? ' · 待复核' : revision.review.status === 'failed' ? ' · 有问题' : ' · 已复核'}`)))) : null,
+        h('option', { value: '' }, '当前任务进度'), ...manifests.map((revision, index) => h('option', { key: revision.id, value: revision.id }, `版本 ${index + 1}${revision.deletion ? ' · 已删除' : `${final?.id === revision.id ? ' · 最终' : ''}${revision.eligibility.complete ? '' : ' · 部分结果'}${revision.review.status === 'pending' ? ' · 待复核' : revision.review.status === 'failed' ? ' · 有问题' : ' · 已复核'}`}`)))) : null,
+    revisionDeletePlan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除文档旧译文确认' },
+      h('p', null, `删除译文版本 ${manifests.findIndex(revision => revision.id === revisionDeletePlan.revisionId) + 1} 及其独占正文、审阅说明和展示文件？保留版本号、调用统计、原稿及仍被其他版本使用的翻译块。`),
+      h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending, onClick: () => { void deleteRevision() } }, pending ? '正在删除…' : '确认删除文档旧译文'),
+        h('button', { type: 'button', disabled: pending, onClick: () => setRevisionDeletePlan(undefined) }, '取消'))) : null,
     message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null,
     recoveryMessage ? h('p', { role: 'status', className: 'dsh-tp-muted' }, recoveryMessage) : null,
     retranslation ? h('p', { role: retranslation.unknown ? 'alert' : 'status', className: 'dsh-tp-muted' }, retranslation.message) : null,

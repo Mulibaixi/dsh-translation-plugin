@@ -1,3 +1,5 @@
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import { parseDocumentReviewBeginRequest, parseDocumentReviewSubmitRequest, parseDocumentReviewQueryRequest, parseDocumentReviewTarget, parseDocumentManualRevisionRequest,
   type DocumentReviewTarget, type DocumentReviewReceipt } from '../shared/document-review.js'
 import { parseDocumentReviewPageRequest, parseDocumentReviewRead, parseDocumentTaskTermsRequest, type DocumentReviewPage, type DocumentTaskTermsReply } from '../shared/document-review-bridge.js'
@@ -11,6 +13,7 @@ const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) ==
 export class DocumentReviewService {
   readonly typertRemote: { readonly service: DocumentReviewService; readonly serviceKey: 'translationReview'; readonly namespace: 'translationReview' }
   private readonly begun = new Map<string, { readonly target: DocumentReviewTarget; readonly auditId: string; readonly agent: ToolExecution['agent'] }>()
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void { for (const [id, entry] of this.begun) if (historyTargetMatches(scope, unitId, { ...entry.target.scope, unitId: entry.target.unitId, sourceVersion: entry.target.sourceVersion }, sourceVersion)) this.begun.delete(id) }
   constructor(readonly ctx: TopicHostContext) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationReview', property: 'ctx' } })
     this.typertRemote = Object.freeze({ service: this, serviceKey: 'translationReview', namespace: 'translationReview' })

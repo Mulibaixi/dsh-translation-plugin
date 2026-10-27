@@ -83,7 +83,8 @@ export function termEvidenceKey(scope: Pick<TopicTermSnapshot, 'ownerId' | 'topi
     ref.range?.start ?? null, ref.range?.end ?? null])
 }
 export interface TopicTermPut extends TopicTermContent {
-  readonly id: string
+  /** null creates a new term; the write owner allocates the id. Existing terms always carry their stored id. */
+  readonly id: string | null
   readonly expectedEntryVersion: number | null
   readonly origin: 'inferred' | 'source_checked' | 'reference_derived'
   readonly status: 'proposal' | 'active'
@@ -95,7 +96,7 @@ export interface TopicTermUserInput extends Omit<TopicTermContent, 'evidence'> {
 }
 export interface TopicTermUserPut extends TopicTermUserInput { readonly id: string }
 export interface TermMutationResult {
-  readonly status: 'updated' | 'unchanged' | 'stale' | 'invalid' | 'requires_user_action' | 'conflict'
+  readonly status: 'updated' | 'unchanged' | 'stale' | 'invalid' | 'requires_user_action' | 'conflict' | 'save_failed'
   readonly snapshot: TopicTermSnapshot
   readonly entry: TopicTerm | null
 }
@@ -150,11 +151,12 @@ export function fileProposalAcceptance(value: unknown): value is FileProposalAcc
 
 export function decodeTopicTermPut(value: unknown): TopicTermPut | undefined {
   if (!record(value) || !exact(value, ['id', 'expectedEntryVersion', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', 'evidence', 'origin', 'status']) ||
-    !text(value.id, 2048) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) || !content(value as unknown as TopicTermContent) ||
+    !(value.id === null || text(value.id, 2048)) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
+    (value.id === null && value.expectedEntryVersion !== null) || !content(value as unknown as TopicTermContent) ||
     !['inferred', 'source_checked', 'reference_derived'].includes(value.origin as string) || !['proposal', 'active'].includes(value.status as string) ||
     (value.status === 'active' && (!['source_checked', 'reference_derived'].includes(String(value.origin)) || !hasSourceBasis(value as unknown as TopicTermContent)))) return undefined
   if (!referenceOriginValid(value as unknown as TopicTerm)) return undefined
-  return { ...copyContent(value as unknown as TopicTermContent), id: value.id, expectedEntryVersion: value.expectedEntryVersion,
+  return { ...copyContent(value as unknown as TopicTermContent), id: value.id as string | null, expectedEntryVersion: value.expectedEntryVersion,
     origin: value.origin as TopicTermPut['origin'], status: value.status as TopicTermPut['status'] }
 }
 
@@ -251,32 +253,43 @@ function replace(snapshot: TopicTermSnapshot, entry: TopicTerm, at: string): Top
 }
 function result(snapshot: TopicTermSnapshot, status: TermMutationResult['status'], entry: TopicTerm | null): TermMutationResult { return { status, snapshot, entry } }
 
-/** Main-model proposals/source checks cannot rewrite a user-adopted rule. */
+/** Model edits retain identity/version checks and return changed adopted content to review. */
 /** One spelling per language inside a topic: an equivalent existing label/tag wins over the incoming one. */
-function alignLanguages<T extends { readonly sourceLanguage: string | null; readonly targetLanguage: string }>(snapshot: TopicTermSnapshot, fields: T): Pick<T, 'sourceLanguage' | 'targetLanguage'> {
+export function alignTopicTermLanguages<T extends { readonly sourceLanguage: string | null; readonly targetLanguage: string }>(snapshot: TopicTermSnapshot, fields: T): Pick<T, 'sourceLanguage' | 'targetLanguage'> {
   const same = (candidates: readonly string[], value: string): string => value === '' ? value
     : candidates.find(candidate => candidate !== '' && languageMatches(candidate, value)) ?? value
   return { sourceLanguage: fields.sourceLanguage === null ? null : same(snapshot.entries.map(entry => entry.sourceLanguage ?? ''), fields.sourceLanguage),
     targetLanguage: same(snapshot.entries.map(entry => entry.targetLanguage), fields.targetLanguage) }
 }
-export function putTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermPut, resolver: TermEvidenceResolver, at: string): TermMutationResult {
-  input = { ...input, ...alignLanguages(snapshot, input) }
-  const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
+export function putTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermPut, resolver: TermEvidenceResolver, at: string, allocateId?: () => string): TermMutationResult {
+  input = { ...input, ...alignTopicTermLanguages(snapshot, input) }
+  if (input.id === null) {
+    // The write owner allocates identity; a create can never target an existing version.
+    if (!allocateId || input.expectedEntryVersion !== null) return result(snapshot, 'invalid', null)
+    let allocated = allocateId()
+    for (let attempt = 0; attempt < 8 && snapshot.entries.some(entry => entry.id === allocated); attempt++) allocated = allocateId()
+    if (snapshot.entries.some(entry => entry.id === allocated)) return result(snapshot, 'invalid', null)
+    input = { ...input, id: allocated }
+  }
+  const id = input.id
+  if (id === null) return result(snapshot, 'invalid', null)
+  const old = snapshot.entries.find(entry => entry.id === id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
-  if (old?.origin === 'user_explicit' || old?.acceptance) return result(snapshot, 'requires_user_action', old)
-  if (!referenceOriginValid(input) || !text(input.id, 2048) || !time(at) || !content(input) || !['inferred', 'source_checked', 'reference_derived'].includes(input.origin) ||
+  if (old && time(at) && referenceOriginValid(input) && content(input) && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
+  if (old) input = { ...input, status: 'proposal' }
+  if (!referenceOriginValid(input) || !text(id, 2048) || !time(at) || !content(input) || !['inferred', 'source_checked', 'reference_derived'].includes(input.origin) ||
     !['proposal', 'active'].includes(input.status) || (input.origin === 'inferred' && input.status === 'active')) return result(snapshot, 'invalid', old)
   let status: TopicTermStatus = input.status
   if (status === 'active' && !validBasis(snapshot, input, resolver)) return result(snapshot, 'invalid', old)
-  if (status === 'active' && hasConflict(snapshot, input, resolver)) status = 'conflict'
-  const entry: TopicTerm = { ...copyContent(input), id: input.id, origin: input.origin, status, confirmation: null, version: (old?.version ?? 0) + 1, createdAt: old?.createdAt ?? at, updatedAt: at }
+  if (status === 'active' && hasConflict(snapshot, { ...input, id }, resolver)) status = 'conflict'
+  const entry: TopicTerm = { ...copyContent(input), id, origin: input.origin, status, confirmation: null, version: (old?.version ?? 0) + 1, createdAt: old?.createdAt ?? at, updatedAt: at }
   if (old && old.origin === entry.origin && old.status === entry.status && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(entry))) return result(snapshot, 'unchanged', old)
   return result(replace(snapshot, entry, at), 'updated', entry)
 }
 
 /** One explicit user save, with no intermediate persisted proposal or second adoption action. */
 export function putUserTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermUserPut, action: { readonly eventId: string; readonly at: string }): TermMutationResult {
-  input = { ...input, ...alignLanguages(snapshot, input) }
+  input = { ...input, ...alignTopicTermLanguages(snapshot, input) }
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
   const submitted = { ...input, evidence: old?.evidence ?? [] }
@@ -311,6 +324,7 @@ export function adoptTopicTerm(snapshot: TopicTermSnapshot, id: string, expected
 
 /** One browser action saves the confirmed card directly; model RPC inputs have no acceptance field. */
 export function acceptTopicTermProposal(snapshot: TopicTermSnapshot, input: TopicTermPut, resolver: TermEvidenceResolver, action: FileProposalAcceptance, revision = false): TermMutationResult {
+  if (input.id === null) return result(snapshot, 'invalid', null)
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if (old?.acceptance?.candidateId === action.candidateId && old.acceptance.batchId === action.batchId &&
     old.status === 'active' && old.origin === input.origin && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
@@ -353,9 +367,10 @@ export function reconcileTopicTerms(snapshot: TopicTermSnapshot, resolver: TermE
   return next
 }
 
-/** Quick never reads terms. Normal lookup is scoped and matches explicit forms exactly. */
+/** Quick never reads terms. Normal lookup is scoped and matches explicit forms exactly. A null source language means "any source language" for this query only; stored entries keep their exact value. */
 export function queryTopicTerms(snapshot: TopicTermSnapshot, query: TopicTermQuery, resolver: TermEvidenceResolver): readonly TopicTerm[] {
   if (query.mode !== 'normal' || query.ownerId !== snapshot.ownerId || query.topicId !== snapshot.topicId) return []
-  return snapshot.entries.filter(entry => languageMatches(entry.sourceLanguage, query.sourceLanguage) && languageMatches(entry.targetLanguage, query.targetLanguage) &&
+  return snapshot.entries.filter(entry => (query.sourceLanguage === null || languageMatches(entry.sourceLanguage, query.sourceLanguage)) &&
+    languageMatches(entry.targetLanguage, query.targetLanguage) &&
     effective(snapshot, entry, resolver) && [...entry.sourceForms, ...entry.aliases].some(form => query.forms.includes(form)))
 }

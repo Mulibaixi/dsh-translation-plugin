@@ -1,3 +1,5 @@
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import { languageMatches } from '../shared/language-tag.js'
 import { FILE_JOBS_REMOTE, MAX_FILE_JOB_PAGE_BYTES, MAX_FILE_JOB_PAGE_ITEMS, MAX_FILE_JOB_TEXT_POINTS, parseFileJobRequest,
   type FileJobBaseline, type FileJobControl, type FileJobFeedback, type FileJobIdentity, type FileJobList, type FileJobMechanicalIssue,
@@ -31,6 +33,7 @@ interface Job {
   constraints: FileJobConstraint[]; topicTerms: readonly TopicTerm[]
   readonly resultFloor: number
   readonly resultReviews: Map<number, 'pending' | 'passed' | 'changes_requested'>
+  readonly resultBases: Map<number, number>
   contexts: readonly FileJobContext[]; delegatedReviews: FileJobDelegatedReview[]; partitions: readonly FileSourcePartition[]; orderedTranslation: boolean
   /** Consecutive rejected semantic decisions per stage; a circuit breaker, never a permanent block. */
   reviewFailures: number; reviewFailuresStage: string | null
@@ -54,7 +57,7 @@ export class FileJobsService {
   readonly runtime: FileWorkerRuntime
   readonly adapter: DshTextExecutionAdapter
   private readonly jobs = new Map<string, Job>()
-  private readonly restarts = new Map<string, { readonly signature: string; readonly controller: AbortController; result: Promise<FileJobResult<FileJobSummary>> }>()
+  private readonly restarts = new Map<string, { readonly signature: string; readonly controller: AbortController; settled: boolean; result: Promise<FileJobResult<FileJobSummary>> }>()
   private nativeActive = 0
   private readonly revisions = new Map<string, { signature: string; result: FileJobResult<FileJobSummary> }>()
   private readonly nativeWaiters: { readonly job: Job; readonly grant: () => void; readonly reject: () => void }[] = []
@@ -92,6 +95,7 @@ export class FileJobsService {
   }
   private find(request: FileJobIdentity, exec?: ToolExecution): FileJobResult<Job> {
     const job = this.jobs.get(JSON.stringify([request.ownerId, request.jobId]))
+    if (job && (this.ctx.get?.('translationHistory') as { unitBlocked(sessionId: string, unitId: string, namespaceId?: string): boolean } | undefined)?.unitBlocked(job.summary.translationSessionId, job.summary.unitId, job.summary.namespaceId)) return bad('unit_deleted', '此文件单元已删除或正在删除。', 'read_file_job')
     const peerId = this.ctx.invocation?.peer.id
     if (!this.authorize(request.ownerId, exec) && (exec || !peerId || !job?.summary.namespaceId || !this.topics.ownsLibrary(job.summary.namespaceId, peerId))) return bad('scope_mismatch', '文件任务不属于此资料库或实际 Agent。', 'authorize_file_job')
     return job ? { ok: true, value: job } : bad('not_found', '此运行时尚无该文件任务；已保存记录仍可在客户端查看。', 'read_file_job')
@@ -212,7 +216,7 @@ export class FileJobsService {
     if (!agent) return bad('unavailable', '所属主 Agent 尚未就绪。', 'start_file_job')
     const delivered = this.materials.deliveredForAgent(request.target, agent)
     if (!delivered.ok) return delivered.error.code === 'material_not_delivered' ? bad(delivered.error.code,
-      '此提交没有当前有效交付。重试或重译已有文件时，先用 translation_file_list 找到保存的准确 unit target，再调用 translation_file_retranslate；不要复用旧 requestId，也不要要求用户复制内部材料 JSON。', delivered.error.stage,
+      '此提交没有当前有效交付。旧文件任务已停用新执行；需要重新翻译时，从当前文件输入重新发送原稿。可用 translation_file_list 查阅已有任务；不要复用旧 requestId，也不要要求用户复制内部材料 JSON。', delivered.error.stage,
       { recoveryTool: 'translation_file_list', ownerId: request.target.mainSessionId }) : delivered
     return this.startFrozen(delivered.value, agent, request.operationId, request.organizedRequirements)
   }
@@ -227,10 +231,10 @@ export class FileJobsService {
     const agent = exec?.agent ?? this.topics.ownerAgent(request.envelope.mainSessionId, peerId), material = request.envelope.material
     if (!agent) return bad('unavailable', '所属主 Agent 尚未就绪。', 'restart_file_job')
     const key = JSON.stringify([request.envelope.mainSessionId, request.operationId]), signature = JSON.stringify(request), old = this.restarts.get(key)
-    if (old) return old.signature === signature ? old.result : bad('idempotency_conflict', '同一重新发送操作不能更换原稿、来源证明或任务要求。', 'restart_file_job')
-    const entry = { signature, controller: new AbortController(), result: undefined as unknown as Promise<FileJobResult<FileJobSummary>> }
+    if (old) return old.signature === '' ? bad('revision_deleted', '原操作的译文已删除，请使用新操作明确重译。', 'restart_file_job') : old.signature === signature ? old.result : bad('idempotency_conflict', '同一重新发送操作不能更换原稿、来源证明或任务要求。', 'restart_file_job')
+    const entry = { signature, controller: new AbortController(), settled: false, result: undefined as unknown as Promise<FileJobResult<FileJobSummary>> }
     this.restarts.set(key, entry)
-    entry.result = this.restoreAndStart(request, agent, peerId, entry.controller.signal)
+    entry.result = this.restoreAndStart(request, agent, peerId, entry.controller.signal).finally(() => { entry.settled = true })
     return entry.result
   }
   private async restoreAndStart(request: FileJobRestart, agent: MainAgent, peerId: string, signal: AbortSignal): Promise<FileJobResult<FileJobSummary>> {
@@ -240,6 +244,8 @@ export class FileJobsService {
     let envelope = request.envelope, recoveredSource: Material['material']['sourceRef'], origin: FileJobSummary['sourceOrigin']
     try {
       if (!current()) return bad('scope_mismatch', '文件重新发送所属连接已变化。', 'restart_file_job')
+      const history = this.ctx.get?.('translationHistory') as { isFileSourceDeleted?(namespaceId: string, sessionId: string, unitId: string, version: number): Promise<boolean> } | undefined
+      if (await history?.isFileSourceDeleted?.(this.topics.namespaceForAgent(envelope.mainSessionId)!, material.translationSessionId, `unit:${material.materialId}`, material.sourceVersion)) return bad('source_deleted', '此文件原稿已删除，不能恢复旧稿任务。', 'restart_file_job')
       const scope = { ownerId: envelope.mainSessionId, mainSessionId: envelope.mainSessionId, topicId: material.topicId, translationSessionId: material.translationSessionId }
       if (request.librarySource) {
         const proof = request.librarySource, original = proof.stored.source, expected = material.sourceRef!
@@ -271,6 +277,9 @@ export class FileJobsService {
   }
   private startFrozen(envelope: Material, agent: MainAgent, operationId: string, requirements: string, resultFloor = 0, sourceOrigin?: FileJobSummary['sourceOrigin']): FileJobResult<FileJobSummary> {
     const material = envelope.material, peerId = this.topics.ownerPeer(envelope.mainSessionId, agent)
+    if (this.restarts.get(JSON.stringify([envelope.mainSessionId, operationId]))?.signature === '') return bad('revision_deleted', '原操作的译文已删除，请使用新操作明确重译。', 'start_file_job')
+    if ((this.ctx.get?.('translationHistory') as { unitBlocked(sessionId: string, unitId: string, namespaceId?: string): boolean } | undefined)?.unitBlocked(material.translationSessionId, `unit:${material.materialId}`, this.topics.namespaceForAgent(envelope.mainSessionId))) return bad('unit_deleted', '此文件单元已删除或正在删除。', 'start_file_job')
+    if ((this.ctx.get?.('translationHistory') as { fileSourceBlocked?(sessionId: string, unitId: string, version: number, namespaceId?: string): boolean } | undefined)?.fileSourceBlocked?.(material.translationSessionId, `unit:${material.materialId}`, material.sourceVersion, this.topics.namespaceForAgent(envelope.mainSessionId))) return bad('source_deleted', '此文件原稿已删除，不能再次启动旧稿任务。', 'start_file_job')
     if (!peerId) return bad('scope_mismatch', '文件原稿不属于此实际主 Agent。', 'authorize_file_job')
     if (!material.sourceRef) return bad('file_source_required', '文件任务需要已冻结的文件原稿。', 'start_file_job')
     if ([...this.jobs.values()].some(job => job.summary.mainSessionId === envelope.mainSessionId && job.summary.materialId === material.materialId && job.summary.removedAt)) return bad('material_removed', '此文件单元已被用户移除，原提交不能重新启动。', 'start_file_job')
@@ -288,7 +297,7 @@ export class FileJobsService {
       review: { version: 0, status: 'not_ready', reviewedBy: null, decidedAt: null }, notification: 'not_needed', error: null, ...(sourceOrigin ? { sourceOrigin } : {}) }
     if (bytes({ ok: true, value: summary }) > MAX_FILE_JOB_PAGE_BYTES) { this.normal.releaseDocumentSession(envelope.mainSessionId, material.translationSessionId, jobId); return bad('page_too_large', '冻结任务摘要超出32768字节，未启动模型调用。', 'start_file_job') }
     const job: Job = { summary, envelope: structuredClone(envelope), agent, peerId, signature, requirements, source: '', baseline: null, proposals: [],
-      plan: [], workers: [], checks: [], preparationChecks: [], capacityChecks: [], result: '', controller: new AbortController(), running: null, notified: new Set(), feedback: null, feedbackOperations: new Set(), results: new Map(), constraints: [], topicTerms: [], resultFloor, resultReviews: new Map(), contexts: [], delegatedReviews: [], partitions: [], orderedTranslation: false, reviewFailures: 0, reviewFailuresStage: null }
+      plan: [], workers: [], checks: [], preparationChecks: [], capacityChecks: [], result: '', controller: new AbortController(), running: null, notified: new Set(), feedback: null, feedbackOperations: new Set(), results: new Map(), constraints: [], topicTerms: [], resultFloor, resultReviews: new Map(), resultBases: new Map(), contexts: [], delegatedReviews: [], partitions: [], orderedTranslation: false, reviewFailures: 0, reviewFailuresStage: null }
     this.jobs.set(key, job)
     try { job.source = this.capture(job) } catch (error) { job.running = this.fail(job, error).finally(() => this.settled(job)); return ok(job.summary) }
     // This promise is held by the Host. RPC/tool acceptance never awaits its model calls.
@@ -508,7 +517,7 @@ export class FileJobsService {
     if (translated.errors.length) throw translated.errors.find(item => (item.error as { code?: string }).code === 'provider_outcome_unknown')?.error ?? translated.errors[0]!.error
     this.active(job)
     const text = translated.results.map(item => item.value).join('')
-    const resultVersion = 1 + Math.max(job.resultFloor, ...[...this.jobs.values()].filter(other => other.summary.namespaceId === job.summary.namespaceId && other.summary.translationSessionId === job.summary.translationSessionId && other.summary.unitId === job.summary.unitId).map(other => other.summary.result?.version ?? 0))
+    const resultVersion = this.nextResultVersion(job)
     job.result = text; job.results.set(resultVersion, text); job.resultReviews.set(resultVersion, 'pending')
     job.plan = job.plan.map(item => ({ ...item, resultVersion }))
     this.touch(job, { phase: 'checking', result: { version: resultVersion, totalCodePoints: points(text).length, semanticStatus: 'pending' } })
@@ -649,7 +658,7 @@ export class FileJobsService {
       const page = { ...base, text: codePoints.slice(range.start, range.end).join(''), range }
       return bytes({ ok: true, value: page }) <= MAX_FILE_JOB_PAGE_BYTES ? ok(page) : bad('page_too_large', '完整正文页超过32768字节，请缩小范围。', 'read_file_review')
     }
-    const all = request.section === 'proposals' ? job.proposals : request.section === 'results' ? [...job.results].map(([version, text]) => ({ version, totalCodePoints: points(text).length, semanticStatus: job.resultReviews.get(version) ?? 'pending' as const })) : request.section === 'baseline' ? [...(job.baseline?.terms ?? []), ...(job.baseline?.conflicts ?? [])] : request.section === 'conflicts' ? job.baseline?.conflicts ?? [] : request.section === 'contexts' ? job.contexts : request.section === 'reviews' ? job.delegatedReviews : request.section === 'constraints' ? job.constraints : request.section === 'plan' ? job.plan : request.section === 'workers' ? job.workers : job.checks
+    const all = request.section === 'proposals' ? job.proposals : request.section === 'results' ? [...job.results].map(([version, text]) => ({ version, totalCodePoints: points(text).length, semanticStatus: job.resultReviews.get(version) ?? 'pending' as const, ...(job.resultBases.has(version) ? { baseVersion: job.resultBases.get(version)! } : {}) })) : request.section === 'baseline' ? [...(job.baseline?.terms ?? []), ...(job.baseline?.conflicts ?? [])] : request.section === 'conflicts' ? job.baseline?.conflicts ?? [] : request.section === 'contexts' ? job.contexts : request.section === 'reviews' ? job.delegatedReviews : request.section === 'constraints' ? job.constraints : request.section === 'plan' ? job.plan : request.section === 'workers' ? job.workers : job.checks
     const offset = Math.min(request.offset ?? 0, all.length), limit = request.limit ?? MAX_FILE_JOB_PAGE_ITEMS, items: typeof all[number][] = []
     const context = request.section === 'baseline' ? job.baseline?.context ?? '' : undefined
     for (const item of all.slice(offset, offset + limit)) { if (bytes({ ok: true, value: { ...base, items: [...items, item], ...(context === undefined ? {} : { context }), ...(request.section === 'checks' && job.feedback ? { feedback: job.feedback } : {}) } }) > MAX_FILE_JOB_PAGE_BYTES) break; items.push(item) }
@@ -716,7 +725,7 @@ export class FileJobsService {
       this.validateProposals(job, proposals)
       const checks = this.mechanical(job, result)
       if (request.decision === 'accept' && checks.length && !request.comment.trim()) return bad('mechanical_issues_unaddressed', '存在机械检查问题，请说明语义判断及保留理由。', 'submit_file_review')
-      if (result !== job.result) { job.result = result; const version = job.summary.result!.version + 1; job.results.set(version, result); this.touch(job, { result: { version, totalCodePoints: points(result).length, semanticStatus: 'pending' } }); job.checks = [...job.capacityChecks, ...job.preparationChecks, ...checks] }
+      if (result !== job.result) { job.result = result; const version = this.nextResultVersion(job); job.resultBases.set(version, job.summary.result!.version); job.results.set(version, result); this.touch(job, { result: { version, totalCodePoints: points(result).length, semanticStatus: 'pending' } }); job.checks = [...job.capacityChecks, ...job.preparationChecks, ...checks] }
       job.proposals = proposals
       const accepted = request.decision === 'accept'
       if (request.stage !== 'assets') job.resultReviews.set(job.summary.result!.version, accepted ? 'passed' : 'changes_requested')
@@ -730,12 +739,17 @@ export class FileJobsService {
     } catch (error) { const detail = error as { code?: string; stage?: string }; return bad(detail.code ?? 'invalid_review', error instanceof Error ? error.message : '集中验收修改无效。', detail.stage ?? 'submit_file_review') }
   }
   /** A user-requested correction to a completed result never needs an old delivery or a model rerun. */
+  private nextResultVersion(job: Job): number {
+    return 1 + Math.max(job.resultFloor, ...[...this.jobs.values()]
+      .filter(other => other.summary.namespaceId === job.summary.namespaceId && other.summary.translationSessionId === job.summary.translationSessionId && other.summary.unitId === job.summary.unitId)
+      .flatMap(other => [other.summary.result?.version ?? 0, ...other.results.keys()]))
+  }
   revise(input: FileJobRevision, exec: ToolExecution): FileJobResult<FileJobSummary> {
     let request: FileJobRevision
     try { request = parseFileJobRequest('revise', input) as FileJobRevision } catch { return bad('invalid_input', '修订必须提供任务、版本、operationId 和含 expectedText 的 edits。', 'revise_file_result') }
     const found = this.find(request, exec); if (!found.ok) return found
     const key = JSON.stringify([request.ownerId, request.jobId, request.operationId]), signature = JSON.stringify(request), previous = this.revisions.get(key)
-    if (previous) return previous.signature === signature ? previous.result : bad('idempotency_conflict', '同一修订操作不能更换内容。', 'revise_file_result')
+    if (previous) return previous.signature === '' ? bad('revision_deleted', '原修订的译文已删除。', 'revise_file_result') : previous.signature === signature ? previous.result : bad('idempotency_conflict', '同一修订操作不能更换内容。', 'revise_file_result')
     const job = found.value
     if (job.summary.phase !== 'completed' || !job.summary.result || job.summary.removedAt) return bad('invalid_state', '仅可修订已完成且未移除的准确译文。', 'revise_file_result')
     if (job.summary.version !== request.expectedVersion) return bad('stale_version', '任务版本已变化，请重新读取当前译文后修订。', 'revise_file_result')
@@ -743,7 +757,8 @@ export class FileJobsService {
       const result = applyFileJobEdits(job.result, request.edits), checks = this.mechanical(job, result)
       if (checks.length && !request.comment.trim()) return bad('mechanical_issues_unaddressed', '修订后仍有机械检查问题，请说明保留理由。', 'revise_file_result')
       if (result !== job.result) {
-        const version = job.summary.result.version + 1
+        const version = this.nextResultVersion(job)
+        job.resultBases.set(version, job.summary.result.version)
         job.result = result; job.results.set(version, result); job.resultReviews.set(version, 'passed')
         job.checks = [...job.capacityChecks, ...job.preparationChecks, ...checks]
         this.touch(job, { result: { version, totalCodePoints: points(result).length, semanticStatus: 'passed' },
@@ -767,6 +782,31 @@ export class FileJobsService {
     return ok(job.summary)
   }
   hasActiveJobs(ownerId?: string): boolean { return [...this.jobs.values()].some(job => (!ownerId || job.summary.mainSessionId === ownerId) && (!terminal.has(job.summary.phase) || job.summary.phase === 'unknown' || !!job.feedback)) }
+  historyUnitBusy(scope: HistoryScope, unitId: string): boolean {
+    return [...this.jobs.values()].some(job => historyTargetMatches(scope, unitId, job.summary) && (!!job.running || !terminal.has(job.summary.phase) || job.summary.phase === 'unknown' || !!job.feedback)) ||
+      [...this.restarts.values()].some(entry => !entry.settled && historyTargetMatches(scope, unitId, JSON.parse(entry.signature).envelope.material)) ||
+      [...this.unitIntents.values()].some(entry => entry.outcome === null && historyTargetMatches(scope, unitId, JSON.parse(entry.signature).target))
+  }
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void {
+    const ids = new Set<string>()
+    for (const [id, job] of this.jobs) if (historyTargetMatches(scope, unitId, job.summary, sourceVersion)) { ids.add(job.summary.jobId); job.controller.abort(); this.jobs.delete(id) }
+    for (const [key] of this.revisions) if (ids.has(JSON.parse(key)[1])) this.revisions.delete(key)
+    for (const [key, entry] of this.restarts) if (entry.signature && historyTargetMatches(scope, unitId, JSON.parse(entry.signature).envelope.material, sourceVersion)) { entry.controller.abort(); this.restarts.delete(key) }
+    for (const [key, entry] of this.unitIntents) if (historyTargetMatches(scope, unitId, JSON.parse(entry.signature).target, sourceVersion)) this.unitIntents.delete(key)
+  }
+  forgetHistoryResultVersion(scope: HistoryScope, unitId: string, version: number): void {
+    const removedJobs = new Set<string>(), removedOperations = new Set<string>()
+    for (const [key, job] of this.jobs) if (historyTargetMatches(scope, unitId, job.summary) && job.results.has(version)) {
+      job.results.delete(version); job.resultReviews.delete(version); job.resultBases.delete(version)
+      if (job.summary.result?.version === version) { job.result = ''; this.touch(job, { result: null }) }
+      if (!job.results.size) {
+        removedJobs.add(job.summary.jobId); removedOperations.add(job.summary.operationId); this.jobs.delete(key)
+        this.restarts.set(JSON.stringify([job.summary.mainSessionId, job.summary.operationId]), { signature: '', controller: job.controller, settled: true, result: Promise.resolve(bad('revision_deleted', '此任务的译文已删除。', 'restart_file_job')) })
+      }
+    }
+    for (const [key, entry] of this.revisions) if (removedJobs.has(JSON.parse(key)[1]) || entry.result.ok && historyTargetMatches(scope, unitId, entry.result.value) && entry.result.value.result?.version === version) this.revisions.set(key, { signature: '', result: bad('revision_deleted', '此修订的译文已删除。', 'revise_file_result') })
+    for (const [key, entry] of this.restarts) if (entry.signature && removedOperations.has(JSON.parse(entry.signature).operationId)) this.restarts.set(key, { signature: '', controller: entry.controller, settled: true, result: Promise.resolve(bad('revision_deleted', '此任务的译文已删除。', 'restart_file_job')) })
+  }
   hasJobs(ownerId: string): boolean { return [...this.jobs.values()].some(job => job.summary.mainSessionId === ownerId && !job.summary.removedAt) }
   materialWorkflow(target: { mainSessionId: string; requestId: string; materialId: string; sourceVersion: number }): { phase: 'waiting' | 'preparing' | 'running' | 'completed' | 'failed' | 'unknown'; message: string } | undefined {
     const job = [...this.jobs.values()].find(item => item.summary.mainSessionId === target.mainSessionId && item.summary.requestId === target.requestId && item.summary.materialId === target.materialId && item.summary.sourceVersion === target.sourceVersion)

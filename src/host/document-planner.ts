@@ -1,3 +1,5 @@
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import type { FrozenReferenceContext } from '../shared/reference-memory.js'
 import type { ModelSelection } from '../shared/contracts.js'
 import { parseDocumentChunkPlan, type ChunkPlanItem, type DocumentChunkPlan, type VersionReference, type DocumentSourceVersion, type DocumentExecutionBaseline } from '../shared/translation-batch.js'
@@ -466,6 +468,12 @@ export class DocumentPlanner {
       const assembled = this.budget(preparation, item, source.points, record.receipt.capacity, inputLimit(input), record.protectedRanges, input.referenceContext)
       return ok(assembled.prompt!)
     } catch (error) { return errorResult(error) }
+  }
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void {
+    const matches = (target: TranslationPlanQuery['target']): boolean => historyTargetMatches(scope, unitId, target, sourceVersion) || target.kind === 'material' && `unit:${target.materialId}` === unitId && (sourceVersion === undefined || target.sourceVersion === sourceVersion)
+    for (const [id, records] of this.plans) if (records.some(record => matches(record.target))) this.plans.delete(id)
+    for (const [id, entry] of this.operations) if (matches(entry.record.target)) this.operations.delete(id)
+    for (const [id] of this.suggestions) if (matches(JSON.parse(id)[0])) this.suggestions.delete(id)
   }
   dispose(): void { this.plans.clear(); this.operations.clear(); this.suggestions.clear(); this.locks.clear() }
 }

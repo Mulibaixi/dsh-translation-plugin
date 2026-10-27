@@ -158,11 +158,12 @@ function replaceAndReview(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEnt
 }
 function result(snapshot: TopicArchiveSnapshot, status: ArchiveMutationResult['status'], entry: TopicArchiveEntry | null): ArchiveMutationResult { return { status, snapshot, entry } }
 
-/** Model inputs carry no adoption event and cannot overwrite an explicitly adopted entry. */
+/** Model edits are allowed; changed content must be reviewed again without inherited adoption. */
 export function putTopicArchive(snapshot: TopicArchiveSnapshot, input: TopicArchivePut, resolver: TermEvidenceResolver, at: string): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
-  if (old?.origin === 'user_explicit' || old?.acceptance) return result(snapshot, 'requires_user_action', old)
+  if (old && time(at) && referenceOriginValid(input) && content(input) && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
+  if (old) input = { ...input, status: 'proposal' }
   if (!referenceOriginValid(input) || !text(input.id, 2048) || !time(at) || !content(input) || (old && old.kind !== input.kind) || !['inferred', 'source_checked', 'reference_derived'].includes(input.origin) ||
     !['proposal', 'active'].includes(input.status) || (input.status === 'active' && (input.origin !== 'source_checked' || !validBasis(snapshot, input, resolver))) ||
     !validReferences(snapshot, input, resolver, input.status === 'active')) return result(snapshot, 'invalid', old)

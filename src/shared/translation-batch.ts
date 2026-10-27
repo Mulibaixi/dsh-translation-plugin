@@ -5,6 +5,7 @@ import { sourceCodePointLength, type TranslationSourceRange } from './translatio
 import type { TranslationMaterialRoute } from './translation-material.js'
 import { parseDocumentCorrectionFact, parseDocumentReuseApproval, type DocumentCorrectionFact, type DocumentReuseApproval } from './document-correction.js'
 import { parseDocumentManualRevisionBase, parseDocumentReviewAudit, type DocumentManualRevisionBase, type DocumentReviewAudit } from './document-review.js'
+import { parseVersionDeletion, type VersionDeletion } from './version-deletion.js'
 
 export interface VersionReference { readonly id: string; readonly version: number }
 export type SourceBody = { readonly kind: 'inline'; readonly text: string }
@@ -21,6 +22,7 @@ export interface DocumentSourceVersion {
   readonly createdAt: string
   readonly operationId: string | null
   readonly historyCommit?: DocumentSourceHistoryCommit
+  readonly deletion?: VersionDeletion & { readonly totalCodePoints: number }
 }
 /** The preparation body is owned by the later preparation service, not copied into history. */
 export interface DocumentPreparationReference extends VersionReference { readonly sourceVersion: number }
@@ -141,6 +143,7 @@ export interface ChunkRevision {
   readonly createdAt: string
   readonly updatedAt: string
   readonly manualBase?: DocumentManualRevisionBase
+  readonly deletion?: VersionDeletion
 }
 export interface ManifestEntry {
   readonly chunkId: string
@@ -166,6 +169,7 @@ export interface DocumentRevision {
   readonly eligibility: DocumentEligibility
   readonly parentRevisionId?: string
   readonly reviewAuditId?: string
+  readonly deletion?: VersionDeletion
 }
 export interface DocumentFinalPointer {
   readonly revisionId: string
@@ -220,6 +224,7 @@ function array(value: unknown, maximum = Number.MAX_SAFE_INTEGER): asserts value
 function same(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right) }
 export function sameVersionReference(left: VersionReference, right: VersionReference): boolean { return left.id === right.id && left.version === right.version }
 export function documentSourceLength(source: DocumentSourceVersion): number {
+  if (source.deletion) return source.deletion.totalCodePoints
   return source.body.kind === 'inline' ? sourceCodePointLength(source.body.text) : source.body.reference.totalCodePoints
 }
 function range(value: unknown, maximum = Number.MAX_SAFE_INTEGER): TranslationSourceRange {
@@ -234,19 +239,25 @@ function taskStatus(value: unknown): asserts value is DocumentTaskStatus {
   if (!['running', 'paused', 'waiting_context', 'waiting_user', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted'].includes(value as string)) throw new TypeError('Invalid document status')
 }
 export function parseDocumentSourceVersion(value: unknown): DocumentSourceVersion {
-  exact(value, ['version', 'body', 'createdAt', 'operationId'], ['historyCommit']); integer(value.version); time(value.createdAt)
+  exact(value, ['version', 'body', 'createdAt', 'operationId'], ['historyCommit', 'deletion']); integer(value.version); time(value.createdAt)
+  const deletion = value.deletion === undefined ? undefined : (() => {
+    exact(value.deletion, ['eventId', 'at', 'totalCodePoints']); integer(value.deletion.totalCodePoints)
+    return { ...parseVersionDeletion({ eventId: value.deletion.eventId, at: value.deletion.at }), totalCodePoints: value.deletion.totalCodePoints }
+  })()
   if (value.operationId !== null) string(value.operationId)
   exact(value.body, ['kind'], ['text', 'reference'])
   let body: SourceBody
   if (value.body.kind === 'inline') {
-    exact(value.body, ['kind', 'text']); string(value.body.text, 2_000_000)
+    exact(value.body, ['kind', 'text']); string(value.body.text, 2_000_000, !deletion)
+    if (deletion && value.body.text !== '') throw new TypeError('Deleted source retains text')
     if (new TextEncoder().encode(value.body.text).byteLength > 2 * 1024 * 1024 || /[\uD800-\uDFFF]/u.test(value.body.text)) throw new TypeError('Invalid document source encoding')
     body = { kind: 'inline', text: value.body.text }
   } else {
     if (value.body.kind !== 'asset') throw new TypeError('Invalid document source body')
     exact(value.body, ['kind', 'reference']); body = { kind: 'asset', reference: parseSourceIdentity(value.body.reference) }
   }
-  const result: DocumentSourceVersion = { version: value.version, body, createdAt: value.createdAt, operationId: value.operationId as string | null }
+  const result: DocumentSourceVersion = { version: value.version, body, createdAt: value.createdAt, operationId: value.operationId as string | null, ...(deletion ? { deletion } : {}) }
+  if (deletion && Object.hasOwn(value, 'historyCommit')) throw new TypeError('Deleted source retains its file reference')
   if (Object.hasOwn(value, 'historyCommit')) {
     if (body.kind !== 'asset') throw new TypeError('Inline sources have no storage transaction')
     exact(value.historyCommit, ['reference', 'historyToken', 'confirmOperationId'])
@@ -392,14 +403,16 @@ export function parseDocumentCallContextReference(value: unknown, sourceLength: 
     contextRanges: contextRef.contextRanges.map(item => range(item, sourceLength)), supplementRefs }
 }
 export function parseChunkRevision(value: unknown, sourceLength: number): ChunkRevision {
-  exact(value, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'], ['manualBase'])
+  exact(value, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'], ['manualBase', 'deletion'])
+  const deletion = value.deletion === undefined ? undefined : parseVersionDeletion(value.deletion)
   string(value.id); string(value.taskId); string(value.childOperationId); integer(value.sourceVersion); string(value.chunkId); time(value.createdAt); time(value.updatedAt); taskStatus(value.status)
   if (!['machine', 'manual', 'copy'].includes(value.kind as string)) throw new TypeError('Invalid document revision kind')
   const planRef = ref(value.planRef), preparationRef = ref(value.preparationRef)
   exact(value.content, ['kind'], ['text', 'sourceVersion', 'range', 'sha256'])
   let content: ChunkContent
   if (value.content.kind === 'text') {
-    exact(value.content, ['kind', 'text']); string(value.content.text, 16 * 1024 * 1024, value.status === 'completed')
+    exact(value.content, ['kind', 'text']); string(value.content.text, 16 * 1024 * 1024, value.status === 'completed' && !deletion)
+    if (deletion && value.content.text !== '') throw new TypeError('Deleted chunk retains text')
     if (new TextEncoder().encode(value.content.text).byteLength > 16 * 1024 * 1024 || /[\uD800-\uDFFF]/u.test(value.content.text)) throw new TypeError('Document chunk exceeds text encoding or byte budget')
     content = { kind: 'text', text: value.content.text }
   } else {
@@ -423,10 +436,11 @@ export function parseChunkRevision(value: unknown, sourceLength: number): ChunkR
   return { id: value.id, taskId: value.taskId, childOperationId: value.childOperationId, attemptId: value.attemptId as string | null,
     callId: value.callId as string | null, sourceVersion: value.sourceVersion, chunkId: value.chunkId, planRef, preparationRef,
     kind: value.kind as ChunkRevision['kind'], status: value.status, content, callRecord, createdAt: value.createdAt, updatedAt: value.updatedAt,
-    ...(value.manualBase === undefined ? {} : { manualBase: parseDocumentManualRevisionBase(value.manualBase) }) }
+    ...(value.manualBase === undefined ? {} : { manualBase: parseDocumentManualRevisionBase(value.manualBase) }), ...(deletion ? { deletion } : {}) }
 }
 export function parseDocumentRevision(value: unknown, sourceLength: number): DocumentRevision {
-  exact(value, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility'], ['parentRevisionId', 'reviewAuditId'])
+  exact(value, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility'], ['parentRevisionId', 'reviewAuditId', 'deletion'])
+  const deletion = value.deletion === undefined ? undefined : parseVersionDeletion(value.deletion)
   string(value.id); string(value.taskId); integer(value.sourceVersion); time(value.createdAt); array(value.entries, 256)
   const entries: ManifestEntry[] = value.entries.map(raw => {
     exact(raw, ['chunkId', 'outputRange', 'revisionId'], ['reuseRef']); string(raw.chunkId); string(raw.revisionId)
@@ -448,12 +462,13 @@ export function parseDocumentRevision(value: unknown, sourceLength: number): Doc
   if (value.review.status === 'passed' && issues.length) throw new TypeError('Passed document review has unresolved issues')
   exact(value.eligibility, ['complete', 'finalEligible'])
   if (typeof value.eligibility.complete !== 'boolean' || typeof value.eligibility.finalEligible !== 'boolean') throw new TypeError('Invalid document eligibility')
+  if (deletion && (issues.length || value.eligibility.finalEligible)) throw new TypeError('Deleted manifest retains review text or eligibility')
   for (const name of ['parentRevisionId', 'reviewAuditId'] as const) if (value[name] !== undefined) string(value[name])
   if (value.reviewAuditId !== undefined && value.parentRevisionId === undefined) throw new TypeError('Reviewed manifest needs its original fixed candidate')
   return { id: value.id, taskId: value.taskId, sourceVersion: value.sourceVersion, planRef: ref(value.planRef), preparationRef: ref(value.preparationRef),
     createdAt: value.createdAt, entries, review: { status: value.review.status as DocumentReview['status'], checkedAt: value.review.checkedAt as string | null, issues },
     eligibility: { complete: value.eligibility.complete, finalEligible: value.eligibility.finalEligible },
-    ...(value.parentRevisionId === undefined ? {} : { parentRevisionId: value.parentRevisionId as string }), ...(value.reviewAuditId === undefined ? {} : { reviewAuditId: value.reviewAuditId as string }) }
+    ...(value.parentRevisionId === undefined ? {} : { parentRevisionId: value.parentRevisionId as string }), ...(value.reviewAuditId === undefined ? {} : { reviewAuditId: value.reviewAuditId as string }), ...(deletion ? { deletion } : {}) }
 }
 
 /** Validates structural facts only; document-task validates their cross references and eligibility. */
@@ -476,6 +491,7 @@ export function parseDocumentUnitShape(value: unknown): DocumentUnit {
   }
   const sourceVersions = value.sourceVersions.map(parseDocumentSourceVersion)
   if (!sourceVersions.length || sourceVersions.some((source, index) => source.version !== index + 1) || value.sourceVersion !== sourceVersions.length) throw new TypeError('Invalid document source versions')
+  if (sourceVersions.at(-1)!.deletion) throw new TypeError('Current source cannot be deleted')
   const sourceLength = (version: unknown): number => {
     integer(version); const source = sourceVersions[version - 1]
     if (!source) throw new TypeError('Document source version unavailable')
@@ -490,8 +506,8 @@ export function parseDocumentUnitShape(value: unknown): DocumentUnit {
       ...(value.final.selectionEventId === undefined ? {} : { selectionEventId: value.final.selectionEventId }) }
   }
   const plans = value.plans.map(raw => { exact(raw, ['id', 'version', 'sourceVersion', 'preparationRef', 'items', 'createdAt', 'operationId'], ['protectedRanges']); return parseDocumentChunkPlan(raw, sourceLength(raw.sourceVersion)) })
-  const chunkRevisions = value.chunkRevisions.map(raw => { exact(raw, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'], ['manualBase']); return parseChunkRevision(raw, sourceLength(raw.sourceVersion)) })
-  const revisions = value.revisions.map(raw => { exact(raw, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility'], ['parentRevisionId', 'reviewAuditId']); return parseDocumentRevision(raw, sourceLength(raw.sourceVersion)) })
+  const chunkRevisions = value.chunkRevisions.map(raw => { exact(raw, ['id', 'taskId', 'childOperationId', 'attemptId', 'callId', 'sourceVersion', 'chunkId', 'planRef', 'preparationRef', 'kind', 'status', 'content', 'callRecord', 'createdAt', 'updatedAt'], ['manualBase', 'deletion']); return parseChunkRevision(raw, sourceLength(raw.sourceVersion)) })
+  const revisions = value.revisions.map(raw => { exact(raw, ['id', 'taskId', 'sourceVersion', 'planRef', 'preparationRef', 'createdAt', 'entries', 'review', 'eligibility'], ['parentRevisionId', 'reviewAuditId', 'deletion']); return parseDocumentRevision(raw, sourceLength(raw.sourceVersion)) })
   const corrections = value.corrections === undefined ? undefined : (() => { array(value.corrections); return value.corrections.map(parseDocumentCorrectionFact) })()
   const reuseApprovals = value.reuseApprovals === undefined ? undefined : (() => { array(value.reuseApprovals); return value.reuseApprovals.map(parseDocumentReuseApproval) })()
   const reviewAudits = value.reviewAudits === undefined ? undefined : (() => { array(value.reviewAudits); return value.reviewAudits.map(parseDocumentReviewAudit) })()

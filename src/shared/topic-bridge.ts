@@ -1,4 +1,7 @@
 import { parseReferenceAssetSelection, parseReferenceContextAsset, type ReferenceAssetSelection, type ReferenceContextAsset } from './reference-memory.js'
+import { parseDirectHistoryContext, type DirectHistoryContext } from './direct-history-context.js'
+import { parseOtherMemoryScope, type OtherMemoryScope } from './other-memory.js'
+import { parseDirectProposalSubmission, type DirectProposalSubmission, type DirectProposalReceipt } from './direct-proposals.js'
 import { parseReferenceFacts, parseReferenceIndex, type ReferenceFacts, type ReferenceIndex } from './reference-memory.js'
 import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
@@ -83,6 +86,8 @@ export type TopicBridgeCommand =
   | { readonly kind: 'reference_assets'; readonly topicId: string; readonly selections: readonly ReferenceAssetSelection[] }
   | { readonly kind: 'reference_bind'; readonly operationId: string; readonly start: TopicSessionStart }
   | { readonly kind: 'reference_scope'; readonly topicId: string }
+  | { readonly kind: 'settings_scope'; readonly topicId: string | null }
+  | { readonly kind: 'direct_proposals'; readonly request: DirectProposalSubmission }
   | { readonly kind: 'reference_sync'; readonly index: ReferenceIndex; readonly expectedVersion: number }
   | { readonly kind: 'document_review_page'; readonly request: DocumentReviewPageRequest }
   | { readonly kind: 'document_review_read'; readonly request: DocumentReviewRead }
@@ -134,6 +139,8 @@ export type TopicBridgeCommand =
   | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
+  | { readonly kind: 'direct_proposals'; readonly receipt: DirectProposalReceipt }
+  | { readonly kind: 'settings_scope'; readonly scope: OtherMemoryScope; readonly rememberHistory: boolean }
   | { readonly kind: 'unit_directory'; readonly directory: UnitDirectory }
   | { readonly kind: 'unit_contents'; readonly contents: readonly UnitContent[] }
   | { readonly kind: 'file_history'; readonly value: FileHistoryValue }
@@ -158,7 +165,7 @@ export type TopicBridgeValue =
   | { readonly kind: 'normal_resolved'; readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }> }
   | { readonly kind: 'normal_source_corrected'; readonly correction: NormalTranslationCorrectionReceipt }
   | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
-  | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot }
+  | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot; readonly historyContext?: DirectHistoryContext }
   | { readonly kind: 'normal_committed'; readonly receipt: DirectTranslationReceipt }
   | { readonly kind: 'normal_exported'; readonly export: NormalTranslationExport }
   | { readonly kind: 'normal_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
@@ -219,6 +226,13 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
   if (protocol === 1 && ['normal_v2_update', 'normal_commit', 'normal_export', 'normal_exchange_resolve', 'preparation_prepare', 'preparation_set', 'preparation_status', 'preparation_read', 'preparation_capture', 'document_accept', 'document_register', 'document_event', 'document_finish', 'document_release', 'document_observe', 'document_control', 'document_restore', 'document_capture', 'document_correct', 'document_accept_unit', 'preparation_review_correction', 'document_correct_observe', 'document_task_terms'].includes(value.kind as string)) throw new TypeError('Command requires topic bridge v2')
   if (String(value.kind).startsWith('reference_') && protocol < 3) throw new TypeError('Reference memory requires topic bridge v3')
   switch (value.kind) {
+    case 'direct_proposals':
+      if (protocol < 4) throw new TypeError('Direct proposals require topic bridge v4')
+      exact(value, ['kind', 'request']); return { kind: 'direct_proposals', request: parseDirectProposalSubmission(value.request) }
+    case 'settings_scope':
+      if (protocol < 4) throw new TypeError('Settings maintenance requires topic bridge v4')
+      exact(value, ['kind', 'topicId']); if (value.topicId !== null) text(value.topicId)
+      return { kind: 'settings_scope', topicId: value.topicId as string | null }
     case 'list_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, false) } }
     case 'read_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, true) } }
       case 'reference_assets': {
@@ -418,6 +432,19 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
   object(value)
   if (protocol === 1 && (String(value.kind).startsWith('document_review_') || ['normal_v2_updated', 'normal_committed', 'normal_exported', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string))) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
+    case 'settings_scope':
+      if (protocol < 4) throw new TypeError('Settings maintenance requires topic bridge v4')
+      exact(value, ['kind', 'scope', 'rememberHistory']); boolean(value.rememberHistory)
+      object(value.scope); exact(value.scope, ['namespaceId', 'topicId'])
+      return { kind: 'settings_scope', scope: parseOtherMemoryScope(value.scope), rememberHistory: value.rememberHistory }
+    case 'direct_proposals': {
+      if (protocol < 4) throw new TypeError('Direct proposals require topic bridge v4')
+      exact(value, ['kind', 'receipt']); object(value.receipt); exact(value.receipt, ['count', 'skipped', 'persistence'])
+      integer(value.receipt.count); if (!Array.isArray(value.receipt.skipped)) throw new TypeError('Invalid proposal summary')
+      for (const message of value.receipt.skipped) text(message, 5000)
+      if (!['saved', 'runtime_only'].includes(value.receipt.persistence as string)) throw new TypeError('Invalid proposal persistence')
+      return { kind: 'direct_proposals', receipt: value.receipt as unknown as DirectProposalReceipt }
+    }
     case 'unit_directory': exact(value, ['kind', 'directory']); return { kind: 'unit_directory', directory: parseUnitDirectory(value.directory) }
     case 'unit_contents':
       exact(value, ['kind', 'contents'])
@@ -446,10 +473,10 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
     case 'normal_source_corrected': exact(value, ['kind', 'correction']); return { kind: 'normal_source_corrected', correction: parseNormalTranslationCorrectionReceipt(value.correction) }
     case 'normal_observed': exact(value, ['kind', 'operation']); return { kind: 'normal_observed', operation: value.operation === null ? null : parseNormalTranslationOperation(value.operation) }
     case 'normal_prepared': {
-      exact(value, ['kind', 'termSnapshot'])
+      exact(value, ['kind', 'termSnapshot', ...(Object.hasOwn(value, 'historyContext') ? ['historyContext'] : [])])
       const termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)
       if (!termSnapshot || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation preparation')
-      return { kind: 'normal_prepared', termSnapshot }
+      return { kind: 'normal_prepared', termSnapshot, ...(value.historyContext === undefined ? {} : { historyContext: parseDirectHistoryContext(value.historyContext) }) }
     }
     case 'normal_committed': {
       exact(value, ['kind', 'receipt'])

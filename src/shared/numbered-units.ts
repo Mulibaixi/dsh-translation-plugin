@@ -16,6 +16,7 @@ export interface NumberedUnit {
   readonly status: string
   readonly versions: readonly number[]
   readonly finalVersion: number | null
+  readonly finalSelection?: 'automatic' | 'user_fixed'
 }
 export interface UnitContent {
   readonly unit: NumberedUnit
@@ -51,7 +52,8 @@ export function parseUnitRequest(value: unknown, read: boolean): UnitDirectoryRe
   return structuredClone(value) as unknown as UnitDirectoryRequest | UnitReadRequest
 }
 export function parseNumberedUnit(value: unknown): NumberedUnit {
-  object(value); fields(value, ['target', 'number', 'kind', 'status', 'versions', 'finalVersion'])
+  object(value); fields(value, ['target', 'number', 'kind', 'status', 'versions', 'finalVersion', 'finalSelection'])
+  if (value.finalSelection !== undefined && !['automatic', 'user_fixed'].includes(value.finalSelection as string)) throw new TypeError('Invalid final selection')
   const target = parseNormalTranslationTarget(value.target)
   if (target.kind !== 'unit' || !['text', 'file'].includes(value.kind as string) || typeof value.status !== 'string' || !Array.isArray(value.versions)) throw new TypeError('Invalid unit directory item')
   integer(value.number, 1); value.versions.forEach(n => integer(n, 1))

@@ -44,6 +44,11 @@ function referencedFacts(sessions: SessionStore, ref: TermEvidenceRef): unknown 
     revision.entries.map(entry => unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId)) : []
   return { sourceVersion: unit?.sourceVersion, source, final: unit?.final, revision, selectionEventId, chunks }
 }
+/** Reconciliation uses already resolved evidence; unrelated session notifications are not changes. */
+export function captureTopicEvidenceCurrent(sessions: SessionStore, scope: Scope, refs: readonly TermEvidenceRef[], resolver: TermEvidenceResolver): () => boolean {
+  const captured = refs.map(ref => ({ ref, facts: structuredClone(referencedFacts(sessions, ref)), text: resolveTermEvidence(scope, ref, resolver), unloaded: isTopicEvidenceUnloaded(sessions, scope, ref) }))
+  return () => captured.every(value => sameFact(value.facts, referencedFacts(sessions, value.ref)) && value.text === resolveTermEvidence(scope, value.ref, resolver) && value.unloaded === isTopicEvidenceUnloaded(sessions, scope, value.ref))
+}
 export interface PreparedTopicEvidence {
   readonly resolver: TermEvidenceResolver
   readonly isUnloaded: (ref: TermEvidenceRef) => boolean

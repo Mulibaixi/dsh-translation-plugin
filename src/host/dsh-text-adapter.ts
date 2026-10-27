@@ -1,6 +1,8 @@
+import { diagnosticSpan, type DiagnosticContext } from './diagnostics.js'
 import type { FrozenReferenceContext } from '../shared/reference-memory.js'
 import type { ModelSelection } from '../shared/contracts.js'
 import type { TextCapabilityEvidence, TextExecutionAdapter, TextExecutionEvent, TextExecutionPacket } from '../shared/domain-contracts.js'
+import type { DirectHistoryContext } from '../shared/direct-history-context.js'
 import { NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION, NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION,
   reconstructTranslationContext, reconstructNormalExchangeTranslationContext, reconstructDirectTranslationContext, reconstructNormalTranslationContext,
   type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
@@ -24,7 +26,7 @@ export interface DshDetachedSession {
   append(type: string, data: unknown, options?: { surfaceOp: 'append' }): unknown
   deriveMessages(): readonly unknown[]
 }
-export interface DshExecutionContext {
+export interface DshExecutionContext extends DiagnosticContext {
   readonly llm?: {
     listModels(provider: string): Promise<readonly { provider: string; id: string }[]>
     resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{ provider: string; id: string; reasoning?: { efforts: readonly { id: string }[]; defaultEffort?: string } }>
@@ -46,6 +48,7 @@ export interface DshLlmHelpers {
 
 export interface SafeExecutionFailure { readonly code: string; readonly message: string; readonly stage: string }
 export interface NormalExecutionPacket {
+  readonly historyContext?: DirectHistoryContext
   readonly operationId: string
   readonly callId: string
   readonly model: ModelSelection
@@ -146,6 +149,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   private readonly routes = new Map<string, ModelSelection>()
   private readonly failures = new Map<string, SafeExecutionFailure>()
   private readonly logs = new Map<string, readonly unknown[]>()
+  private readonly callOperations = new Map<string, string>()
   private readonly calls = new Map<string, Omit<TranslationCallMetadata, 'usage'>>()
   private helpers: DshLlmHelpers | undefined
   private loading: Promise<DshLlmHelpers> | undefined
@@ -163,8 +167,9 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   }
 
   async prepareOperation(operationId: string, route: ModelSelection, signal: AbortSignal): Promise<void> {
-    if (!await this.ready()) throw Object.assign(new Error('DSH text runtime unavailable'), { code: 'EXECUTION_UNAVAILABLE' })
+    const report = diagnosticSpan(this.ctx, 'model.prepare', { provider: route.providerId, model: route.modelId }, operationId)
     try {
+      if (!await this.ready()) throw Object.assign(new Error('DSH text runtime unavailable'), { code: 'EXECUTION_UNAVAILABLE' })
       signal.throwIfAborted()
       const llm = this.llm!
       const models = await llm.listModels(route.providerId)
@@ -189,10 +194,16 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       }
       this.prepared.set(operationId, { route: frozen(structuredClone(route)), call, requestContext: false })
       this.routes.set(key(route), frozen(structuredClone(route)))
-    } catch (error) { this.failures.set(operationId, failure(error, 'prepare')); throw error }
+      report('completed')
+    } catch (error) { const diagnostic = failure(error, 'prepare'); report(signal.aborted ? 'cancelled' : 'failed', { failureCode: diagnostic.code, failureStage: diagnostic.stage }, error); this.failures.set(operationId, diagnostic); throw error }
   }
 
   discard(operationId: string): void { this.prepared.delete(operationId) }
+  forgetCallLog(callId: string): void {
+    const operationId = this.callOperations.get(callId)
+    if (operationId) this.logs.delete(operationId)
+    this.callOperations.delete(callId)
+  }
   /** Prepare the real selected route without dispatching a stream or retaining any document body. */
   async prepareDocumentCapacity(operationId: string, route: ModelSelection, signal: AbortSignal): Promise<DocumentPreparedCapacity> {
     await this.prepareOperation(operationId, route, signal)
@@ -291,7 +302,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       const material = { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }
       const context = requestContext
         ? reconstructNormalExchangeTranslationContext(material, packet.context, bound.exchangeResume, packet.referenceContext)
-        : direct ? reconstructDirectTranslationContext(material, packet.context, packet.referenceContext)
+        : direct ? reconstructDirectTranslationContext(material, packet.context, packet.referenceContext, packet.historyContext)
         : reconstructNormalTranslationContext(material, packet.context, packet.referenceContext)
       // Model capacity is decided by the bound adapter, not by treating bytes as tokens.
       const normalContext = frozen(structuredClone(packet.context))
@@ -316,6 +327,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   }
   /** Host diagnostics only; this is never registered as a Remote method. */
   inspectLog(operationId: string): readonly unknown[] | undefined { return this.logs.get(operationId) }
+  inspectCallLog(callId: string): readonly unknown[] | undefined { const operation = this.callOperations.get(callId); return operation ? this.logs.get(operation) : undefined }
 
   capabilities(route: ModelSelection): TextCapabilityEvidence {
     return {
@@ -346,7 +358,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     const promptVersion = bound.requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : bound.direct ? NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION
     yield* this.executePrepared(packet.operationId, packet.callId, bound.call, 'normal',
       bound.requestContext ? reconstructNormalExchangeTranslationContext(material, bound.normalContext, bound.exchangeResume, packet.referenceContext)
-        : bound.direct ? reconstructDirectTranslationContext(material, bound.normalContext, packet.referenceContext)
+        : bound.direct ? reconstructDirectTranslationContext(material, bound.normalContext, packet.referenceContext, packet.historyContext)
         : reconstructNormalTranslationContext(material, bound.normalContext, packet.referenceContext),
       signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion, promptVersion)
   }
@@ -355,8 +367,10 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     onDispatch?: () => void, requestContext = false, sourceCodePointLength = 0,
     exchangeResume?: Extract<NormalTranslationResolution, { readonly kind: 'answer' }>, exchangeContextVersion = 1,
     promptVersion?: TranslationCallMetadata['promptVersion']): AsyncGenerator<NormalExecutionEvent> {
+    const report = diagnosticSpan(this.ctx, 'model.stream', { mode, promptVersion, provider: call.config.provider, model: call.config.model, inputChars: context.systemPrompt.length + context.userMessage.length, terms: normalContext?.terms.length }, operationId)
     const helpers = this.helpers!
     const session = this.sessions!.prepare(`translation-${mode}:${attemptId}`)
+    this.callOperations.set(attemptId, operationId)
     const events: unknown[] = []
     const append = (type: string, data: unknown, surface = false): void => {
       events.push(session.append(type, data, ...(surface ? [{ surfaceOp: 'append' as const }] : [])))
@@ -491,13 +505,16 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       // rc.2 wraps *any* adapter throw while signal.aborted as kind:'aborted'. Preserve non-abort failures.
       const nativeFailure = finish.failure as { code?: unknown } | undefined
       const abortFailureUnknown = mode === 'document' && finish.kind === 'aborted' && nativeFailure !== undefined && nativeFailure.code !== 'ABORTED'
+      report(signal.aborted || finish.kind === 'aborted' ? 'cancelled' : complete ? 'completed' : 'incomplete', { finishKind: String(finish.kind), outputChars: totalText, needsContext: !!needsContext, providerUnknown: abortFailureUnknown })
       yield {
         type: 'terminal', reason: abortFailureUnknown ? 'error' : signal.aborted || finish.kind === 'aborted' ? 'aborted' : finish.kind === 'max-tokens' ? 'max_tokens' : finish.kind === 'error' ? 'error' : 'stop',
         completeness: complete ? 'complete' : 'incomplete', checks_passed: complete,
         provider_state: abortFailureUnknown ? 'unknown' : finish.kind === 'aborted' || signal.aborted ? 'stopped' : 'finished',
       }
     } catch (error) {
-      this.failures.set(operationId, failure(error, code(error) === 'INVALID_STREAM' || code(error) === 'OUTPUT_LIMIT' ? 'protocol' : 'stream'))
+      const diagnostic = failure(error, code(error) === 'INVALID_STREAM' || code(error) === 'OUTPUT_LIMIT' ? 'protocol' : 'stream')
+      report(signal.aborted ? 'cancelled' : 'failed', { outputChars: totalText, failureCode: diagnostic.code, failureStage: diagnostic.stage }, error)
+      this.failures.set(operationId, diagnostic)
       throw error
     } finally {
       if (!settlementDone) append('assistant/attempt', { turn: 0, step: 0, stream: stream.snapshot() })

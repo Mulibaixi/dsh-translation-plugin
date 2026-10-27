@@ -77,6 +77,7 @@ export interface DocumentTermSedimentResult {
 }
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
 interface NormalPort {
+  recoverInterrupted(sessionId: string, ownerId?: string): Promise<void>
   prepare(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
   accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
   commitResult(ownerId: string, request: DirectTranslationCommit): NormalTranslationReply
@@ -163,6 +164,7 @@ export class TopicBridgeClient {
       ?? [...this.connections].find(([, connection]) => !connection.controller.signal.aborted)?.[0]
   }
   getStatus(ownerId: string): { readonly ready: boolean; readonly reason: string | undefined } {
+    if (!this.sessions.isHistoryReady()) return { ready: false, reason: this.sessions.getNotice() ?? '正在读取宿主会话历史，请稍候。' }
     const connection = this.connections.get(ownerId)
     return { ready: connection?.ready ?? false, reason: connection?.reason }
   }
@@ -271,6 +273,7 @@ export class TopicBridgeClient {
       active: this.sessions.getActiveSession(ownerId)?.id === session.id }
   }
   private async dispatch(ownerId: string, request: TopicBridgeRequest): Promise<TopicBridgeReply> {
+    if (!this.sessions.isHistoryReady()) return error(request.requestId, 'operation_failed', this.sessions.getNotice() ?? '正在读取宿主会话历史，请稍候。')
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
     if (command.kind === 'list_units' || command.kind === 'read_units') {
@@ -445,6 +448,9 @@ export class TopicBridgeClient {
     }
     if (command.kind === 'normal_accept' || command.kind === 'normal_prepare' || command.kind === 'normal_update') {
       const { kind, ...payload } = command
+      if (kind !== 'normal_update' && 'envelope' in payload && payload.envelope.mainSessionId === ownerId) {
+        await this.normal?.recoverInterrupted(payload.envelope.material.translationSessionId, ownerId)
+      }
       if (kind !== 'normal_update' && 'envelope' in payload) await this.terms.reconcileAsync?.(ownerId, payload.envelope.material.topicId)
       const result = kind === 'normal_update' ? this.normal?.update(ownerId, payload as NormalTranslationUpdate)
         : kind === 'normal_prepare' ? this.normal?.prepare(ownerId, payload as NormalTranslationAcceptance)
@@ -458,6 +464,8 @@ export class TopicBridgeClient {
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译 v2 通道尚未就绪。')
     }
     if (command.kind === 'normal_exchange_resolve') {
+      const session = this.sessions.getSession(command.translationSessionId)
+      if (session && command.resolution.kind === 'answer') await this.terms.reconcileAsync?.(ownerId, session.topicId)
       const result = this.normal?.resolveExchange(ownerId, command)
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译 exchange 通道尚未就绪。')
     }
@@ -483,6 +491,17 @@ export class TopicBridgeClient {
           : this.references.sync(ownerId, command.index, command.expectedVersion)
         return success({ kind: 'reference_facts', facts })
       } catch (cause) { return error(request.requestId, String((cause as {code?: string}).code ?? 'reference_unavailable'), (cause as Error).message) }
+    }
+    if (command.kind === 'direct_proposals') {
+      if (!this.files || command.request.target.mainSessionId !== ownerId) return error(request.requestId, 'scope_mismatch', '资产提案不属于当前主会话。')
+      try { return success({ kind: 'direct_proposals', receipt: await this.files.submitProposals(ownerId, command.request) }) }
+      catch (cause) { return error(request.requestId, String((cause as { code?: string }).code ?? 'proposal_failed'), (cause as Error).message) }
+    }
+    if (command.kind === 'settings_scope') {
+      if (command.topicId !== null && !this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId))
+        return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
+      return success({ kind: 'settings_scope', scope: { namespaceId: this.sessions.getNamespaceId(), topicId: command.topicId },
+        rememberHistory: this.sessions.getSettings().rememberHistory })
     }
     if (command.kind === 'list_sessions') return success({ kind: 'sessions',
       sessions: this.sessions.getDisplaySessions(ownerId)

@@ -407,17 +407,16 @@ export function parseDocumentUnitQueryResult(value: unknown): import('./translat
   return parseDocumentUnitIntentResult(value, true)
 }
 const executionPackage = 'dsh-translation-plugin'
-export const DOCUMENT_EXECUTION_REMOTE = { package: executionPackage, descriptors: [...(['status', 'pause', 'cancel', 'resume', 'update'] as const).map(method => ({
+export const DOCUMENT_EXECUTION_REMOTE = { package: executionPackage, descriptors: [...(['status', 'pause', 'cancel'] as const).map(method => ({
   id: `${executionPackage}#translationBatch/${method}`, service: 'translationBatch', namespace: 'translationBatch', method,
   invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const,
-    codec: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Request`, create: () => ({ parse: (value: unknown) => method === 'status' ? parseTranslationBatchStatus(value) : method === 'update' ? parseTranslationBatchUpdate(value) : parseTranslationBatchControl(value) }) } }],
+    codec: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Request`, create: () => ({ parse: (value: unknown) => method === 'status' ? parseTranslationBatchStatus(value) : parseTranslationBatchControl(value) }) } }],
   result: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Result`, create: () => ({ parse: (value: unknown) => parseDocumentRemoteResult(method, value) }) },
-})), ...(['submitUnit', 'queryUnit'] as const).map(method => ({
+})), ...(['queryUnit'] as const).map(method => ({
   id: `${executionPackage}#translationBatch/${method}`, service: 'translationBatch', namespace: 'translationBatch', method,
   invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const,
     codec: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Request`, create: () => ({ parse: parseNormalTranslationUnitRequest }) } }],
-  ...(method === 'submitUnit' ? { cancellation: { parameter: 'signal' } } : {}),
-  result: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Result`, create: () => ({ parse: method === 'submitUnit' ? parseDocumentUnitSubmitResult : parseDocumentUnitQueryResult }) },
+  result: { mode: 'strict' as const, typeSymbol: `${executionPackage}#batch/${method}Result`, create: () => ({ parse: parseDocumentUnitQueryResult }) },
 }))] }
 export function parseDocumentBlockReceipt(value: unknown): DocumentBlockReceipt {
   packet(value); exact(value, ['scope', 'taskId', 'unitId', 'childOperationId', 'revisionId', 'callId', 'attemptId', 'sequence', 'registered'])

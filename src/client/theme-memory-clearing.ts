@@ -51,6 +51,14 @@ export class ThemeMemoryClearing {
     if (!topic) throw new Error('Topic clearing scope is unavailable')
     return { ownerId, topicId, topicName: topic.name, terms: this.terms.captureClearVersion(ownerId, topicId), archive: this.archive.captureClearVersion(ownerId, topicId) }
   }
+  async captureAsync(ownerId: string, topicId: string): Promise<ThemeMemoryClearPlan> {
+    for (const session of this.sessions.getTopicSessions(topicId)) if (!await this.sessions.ensureSessionHistory(session.id)) throw new Error('主题会话尚未读取，请重试。')
+    const [terms, archive] = await Promise.all([
+      this.terms.captureClearVersionAsync(ownerId, topicId), this.archive.captureClearVersionAsync(ownerId, topicId),
+    ])
+    const plan = this.capture(ownerId, topicId)
+    return { ...plan, terms, archive }
+  }
 
   async clear(plan: ThemeMemoryClearPlan, selection: ThemeMemoryClearSelection = DEFAULT_THEME_MEMORY_CLEAR_SELECTION): Promise<ThemeMemoryClearResult> {
     const fixed = structuredClone(plan), chosen = { terms: selection.terms === true, archive: selection.archive === true }
@@ -58,7 +66,7 @@ export class ThemeMemoryClearing {
       terms: chosen.terms ? 'not_started' : 'not_selected', archive: chosen.archive ? 'not_started' : 'not_selected' })
     if (!chosen.terms && !chosen.archive) return stopped('empty_selection', '请选择要清空的记忆类型。')
     try {
-      return await this.terms.withTopicLock(() => {
+      return await this.terms.withTopicLock(async () => {
         const topic = this.sessions.getTopics(fixed.ownerId).find(topic => topic.id === fixed.topicId)
         if (!topic || topic.name !== fixed.topicName || [fixed.terms, fixed.archive].some(version => version.ownerId !== this.sessions.getTopicStorageScope(fixed.topicId) || version.topicId !== fixed.topicId) ||
           chosen.terms && !this.terms.isClearVersionCurrent(fixed.terms) || chosen.archive && !this.archive.isClearVersionCurrent(fixed.archive)) {
@@ -66,9 +74,18 @@ export class ThemeMemoryClearing {
         }
         const blocked = this.getBlockedReason(fixed.ownerId, fixed.topicId)
         if (blocked) return stopped('busy', blocked)
-        // Each successful write also updates its runtime seat. Multi-key storage does not promise rollback.
-        const terms = chosen.terms ? this.terms.clearLocked(fixed.terms) ? 'cleared' : 'failed' : 'not_selected'
-        const archive = chosen.archive ? this.archive.clearLocked(fixed.archive) ? 'cleared' : 'failed' : 'not_selected'
+        const [termsCurrent, archiveCurrent] = await Promise.all([
+          chosen.terms ? this.terms.isClearVersionCurrentAsync(fixed.terms) : true,
+          chosen.archive ? this.archive.isClearVersionCurrentAsync(fixed.archive) : true,
+        ])
+        if (!termsCurrent || !archiveCurrent || chosen.terms && !this.terms.isClearVersionCurrent(fixed.terms) || chosen.archive && !this.archive.isClearVersionCurrent(fixed.archive)) {
+          return stopped('stale', '主题或所选记忆已变化，请重新打开清空确认；本次尚未清空任何范围。')
+        }
+        const blockedAfterRead = this.getBlockedReason(fixed.ownerId, fixed.topicId)
+        if (blockedAfterRead) return stopped('busy', blockedAfterRead)
+        // Each asset command commits separately; a later failure preserves the completed result.
+        const terms = chosen.terms ? await this.terms.clearCaptured(fixed.terms) ? 'cleared' : 'failed' : 'not_selected'
+        const archive = chosen.archive ? await this.archive.clearCaptured(fixed.archive) ? 'cleared' : 'failed' : 'not_selected'
         const completed = [...(terms === 'cleared' ? ['术语'] : []), ...(archive === 'cleared' ? ['结构化档案'] : [])]
         const failed = [...(terms === 'failed' ? ['术语'] : []), ...(archive === 'failed' ? ['结构化档案'] : [])]
         const runtimeOnly = terms === 'cleared' && !fixed.terms.storageAvailable || archive === 'cleared' && !fixed.archive.storageAvailable

@@ -50,6 +50,9 @@ export class TranslationSourcesService {
   private storage: Promise<TranslationSourceStorage> | undefined
   private storageInstance: TranslationSourceStorage | undefined
   private disposed = false
+  private storageCleanup = false
+  private storageGeneration = 0
+  private libraryReads = 0
   constructor(readonly ctx: QuickHostContext, private readonly options: TranslationSourceHostOptions = {}) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationSources', property: 'ctx' } })
     this.typertRemote = Object.freeze({ service: this, serviceKey: 'translationSources', namespace: 'translationSources' })
@@ -57,7 +60,7 @@ export class TranslationSourcesService {
   private owns(scope: TranslationSourceScope, peerId: string | undefined, agent?: Pick<Agent, 'id' | 'session'>): boolean {
     const topics = this.ctx.get?.('translationTopics') as { ownsConnection(ownerId: string, peerId: string): boolean; ownsLibrary(namespaceId: string, peerId: string): boolean } | undefined
     const agents = this.ctx.get?.('agents') as { get(id: string): Agent | undefined } | undefined
-    return !this.disposed && !!peerId && (scope.namespaceId ? topics?.ownsLibrary(scope.namespaceId, peerId) === true : topics?.ownsConnection(scope.ownerId, peerId) === true) && (!agent ||
+    return !this.disposed && !this.storageCleanup && !!peerId && (scope.namespaceId ? topics?.ownsLibrary(scope.namespaceId, peerId) === true : topics?.ownsConnection(scope.ownerId, peerId) === true) && (!agent ||
       agent.id === scope.mainSessionId && agent.session.id === scope.mainSessionId && agents?.get(scope.mainSessionId) === agent)
   }
   private ready(): boolean {
@@ -94,12 +97,13 @@ export class TranslationSourcesService {
   }
   /** Private correction writer: immutable assets are created only from Host-verified text. */
   async createCorrectedForAgent(scope: TranslationSourceScope, text: string, name: string, peerId: string, agent: Agent): Promise<TranslationSourceResult<TranslationSourceAsset>> {
+    const generation = this.storageGeneration
     if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', '纠错原稿不属于实际主 Agent。', 'correct_document_source')
     const bytes = new TextEncoder().encode(text), totalCodePoints = sourceCodePointLength(text)
     if (!totalCodePoints || bytes.byteLength > MAX_TRANSLATION_SOURCE_BYTES || /[\uD800-\uDFFF]/u.test(text)) return bad('invalid_input', '纠错后的原稿为空、编码无效或超过 2 MiB。', 'correct_document_source')
     const source: TranslationSourceAsset = { sourceId: `source-${crypto.randomUUID()}`, version: 1, name, bytes: bytes.byteLength,
       totalCodePoints, encoding: 'utf-8', bom: bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf, sha256: await sourceSha256(bytes), persistence: 'runtime_only' }
-    if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', '纠错原稿生成时所属连接已失效。', 'correct_document_source')
+    if (generation !== this.storageGeneration || !this.owns(scope, peerId, agent)) return bad('scope_mismatch', '纠错原稿生成时所属连接或存储范围已变化。', 'correct_document_source')
     this.sources.set(source.sourceId, { scope, peerId, agent, source, text, bytes, codePointOffsets: indexText(text) })
     return ok(source)
   }
@@ -138,6 +142,7 @@ export class TranslationSourcesService {
     } finally { if (timer) clearTimeout(timer) }
   }
   async importReceipt(input: TranslationSourceImport, signal: AbortSignal): Promise<TranslationSourceResult<TranslationSourceAsset>> {
+    const generation = this.storageGeneration
     let request: TranslationSourceImport
     try { request = parseTranslationSourceRequest('importReceipt', input) as TranslationSourceImport } catch { return bad('invalid_input', '文件导入参数无效。', 'resolve_upload') }
     const peerId = this.ctx.invocation?.peer.id
@@ -160,7 +165,7 @@ export class TranslationSourcesService {
     if ('error' in found) return bad('unavailable', '所属普通主会话不可用。', 'resolve_upload')
     const agent = found.agent
     // Gateway invocation is synchronous. All later checks use the captured peer and exact Agent.
-    if (!this.owns(request.scope, peerId, agent)) return bad('scope_mismatch', '上传主 Agent 身份或所属连接已失效。', 'resolve_upload')
+    if (generation !== this.storageGeneration || !this.owns(request.scope, peerId, agent)) return bad('scope_mismatch', '上传主 Agent 身份、所属连接或存储范围已变化。', 'resolve_upload')
     const existing = this.sources.get(this.receipts.get(signature) ?? '')
     if (existing) return existing.peerId === peerId && existing.agent === agent ? ok(existing.source) : bad('scope_mismatch', '此固定源资产属于另一连接或 Agent。', 'resolve_upload')
     let pending = this.pending.get(signature)
@@ -265,26 +270,26 @@ export class TranslationSourcesService {
   private storageOwns(scope: TranslationSourceScope, peerId: string | undefined, agent?: Agent, namespaceId?: string): boolean {
     if (!namespaceId) return this.owns(scope, peerId, agent)
     const topics = this.ctx.get?.('translationTopics') as { ownsLibrary(namespaceId: string, peerId: string): boolean } | undefined
-    return !this.disposed && !!peerId && topics?.ownsLibrary(namespaceId, peerId) === true
+    return !this.disposed && !this.storageCleanup && !!peerId && topics?.ownsLibrary(namespaceId, peerId) === true
   }
-  private async currentAgent(scope: TranslationSourceScope, peerId: string | undefined, namespaceId?: string): Promise<TranslationSourceStorageResult<Agent | undefined>> {
+  private async currentAgent(scope: TranslationSourceScope, peerId: string | undefined, namespaceId?: string): Promise<TranslationSourceStorageResult<{ agent: Agent | undefined; generation: number }>> {
+    const generation = this.storageGeneration
     if (!this.storageOwns(scope, peerId, undefined, namespaceId)) return storageBad('scope_mismatch', '原稿存储不属于此资料库连接。', 'authorize_source_storage')
-    if (namespaceId) return { ok: true, value: undefined }
-    if (scope.namespaceId) return { ok: true, value: undefined }
+    if (namespaceId || scope.namespaceId) return { ok: true, value: { agent: undefined, generation } }
     const controller = this.ctx.get?.('sessionController') as Controller | undefined
     if (!controller?.resolveAgent) return storageBad('unavailable', '宿主主会话服务尚未就绪。', 'authorize_source_storage')
     let found: Awaited<ReturnType<Controller['resolveAgent']>>
     try { found = await controller.resolveAgent(scope.mainSessionId) } catch { return storageBad('unavailable', '无法解析原稿所属主会话。', 'authorize_source_storage') }
-    if (!this.owns(scope, peerId)) return storageBad('scope_mismatch', '原稿存储所属连接已失效。', 'authorize_source_storage')
+    if (generation !== this.storageGeneration || !this.owns(scope, peerId)) return storageBad('scope_mismatch', '原稿存储所属连接或范围已变化。', 'authorize_source_storage')
     if ('error' in found) return storageBad('unavailable', '原稿所属普通主会话不可用。', 'authorize_source_storage')
-    return this.owns(scope, peerId, found.agent) ? { ok: true, value: found.agent } : storageBad('scope_mismatch', '原稿存储所属主 Agent 已失效。', 'authorize_source_storage')
+    return this.owns(scope, peerId, found.agent) ? { ok: true, value: { agent: found.agent, generation } } : storageBad('scope_mismatch', '原稿存储所属主 Agent 已失效。', 'authorize_source_storage')
   }
-  private async referenceTransaction<T>(scope: TranslationSourceScope, referenceKey: string, peerId: string, agent: Agent | undefined, namespaceId: string | undefined,
+  private async referenceTransaction<T>(scope: TranslationSourceScope, referenceKey: string, peerId: string, agent: Agent | undefined, namespaceId: string | undefined, generation: number,
     action: (storage: TranslationSourceStorage, prior: StoredSourceReference | undefined) => Promise<TranslationSourceStorageResult<T>>): Promise<TranslationSourceStorageResult<T>> {
     const key = JSON.stringify([scope, referenceKey]), previous = this.referenceQueues.get(key)
     const operation = (async (): Promise<TranslationSourceStorageResult<T>> => {
       if (previous) await previous
-      if (!this.storageOwns(scope, peerId, agent, namespaceId)) return storageBad('scope_mismatch', '原稿引用所属连接或 Agent 已失效。', 'source_reference')
+      if (generation !== this.storageGeneration || !this.storageOwns(scope, peerId, agent, namespaceId)) return storageBad('scope_mismatch', '原稿引用所属连接或存储范围已变化。', 'source_reference')
       let storage: TranslationSourceStorage
       try { storage = await this.storagePort() } catch { return storageBad('unavailable', '宿主原稿持久存储尚未就绪。', 'load_source_storage') }
       if (!this.storageOwns(scope, peerId, agent, namespaceId)) return storageBad('scope_mismatch', '原稿引用所属连接或 Agent 已失效。', 'source_reference')
@@ -316,9 +321,9 @@ export class TranslationSourcesService {
     try { request = parseTranslationSourceStorageRequest('prepareSave', input) as TranslationSourcePrepareSave } catch { return storageBad('invalid_input', '原稿保存参数无效。', 'prepare_source_save') }
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId, request.namespaceId)
     if (!authorized.ok) return authorized
-    const agent = authorized.value
+    const { agent, generation } = authorized.value
     const signature = JSON.stringify({ scope: request.scope, sourceRef: request.sourceRef, referenceKey: request.referenceKey, operationId: request.operationId })
-    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, async (storage, prior) => {
+    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, generation, async (storage, prior) => {
       if (prior) return prior.prepareOperationId === request.operationId && prior.prepareSignature === signature ? ok(prior.reference)
         : storageBad('idempotency_conflict', '此原稿引用已绑定另一保存请求。', 'prepare_source_save')
       const found = this.referenceRecord(request.scope, request.sourceRef, peerId!, agent)
@@ -338,7 +343,7 @@ export class TranslationSourcesService {
     try { request = parseTranslationSourceStorageRequest('confirmReference', input) as TranslationSourceConfirmReference } catch { return storageBad('invalid_input', '原稿引用确认参数无效。', 'confirm_source_reference') }
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId, request.namespaceId)
     if (!authorized.ok) return authorized
-    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, authorized.value, request.namespaceId, async (storage, prior) => {
+    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, authorized.value.agent, request.namespaceId, authorized.value.generation, async (storage, prior) => {
       if (!prior) return storageBad('not_found', '此范围的原稿引用不存在。', 'confirm_source_reference')
       const { namespaceId: _connectionNamespace, ...transaction } = request
       const signature = JSON.stringify(transaction), repeated = prior.operations.find(item => item.operationId === request.operationId)
@@ -358,7 +363,7 @@ export class TranslationSourcesService {
     try { request = parseTranslationSourceStorageRequest('queryReference', input) as TranslationSourceQueryReference } catch { return storageBad('invalid_input', '原稿引用查询参数无效。', 'query_source_reference') }
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId, request.namespaceId)
     if (!authorized.ok) return authorized
-    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, authorized.value, request.namespaceId, async (_storage, prior) => prior ? ok(prior.reference) : storageBad('not_found', '此范围的原稿引用不存在。', 'query_source_reference'))
+    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, authorized.value.agent, request.namespaceId, authorized.value.generation, async (_storage, prior) => prior ? ok(prior.reference) : storageBad('not_found', '此范围的原稿引用不存在。', 'query_source_reference'))
   }
   private confirmed(prior: StoredSourceReference | undefined, request: TranslationSourceStoredRead): TranslationSourceStorageResult<TranslationSourceReference> {
     if (!prior) return storageBad('not_found', '此范围的原稿引用不存在。', 'authorize_saved_source')
@@ -370,6 +375,8 @@ export class TranslationSourcesService {
     return ok(prior.reference)
   }
   private async verifiedContent(storage: TranslationSourceStorage, request: TranslationSourceStoredRead, peerId: string, agent: Agent | undefined, current = () => this.storageOwns(request.scope, peerId, agent, request.namespaceId)): Promise<TranslationSourceStorageResult<{ bytes: Uint8Array; text: string }>> {
+    const history = this.ctx.get?.('translationHistory') as { sourceReferenceAvailable(reference: TranslationSourceStoredRead): Promise<boolean> } | undefined
+    if (history && !await history.sourceReferenceAvailable(request)) return storageBad('reference_released', '原稿所属历史已删除。', 'verify_saved_source')
     const bytes = await storage.readContent(request.source)
     if (!current()) return storageBad('scope_mismatch', '读取已保存原稿时所属连接或 Agent 已失效。', 'verify_saved_source')
     if (!bytes) return storageBad('source_missing', '已保存原稿内容不存在。', 'verify_saved_source')
@@ -380,6 +387,7 @@ export class TranslationSourcesService {
     try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { return storageBad('source_corrupt', '已保存原稿不是有效 UTF-8。', 'verify_saved_source') }
     if (digest !== request.source.sha256 || (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) !== request.source.bom ||
       sourceCodePointLength(text) !== request.source.totalCodePoints) return storageBad('source_corrupt', '已保存原稿内容与固定身份不一致。', 'verify_saved_source')
+    if (history && !await history.sourceReferenceAvailable(request)) return storageBad('reference_released', '原稿所属历史已删除。', 'verify_saved_source')
     return { ok: true, value: { bytes, text } }
   }
   /** Read-only access proved by an exact saved history commit, independent of the old main Agent. */
@@ -390,17 +398,20 @@ export class TranslationSourcesService {
     // The public Remote supplies no third argument and uses its own invocation.
     const peerId = capturedPeerId ?? this.ctx.invocation?.peer.id
     const topics = this.ctx.get?.('translationTopics') as { ownsAssetConnection(scope: { namespaceId: string; ownerId: string }, peerId: string): boolean } | undefined
-    const current = (): boolean => !this.disposed && !signal?.aborted && !!peerId && !!topics?.ownsAssetConnection({ namespaceId: request.namespaceId, ownerId: request.stored.scope.ownerId }, peerId)
+    const current = (): boolean => !this.disposed && !this.storageCleanup && !signal?.aborted && !!peerId && !!topics?.ownsAssetConnection({ namespaceId: request.namespaceId, ownerId: request.stored.scope.ownerId }, peerId)
     if (!current()) return storageBad('scope_mismatch', '共享原稿读取不属于已连接的本地资产库。', 'read_library_source')
+    this.libraryReads++
     try {
       const storage = await this.storagePort(), prior = await storage.readReference(request.stored.scope, request.stored.referenceKey)
       if (!current()) return storageBad('scope_mismatch', '共享原稿连接已失效。', 'read_library_source')
       const confirmed = this.confirmed(prior, request.stored)
       if (!confirmed.ok) return confirmed
       if (confirmed.value.prepareToken !== request.prepareToken) return storageBad('token_mismatch', '共享原稿准备凭据不一致。', 'read_library_source')
-      const content = await this.verifiedContent(storage, request.stored, peerId!, undefined, current)
+      const content = await this.verifiedContent(storage, { ...request.stored, namespaceId: request.namespaceId }, peerId!, undefined, current)
       if (!content.ok) return content
       const latest = await storage.readReference(request.stored.scope, request.stored.referenceKey)
+      const history = this.ctx.get?.('translationHistory') as { sourceReferenceAvailable(reference: TranslationSourceStoredRead): Promise<boolean> } | undefined
+      if (history && !await history.sourceReferenceAvailable({ ...request.stored, namespaceId: request.namespaceId })) return storageBad('reference_released', '原稿所属历史已删除。', 'read_library_source')
       if (!current() || JSON.stringify(latest?.reference) !== JSON.stringify(prior?.reference)) return storageBad('scope_mismatch', '共享原稿引用或连接已变化。', 'read_library_source')
       if (request.action === 'open') {
         const controller = this.ctx.get?.('sessionController') as Controller | undefined
@@ -412,26 +423,28 @@ export class TranslationSourcesService {
       const text = content.value.text.slice(offsets[range.start]!, offsets[range.end]!)
       if (request.action === 'page') return ok({ kind: 'page', text })
       const digest = await sourceSha256(new TextEncoder().encode(text))
+      if (history && !await history.sourceReferenceAvailable({ ...request.stored, namespaceId: request.namespaceId })) return storageBad('reference_released', '原稿所属历史已删除。', 'read_library_source')
       if (!current()) return storageBad('scope_mismatch', '共享原稿连接已失效。', 'read_library_source')
       return digest === request.sha256 ? ok({ kind: 'verified' }) : storageBad('source_corrupt', '共享原稿复制范围的哈希不一致。', 'read_library_source')
     } catch { return storageBad('storage_failed', '共享原稿读取或打开未完成。', 'read_library_source') }
+    finally { this.libraryReads-- }
   }
   async restore(input: TranslationSourceStoredRead): Promise<TranslationSourceStorageResult<TranslationSourceRestored>> {
     let request: TranslationSourceStoredRead
     try { request = parseTranslationSourceStorageRequest('restore', input) as TranslationSourceStoredRead } catch { return storageBad('invalid_input', '原稿恢复参数无效。', 'restore_source') }
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId, request.namespaceId)
     if (!authorized.ok) return authorized
-    return this.restoreAuthorized(request, peerId!, authorized.value)
+    return this.restoreAuthorized(request, peerId!, authorized.value.agent, authorized.value.generation)
   }
   /** Private document recovery. The actual owner bridge supplies the current Peer, never the request body. */
   async restoreForAgent(input: TranslationSourceStoredRead, peerId: string, agent: Agent): Promise<TranslationSourceStorageResult<TranslationSourceRestored>> {
     let request: TranslationSourceStoredRead
     try { request = parseTranslationSourceStorageRequest('restore', input) as TranslationSourceStoredRead } catch { return storageBad('invalid_input', '原稿恢复参数无效。', 'restore_source') }
     if (!this.storageOwns(request.scope, peerId, agent, request.namespaceId)) return storageBad('scope_mismatch', '原稿恢复不属于实际主 Agent 和负责人连接。', 'restore_source')
-    return this.restoreAuthorized(request, peerId, agent)
+    return this.restoreAuthorized(request, peerId, agent, this.storageGeneration)
   }
-  private restoreAuthorized(request: TranslationSourceStoredRead, peerId: string, agent: Agent | undefined): Promise<TranslationSourceStorageResult<TranslationSourceRestored>> {
-    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, async (storage, prior) => {
+  private restoreAuthorized(request: TranslationSourceStoredRead, peerId: string, agent: Agent | undefined, generation: number): Promise<TranslationSourceStorageResult<TranslationSourceRestored>> {
+    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, generation, async (storage, prior) => {
       const reference = this.confirmed(prior, request)
       if (!reference.ok) return reference
       const content = await this.verifiedContent(storage, request, peerId!, agent, () => this.storageOwns(request.scope, peerId, agent, request.namespaceId))
@@ -449,8 +462,8 @@ export class TranslationSourcesService {
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId, request.namespaceId)
     signal.throwIfAborted()
     if (!authorized.ok) return authorized
-    const agent = authorized.value
-    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, async (storage, prior) => {
+    const { agent, generation } = authorized.value
+    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, generation, async (storage, prior) => {
       const reference = this.confirmed(prior, request)
       if (!reference.ok) return reference
       const controller = this.ctx.get?.('sessionController') as Controller | undefined
@@ -470,7 +483,7 @@ export class TranslationSourcesService {
     try { request = parseTranslationSourceStorageRequest('releaseReference', input) as TranslationSourceReleaseReference } catch { return storageBad('invalid_input', '原稿引用释放参数无效。', 'release_source_reference') }
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId, request.namespaceId)
     if (!authorized.ok) return authorized
-    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, authorized.value, request.namespaceId, async (storage, prior) => {
+    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, authorized.value.agent, request.namespaceId, authorized.value.generation, async (storage, prior) => {
       if (!prior) return storageBad('not_found', '此范围的原稿引用不存在。', 'release_source_reference')
       const { namespaceId: _connectionNamespace, ...transaction } = request
       const signature = JSON.stringify(transaction), repeated = prior.operations.find(item => item.operationId === request.operationId)
@@ -482,6 +495,28 @@ export class TranslationSourcesService {
       await storage.writeReference({ ...prior, reference, operations: [...prior.operations, { method: 'releaseReference', operationId: request.operationId, signature, result: reference }] })
       return ok(reference)
     })
+  }
+  hasActiveJobs(): boolean { return this.pending.size > 0 || this.referenceQueues.size > 0 || this.libraryReads > 0 }
+  heldSourceDigests(ids: ReadonlySet<string>): readonly string[] { return [...this.sources].filter(([id]) => ids.has(id)).map(([, record]) => record.source.sha256) }
+  forgetSourceIds(ids: ReadonlySet<string>, retained: ReadonlySet<string>): void {
+    for (const id of ids) if (!retained.has(id)) {
+      this.sources.delete(id)
+      for (const [receipt, sourceId] of this.receipts) if (sourceId === id) { this.receipts.delete(receipt); this.bindings.delete(receipt) }
+    }
+  }
+  /** Scoped file cleanup must not split a source's content write and reference commit. */
+  beginStorageCleanup(): (() => void) | undefined {
+    if (this.disposed || this.storageCleanup || this.hasActiveJobs()) return undefined
+    this.storageCleanup = true
+    this.storageGeneration++
+    return () => { this.storageCleanup = false }
+  }
+  forgetTopic(topicId: string, ownerId: string, namespaceId?: string): void {
+    for (const [id, record] of this.sources) if (record.scope.topicId === topicId &&
+      (record.scope.namespaceId && namespaceId ? record.scope.namespaceId === namespaceId : record.scope.ownerId === ownerId)) this.sources.delete(id)
+  }
+  forgetSession(namespaceId: string, sessionId: string): void {
+    for (const [id, record] of this.sources) if (record.scope.namespaceId === namespaceId && record.scope.translationSessionId === sessionId) this.sources.delete(id)
   }
   dispose(): void { this.disposed = true; this.sources.clear(); this.receipts.clear(); this.bindings.clear(); this.pending.clear(); this.referenceQueues.clear(); this.storage = undefined; this.storageInstance = undefined }
 }

@@ -1,3 +1,5 @@
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import {
   MAX_ANALYSIS_CALLS, MAX_ANALYSIS_PAGE_BYTES, MAX_ANALYSIS_PAGE_ITEMS, TERMINOLOGY_ANALYSIS_PROMPT_VERSION,
   parseAnalysisCandidateOutput, parseAnalysisPhaseReference, parseTranslationAnalysisQuery, parseTranslationAnalysisRead,
@@ -367,6 +369,10 @@ export class TerminologyAnalysisService {
     return structuredClone(job.run)
   }
   hasActiveJobs(ownerId?: string): boolean { return [...this.jobs.values()].some(job => (ownerId === undefined || job.run.scope.ownerId === ownerId) && (ownerId === undefined ? ['running', 'unknown'] : ['frozen', 'preparing', 'running', 'unknown']).includes(job.run.status)) }
+  historyUnitBusy(scope: HistoryScope, unitId: string): boolean { return [...this.jobs.values()].some(job => historyTargetMatches(scope, unitId, { ...job.run.scope, ...job.request.target }) && ['frozen', 'preparing', 'running', 'unknown'].includes(job.run.status)) }
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void {
+    for (const map of [this.jobs, this.operations]) for (const [id, job] of map) if (historyTargetMatches(scope, unitId, { ...job.run.scope, ...job.request.target }, sourceVersion)) { job.controller.abort(); map.delete(id) }
+  }
   dispose(): void {
     this.disposed = true
     for (const job of this.jobs.values()) job.controller.abort()

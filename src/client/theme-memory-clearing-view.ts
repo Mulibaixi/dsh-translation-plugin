@@ -31,12 +31,17 @@ export function useThemeMemoryClearing({ clearing, ownerId, topicId, visible }: 
   function showFailure(message: string): void {
     setNotice({ id: ++lifetime.current.sequence, result: { status: 'failed', terms: 'not_started', archive: 'not_started', message } })
   }
-  function prepare(): void {
+  async function prepare(): Promise<void> {
     setOpen(false)
     if (!clearing || lifetime.current.pending) return
+    const requestedScope = scope
+    lifetime.current.pending = true; setPending(true)
     try {
-      setPlan(clearing.capture(ownerId, topicId)); setSelection(DEFAULT_THEME_MEMORY_CLEAR_SELECTION); setCompleted({ terms: false, archive: false }); setNotice(undefined)
-    } catch { showFailure('当前术语或档案副本已变化或无法读取，请在相应界面读取最新副本后重新确认清空。') }
+      const captured = await clearing.captureAsync(ownerId, topicId)
+      if (!lifetime.current.mounted || !lifetime.current.visible || lifetime.current.scope !== requestedScope) return
+      setPlan(captured); setSelection(DEFAULT_THEME_MEMORY_CLEAR_SELECTION); setCompleted({ terms: false, archive: false }); setNotice(undefined)
+    } catch { if (lifetime.current.mounted && lifetime.current.visible && lifetime.current.scope === requestedScope) showFailure('当前术语或档案副本已变化或无法读取，请在相应界面读取最新副本后重新确认清空。') }
+    finally { lifetime.current.pending = false; if (lifetime.current.mounted) setPending(false) }
   }
   async function confirm(): Promise<void> {
     if (!clearing || !plan || lifetime.current.pending) return
@@ -64,7 +69,7 @@ export function useThemeMemoryClearing({ clearing, ownerId, topicId, visible }: 
     menu: clearing ? h(Menu, { open: visible && open, onClose: () => setOpen(false), portal: true, compact: true, listClassName: 'dsh-tp-popup',
       anchor: h('button', { type: 'button', disabled: pending, 'aria-label': '本主题记忆管理', 'aria-haspopup': 'menu', 'aria-expanded': visible && open,
         onClick: () => setOpen(!open) }, '记忆管理', h(IconChevronDownOutlineRegular, { size: 12 })) },
-      h('div', { className: 'dsh-tp dsh-tp-menu-content' }, h(MenuItemButton, { disabled: pending || !!blocked, onSelect: prepare }, '清空本主题记忆'),
+      h('div', { className: 'dsh-tp dsh-tp-menu-content' }, h(MenuItemButton, { disabled: pending || !!blocked, onSelect: () => { void prepare() } }, '清空本主题记忆'),
         blocked ? h('p', { className: 'dsh-tp-muted' }, blocked) : null)) : null,
     dialog: visible && plan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '清空本主题记忆确认', 'aria-busy': pending,
       'data-owner-id': plan.ownerId, 'data-topic-id': plan.topicId },

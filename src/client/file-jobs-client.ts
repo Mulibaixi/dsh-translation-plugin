@@ -1,3 +1,5 @@
+import { currentFileJob } from '../memory/file-job-current.js'
+import { fileResultDeletionBlockedReason, eraseFileResult, fileSourceDeletionBlockedReason, eraseFileSource } from '../memory/file-job-deletion.js'
 import { MAX_FILE_JOB_TEXT_POINTS, parseFileJobResult, type FileJobsPort, type FileJobRestart, type FileJobReadReview, type FileJobSummary, type FileJobReviewPage, type FileJobProposal, type FileJobWorker, type FileJobResult } from '../shared/file-jobs.js'
 import type { EvidenceReadRequest, EvidenceReadResult, EvidenceUnavailableResult } from '../shared/translation-evidence.js'
 import type { FileProposalAcceptance, TermEvidenceFact, TermEvidenceRef, TopicTermPut } from '../memory/topic-terms.js'
@@ -13,7 +15,9 @@ import type { FileJobExportUnit } from './translation-export.js'
 import { reviewFileProposals, fileRevisionEvidence, type FileProposalReviews } from './file-proposal-revisions.js'
 import { applyFileJobEdits } from '../shared/file-job-edits.js'
 import type { FileJobRevision } from '../shared/file-jobs.js'
-import { isDocumentUnit, isFileJobUnit, type FileJobUnit } from './translation-history.js'
+import { isDocumentUnit, isFileJobUnit, isTextUnit, type FileJobUnit } from './translation-history.js'
+import { parseDirectProposalSubmission, type DirectProposalSubmission, type DirectProposalReceipt } from '../shared/direct-proposals.js'
+import { putAssetProposals } from './topic-asset-actions.js'
 export type { FileJobRecord, FileJobCardState } from './file-jobs-store.js'
 
 export type FileJobsRemotePort = { [K in keyof FileJobsPort]: (request: Parameters<FileJobsPort[K]>[0]) => Promise<unknown> }
@@ -65,7 +69,10 @@ export class FileJobsClient implements TranslationEvidenceReader {
     private readonly uiLocale?: () => string | undefined) {
     this.records = new FileJobsStore(sessions.createFileJobsStoreOptions(), () => { this.units(undefined, true); this.emit() })
     this.units(undefined, true)
-    this.stopStore = sessions.subscribe(() => { this.records.reconcile(); this.reconcileLeases() })
+    this.stopStore = sessions.subscribe(() => {
+      this.records.reconcile(); this.reconcileLeases()
+      for (const [id, intent] of this.retranslationIntents) if (this.sourceDeleted(intent.request.target.translationSessionId, intent.request.target.unitId, intent.request.target.sourceVersion)) this.retranslationIntents.delete(id)
+    })
     this.timer = setInterval(() => { void this.refresh() }, 1800)
     queueMicrotask(() => { void this.refresh() })
   }
@@ -75,6 +82,16 @@ export class FileJobsClient implements TranslationEvidenceReader {
     this.assets = { terms, archive }; this.retainOwner = retain; this.reconcileLeases()
   }
   proposalReviews(record: FileJobRecord): FileProposalReviews {
+    if (this.assets) {
+      for (const store of [this.assets.terms, this.assets.archive]) {
+        const state = store.getReadState(record.summary.mainSessionId, record.summary.topicId)
+        if (state.status !== 'ready' || state.retired) {
+          if (state.status === 'idle') void store.ensureLoaded(record.summary.mainSessionId, record.summary.topicId).catch(() => {})
+          return Object.fromEntries(record.proposals.map(proposal => [proposal.candidateId,
+            { kind: 'blocked' as const, message: state.retired ? '此主题记忆已删除，不能采纳提案。' : state.error ?? '正在读取主题记忆，请完成后再审阅提案。' }]))
+        }
+      }
+    }
     return reviewFileProposals(record, this.assets?.terms.getSnapshot(record.summary.mainSessionId, record.summary.topicId).entries ?? [],
       this.assets?.archive.getSnapshot(record.summary.mainSessionId, record.summary.topicId).entries ?? [])
   }
@@ -88,8 +105,35 @@ export class FileJobsClient implements TranslationEvidenceReader {
   getNotice(): string | undefined { return this.notice }
   get(jobId: string): FileJobRecord | undefined { return this.records.all().find(record => record.summary.jobId === jobId) }
   all(sessionId?: string, topicId?: string): readonly FileJobRecord[] {
-    return this.records.all().filter(record => (!sessionId || record.summary.translationSessionId === sessionId) && (!topicId || record.summary.topicId === topicId))
+    return this.records.all().filter(record => (!sessionId || record.summary.translationSessionId === sessionId) && (!topicId || record.summary.topicId === topicId) && !this.unitDeleted(record.summary.translationSessionId, record.summary.unitId))
       .sort((left, right) => Date.parse(left.summary.createdAt) - Date.parse(right.summary.createdAt))
+  }
+  /** Candidates go directly to the four ordinary archives, without a separate review batch. */
+  async submitDirectProposals(ownerId: string, raw: DirectProposalSubmission): Promise<DirectProposalReceipt> {
+    const request = parseDirectProposalSubmission(raw), target = request.target
+    const session = this.sessions.getSession(target.translationSessionId)
+    const unit = this.sessions.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
+    const revision = unit && isTextUnit(unit) ? unit.revisions.at(-1) : undefined
+    const file = this.materials?.getFileUnits(target.translationSessionId).find(file => file.materialId === (unit && isTextUnit(unit) ? unit.material?.materialId : undefined))
+    if (ownerId !== target.mainSessionId || !session || !this.sessions.isSessionOpen(ownerId, session.id) || !unit || !isTextUnit(unit) || unit.deletion ||
+      unit.sourceVersion !== target.sourceVersion || !revision || revision.id !== request.revisionId || revision.status !== 'completed' || revision.sourceVersion !== unit.sourceVersion || !file)
+      throw Object.assign(new Error('文件原文或译文版本已变化，或不属于已打开会话，请重新读取后总结提案。'), { code: 'stale_proposals' })
+    const proposals: FileJobProposal[] = request.proposals.map(({ quotes, ...proposal }) => ({ ...proposal, origin: 'inferred', disposition: 'pending', evidence: quotes.map((quote, index) => {
+      const offset = unit.source.indexOf(quote)
+      if (offset < 0) throw new Error(`候选 ${proposal.candidateId} 的 quotes[${index}] 未出现在此单元原文中，请复制准确原文。`)
+      if (unit.source.indexOf(quote, offset + 1) >= 0) throw new Error(`候选 ${proposal.candidateId} 的 quotes[${index}] 在原文出现多次，请扩大为包含上下文的唯一片段；同一原文可以支持多个不同候选。`)
+      const start = Array.from(unit.source.slice(0, offset)).length
+      return { range: { start, end: start + Array.from(quote).length } }
+    }) }))
+    if (!this.assets) throw new Error('主题记忆尚未就绪，请重新打开记忆资产。')
+    const check = (): void => {
+      const current = this.sessions.getTranslationHistory(session.id)?.units.find(item => item.id === unit.id)
+      if (!current || !isTextUnit(current) || current.deletion || current.sourceVersion !== unit.sourceVersion || current.revisions.at(-1)?.id !== revision.id || !this.sessions.isSessionOpen(ownerId, session.id))
+        throw Object.assign(new Error('原文或译文已变化，请重新总结。'), { code: 'stale_proposals' })
+    }
+    const result = await putAssetProposals(this.assets.terms, this.assets.archive, { ownerId, topicId: session.topicId, sessionId: session.id,
+      unitId: unit.id, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage }, proposals, check)
+    return { ...result, persistence: this.sessions.getSettings().rememberHistory ? 'saved' : 'runtime_only' }
   }
   units(sessionId?: string, includeRemoved = false): readonly FileJobRecord[] {
     const groups = new Map<string, FileJobRecord[]>()
@@ -98,12 +142,8 @@ export class FileJobsClient implements TranslationEvidenceReader {
       groups.set(key, [...groups.get(key) ?? [], record])
     }
     return [...groups.values()].filter(records => includeRemoved || !records.some(record => record.summary.removedAt)).map(records => {
-      const latest = records.at(-1)!, sources = new Map<number, FileJobTextVersion>(), results = new Map<number, FileJobTextVersion>()
-      for (const record of records) { for (const source of record.sources) sources.set(source.version, source); for (const result of record.results) results.set(result.version, result) }
-      const fixed = records.map(record => record.final).filter(value => value?.selection === 'user_fixed').sort((left, right) => Date.parse(right!.selectedAt) - Date.parse(left!.selectedAt))[0]
-      const automatic = records.map(record => record.final).filter(value => value !== null).sort((left, right) => right!.version - left!.version)[0]
-      const merged = { ...latest, summary: { ...latest.summary, createdAt: records[0]!.summary.createdAt }, sources: [...sources.values()].sort((left, right) => left.version - right.version),
-        results: [...results.values()].sort((left, right) => left.version - right.version), final: fixed ?? automatic ?? null }
+      const unit = this.sessions.getTranslationHistory(records[0]!.summary.translationSessionId)?.units.find(unit => unit.id === records[0]!.summary.unitId)
+      const merged = currentFileJob(records, unit?.sourceVersion)!.record
       this.registerUnit(merged)
       return merged
     })
@@ -113,6 +153,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     if (!history || this.sessions.isSessionDeleted(job.translationSessionId)) return
     const old = history.units.find(unit => unit.id === job.unitId)
     if (old && !isFileJobUnit(old)) return
+    if (old && old.sourceVersion > job.sourceVersion) return
     const removedAt = this.isUnitRemoved(job.translationSessionId, job.unitId) ? job.removedAt ?? this.all(job.translationSessionId).find(value => value.summary.unitId === job.unitId && value.summary.removedAt)!.summary.removedAt! : undefined
     if (old && old.sourceVersion === job.sourceVersion && (!!old.deletion || !removedAt)) return
     const identity: FileJobUnit = { kind: 'file_job', id: job.unitId, order: old?.order ?? history.units.length + 1,
@@ -124,11 +165,71 @@ export class FileJobsClient implements TranslationEvidenceReader {
   unitRecord(jobId: string): FileJobRecord | undefined { const record = this.get(jobId); return record && this.forUnit(record.summary.translationSessionId, record.summary.unitId) }
   forUnit(sessionId: string, unitId: string): FileJobRecord | undefined { return this.units(sessionId, true).find(record => record.summary.unitId === unitId) }
   isUnitRemoved(sessionId: string, unitId: string): boolean { return this.all(sessionId).some(record => record.summary.unitId === unitId && !!record.summary.removedAt) }
+  private unitDeleted(sessionId: string, unitId: string): boolean {
+    const unit = this.sessions.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
+    return !!unit?.deletion && (!isFileJobUnit(unit) || unit.deletion.calls !== undefined)
+  }
+  private sourceDeleted(sessionId: string, unitId: string, version: number): boolean {
+    return this.sessions.getTranslationHistory(sessionId)?.events.some(event => event.type === 'source.deleted' && event.unitId === unitId && event.sourceVersion === version) ?? false
+  }
+  unitDeletionBlockedReason(jobId: string): string | undefined {
+    const record = this.get(jobId)
+    if (!record) return '文件单元已不可用。'
+    if (this.all(record.summary.translationSessionId).some(item => item.summary.unitId === record.summary.unitId && (running(item.summary) || this.pending.has(item.summary.jobId)))) return '此文件仍有未结算操作，请先结束或查询。'
+    return this.sessions.getTextUnitDeletionBlockedReason(record.summary.translationSessionId, record.summary.unitId)
+  }
+  captureUnitDeletion(jobId: string): import('./session-store.js').TextUnitDeletionPlan | undefined {
+    const record = this.get(jobId)
+    return record && !this.unitDeletionBlockedReason(jobId) ? this.sessions.captureTextUnitDeletion(record.summary.translationSessionId, record.summary.unitId) : undefined
+  }
+  async deleteUnit(plan: import('./session-store.js').TextUnitDeletionPlan): Promise<void> {
+    const result = await this.sessions.deleteTextUnitAsync(plan, { blockedReason: () => {
+      const record = this.all(plan.sessionId).find(record => record.summary.unitId === plan.unitId)
+      return record && this.unitDeletionBlockedReason(record.summary.jobId)
+    } })
+    this.notice = result.message; this.emit()
+  }
+  resultDeletionBlockedReason(jobId: string, version: number): string | undefined {
+    const record = this.unitRecord(jobId)
+    return !record ? '文件单元已不可用。' : this.unitDeletionBlockedReason(jobId) ?? fileResultDeletionBlockedReason(this.all(record.summary.translationSessionId).filter(item => item.summary.unitId === record.summary.unitId), record.summary.sourceVersion, version)
+  }
+  captureResultDeletion(jobId: string, version: number): (import('./session-store.js').TextUnitDeletionPlan & { readonly resultVersion: number }) | undefined {
+    const record = this.unitRecord(jobId)
+    if (!record || this.resultDeletionBlockedReason(jobId, version)) return undefined
+    const plan = this.sessions.captureTextUnitDeletion(record.summary.translationSessionId, record.summary.unitId)
+    return plan && { ...plan, resultVersion: version }
+  }
+  async deleteResult(plan: import('./session-store.js').TextUnitDeletionPlan & { readonly resultVersion: number }): Promise<void> {
+    const result = await this.sessions.deleteFileResultAsync(plan, () => {
+      const record = this.forUnit(plan.sessionId, plan.unitId)
+      return record ? this.resultDeletionBlockedReason(record.summary.jobId, plan.resultVersion) : '文件单元已变化。'
+    })
+    this.notice = result.message; this.emit()
+  }
+  sourceDeletionBlockedReason(jobId: string, version: number): string | undefined {
+    const record = this.unitRecord(jobId)
+    return !record ? '文件单元已不可用。' : this.unitDeletionBlockedReason(jobId) ?? fileSourceDeletionBlockedReason(this.all(record.summary.translationSessionId).filter(item => item.summary.unitId === record.summary.unitId), record.summary.sourceVersion, version)
+  }
+  captureSourceDeletion(jobId: string, version: number): (import('./session-store.js').TextUnitDeletionPlan & { readonly sourceVersion: number }) | undefined {
+    const record = this.unitRecord(jobId)
+    if (!record || this.sourceDeletionBlockedReason(jobId, version)) return undefined
+    const plan = this.sessions.captureTextUnitDeletion(record.summary.translationSessionId, record.summary.unitId)
+    return plan && { ...plan, sourceVersion: version }
+  }
+  async deleteSource(plan: import('./session-store.js').TextUnitDeletionPlan & { readonly sourceVersion: number }): Promise<void> {
+    const result = await this.sessions.deleteFileSourceAsync(plan, () => {
+      const record = this.forUnit(plan.sessionId, plan.unitId)
+      return record ? this.sourceDeletionBlockedReason(record.summary.jobId, plan.sourceVersion) : '文件单元已变化。'
+    })
+    this.notice = result.message; this.emit()
+  }
   exportUnits(sessionIds: readonly string[]): readonly FileJobExportUnit[] {
-    return this.units().filter(record => sessionIds.includes(record.summary.translationSessionId)).map(record => ({ sessionId: record.summary.translationSessionId,
-      topicId: record.summary.topicId, unitId: record.summary.unitId, createdAt: record.summary.createdAt, sourceVersion: record.summary.sourceVersion, targetLanguage: record.summary.targetLanguage,
-      source: record.sources.find(value => value.version === record.summary.sourceVersion)?.text ?? null,
-      translation: record.results.find(value => value.version === record.final?.version)?.text ?? null, resultVersion: record.final?.version ?? null, selection: record.final?.selection ?? null }))
+    return this.units().filter(record => sessionIds.includes(record.summary.translationSessionId)).map(record => {
+      const selected = currentFileJob(this.all(record.summary.translationSessionId).filter(value => value.summary.unitId === record.summary.unitId), record.summary.sourceVersion)!
+      return { sessionId: record.summary.translationSessionId, topicId: record.summary.topicId, unitId: record.summary.unitId,
+        createdAt: record.summary.createdAt, sourceVersion: record.summary.sourceVersion, targetLanguage: selected.targetLanguage,
+        source: selected.source?.text ?? null, translation: selected.final?.text ?? null, resultVersion: selected.final?.version ?? null, selection: selected.record.final?.selection ?? null }
+    })
   }
   status(jobId: string) { return this.records.status(jobId) }
   async preserveDocument(record: FileJobRecord): Promise<void> {
@@ -207,14 +308,14 @@ export class FileJobsClient implements TranslationEvidenceReader {
   }
   private async project(summary: FileJobSummary): Promise<void> {
     const session = this.sessions.getSession(summary.translationSessionId)
-    if (!session || session.topicId !== summary.topicId || this.sessions.isSessionDeleted(session.id)) return
+    if (!session || session.topicId !== summary.topicId || this.sessions.isSessionDeleted(session.id) || this.unitDeleted(session.id, summary.unitId) || this.sourceDeleted(session.id, summary.unitId, summary.sourceVersion)) return
     this.missingHosts.delete(summary.jobId)
     const previous = this.records.get(summary.jobId)
     if (previous?.summary.removedAt && !summary.removedAt) return
     if (previous && this.projectedVersions.get(summary.jobId) === summary.version) return
     let record: FileJobRecord = previous ?? { schemaVersion: 1, summary, sources: [], results: [], proposals: [], proposalVersion: null, cards: [], workers: [], final: null }
-    // Publish the stage first; body paging never hides accepted/preparing progress.
-    this.records.put({ ...record, summary })
+    // Publish running progress immediately; terminal results commit after complete paging.
+    if (running(summary)) { this.records.put({ ...record, summary }); this.registerUnit({ ...record, summary }) }
     const source = record.sources.find(value => value.version === summary.sourceVersion)
     if (!source) {
       const text = await this.text(summary, 'source', summary.sourceTotalCodePoints)
@@ -224,11 +325,11 @@ export class FileJobsClient implements TranslationEvidenceReader {
       }
       record = { ...record, sources: rememberText(record.sources, summary.sourceVersion, text, summary.createdAt) }
     }
-    const versions = await this.items(summary, 'results') as readonly { readonly version: number; readonly totalCodePoints: number; readonly semanticStatus?: 'pending' | 'passed' | 'changes_requested' }[]
+    const versions = await this.items(summary, 'results') as readonly { readonly version: number; readonly totalCodePoints: number; readonly semanticStatus?: 'pending' | 'passed' | 'changes_requested'; readonly baseVersion?: number }[]
     for (const version of versions) {
       if (!record.results.some(value => value.version === version.version)) record = { ...record,
         results: rememberText(record.results, version.version, await this.text(summary, 'result', version.totalCodePoints, version.version), summary.updatedAt) }
-      record = { ...record, results: record.results.map(value => value.version === version.version ? { ...value,
+      record = { ...record, results: record.results.map(value => value.version === version.version ? { ...value, sourceVersion: summary.sourceVersion, ...(version.baseVersion === undefined ? {} : { baseVersion: version.baseVersion }),
         semanticStatus: version.semanticStatus ?? (summary.result?.version === value.version ? summary.result.semanticStatus : value.semanticStatus ?? 'pending') } : value) }
     }
     if (summary.proposalBatch?.status === 'reviewed' && record.proposalVersion !== summary.proposalBatch.version) record = { ...record,
@@ -245,35 +346,16 @@ export class FileJobsClient implements TranslationEvidenceReader {
     record = { ...record, summary, workers, constraints, plan, checks, contexts, reviews, cards: (current?.cards ?? record.cards).map(card => card.draft && card.draftBatchVersion !== undefined && card.draftBatchVersion !== summary.proposalBatch?.version
       ? { ...card, message: '主模型已更新提案；当前编辑草稿基于旧批次，请核对新内容后再采纳。' } : card),
       final: final?.selection === 'user_fixed' ? final : summary.result?.semanticStatus === 'passed' ? { version: summary.result.version, selection: 'automatic', selectedAt: summary.review.decidedAt ?? summary.updatedAt } : final }
-    this.records.put(record)
-    this.projectedVersions.set(summary.jobId, summary.version)
+    for (const value of this.records.get(summary.jobId)?.results ?? []) if (value.deletion) record = eraseFileResult(record, value.version, value.deletion)
+    for (const stored of this.all(session.id).filter(item => item.summary.unitId === summary.unitId)) for (const source of stored.sources) if (source.deletion) record = eraseFileSource(record, source.version, source.deletion)
+    if (!this.unitDeleted(session.id, summary.unitId) && !this.sourceDeleted(session.id, summary.unitId, summary.sourceVersion)) { this.records.put(record); this.registerUnit(record); this.projectedVersions.set(summary.jobId, summary.version) }
   }
   async cancel(jobId: string): Promise<void> {
     await this.action(jobId, async record => { await this.project(await this.call('control', { ownerId: record.summary.mainSessionId, jobId, action: 'cancel' })) })
   }
   async retranslate(jobId: string, executionOwnerId?: string): Promise<void> {
-    if (!this.canExecute(executionOwnerId)) { this.notice = '请选择本次任务使用的主会话。'; this.emit(); return }
-    const previous = this.retranslationIntents.get(jobId)
-    if (previous && previous.status !== 'failed') { this.notice = previous.message; this.emit(); return }
-    await this.action(jobId, async record => {
-      if (this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('此文件单元已移除，不能重新发送旧材料。')
-      if (running(record.summary)) throw new Error('请先确认当前任务已结束，再明确重译。')
-      const ownerId = executionOwnerId!, locale = this.uiLocale?.()?.trim().slice(0, 64)
-      const request: import('../shared/normal-translation.js').NormalTranslationUnitRequest = { target: { kind: 'unit', mainSessionId: ownerId, translationSessionId: record.summary.translationSessionId,
-        unitId: record.summary.unitId, sourceVersion: record.summary.sourceVersion }, operationId: `file-retranslate-intent:${crypto.randomUUID()}`, ...(locale ? { uiLocale: locale } : {}) }
-      const intent = { request, status: 'pending' as 'pending' | 'submitted' | 'unknown' | 'failed', message: '正在发送文件重译意图…' }
-      this.retranslationIntents.set(jobId, intent)
-      try {
-        const receipt = await this.call('submitUnit', request)
-        if (receipt.accepted !== true || receipt.operationId !== request.operationId || !same(receipt.target, request.target)) throw new Error('文件重译意图回执身份不一致。')
-        intent.status = 'submitted'; intent.message = '重译意图已发送，等待主模型整理要求并受理；尚未启动翻译。'
-      } catch (cause) {
-        const code = (cause as { code?: string }).code
-        intent.status = !code || ['main_admission_unknown', 'outcome_unknown'].includes(code) ? 'unknown' : 'failed'
-        intent.message = intent.status === 'unknown' ? '重译意图发送状态未知，请检查原操作；未自动重发。' : cause instanceof Error ? cause.message : '重译意图未发送。'
-      }
-      this.notice = intent.message
-    })
+    this.notice = '旧文件任务仅供读取与清理；需要重译时，请重新发送原稿，使用当前翻译流程。'
+    this.emit()
   }
   async queryRetranslation(jobId: string): Promise<void> {
     const intent = this.retranslationIntents.get(jobId)
@@ -293,13 +375,15 @@ export class FileJobsClient implements TranslationEvidenceReader {
       const record = this.get(jobId)
       if (!record || this.records.blocked(jobId) || this.isUnitRemoved(record.summary.translationSessionId, record.summary.unitId)) throw new Error('文件历史已移除或变化。')
       if (running(record.summary)) throw new Error('此文件仍有未结算或结果未知的任务，不能重新派发。')
+      if (this.sourceDeleted(record.summary.translationSessionId, record.summary.unitId, record.summary.sourceVersion)) throw new Error('此原稿版本已删除，不能重新派发。')
       const config = record.summary, session = this.sessions.getSession(config.translationSessionId)!, ownerId = executionOwnerId!
       if (!this.sessions.isSessionOpen(ownerId, session.id)) throw new Error('请先在当前主会话打开此翻译会话。')
       const commit = this.materials?.getFileHistoryCommit(session.id, config.unitId), namespaceId = this.assetNamespaceId?.()
-      let librarySource: FileJobRestart['librarySource'] = commit && namespaceId ? {
+      let librarySource: FileJobRestart['librarySource'] = config.sourceOrigin ? await this.materials?.readFileSourceOrigin(config.sourceOrigin) : undefined
+      if (!librarySource && commit && namespaceId && (!config.sourceRef || commit.reference.source.sha256 === config.sourceRef.sha256)) librarySource = {
         stored: { scope: commit.reference.scope, referenceKey: commit.reference.referenceKey, source: commit.reference.source, historyToken: commit.historyToken },
         namespaceId, prepareToken: commit.reference.prepareToken,
-      } : undefined
+      }
       if (!librarySource && namespaceId) {
         const document = this.sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === config.unitId)
         const source = document && isDocumentUnit(document) ? document.sourceVersions.find(source => source.version === config.sourceVersion) : undefined
@@ -311,6 +395,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
         : (!this.missingHosts.has(jobId) && ownerId === config.mainSessionId ? config.sourceRef : undefined)
           ?? (await this.materials?.resolveFileSource(session.id, config.unitId))?.sourceRef
       if (!sourceRef) throw new Error('已保存原稿未能恢复，且运行期引用不可用；请打开原稿后重新选择文件。')
+      if (this.disposed || this.sessions.isSessionDeleted(session.id) || this.unitDeleted(session.id, config.unitId) || this.sourceDeleted(session.id, config.unitId, config.sourceVersion)) throw new Error('此文件或原稿已删除，未恢复旧稿任务。')
       const locale = this.uiLocale?.()?.trim().slice(0, 64)
       return { operationId, previousResultVersion: this.unitRecord(jobId)?.results.at(-1)?.version ?? 0,
         organizedRequirements: organizedRequirements.trim() ? organizedRequirements : config.organizedRequirements ?? '',
@@ -325,16 +410,17 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const updated = await this.records.mutate(request.jobId, record => {
       if (record.summary.mainSessionId !== request.ownerId) throw new Error('文件修订不属于当前主会话。')
       const old = record.revisionOperations?.find(item => item.operationId === request.operationId)
-      if (old) { if (old.signature !== signature) throw new Error('同一修订操作不能更换内容。'); return record }
+      if (old) { if (old.signature === '') throw new Error('此操作的译文版本已删除，不能重放原修订。'); if (old.signature !== signature) throw new Error('同一修订操作不能更换内容。'); return record }
       if (record.summary.phase !== 'completed' || !record.summary.result || record.summary.removedAt) throw new Error('仅可修订已完成且未移除的文件。')
       if (record.summary.version !== request.expectedVersion) throw new Error('文件版本已变化，请重新读取当前译文。')
       const source = record.results.find(result => result.version === record.summary.result!.version)
-      if (!source) throw new Error('此准确结果尚未完整保存，未修改译文。')
-      const text = applyFileJobEdits(source.text, request.edits), at = new Date().toISOString(), version = text === source.text ? source.version : Math.max(...record.results.map(result => result.version)) + 1
+      if (!source || source.deletion) throw new Error('此准确结果尚未完整保存或已删除，未修改译文。')
+      const text = applyFileJobEdits(source.text, request.edits), at = new Date().toISOString(), version = text === source.text ? source.version
+        : 1 + Math.max(0, ...this.all(record.summary.translationSessionId).filter(item => item.summary.unitId === record.summary.unitId).flatMap(item => item.results.map(result => result.version)))
       const summary: FileJobSummary = text === source.text ? record.summary : { ...record.summary, version: record.summary.version + 1, updatedAt: at,
         result: { version, totalCodePoints: Array.from(text).length, semanticStatus: 'passed' },
         review: { version: record.summary.review.version + 1, status: 'passed', reviewedBy: actingOwner, decidedAt: at } }
-      return { ...record, summary, results: text === source.text ? record.results : [...record.results, { version, text, createdAt: at, semanticStatus: 'passed' }],
+      return { ...record, summary, results: text === source.text ? record.results : [...record.results, { version, sourceVersion: record.summary.sourceVersion, baseVersion: source.version, text, createdAt: at, semanticStatus: 'passed' }],
         final: record.final?.selection === 'user_fixed' ? record.final : { version, selection: 'automatic', selectedAt: at },
         revisionOperations: [...record.revisionOperations ?? [], { operationId: request.operationId, signature, summary }] }
     })
@@ -346,12 +432,12 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const { summary } = record
     if (request.section === 'source' || request.section === 'result') {
       const value = request.section === 'source' ? record.sources.find(item => item.version === summary.sourceVersion) : record.results.find(item => item.version === (request.resultVersion ?? summary.result?.version))
-      if (!value) throw new Error('准确正文版本尚未完整保存。')
+      if (!value || value.deletion) throw new Error('准确正文版本尚未完整保存或已删除。')
       const text = Array.from(value.text), range = request.range ?? { start: 0, end: Math.min(4000, text.length) }
       if (range.start < 0 || range.end > text.length || range.end <= range.start || range.end - range.start > 4000) throw new Error('正文范围必须为准确版本内的最多4000码点。')
       return { summary, section: request.section, text: text.slice(range.start, range.end).join(''), range, nextOffset: range.end < text.length ? range.end : null }
     }
-    const values: Record<string, readonly unknown[]> = { results: record.results.map(result => ({ version: result.version, totalCodePoints: Array.from(result.text).length, semanticStatus: result.semanticStatus ?? 'pending' })),
+    const values: Record<string, readonly unknown[]> = { results: record.results.filter(result => !result.deletion).map(result => ({ version: result.version, totalCodePoints: Array.from(result.text).length, semanticStatus: result.semanticStatus ?? 'pending', ...(result.baseVersion === undefined ? {} : { baseVersion: result.baseVersion }) })),
       proposals: record.proposals, baseline: record.preparation?.items ?? [], conflicts: [], workers: record.workers, constraints: record.constraints ?? [], plan: record.plan ?? [], checks: record.checks ?? [], contexts: record.contexts ?? [], reviews: record.reviews ?? [] }
     const all = values[request.section] ?? [], offset = request.offset ?? 0, items = all.slice(offset, offset + Math.min(200, request.limit ?? 40)) as NonNullable<FileJobReviewPage['items']>
     return { summary, section: request.section, items, total: all.length, ...(request.section === 'baseline' ? { context: record.preparation?.context ?? '' } : {}), nextOffset: offset + items.length < all.length ? offset + items.length : null }
@@ -403,6 +489,8 @@ export class FileJobsClient implements TranslationEvidenceReader {
   async adopt(jobId: string, candidateIds: readonly string[], reviewed?: FileProposalReviews): Promise<void> {
     await this.action(jobId, async initial => {
       if (!this.assets || initial.summary.proposalBatch?.status !== 'reviewed') throw new Error('资产尚未完成集中验收。')
+      await this.assets.terms.refresh(initial.summary.mainSessionId, initial.summary.topicId)
+      await this.assets.archive.refresh(initial.summary.mainSessionId, initial.summary.topicId)
       const selected = new Set(candidateIds), ordered: FileJobProposal[] = [], visiting = new Set<string>(), visited = new Set<string>()
       const visit = (id: string): void => {
         if (visited.has(id)) return
@@ -423,6 +511,8 @@ export class FileJobsClient implements TranslationEvidenceReader {
       const approvals = { ...(reviewed ?? this.proposalReviews(initial)) }
       let adopted = 0, failed = 0
       for (const proposal of ordered) {
+        await this.assets.terms.refresh(initial.summary.mainSessionId, initial.summary.topicId)
+        await this.assets.archive.refresh(initial.summary.mainSessionId, initial.summary.topicId)
         const record = this.get(jobId)!, previous = record.cards.find(card => card.candidateId === proposal.candidateId)
         if (previous?.status === 'adopted') continue
         const review = approvals[proposal.candidateId], currentReview = this.proposalReviews(record)[proposal.candidateId]
@@ -494,14 +584,16 @@ export class FileJobsClient implements TranslationEvidenceReader {
   }
   selectFinal(jobId: string, version: number): void {
     const record = this.unitRecord(jobId)
-    if (!record || !record.results.some(result => result.version === version && result.semanticStatus === 'passed')) return
-    this.records.put({ ...record, final: { version, selection: 'user_fixed', selectedAt: new Date().toISOString() } })
+    const result = record?.results.find(result => result.version === version && !result.deletion && result.semanticStatus === 'passed' && result.sourceVersion === record.summary.sourceVersion)
+    if (!record || !result) return
+    const origin = this.all(record.summary.translationSessionId).find(item => item.summary.unitId === record.summary.unitId && item.summary.sourceVersion === result.sourceVersion && item.results.some(value => value.version === version && value.text === result.text))
+    if (origin) this.records.put({ ...origin, final: { version, selection: 'user_fixed', selectedAt: new Date().toISOString() } })
   }
   async open(jobId: string, side: 'source' | 'result', version: number, views: ViewFilesClient): Promise<void> {
     await this.action(jobId, async raw => {
       const record = this.unitRecord(raw.summary.jobId) ?? raw
       const value = (side === 'source' ? record.sources : record.results).find(value => value.version === version)
-      if (!value) throw new Error('所选固定版本尚未取得。')
+      if (!value || value.deletion) throw new Error('所选固定版本尚未取得或已删除。')
       const outcome = await views.open({ namespaceId: this.sessions.getNamespaceId(), sessionId: record.summary.translationSessionId, unitId: record.summary.unitId,
         kind: side, title: `${side === 'source' ? '原稿' : '译文'} · 版本 ${version}`, revisionId: `${side}:${record.summary.unitId}:${version}`, fileName: `${side === 'source' ? '原稿' : '译文'}-v${version}.txt`, format: 'txt', text: value.text })
       if (!outcome.ok) throw new Error(outcome.message)
@@ -527,7 +619,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const record = this.forUnit(request.sessionId, request.unitId)
     if (!record) return this.fallback.isCurrent(request)
     return !this.disposed && request.side === 'source' && record.summary.mainSessionId === request.ownerId && record.summary.topicId === request.topicId &&
-      !this.records.blocked(record.summary.jobId) && this.sessions.getStatus(request.sessionId) !== 'conflict' && record.sources.some(source => source.version === request.sourceVersion)
+      !this.records.blocked(record.summary.jobId) && this.sessions.getStatus(request.sessionId) !== 'conflict' && record.sources.some(source => source.version === request.sourceVersion && !source.deletion)
   }
   async read(request: EvidenceReadRequest): Promise<EvidenceReadResult> {
     const record = this.forUnit(request.sessionId, request.unitId)

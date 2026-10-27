@@ -12,14 +12,36 @@ function ok<T>(value: T): ViewFileResult<T> { return { ok: true, value: structur
 function bad<T>(code: ViewFileErrorCode, message: string): ViewFileResult<T> { return { ok: false, error: { code, message } } }
 function escapeHtml(value: string): string { return value.replace(/[&<>]/gu, character => character === '&' ? '&amp;' : character === '<' ? '&lt;' : '&gt;') }
 function absent(error: unknown): boolean { return !!error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'ENOENT' }
-/** Accept only names generated here, including the earlier HTML-only layout. */
+/** Scope keys also recognize earlier flat opening copies for resource cleanup. */
+export function viewFileStorageName(file: string): string {
+  const normalized = file.replace(/\\/gu, '/'), marker = '/views/v1/'
+  const relative = normalized.includes(marker) ? normalized.slice(normalized.lastIndexOf(marker) + marker.length) : normalized
+  return relative.replace(/^([a-f0-9]{64})-(?:([a-f0-9]{64})-)?/u, (_match, session: string, unit?: string) => `${session.slice(0, 16)}-${unit ? `${unit.slice(0, 16)}-` : ''}`)
+}
+/** The directory carries identity; the filename remains readable. */
+export function isViewFileStorageDirectory(name: string): boolean { return /^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}-(?:source|result)$/u.test(name) }
 export function isViewFileStorageName(name: string): boolean {
-  return /^[a-f0-9]{64}-[a-f0-9]{64}\.html$/u.test(name) || /^[a-f0-9]{64}-[a-f0-9]{64}--[^\\/<>:"|?*\u0000-\u001f\u007f]{1,64}\.txt$/u.test(name)
+  return /^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}-(?:source|result)\/[^\\/<>:"|?*\u0000-\u001f\u007f]{1,64}\.(?:txt|html)$/u.test(name) ||
+    /^(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:[a-f0-9]{16}-)?)?(?:[a-f0-9]{16}|[a-f0-9]{64})\.html$/u.test(name) ||
+    /^(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:[a-f0-9]{16}-)?)?(?:[a-f0-9]{16}|[a-f0-9]{64})--[^\\/<>:"|?*\u0000-\u001f\u007f]{1,64}\.txt$/u.test(name)
+}
+export async function viewUnitStoragePrefix(namespaceId: string, sessionId: string, unitId: string): Promise<string> {
+  const digest = (parts: readonly string[]): Promise<string> => sourceSha256(new TextEncoder().encode(JSON.stringify(parts)))
+  return `${(await digest(['view-session', sessionId])).slice(0, 16)}-${(await digest(['view-unit', namespaceId, unitId])).slice(0, 16)}-`
+}
+export async function viewSessionStoragePrefix(sessionId: string): Promise<string> {
+  return `${(await sourceSha256(new TextEncoder().encode(JSON.stringify(['view-session', sessionId])))).slice(0, 16)}-`
+}
+export async function viewVersionStoragePrefix(namespaceId: string, sessionId: string, unitId: string, revisionId: string | null): Promise<string> {
+  const version = (await sourceSha256(new TextEncoder().encode(JSON.stringify(['view-version', revisionId])))).slice(0, 16)
+  return `${await viewUnitStoragePrefix(namespaceId, sessionId, unitId)}${version}-`
 }
 function txtStem(name: string): string {
   const safe = name.replace(/\.txt$/iu, '').replace(/[\\/<>:"|?*\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, '_').replace(/^[. ]+|[. ]+$/gu, '')
   // Bound the UTF-16 component length even when the stem contains supplementary characters.
-  return [...safe].slice(0, 32).join('') || 'document'
+  let stem = ''
+  for (const character of safe) { if (stem.length + character.length > 32) break; stem += character }
+  return stem || 'document'
 }
 /** The only page the Host renders: escaped text, no scripts, no network. */
 export function renderViewPage(title: string, text: string): string {
@@ -36,11 +58,10 @@ export async function loadViewFileStorage(ctx: QuickHostContext): Promise<ViewFi
     loader.internal.import('@deepseek-ai/dsh-atomic-write', ctx.baseUrl, {}) as Promise<{ writeFileAtomic(path: string, content: string, options: { mode: number; dirMode: number }): Promise<void> }>,
   ])
   const fsName = 'node:fs/promises', pathName = 'node:path'
-  const fs = await import(fsName) as { readdir(path: string, options: { withFileTypes: true }): Promise<readonly { readonly name: string; isFile(): boolean }[]>; unlink(path: string): Promise<void> }
+  const fs = await import(fsName) as { readdir(path: string, options: { withFileTypes: true }): Promise<readonly { readonly name: string; isFile(): boolean; isDirectory(): boolean }[]>; unlink(path: string): Promise<void>; rmdir(path: string): Promise<void> }
   const path = await import(pathName) as { join(...parts: string[]): string }
   const root = home.dshHomePath('translation-plugin', 'views', 'v1')
-  const digest = async (parts: readonly (string | null)[]): Promise<string> => await sourceSha256(new TextEncoder().encode(JSON.stringify(parts)))
-  const sessionPrefix = async (sessionId: string): Promise<string> => `${await digest(['view-session', sessionId])}-`
+  const sessionPrefix = viewSessionStoragePrefix
   // Serialize with the profile-wide data clear; the writer generation must be current at call time.
   const gate = <T>(action: () => Promise<T>): Promise<T> => {
     const data = ctx.get?.('translationLocalData') as { storageWriter?: () => <U>(action: () => Promise<U>) => Promise<U> } | undefined
@@ -50,22 +71,28 @@ export async function loadViewFileStorage(ctx: QuickHostContext): Promise<ViewFi
   return {
     async write(request, content) {
       const format = request.format ?? 'html'
-      const contentHash = await sourceSha256(new TextEncoder().encode(content))
-      const identity = format === 'html' && request.revisionId === undefined ? await digest(['view-slot', request.unitId, request.kind])
-        : await digest(['view-artifact', request.namespaceId, request.unitId, request.kind, request.revisionId ?? null, format, contentHash])
-      const name = `${await sessionPrefix(request.sessionId)}${identity}${format === 'txt' ? `--${txtStem(request.fileName ?? request.title)}.txt` : '.html'}`
-      const destination = path.join(root, name)
+      const directory = `${await viewVersionStoragePrefix(request.namespaceId, request.sessionId, request.unitId, request.revisionId ?? null)}${request.kind}`
+      const destination = path.join(root, directory, `${txtStem(request.fileName ?? request.title)}.${format}`)
       await gate(() => atomic.writeFileAtomic(destination, content, { mode: 0o600, dirMode: 0o700 }))
       return destination
     },
     async clear(sessionIds) {
       const prefixes = await Promise.all(sessionIds.map(sessionPrefix))
-      let entries: readonly { readonly name: string; isFile(): boolean }[]
+      let entries: Awaited<ReturnType<typeof fs.readdir>>
       try { entries = await fs.readdir(root, { withFileTypes: true }) } catch (error) { if (absent(error)) return 0; throw error }
       let removed = 0
       for (const entry of entries) {
-        if (!entry.isFile() || !isViewFileStorageName(entry.name) || !prefixes.some(prefix => entry.name.startsWith(prefix))) continue
-        try { await fs.unlink(path.join(root, entry.name)); removed += 1 } catch (error) { if (!absent(error)) throw error }
+        const key = viewFileStorageName(entry.name)
+        if (!prefixes.some(prefix => key.startsWith(prefix))) continue
+        if (entry.isFile() && isViewFileStorageName(key)) {
+          try { await fs.unlink(path.join(root, entry.name)); removed++ } catch (error) { if (!absent(error)) throw error }
+        } else if (entry.isDirectory() && isViewFileStorageDirectory(entry.name)) {
+          const directory = path.join(root, entry.name)
+          for (const file of await fs.readdir(directory, { withFileTypes: true })) if (file.isFile() && isViewFileStorageName(`${entry.name}/${file.name}`)) {
+            try { await fs.unlink(path.join(directory, file.name)); removed++ } catch (error) { if (!absent(error)) throw error }
+          }
+          try { await fs.rmdir(directory) } catch (error) { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes((error as { code?: string }).code ?? '')) throw error }
+        }
       }
       return removed
     },
@@ -76,8 +103,10 @@ export async function loadViewFileStorage(ctx: QuickHostContext): Promise<ViewFi
 export class ViewFilesService {
   readonly typertRemote: { readonly service: ViewFilesService; readonly serviceKey: 'translationViews'; readonly namespace: 'translationViews' }
   private storage: Promise<ViewFileStorage> | undefined
-  private readonly writes = new Map<Promise<string>, { readonly namespaceId: string; readonly sessionId: string }>()
+  private readonly writes = new Map<Promise<string>, { readonly namespaceId: string; readonly sessionId: string; readonly unitId: string; readonly revisionId: string | null }>()
   private readonly clearedSessions = new Set<string>()
+  private readonly clearedUnits = new Set<string>()
+  private readonly clearedVersions = new Set<string>()
   private disposed = false
   constructor(readonly ctx: QuickHostContext, private readonly options: ViewFilesHostOptions = {}) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationViews', property: 'ctx' } })
@@ -92,25 +121,46 @@ export class ViewFilesService {
     if (!this.storage) this.storage = (this.options.storage ? Promise.resolve(this.options.storage) : (this.options.loadStorage ?? (() => loadViewFileStorage(this.ctx)))()).catch(error => { this.storage = undefined; throw error })
     return this.storage
   }
-  private cleared(namespaceId: string, sessionId: string): boolean { return this.clearedSessions.has(JSON.stringify([namespaceId, sessionId])) }
+  private cleared(namespaceId: string, sessionId: string, unitId?: string, revisionId?: string): boolean { return this.clearedSessions.has(JSON.stringify([namespaceId, sessionId])) || this.clearedUnits.has(JSON.stringify([namespaceId, sessionId, unitId])) || this.clearedVersions.has(JSON.stringify([namespaceId, sessionId, unitId, revisionId])) }
+  invalidateHistoryResult(scope: { namespaceId: string; sessionId: string }, unitId: string, version: number): boolean {
+    const revisionId = `result:${unitId}:${version}`
+    return this.invalidateHistoryVersion(scope, unitId, revisionId)
+  }
+  invalidateHistoryVersion(scope: { namespaceId: string; sessionId: string }, unitId: string, revisionId: string): boolean {
+    this.clearedVersions.add(JSON.stringify([scope.namespaceId, scope.sessionId, unitId, revisionId]))
+    return ![...this.writes.values()].some(value => value.namespaceId === scope.namespaceId && value.sessionId === scope.sessionId && value.unitId === unitId && value.revisionId === revisionId)
+  }
+  invalidateHistoryUnit(scope: { namespaceId: string; sessionId: string }, unitId: string): boolean {
+    this.clearedUnits.add(JSON.stringify([scope.namespaceId, scope.sessionId, unitId]))
+    return ![...this.writes.values()].some(value => value.namespaceId === scope.namespaceId && value.sessionId === scope.sessionId && value.unitId === unitId)
+  }
+  invalidateHistorySession(scope: { namespaceId: string; sessionId: string }): boolean {
+    this.clearedSessions.add(JSON.stringify([scope.namespaceId, scope.sessionId]))
+    return ![...this.writes.values()].some(value => value.namespaceId === scope.namespaceId && value.sessionId === scope.sessionId)
+  }
   async open(input: ViewFileOpen, signal: AbortSignal): Promise<ViewFileResult<{ readonly opened: true }>> {
     let request: ViewFileOpen
     try { request = parseViewFileRequest('open', input) as ViewFileOpen } catch { return bad('invalid_input', '打开文件参数无效或正文超过 16 MiB。') }
     if (!this.owns(request.namespaceId)) return bad('scope_mismatch', '打开文件不属于此主会话连接。')
-    if (this.cleared(request.namespaceId, request.sessionId)) return bad('scope_mismatch', '此会话的打开文件已经清理。')
+    const history = this.ctx.get?.('translationHistory') as { isUnitDeleted(namespaceId: string, sessionId: string, unitId: string): Promise<boolean>; isFileResultDeleted?(namespaceId: string, sessionId: string, unitId: string, version: number): Promise<boolean>; isFileSourceDeleted?(namespaceId: string, sessionId: string, unitId: string, version: number): Promise<boolean>; isDocumentViewDeleted?(namespaceId: string, sessionId: string, unitId: string, revisionId: string): Promise<boolean> } | undefined
+    if (request.revisionId && await history?.isDocumentViewDeleted?.(request.namespaceId, request.sessionId, request.unitId, request.revisionId)) return bad('scope_mismatch', '此文档版本已删除。')
+    const prefix = `result:${request.unitId}:`, version = request.revisionId?.startsWith(prefix) ? Number(request.revisionId.slice(prefix.length)) : undefined
+    const sourcePrefix = `source:${request.unitId}:`, sourceVersion = request.revisionId?.startsWith(sourcePrefix) ? Number(request.revisionId.slice(sourcePrefix.length)) : undefined
+    if (sourceVersion !== undefined && Number.isSafeInteger(sourceVersion) && await history?.isFileSourceDeleted?.(request.namespaceId, request.sessionId, request.unitId, sourceVersion)) return bad('scope_mismatch', '此文件原稿已删除。')
+    if (this.cleared(request.namespaceId, request.sessionId, request.unitId, request.revisionId) || await history?.isUnitDeleted(request.namespaceId, request.sessionId, request.unitId) || version !== undefined && Number.isSafeInteger(version) && await history?.isFileResultDeleted?.(request.namespaceId, request.sessionId, request.unitId, version)) return bad('scope_mismatch', '此单元或版本的打开文件已经清理。')
     const controller = this.ctx.get?.('sessionController') as Controller | undefined
     if (typeof controller?.canOpenWorkspacePath !== 'function' || !controller.canOpenWorkspacePath() || typeof controller.openWorkspacePath !== 'function') return bad('unavailable', '当前宿主不支持打开本地文件。')
     signal.throwIfAborted()
     let destination: string
     const writing = (async () => (await this.disk()).write(request, request.format === 'txt' ? request.text : renderViewPage(request.title, request.text)))()
-    this.writes.set(writing, { namespaceId: request.namespaceId, sessionId: request.sessionId })
+    this.writes.set(writing, { namespaceId: request.namespaceId, sessionId: request.sessionId, unitId: request.unitId, revisionId: request.revisionId ?? null })
     try { destination = await writing }
     catch (error) {
       signal.throwIfAborted()
       return (error as { code?: string } | undefined)?.code === 'local_data_blocked' ? bad('local_data_stale', '本地数据已清理，打开文件已停止写入。') : bad('storage_failed', '打开文件写入失败，请重试。')
     } finally { this.writes.delete(writing) }
     signal.throwIfAborted()
-    if (!this.owns(request.namespaceId) || this.cleared(request.namespaceId, request.sessionId)) return bad('scope_mismatch', '打开文件时所属连接或会话已失效。')
+    if (!this.owns(request.namespaceId) || this.cleared(request.namespaceId, request.sessionId, request.unitId, request.revisionId)) return bad('scope_mismatch', '打开文件时所属连接或会话已失效。')
     try { await controller.openWorkspacePath({ path: destination }, signal) }
     catch { signal.throwIfAborted(); return bad('open_failed', '文件未能在系统默认应用中打开，请重试。') }
     signal.throwIfAborted()

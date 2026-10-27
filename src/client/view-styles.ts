@@ -81,6 +81,7 @@ export const styles = `
 .dsh-tp-translation + .dsh-tp-translation { border-top: 1px solid var(--dsw-alias-border-l2, #8883); padding-top: 18px; }
 .dsh-tp-translation > button:last-child { margin-bottom: 18px; }
 .dsh-tp-translation-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 12px; }
+.dsh-tp-source-collapsed { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .dsh-tp-unit-header, .dsh-tp-version-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
 .dsh-tp-version { padding: 6px 0; }
 /* 单元内各行功能（原文行、译文行、编辑器与执行行）使用同一按钮规格：12px、间距 4px。 */
@@ -119,7 +120,13 @@ export const styles = `
 .dsh-tp-assets-module[hidden] { display: none; }
 .dsh-tp-structured { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 .dsh-tp-archive-toolbar { flex: none; padding: 7px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
-.dsh-tp-archive-toolbar select { padding: 4px 6px; }
+/* Toolbar buttons keep one size whether they sit in a wrapper or directly in the header. */
+.dsh-tp-archive-toolbar .dsh-tp-unit-header .dsh-tp-actions,
+.dsh-tp-asset-toolbar .dsh-tp-unit-header .dsh-tp-actions { font-size: 14px; }
+/* Peer choices sit side by side with one selected segment, replacing the former dropdown. */
+.dsh-tp-segmented { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--dsw-alias-border-l2, #8883); border-radius: 8px; }
+.dsh-tp-segmented button { border-radius: 6px; padding: 4px 10px; }
+.dsh-tp-segmented button[aria-checked=true] { background: var(--dsw-alias-interactive-bg-hover, #8882); }
 .dsh-tp-archive-toolbar small { display: block; margin-top: 4px; font-size: 11px; }
 .dsh-tp-archive-entities { margin: 10px 0; padding: 6px 8px; border: 1px solid var(--dsw-alias-border-l2, #8884); border-radius: 6px; }
 .dsh-tp-archive-entities label { display: flex; align-items: flex-start; gap: 6px; margin: 4px 0; }
@@ -142,6 +149,11 @@ export const styles = `
 /* Continuous translation records: one scroll surface, paired rows in reading order. */
 .dsh-tp-records-scope { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .dsh-tp-records-scope select { max-width: 100%; padding: 4px 6px; }
+.dsh-tp-record-search { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.dsh-tp-record-search input { flex: 1; min-width: 140px !important; padding: 5px 8px !important; }
+.dsh-tp-record-search-hit { color: inherit; background: #e6bf4266; border-radius: 2px; }
+.dsh-tp-record-search-current { background: #ef9f437a; outline: 1px solid currentColor; }
+.dsh-tp-record-search-excerpt { padding: 6px 10px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-records-reader { flex: 1; min-height: 0; min-width: 0; overflow-y: auto; overflow-wrap: anywhere; }
 .dsh-tp-records-session > h3, .dsh-tp-records-session > p { margin: 8px 10px; }
 .dsh-tp-record-unit { border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
@@ -165,10 +177,18 @@ export const styles = `
 .dsh-tp-record-source, .dsh-tp-record-target { min-width: 0; padding: 8px 10px; }
 .dsh-tp-record-source { border-right: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-record-pair h4 { margin: 0 0 4px; font-size: 12px; }
-.dsh-tp-record-column-heading { display: flex; align-items: baseline; gap: 6px; margin: 0 0 4px; }
+.dsh-tp-record-column-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 0 0 4px; }
 .dsh-tp-record-column-heading h4 { margin: 0; }
+/* Revision status, actions and the open control share the column heading row, so both columns
+   start their body text on the same line. The status yields space first instead of wrapping. */
+.dsh-tp-record-heading-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex: 0 0 auto; margin-left: auto; font-size: 12px; }
+.dsh-tp-record-heading-actions .dsh-tp-actions { flex: none; flex-wrap: nowrap; }
+.dsh-tp-record-heading-actions .dsh-tp-record-open { flex: none; }
+.dsh-tp-record-revision-status { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-tp-record-heading-actions .dsh-tp-record-open .dsh-tp-object-link { padding: 5px 8px; font-size: 12px; color: inherit; text-decoration: none; }
+.dsh-tp-record-revision-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; font-size: 12px; }
 .dsh-tp-record-revision + .dsh-tp-record-revision { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-l2, #8883); }
-.dsh-tp-record-version-actions { margin: 6px 0; }
+.dsh-tp-record-version-actions { margin: 0; }
 .dsh-tp-record-actions { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-record-actions[hidden] { display: none; }
 /* Managed originals: plain body segments with explicit, immutable links. */
@@ -222,4 +242,17 @@ export const styles = `
 .dsh-tp-file-card-content, .dsh-tp-file-card-evidence { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }
 .dsh-tp-file-card-field { display: grid; gap: 4px; margin: 8px 0; }
 .dsh-tp-file-card-field input, .dsh-tp-file-card-field textarea, .dsh-tp-file-card-field select { width: 100%; box-sizing: border-box; }
+.dsh-tp-other-memory-module { display: block; overflow-y: auto; }
+.dsh-tp-other-memory { padding: 12px; min-width: 0; }
+.dsh-tp-other-memory > section, .dsh-tp-other-memory-legacy { margin-top: 20px; }
+.dsh-tp-other-memory .dsh-tp-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.dsh-tp-other-memory-setting, .dsh-tp-other-memory-file { padding: 12px 0; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); overflow-wrap: anywhere; }
+.dsh-tp-other-memory-setting .dsh-tp-translation-text { max-height: 240px; overflow-y: auto; margin: 6px 0; }
+.dsh-tp-other-memory-form { margin-top: 12px; padding: 12px; border: 1px solid var(--dsw-alias-border-l2, #8884); border-radius: 6px; }
+.dsh-tp-other-memory-form > label, .dsh-tp-other-memory-upload > label { display: grid; gap: 4px; margin: 8px 0; }
+.dsh-tp-other-memory-form input:not([type=checkbox]), .dsh-tp-other-memory-form textarea, .dsh-tp-other-memory-form select { width: 100%; box-sizing: border-box; }
+.dsh-tp-other-memory-form > .dsh-tp-checkbox { display: flex; align-items: center; }
+.dsh-tp-other-memory-upload { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.dsh-tp-other-memory-upload input[type=file] { max-width: 100%; }
+.dsh-tp-other-memory-legacy { padding: 0 12px 12px; }
 `

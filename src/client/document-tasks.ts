@@ -108,6 +108,10 @@ export class DocumentTasksClient {
     })
     this.stopStore = store.subscribe(() => {
       let changed = false
+      for (const [id, task] of this.tasks) {
+        const unit = this.unit(task), sourceVersion = unit?.tasks.find(record => record.taskId === task.scope.taskId)?.sourceVersion
+        if (unit?.sourceVersions.some(source => source.version === sourceVersion && source.deletion)) { task.release(); task.releaseLease(); task.releaseBridge(); this.tasks.delete(id); this.admissions.delete(id) }
+      }
       for (const item of this.unitRequests.values()) {
         const target = item.request.target, unit = this.store.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
         if (unit && isDocumentUnit(unit) && unit.tasks.some(task => !item.previousTasks.includes(task.taskId)) && item.outcome !== 'accepted') {
@@ -156,7 +160,7 @@ export class DocumentTasksClient {
     if (this.disposed || target.mainSessionId !== ownerId || !session || !unit || !isDocumentUnit(unit) || session.mode !== 'normal' || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档捕获不属于此实际主会话。', 'capture_document')
     if (this.store.getStatus(session.id) === 'conflict') return bad('history_conflict', '当前历史副本已变化。', 'capture_document')
     const source = unit.sourceVersions.find(source => source.version === target.sourceVersion)
-    if (!source) return bad('source_version_missing', '准确原稿版本不存在。', 'capture_document')
+    if (!source || source.deletion) return bad('source_version_missing', '准确原稿版本已删除或不存在。', 'capture_document')
     const scope = { ownerId, mainSessionId: ownerId, topicId: session.topicId, translationSessionId: session.id }
     const reference = request.preparationRef ?? [...unit.preparations].reverse().find(preparation => preparation.sourceVersion === target.sourceVersion) ?? unit.preparations.at(-1)
     let preparation: PreparationSnapshot | null = null
@@ -169,7 +173,7 @@ export class DocumentTasksClient {
       preparation = prepared.value
       if (request.requireReady && preparation.sourceVersion !== target.sourceVersion) return bad('preparation_not_ready', '新原稿的准备尚待明确复核。', 'capture_document')
     }
-    const selected = request.revisionIds ?? [], chunks = unit.chunkRevisions.filter(chunk => selected.includes(chunk.id)).map(({ content, ...chunk }) => ({ ...chunk,
+    const selected = request.revisionIds ?? [], chunks = unit.chunkRevisions.filter(chunk => !chunk.deletion && selected.includes(chunk.id)).map(({ content, ...chunk }) => ({ ...chunk,
       completeResult: chunk.status === 'completed' && (content.kind === 'source_copy' || Boolean(content.text)), outputBytes: content.kind === 'text' ? new TextEncoder().encode(content.text).byteLength : null }))
     if (selected.some(id => !chunks.some(chunk => chunk.id === id))) return bad('chunk_not_found', '请求的准确旧块不存在。', 'capture_document')
     const sourceRestore = source.body.kind === 'asset' ? await this.store.readStoredSourceRequest({ sessionId: session.id, unitId: unit.id, sourceVersion: source.version }) : null
@@ -521,6 +525,7 @@ export class DocumentTasksClient {
     try { request = parseDocumentRestoreRequest(raw) } catch { return bad('invalid_input', '文档恢复查询参数无效。', 'restore_document') }
     const scope = request.scope, session = this.store.getSession(scope.translationSessionId)
     if (this.disposed || !session || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || session.topicId !== scope.topicId || session.mode !== 'normal' || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '文档恢复不属于此主会话。', 'restore_document')
+    if (!this.store.getTranslationHistory(session.id) && !await this.store.ensureSessionHistory(session.id)) return bad('history_unavailable', '会话正文尚未读取，请重试。', 'restore_document')
     const current = this.store.getTranslationHistory(session.id)?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === request.taskId))
     if (!current || !isDocumentUnit(current) || request.unitId !== undefined && request.unitId !== current.id) return bad('task_not_found', '此范围内没有确切任务。', 'restore_document')
     const blocked = this.materials.fileAccessBlockedReason(session.id, current.id)
@@ -530,6 +535,8 @@ export class DocumentTasksClient {
     const saved = this.store.readStoredDocumentTask(session.id, current.id, record.taskId)
     if (!saved) return bad('history_not_saved', '当前任务执行事实没有准确的已保存副本。', 'restore_document')
     const savedRecord = saved.tasks.find(task => task.taskId === record.taskId)!, facts = savedRecord.executionFacts!, source = saved.sourceVersions.find(source => source.version === record.sourceVersion)!, plan = saved.plans.find(plan => sameVersionReference(plan, record.planRef))!
+    if (source.deletion) return bad('source_deleted', '原稿已删除，请以当前原稿开始新任务。', 'restore_document')
+    if (saved.chunkRevisions.some(chunk => chunk.taskId === record.taskId && chunk.deletion)) return bad('chunks_deleted', '此任务的旧翻译块已清理，请开始新任务。', 'restore_document')
     if (['waiting_context', 'waiting_user'].includes(savedRecord.status)) return bad('context_restore_unavailable', '旧任务的动态求助问题未保存，无法恢复此等待；已有结果仍可查阅。', 'restore_document')
     if (saved.chunkRevisions.filter(chunk => chunk.taskId === record.taskId).some(chunk => chunk.callRecord?.contextRef.supplementRefs.some(ref => !facts.supplements?.some(supplement => supplement.chunkId === chunk.chunkId && sameVersionReference(ref, supplement))))) return bad('context_restore_unavailable', '实际调用的补充正文缺失，无法重建该调用准备。', 'restore_document')
     const sourceSha256 = source.body.kind === 'asset' ? source.body.reference.sha256 : await digest(new TextEncoder().encode(source.body.text))
@@ -552,6 +559,7 @@ export class DocumentTasksClient {
     const blocked = this.materials.fileAccessBlockedReason(request.scope.translationSessionId, request.unitId)
     if (blocked) return bad('unit_removed_or_conflicted', blocked)
     const before = this.store.getTranslationHistory(request.scope.translationSessionId)?.units.find(unit => unit.id === request.unitId)
+    if (request.kind === 'resume' && before && isDocumentUnit(before) && before.chunkRevisions.some(chunk => chunk.taskId === request.taskId && chunk.deletion)) return bad('revision_deleted', '此旧任务有译文已删除，请使用新操作明确重译。')
     if (request.kind === 'resume' && before && isDocumentUnit(before) && before.tasks.find(task => task.taskId === request.taskId)?.sourceVersion !== before.sourceVersion) return bad('stale_source_version', '旧任务原稿已被纠错版本取代，不能继续旧源派发。')
     let task = this.locate(ownerId, { scope: request.scope, taskId: request.taskId, unitId: request.unitId })
     if (!task) {
@@ -647,10 +655,11 @@ export class DocumentTasksClient {
     const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === taskId))
     const task = unit && isDocumentUnit(unit) ? unit.tasks.find(task => task.taskId === taskId) : undefined, key = session ? this.key(this.store.getOperationMainSessionId(sessionId, taskId) ?? '', taskId) : ''
     const uncertain = task?.executionFacts?.blocks.some(block => block.phase !== 'settled') || unit && isDocumentUnit(unit) && unit.chunkRevisions.some(chunk => chunk.taskId === taskId && ['running', 'unknown', 'interrupted'].includes(chunk.status))
-    const recoverability = !task?.executionFacts ? '此旧任务缺少执行恢复事实；已有原稿与结果可查阅。' : uncertain && ['interrupted', 'unknown'].includes(task.status) ? '旧调用未确认结束，请查询任务状态。' : null
+    const deletedBlocks = unit && isDocumentUnit(unit) && unit.chunkRevisions.some(chunk => chunk.taskId === taskId && chunk.deletion)
+    const recoverability = deletedBlocks ? '此任务有译文已删除，请使用新的重译操作。' : !task?.executionFacts ? '此旧任务缺少执行恢复事实；已有原稿与结果可查阅。' : uncertain && ['interrupted', 'unknown'].includes(task.status) ? '旧调用未确认结束，请查询任务状态。' : null
     return { pending: Boolean(this.controlsPending.get(key)?.size), pausing: this.controlsPending.get(key)?.has('pause') ?? false,
       cancelling: this.controlsPending.get(key)?.has('cancel') ?? false, message: this.notices.get(key) ?? null,
-      canResume: Boolean(task?.executionFacts && !uncertain && unit && !this.materials.fileAccessBlockedReason(sessionId, unit.id) && ['paused', 'failed', 'cancelled', 'interrupted'].includes(task.status)), recoverability }
+      canResume: Boolean(task?.executionFacts && !deletedBlocks && !uncertain && unit && !this.materials.fileAccessBlockedReason(sessionId, unit.id) && ['paused', 'failed', 'cancelled', 'interrupted'].includes(task.status)), recoverability }
   }
   async requestControl(sessionId: string, taskId: string, kind: 'pause' | 'cancel' | 'resume' | 'status'): Promise<void> {
     const session = this.store.getSession(sessionId), history = this.store.getTranslationHistory(sessionId), unit = history?.units.find(unit => isDocumentUnit(unit) && unit.tasks.some(task => task.taskId === taskId))
@@ -689,22 +698,7 @@ export class DocumentTasksClient {
     item.release?.(); delete item.release; this.emit()
   }
   retranslationBlockedReason(sessionId: string, unitId: string): string | undefined {
-    const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
-    if (this.disposed || !session || !unit || !isDocumentUnit(unit) || session.mode !== 'normal' || this.store.isSessionDeleted(sessionId)) return '此文档单元已不可用。'
-    const blocked = this.materials.fileAccessBlockedReason(sessionId, unitId)
-    if (blocked) return blocked
-    if (session.archivedAt !== null) return '请先恢复归档会话。'
-    if (!session.model) return '请先选择本次翻译模型。'
-    if (this.store.getStatus(sessionId) === 'conflict') return '本地历史副本已变化，请核对最新记录。'
-
-    const intent = this.unitRequests.get(JSON.stringify([sessionId, unitId]))
-    if (intent?.pending) return '正在发送或查询此文档的重译意图。'
-    if (intent?.unknown) return '重译意图发送状态未知，请先检查状态。'
-    if (intent?.outcome === 'submitted') return '重译意图已发送，正在等待主模型受理。'
-    if (this.options.isSessionBusy?.(sessionId) || this.store.hasDocumentLease(sessionId) ||
-      this.store.getTranslationHistory(sessionId)?.units.some(item => isDocumentUnit(item) && item.tasks.some(task =>
-        ['running', 'unknown', 'paused', 'waiting_user', 'waiting_context'].includes(task.status) || task.executionFacts?.blocks.some(block => block.phase !== 'settled')))) return '当前会话仍有未结束或未知任务，请先查询或取消。'
-    return undefined
+    return '旧文档不再启动重译；请重新发送原稿，使用当前翻译流程。'
   }
   async requestRetranslation(sessionId: string, unitId: string, executionOwner?: string): Promise<void> {
     if (!executionOwner || !this.store.isSessionOpen(executionOwner, sessionId) || this.retranslationBlockedReason(sessionId, unitId)) return

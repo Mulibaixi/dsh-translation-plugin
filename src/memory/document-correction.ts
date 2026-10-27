@@ -138,7 +138,7 @@ export async function verifyDocumentReuse(input: VerifyDocumentReuseInput): Prom
   const oldPlan = unit.plans.find(item => sameVersionReference(item, request.planRef)), item = plan.items.find(item => item.chunkId === request.chunkId)
   const oldItem = oldPlan?.items.find(item => item.chunkId === chunk?.chunkId)
   const oldSource = unit.sourceVersions.find(source => source.version === request.sourceVersion), source = unit.sourceVersions.find(source => source.version === plan.sourceVersion)
-  if (!chunk || !oldPlan || !oldItem || !item || !oldSource || !source || chunk.status !== 'completed' || chunk.completeResult === false || chunk.sourceVersion !== request.sourceVersion ||
+  if (!chunk || chunk.deletion || !oldPlan || !oldItem || !item || !oldSource || !source || chunk.status !== 'completed' || chunk.completeResult === false || chunk.sourceVersion !== request.sourceVersion ||
     chunk.kind === 'manual' || chunk.kind === 'machine' && !chunk.callRecord || !sameVersionReference(chunk.planRef, request.planRef) ||
     !sameVersionReference(chunk.preparationRef, oldPreparation) || plan.sourceVersion !== unit.sourceVersion || request.sourceVersion >= plan.sourceVersion ||
     oldItem.mode !== item.mode || !newPreparation.preparationReady || !same(mappedRange(oldItem.outputRange, request.sourceVersion, plan.sourceVersion, unit.corrections ?? []), item.outputRange)) throw new TypeError('Document reuse requires a complete original revision and exact surviving output range')
@@ -183,6 +183,7 @@ export function validateDocumentReuseApproval(unit: DocumentUnit, supplied: Docu
 }
 /** Later dependency updates preserve this completed fact; eligibility separately records mixed dependencies. */
 export function isDocumentManifestReuse(unit: DocumentUnit, revision: Pick<DocumentRevision, 'taskId' | 'sourceVersion' | 'planRef' | 'preparationRef'>, entry: ManifestEntry): boolean {
+  if (unit.chunkRevisions.find(chunk => chunk.id === entry.revisionId)?.deletion) return false
   if (!entry.reuseRef?.approvalId) return false
   const approval = unit.reuseApprovals?.find(item => item.id === entry.reuseRef!.approvalId)
   if (!approval) return false

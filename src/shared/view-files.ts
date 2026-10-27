@@ -7,7 +7,7 @@ export interface ViewFileOpen {
   readonly sessionId: string
   readonly unitId: string
   readonly kind: ViewFileKind
-  /** Human-readable page title; rendered into the Host page, never used as a file name. */
+  /** Human-readable page title and fallback display filename. */
   readonly title: string
   readonly text: string
   /** Fixed source/manifest identity; independent revisions never share an opening artifact. */

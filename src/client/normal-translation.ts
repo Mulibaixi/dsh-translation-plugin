@@ -1,4 +1,6 @@
 import { isDocumentUnit } from './translation-history.js'
+import { historyContextRefs, type DirectHistoryContext } from '../shared/direct-history-context.js'
+import { parseTranslationLogResult, type TranslationLogRead } from '../shared/translation-log.js'
 import { parseNormalTranslationAcceptance, parseNormalTranslationUpdate, parseNormalTranslationJob, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseDirectTranslationCommit, type NormalTranslationAcceptance,
   type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationQuery, type NormalTranslationUnitTarget, type NormalTranslationTarget, type NormalTranslationSourceCorrection, type NormalTranslationUnitRequest,
   type DirectTranslationCommit, type DirectTranslationReceipt, type NormalTranslationExportSegment, draftTranslationTerms } from '../shared/normal-translation.js'
@@ -7,13 +9,13 @@ import { assetPriority } from '../memory/asset-priority.js'
 import { sameLanguage } from '../shared/language-tag.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
-import type { TopicTermSnapshot } from '../memory/topic-terms.js'
+import { emptyTopicTerms, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { isNormalExchangePromptVersion, isNormalTranslationPromptVersion, type TranslationCallMetadata } from '../shared/translation-call.js'
 import { parseRequestContextInput } from '../shared/request-context.js'
 import { parseNormalTranslationV2Event, parseNormalTranslationV2Job, type NormalTranslationResolution, type NormalTranslationV2Event, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
 import { appendAdmittedTextUnit, appendAdmittedFileUnit, appendTextRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation,
   registerTranslationExchange, registerTranslationResolution, registerTranslationResume, recordTranslationExchangeStatus, bindTranslationExchangeId,
-  recordTranslationResumeStarted, finishTranslationExchange, isTextUnit, currentResultRevision } from './translation-history.js'
+  recordTranslationResumeStarted, finishTranslationExchange, isTextUnit, currentResultRevision, finalizeCompletedUnit, finalizeExportedUnit } from './translation-history.js'
 import type { TranslationExchangeResolution } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import type { TranslationHistory, TextRevisionStatus } from './translation-history.js'
@@ -23,6 +25,7 @@ import type { TopicBridgeTermsPort } from './topic-bridge.js'
 export type NormalTranslationReply = { readonly ok: true; readonly value: Extract<TopicBridgeValue, { kind: 'normal_operation' | 'normal_prepared' | 'normal_committed' | 'normal_exported' | 'normal_updated' | 'normal_v2_updated' | 'normal_exchange_resolved' | 'normal_observed' | 'normal_resolved' | 'normal_source_corrected' }> }
   | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }
 export interface NormalTranslationRemotePort {
+  readLog?(request: TranslationLogRead): Promise<unknown>
   status(request: NormalTranslationQuery): Promise<unknown>
   cancel(request: NormalTranslationQuery): Promise<unknown>
   requestUnit?(request: NormalTranslationUnitRequest): Promise<unknown>
@@ -32,6 +35,8 @@ export interface NormalTranslationV2RemotePort {
   cancel(request: NormalTranslationQuery): Promise<unknown>
 }
 interface AcceptedOperation {
+  /** Loaded from interrupted history; only an authoritative missing Host operation can retire it. */
+  restored?: boolean
   readonly signature: string
   operation: NormalTranslationOperation
   readonly termSnapshot: TopicTermSnapshot
@@ -51,8 +56,28 @@ const failure = (code: string, message: string): NormalTranslationReply => ({ ok
 
 /** Admission facts live in SessionStore; this runtime index only correlates short bridge receipts. */
 export class NormalTranslationClient {
+  async exportCallLog(sessionId: string, operationId: string, callId: string): Promise<string> {
+    const owner = this.store.getOperationMainSessionId(sessionId, operationId)
+    const remote = typeof this.options.remote === 'function' ? await this.options.remote() : this.options.remote
+    if (!owner || !remote?.readLog) throw new Error('该版本的调用日志当前不可读取，请在原宿主运行期间导出。')
+    let start = 0, text = '', total: number | undefined
+    do {
+      const reply = await remote.readLog({ mainSessionId: owner, translationSessionId: sessionId, operationId, callId, afterSequence: 0, start }) as { ok?: boolean; value?: unknown; error?: { message?: string } }
+      if (reply?.ok !== true) throw new Error(reply?.error?.message ?? '调用日志服务未返回有效回执。')
+      const result = parseTranslationLogResult(reply.value)
+      if (!result.ok) throw new Error(result.error.message)
+      const page = result.value
+      if (total !== undefined && total !== page.total || (page.next ?? page.total) !== start + page.text.length) throw new Error('执行日志仍在变化，请在本次调用结束后重试导出。')
+      total = page.total; text += page.text
+      if (page.next === null) return text
+      if (!page.text.length) throw new Error('调用日志分页未前进。')
+      start = page.next
+    } while (!this.disposed)
+    throw new Error('日志读取已关闭。')
+  }
   private readonly operations = new Map<string, AcceptedOperation>()
   private readonly unitSnapshots = new Map<string, Extract<TranslationMaterialEnvelope, { kind: 'material' }>>()
+  private readonly preparedHistory = new Map<string, DirectHistoryContext>()
   private readonly unitRequests = new Map<string, { operationId: string; pending: boolean; outcome: 'pending' | 'submitted' | 'failed' | 'unknown'; message: string; release: (() => void) | undefined }>()
   private readonly listeners = new Set<() => void>()
   private readonly stopBridge: (() => void) | undefined
@@ -160,23 +185,55 @@ export class NormalTranslationClient {
     if (!material.model) return failure('invalid_input', '此材料未选择翻译模型，请重新提交已选模型的材料。')
     if (this.store.hasDocumentLease(session.id) || this.options.isSessionBusy?.(session.id) || this.store.getTranslationHistory(session.id)?.units.some(unit => isTextUnit(unit)
       ? unit.revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status)) : isDocumentUnit(unit) && unit.tasks.some(task => ['running', 'unknown'].includes(task.status))) ||
-      this.isBusy(session.id)) return failure('busy', '此翻译会话仍有执行中或结果未知的操作。')
+      this.isBusy(session.id)) return failure('busy', '此翻译会话仍有执行中或结果未知的操作。请在翻译面板查询或取消原操作；等待、Sleep 或更换操作编号不会解除占用，请停止重复提交。')
     const contentOwner = this.store.getTopicStorageScope(session.topicId)!, snapshot = this.terms.getSnapshot(contentOwner, material.topicId), selected = request.termReferences.map(ref => snapshot.entries.find(entry => entry.id === ref.id && entry.version === ref.entryVersion))
-    // Name the exact rejected reference: "术语不符" alone leaves a model guessing or rewriting by hand.
+    // Name the exact rejected reference and separate "unknown id" from "stale version": each needs a different
+    // correction, and "not found (version may have changed)" sends a model that mistyped an id to the wrong fix.
     const rejected = request.termReferences.flatMap((ref, index) => {
       const entry = selected[index]
-      if (!entry) return [`${ref.id}@v${ref.entryVersion} 未找到（可能版本已变化）`]
+      if (!entry) {
+        const known = snapshot.entries.find(candidate => candidate.id === ref.id)
+        return [known ? `${ref.id} 的引用版本 v${ref.entryVersion} 已过期（当前 v${known.version}）` : `${ref.id} 不存在（此主题没有该术语 ID）`]
+      }
       if (entry.status !== 'active') return [`${ref.id} 未生效（状态 ${entry.status}）`]
       if (!sameLanguage(entry.targetLanguage, material.targetLanguage)) return [`${ref.id} 目标语为 ${entry.targetLanguage}，本次为 ${material.targetLanguage}`]
       return []
     })
-    if (rejected.length) return failure('stale_terms', `术语引用未通过：${rejected.slice(0, 5).join('；')}${rejected.length > 5 ? ` 等 ${rejected.length} 条` : ''}。请重新查询术语后只引用可用的 id/版本。`)
+    // The model has not called the translation model at this point; say so and name the retry action.
+    if (rejected.length) return failure('stale_terms', `术语引用未通过：${rejected.slice(0, 5).join('；')}${rejected.length > 5 ? ` 等 ${rejected.length} 条` : ''}。本次尚未调用翻译模型；请用 translation_query_terms 核对准确 id/版本后修正重试，若沿用原 operationId 仍被拒绝，请改用新的 operationId。`)
     for (const entry of selected) {
       const usable = entry !== undefined && this.terms.query(contentOwner, material.topicId, { mode: 'normal', sourceLanguage: entry.sourceLanguage,
         targetLanguage: entry.targetLanguage, forms: entry.sourceForms }).entries.some(candidate => candidate.id === entry.id && candidate.version === entry.version)
       if (!usable) return failure('stale_terms', `术语 ${entry?.id ?? '未找到'} 的原文依据已失效，请重新查询后引用。`)
     }
-    return { ok: true, value: { kind: 'normal_prepared', termSnapshot: structuredClone({ ...snapshot, entries: selected.filter(entry => entry !== undefined) }) } }
+    let historyContext = this.captureHistory(envelope)
+    const termSnapshot = structuredClone({ ...snapshot, entries: selected.filter(entry => entry !== undefined) })
+    const replyBytes = (): number => new TextEncoder().encode(JSON.stringify({ kind: 'normal_prepared', termSnapshot, historyContext })).byteLength
+    while (historyContext.nearby.length && replyBytes() > MAX_TOPIC_BRIDGE_REPLY_BYTES - 1024) historyContext = { ...historyContext, nearby: historyContext.nearby.slice(1) }
+    if (replyBytes() > MAX_TOPIC_BRIDGE_REPLY_BYTES - 1024) return failure('revision_base_limit', '术语或待修订译文超过准备回包上限，请减少术语或分段修改；未截断基准。')
+    const historyKey = this.key(ownerId, request.operationId), frozenHistory = this.preparedHistory.get(historyKey)
+    if (frozenHistory && JSON.stringify(frozenHistory) !== JSON.stringify(historyContext)) return failure('history_context_changed', '修订基准或邻近对白在执行期间变化，请重新读取后用新操作重试。')
+    if (historyContext.base && Array.from(historyContext.base.text).length > 20000) return failure('revision_base_limit', '待修订译文超过单次基准上限，请分段修改；未截断旧译文。')
+    this.preparedHistory.set(historyKey, historyContext)
+    return { ok: true, value: { kind: 'normal_prepared', termSnapshot,
+      ...(historyContext.base || historyContext.nearby.length ? { historyContext } : {}) } }
+  }
+
+  private captureHistory(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): DirectHistoryContext {
+    const history = this.store.getTranslationHistory(envelope.material.translationSessionId)
+    const target = envelope.material.unitReference?.unitId ?? `unit:${envelope.material.materialId}`
+    const index = history?.units.findIndex(unit => unit.id === target) ?? -1
+    const unit = index >= 0 ? history!.units[index] : undefined
+    const base = unit && isTextUnit(unit) ? currentResultRevision(unit) : undefined
+    const nearby: DirectHistoryContext['nearby'][number][] = []
+    for (const candidate of [...history?.units.slice(0, index < 0 ? undefined : index) ?? []].reverse()) {
+      if (!isTextUnit(candidate) || candidate.deletion || candidate.targetLanguage !== envelope.material.targetLanguage) continue
+      const revision = currentResultRevision(candidate)
+      if (!revision || Array.from(candidate.source).length > 1200 || Array.from(revision.text).length > 1200) continue
+      nearby.unshift({ unitId: candidate.id, sourceVersion: candidate.sourceVersion, revisionId: revision.id, source: candidate.source, text: revision.text })
+      if (nearby.length === 3) break
+    }
+    return { ...(base && unit ? { base: { unitId: unit.id, sourceVersion: unit.sourceVersion, revisionId: base.id, text: base.text } } : {}), nearby }
   }
 
   accept(ownerId: string, input: NormalTranslationAcceptance): NormalTranslationReply {
@@ -249,7 +306,9 @@ export class NormalTranslationClient {
       model.reasoningEffort !== undefined && metadata.model.reasoningEffort !== model.reasoningEffort) {
       return failure('invalid_metadata', '实际调用路由与材料冻结模型不一致，未记录。')
     }
-    const context = { organizedRequirements: request.organizedNotes,
+    const context = { ...(metadata.context?.memoryRequirements ? { memoryRequirements: metadata.context.memoryRequirements } : {}), organizedRequirements: request.organizedNotes,
+      ...(this.preparedHistory.get(this.key(ownerId, request.operationId)) && metadata.context?.historyContext
+        ? { historyContext: historyContextRefs(this.preparedHistory.get(this.key(ownerId, request.operationId))!) } : {}),
       ...(request.userRequirements ? { userRequirements: request.userRequirements } : {}),
       ...(request.auxiliaryContext ? { auxiliaryContext: request.auxiliaryContext } : {}),
       terms: [...prepared.value.termSnapshot.entries.map((entry): NormalTranslationTerm => {
@@ -269,11 +328,13 @@ export class NormalTranslationClient {
             ? acceptUnitRetranslation(current, unitId, request.operationId, material.sourceVersion, at, ownerId)
             : appendAdmittedTextUnit(current, envelope, request.operationId, at)
           : appendAdmittedFileUnit(current, envelope, unitId, request.sourceText!, request.operationId, at)
-      return appendTextRevision(admitted, unitId, { id: request.revisionId, operationId: request.operationId, model,
+      const recorded = appendTextRevision(admitted, unitId, { id: request.revisionId, operationId: request.operationId, model,
         draftVersion: material.draftVersion, createdAt: at, updatedAt: at, accepted: true, status: request.status,
         text: request.text, callRecord: metadata, message: request.message || null })
+      return request.status === 'completed' ? finalizeCompletedUnit(recorded, unitId, at) : recorded
     })
     if (!updated) return failure('history_update_failed', '译文记录未完成，请查询当前单元。')
+    this.preparedHistory.delete(this.key(ownerId, request.operationId))
     if (!material.unitReference) this.materials.consumeSubmittedMaterial(envelope)
     else {
       const intent = this.unitRequests.get(JSON.stringify([session.id, material.unitReference.unitId]))
@@ -351,6 +412,11 @@ export class NormalTranslationClient {
       totalCodePoints, complete, segments, missing, overlapping } }
     if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) {
       return failure('export_too_large', '本次译文总长度超过单次导出上限；请分段落保存或缩小范围。')
+    }
+    if (complete) {
+      const at = new Date().toISOString()
+      if (!this.store.updateTranslationHistory(session.id, current => segments.reduce((next, segment) => finalizeExportedUnit(next, segment.unitId, at), current)))
+        return failure('history_update_failed', '译文交付的最终选择未记录，请核对后重试。')
     }
     return { ok: true, value }
   }
@@ -569,7 +635,7 @@ export class NormalTranslationClient {
     const terms = item.termSnapshot.entries.map(entry => ({ id: entry.id, entryVersion: entry.version, sourceForms: entry.sourceForms,
       aliases: entry.aliases, sense: entry.sense, preferred: entry.preferred, forbidden: entry.forbidden, userFixed: entry.origin === 'user_explicit' }))
     return metadata.model.provider === model.provider && metadata.model.model === model.model && (model.reasoningEffort === undefined || metadata.model.reasoningEffort === model.reasoningEffort) &&
-      JSON.stringify(metadata.context) === JSON.stringify({ organizedRequirements: request.organizedRequirements, ...(request.referenceContextRef ? {referenceContextRef:request.referenceContextRef} : {}), terms })
+      JSON.stringify(metadata.context) === JSON.stringify({ ...(metadata.context.memoryRequirements ? { memoryRequirements: metadata.context.memoryRequirements } : {}), organizedRequirements: request.organizedRequirements, ...(request.referenceContextRef ? {referenceContextRef:request.referenceContextRef} : {}), terms })
   }
 
   private locate(ownerId: string, operationId: string): AcceptedOperation | undefined {
@@ -586,13 +652,15 @@ export class NormalTranslationClient {
       const revision = [...unit.revisions].reverse().find(revision => revision.operationId === operationId)
       if (!accepted && !isNormalTranslationPromptVersion((revision?.callRecord ?? revision?.deletion?.callFacts)?.promptVersion)) continue
       const receipt = [...history!.events].reverse().find(event => event.operationId === operationId && event.normalSequence !== undefined)
-      const state = revision?.deletion?.originalStatus ?? revision?.status ?? event?.status
+      const revisionState = revision?.deletion?.originalStatus ?? revision?.status
+      const retired = event?.type === 'operation.updated' && event.reason === 'restored' && event.status === 'failed'
+      const state = retired ? 'failed' : revisionState ?? event?.status
       const restoredV2Status: NormalTranslationV2Status = ['completed', 'failed', 'cancelled'].includes(state ?? '')
         ? state as NormalTranslationV2Status : 'unknown'
-      const item: AcceptedOperation = { signature: '', operation: { operationId, mainSessionId: ownerId, topicId: session.topicId,
+      const item: AcceptedOperation = { restored: !retired && !['completed', 'failed', 'cancelled'].includes(state ?? ''), signature: '', operation: { operationId, mainSessionId: ownerId, topicId: session.topicId,
         translationSessionId: session.id, materialId: material?.materialId ?? unit.id, unitId: unit.id, sourceVersion: revision?.sourceVersion ?? accepted?.sourceVersion ?? 1,
         draftVersion: material?.draftVersion ?? 1, status: ['completed', 'failed', 'cancelled'].includes(state ?? '') ? state as 'completed' | 'failed' | 'cancelled' : 'unknown',
-        persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' }, termSnapshot: { ...this.terms.getSnapshot(ownerId, session.topicId), entries: [] },
+        persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' }, termSnapshot: emptyTopicTerms(this.store.getTopicStorageScope(session.topicId)!, session.topicId, accepted?.at ?? unit.createdAt),
         release: undefined, callId: revision?.id ?? null, sequence: receipt?.normalSequence ?? 0, text: revision?.text ?? '', message: revision?.message ??
           (['completed', 'failed', 'cancelled'].includes(state ?? '') ? undefined : '上次普通执行已中断，可查询原操作；未自动重发。'), querying: false, updates: new Map(),
         v2Sequence: history?.events.filter(event => event.operationId === operationId && event.normalV2Sequence !== undefined).at(-1)?.normalV2Sequence ?? 0,
@@ -632,10 +700,30 @@ export class NormalTranslationClient {
   }
   async query(sessionId: string, unitId: string): Promise<void> { await this.request(sessionId, unitId, 'status') }
   async cancel(sessionId: string, unitId: string): Promise<void> { await this.request(sessionId, unitId, 'cancel') }
+  async recoverInterrupted(sessionId: string, ownerId?: string): Promise<void> {
+    this.isBusy(sessionId) // Discover saved operations without replaying their requests.
+    for (const item of [...this.operations.values()]) {
+      if (item.operation.translationSessionId !== sessionId || ownerId && item.operation.mainSessionId !== ownerId ||
+        !item.restored || item.operation.status !== 'unknown') continue
+      await this.request(sessionId, item.operation.unitId, 'status', item.operation.operationId)
+    }
+  }
+  private retireInterrupted(item: AcceptedOperation): void {
+    const op = item.operation, at = new Date().toISOString()
+    const message = '原宿主已无此中断任务，旧执行已结束；原文和已有输出保留，可以重新翻译。'
+    const updated = this.store.updateTranslationHistory(op.translationSessionId, history => {
+      const next = item.callId ? updateTextRevision(history, op.unitId, item.callId, { status: 'interrupted', message, updatedAt: at }) : history
+      return appendTranslationEvent(next, { id: `text-event:${next.events.length + 1}`, type: 'operation.updated', at,
+        unitId: op.unitId, revisionId: item.callId, operationId: op.operationId, status: 'failed', reason: 'restored', sourceVersion: op.sourceVersion })
+    })
+    if (!updated) return
+    item.restored = false; item.operation = { ...op, status: 'failed' }; item.v2Status = 'failed'; item.message = message
+    item.release?.(); item.release = undefined
+  }
   getRetranslationStatus(sessionId: string, unitId: string): { readonly pending: boolean; readonly message: string } | undefined {
     return this.unitRequests.get(JSON.stringify([sessionId, unitId]))
   }
-  retranslateBlockedReason(sessionId: string, unitId: string): string | undefined {
+  retranslateBlockedReason(sessionId: string, unitId: string, recovering = false): string | undefined {
     const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
     if (!session || session.mode !== 'normal' || !unit || this.store.isSessionDeleted(sessionId)) return '普通单元已不可用。'
     if (!isTextUnit(unit)) return '整篇文档重译尚未接通。'
@@ -643,17 +731,21 @@ export class NormalTranslationClient {
     if (session.archivedAt !== null) return '请先恢复归档会话。'
     if (!session.model) return '请先选择本次翻译模型。'
     if (this.store.getStatus(sessionId) === 'conflict') return '本地记录已变化，请核对当前副本。'
-    if (this.isBusy(sessionId)) return '当前会话仍有执行中或未知操作，请先查询或取消。'
+    if (this.isBusy(sessionId) && (recovering || [...this.operations.values()].some(item => item.operation.translationSessionId === sessionId &&
+      ['accepted', 'running', 'unknown'].includes(item.operation.status) && !item.restored))) return '当前会话仍有执行中或未知操作，请先查询或取消。'
     if (this.getRetranslationStatus(sessionId, unitId)?.pending) return '正在发送重译意图。'
     return undefined
   }
   async retranslate(sessionId: string, unitId: string, executionOwner?: string): Promise<void> {
     if (this.disposed || !executionOwner || !this.store.isSessionOpen(executionOwner, sessionId) || this.retranslateBlockedReason(sessionId, unitId)) return
+    await this.recoverInterrupted(sessionId)
+    if (this.disposed || this.retranslateBlockedReason(sessionId, unitId, true)) return
     const session = this.store.getSession(sessionId)!, unit = this.store.getTranslationHistory(sessionId)!.units.find(unit => unit.id === unitId)!
     const key = JSON.stringify([sessionId, unitId]), old = this.unitRequests.get(key), operationId = old?.outcome === 'unknown' ? old.operationId : `unit-intent:${crypto.randomUUID()}`
     const locale = this.options.uiLocale?.()?.trim()
+    const fileName = this.materials.getFileUnits(sessionId).find(file => file.unitId === unitId)?.name
     const request: NormalTranslationUnitRequest = { operationId, target: { kind: 'unit', mainSessionId: executionOwner, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion },
-      ...(locale ? { uiLocale: locale.slice(0, 64) } : {}) }
+      ...(locale ? { uiLocale: locale.slice(0, 64) } : {}), ...(fileName ? { fileName } : {}) }
     const release = this.retain(executionOwner)
     old?.release?.()
     const item = { operationId, pending: true, outcome: 'pending' as 'pending' | 'submitted' | 'failed' | 'unknown', message: '正在发送重译意图…', release: release as (() => void) | undefined }; this.unitRequests.set(key, item); this.emit()
@@ -671,8 +763,8 @@ export class NormalTranslationClient {
     } catch (error) { item.outcome = handoff ? 'unknown' : 'failed'; item.message = `${handoff ? '发送状态未知' : '发送失败'}：${error instanceof Error ? error.message : '请核对主会话。'} 未自动重发。` }
     finally { item.pending = false; if (!handoff) { item.release?.(); item.release = undefined }; this.emit() }
   }
-  private async request(sessionId: string, unitId: string, method: 'status' | 'cancel'): Promise<void> {
-    const status = this.getUnitStatus(sessionId, unitId), session = this.store.getSession(sessionId)
+  private async request(sessionId: string, unitId: string, method: 'status' | 'cancel', operationId?: string): Promise<void> {
+    const status = operationId ? { operationId } : this.getUnitStatus(sessionId, unitId), session = this.store.getSession(sessionId)
     if (this.disposed || !status || !session) return
     const ownerId = this.store.getOperationMainSessionId(session.id, status.operationId)
     if (!ownerId) return
@@ -698,11 +790,13 @@ export class NormalTranslationClient {
           if (this.disposed) return
           action = 'status'
           const error = raw?.error ?? raw?.value?.error
+          if (raw?.ok === true && raw.value?.ok === false && error?.code === 'not_found' && item.restored) { this.retireInterrupted(item); return }
           if (raw?.ok !== true || raw.value?.ok !== true) throw new Error(error ? `${error.code ?? 'remote_error'}${error.stage ? ` (${error.stage})` : ''}: ${error.message ?? '未取得普通 v2 状态。'}` : '未取得普通 v2 状态；未自动重发。')
           const job: NormalTranslationV2Job = parseNormalTranslationV2Job(raw.value.value)
           const operation = job.operation
           if (operation.mainSessionId !== ownerId || operation.operationId !== status.operationId || operation.translationSessionId !== sessionId || operation.unitId !== unitId ||
             operation.sourceVersion !== item.operation.sourceVersion) throw new Error('普通 v2 状态身份不一致；未自动重发。')
+          item.restored = false
           for (const event of job.events) {
             const result = this.updateV2(ownerId, { mainSessionId: ownerId, translationSessionId: sessionId, unitId, operationId: status.operationId,
               sourceVersion: item.operation.sourceVersion, event })
@@ -720,12 +814,14 @@ export class NormalTranslationClient {
       while (more && !this.disposed) {
         let timer: ReturnType<typeof setTimeout> | undefined
         const after = item.sequence, raw = await Promise.race([port[action]({ mainSessionId: ownerId, translationSessionId: sessionId, operationId: status.operationId, afterSequence: after }),
-          new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('普通执行状态查询超时，请查询原操作；未自动重发。')), 15000) })]).finally(() => clearTimeout(timer)) as { ok?: boolean; value?: { ok?: boolean; value?: unknown; error?: { message?: string } } }
+          new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('普通执行状态查询超时，请查询原操作；未自动重发。')), 15000) })]).finally(() => clearTimeout(timer)) as { ok?: boolean; value?: { ok?: boolean; value?: unknown; error?: { code?: string; message?: string } } }
         if (this.disposed) return
         action = 'status'
+        if (raw?.ok === true && raw.value?.ok === false && raw.value.error?.code === 'not_found' && item.restored) { this.retireInterrupted(item); return }
         if (raw?.ok !== true || raw.value?.ok !== true) throw new Error(raw?.value?.error?.message ?? '未取得普通执行状态，未自动重发。')
         const job = parseNormalTranslationJob(raw.value.value)
         if (!job.operation || job.operation.mainSessionId !== ownerId || job.operation.operationId !== status.operationId || job.operation.translationSessionId !== sessionId || job.operation.unitId !== unitId) throw new Error(job.error?.message ?? '普通执行状态身份不一致或已不可查询。')
+        item.restored = false
         for (const update of job.updates) { const result = this.update(ownerId, update); if (!result.ok) throw new Error(result.error.message) }
         if (job.lastSequence > item.sequence && !job.more) throw new Error('执行状态仍缺少回执，请再次查询原操作。')
         more = job.more
@@ -766,6 +862,6 @@ export class NormalTranslationClient {
     this.disposed = true; this.stopBridge?.(); this.stopStore()
     for (const item of this.operations.values()) item.release?.()
     for (const item of this.unitRequests.values()) item.release?.()
-    this.operations.clear(); this.unitSnapshots.clear(); this.unitRequests.clear(); this.listeners.clear()
+    this.operations.clear(); this.unitSnapshots.clear(); this.preparedHistory.clear(); this.unitRequests.clear(); this.listeners.clear()
   }
 }

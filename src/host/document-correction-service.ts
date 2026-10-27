@@ -1,3 +1,5 @@
+import { historyTargetMatches } from './history-resources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import { parseTranslationBatchCorrection, parseDocumentCorrectionReceipt, type TranslationBatchCorrection, type DocumentCorrectionReceipt } from '../shared/document-correction.js'
 import { parseDocumentUnitCapture, parseDocumentCorrectionQuery, type DocumentUnitCapture } from '../shared/document-unit-capture.js'
 import type { NormalTranslationUnitTarget } from '../shared/normal-translation.js'
@@ -15,7 +17,7 @@ function rejected(code: string, message: string, stage: string): Error { return 
 export interface CapturedDocumentSource { readonly capture: DocumentUnitCapture; readonly readSource: (range: TranslationSourceRange) => Promise<string>; readonly text: string }
 /** Reads and corrects the immutable source; the sole Client bridge owns the version CAS. */
 export class DocumentCorrectionService {
-  private readonly operations = new Map<string, { signature: string; result: Promise<AnalysisResult<DocumentCorrectionReceipt>> }>()
+  private readonly operations = new Map<string, { signature: string; settled: boolean; result: Promise<AnalysisResult<DocumentCorrectionReceipt>> }>()
   constructor(readonly ctx: TopicHostContext) {}
   private get topics(): TopicToolsService { return this.ctx.get?.('translationTopics') as TopicToolsService }
   private get sources(): TranslationSourcesService { return this.ctx.get?.('translationSources') as TranslationSourcesService }
@@ -61,8 +63,11 @@ export class DocumentCorrectionService {
     try { request = parseTranslationBatchCorrection(args) } catch { return Promise.resolve(failure('invalid_input', '文档纠错参数无效。')) }
     const key = JSON.stringify([request.scope.mainSessionId, request.operationId]), signature = JSON.stringify(request), old = this.operations.get(key)
     if (old) return old.signature === signature ? old.result : Promise.resolve(failure('idempotency_conflict', '同一纠错标识已绑定另一版本或补丁。'))
-    const result = this.correctOnce(request, exec); this.operations.set(key, { signature, result }); return result
+    const entry = { signature, settled: false, result: undefined as unknown as Promise<AnalysisResult<DocumentCorrectionReceipt>> }
+    entry.result = this.correctOnce(request, exec).finally(() => { entry.settled = true }); this.operations.set(key, entry); return entry.result
   }
+  historyUnitBusy(scope: HistoryScope, unitId: string): boolean { return [...this.operations.values()].some(entry => { const request = JSON.parse(entry.signature); return !entry.settled && historyTargetMatches(scope, unitId, { ...request.scope, unitId: request.unitId }) }) }
+  forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void { for (const [id, entry] of this.operations) { const request = JSON.parse(entry.signature); if (historyTargetMatches(scope, unitId, { ...request.scope, unitId: request.unitId, sourceVersion: request.expectedSourceVersion }, sourceVersion)) this.operations.delete(id) } }
   async status(args: unknown, exec: ToolExecution): Promise<AnalysisResult<DocumentCorrectionReceipt | null>> {
     try {
       const request = parseDocumentCorrectionQuery(args)

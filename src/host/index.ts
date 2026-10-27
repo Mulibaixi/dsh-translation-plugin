@@ -1,5 +1,12 @@
 import { LocalDataService } from './local-data.js'
 import { ReferenceFilesService } from './reference-files.js'
+import { OtherMemoryService } from './other-memory.js'
+import { OtherMemoryFilesService } from './other-memory-files.js'
+import { TopicArchiveService } from './topic-archive.js'
+import { TopicTermsService } from './topic-terms.js'
+import { EmbeddingService } from './embedding.js'
+import { MemorySearchService } from './memory-search.js'
+import { HistoryService } from './history.js'
 import { createTranslationFramework } from './framework.js'
 import { installQuickTranslation, type QuickHostContext } from './quick-translation.js'
 import { installTopicTools, type TopicHostContext } from './topic-tools.js'
@@ -16,10 +23,25 @@ import { installDocumentExecution } from './document-execution-service.js'
 import { installDocumentCorrection } from './document-correction-service.js'
 import { installDocumentReview } from './document-review-service.js'
 import { installFileJobs } from './file-jobs.js'
+import { TermHandleRegistry } from './term-handles.js'
 import type { AnalysisNotification, AnalysisRun } from '../shared/translation-preparation.js'
 import type { TaskPhaseEvent, TranslationExchangeService } from 'dsh-composer-extension/contracts'
 
 export { createTranslationFramework } from './framework.js'
+export { OtherMemoryService } from './other-memory.js'
+export { OtherMemoryFilesService } from './other-memory-files.js'
+export { TopicArchiveService } from './topic-archive.js'
+export { TopicTermsService } from './topic-terms.js'
+export { EmbeddingService } from './embedding.js'
+export { MemorySearchService } from './memory-search.js'
+export { HistoryService } from './history.js'
+export type * from '../shared/history-bundle.js'
+export type * from '../shared/history-remote.js'
+export type * from '../shared/embedding.js'
+export type * from '../shared/other-memory.js'
+export type * from '../shared/other-memory-files.js'
+export type * from '../shared/topic-archive-remote.js'
+export type * from '../shared/topic-terms-remote.js'
 export { TextTranslationRuntime } from './text-runtime.js'
 export { QuickTranslationService, installQuickTranslation } from './quick-translation.js'
 export { DshTextExecutionAdapter } from './dsh-text-adapter.js'
@@ -47,7 +69,7 @@ export type * from '../shared/translation-source-storage.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationLocalData', 'translationFileJobs'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationOtherMemory', 'translationOtherMemoryFiles', 'translationArchive', 'translationTerms', 'translationEmbedding', 'translationMemorySearch', 'translationHistory', 'translationLocalData', 'translationFileJobs'] as const
 
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
@@ -109,10 +131,32 @@ export function installTerminologyAnalysis(ctx: TopicHostContext): TerminologyAn
 
 export function apply(ctx: QuickHostContext): void {
   ctx.provide('translationLocalData', new LocalDataService(ctx as TopicHostContext))
+  const embedding = new EmbeddingService(ctx as TopicHostContext)
+  ctx.provide('translationEmbedding', embedding)
+  ctx.effect?.(() => () => { void embedding.dispose() }, 'embedding lifetime')
+  // Model-facing short handles for term query results; shared by the query projection and the direct call.
+  ctx.provide('translationTermHandles', new TermHandleRegistry())
   installTopicTools(ctx as TopicHostContext, undefined, false)
   const references = new ReferenceFilesService(ctx as TopicHostContext)
   ctx.provide('translationReferences', references)
   ctx.effect?.(() => () => references.dispose(), 'reference files lifetime')
+  const otherMemory = new OtherMemoryService(ctx as TopicHostContext)
+  ctx.provide('translationOtherMemory', otherMemory)
+  const otherMemoryFiles = new OtherMemoryFilesService(ctx as TopicHostContext, otherMemory)
+  ctx.provide('translationOtherMemoryFiles', otherMemoryFiles)
+  ctx.effect?.(() => async () => { await otherMemoryFiles.dispose(); await otherMemory.dispose() }, 'other memory lifetime')
+  const archive = new TopicArchiveService(ctx as TopicHostContext, otherMemory)
+  ctx.provide('translationArchive', archive)
+  ctx.effect?.(() => () => archive.dispose(), 'topic archive lifetime')
+  const memorySearch = new MemorySearchService(ctx as TopicHostContext, otherMemory, archive, otherMemoryFiles, embedding)
+  ctx.provide('translationMemorySearch', memorySearch)
+  ctx.effect?.(() => () => memorySearch.dispose(), 'memory search lifetime')
+  const history = new HistoryService(ctx as TopicHostContext, otherMemory)
+  ctx.provide('translationHistory', history)
+  ctx.effect?.(() => () => history.dispose(), 'history lifetime')
+  const terms = new TopicTermsService(ctx as TopicHostContext, otherMemory)
+  ctx.provide('translationTerms', terms)
+  ctx.effect?.(() => () => terms.dispose(), 'topic terms lifetime')
   installObjectAssets(ctx, {}, false)
   installViewFiles(ctx, {}, false)
   installTranslationMaterials(ctx as TranslationMaterialHostContext, undefined, false)

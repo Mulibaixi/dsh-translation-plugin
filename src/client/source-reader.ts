@@ -122,12 +122,12 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     this.stopSessions = options.sessions.subscribe?.(() => {
       for (const [key, page] of this.pages) {
         const unit = options.sessions.getTranslationHistory(page.result.request.sessionId)?.units.find(unit => unit.id === page.result.request.unitId)
-        if (unit && !isDocumentUnit(unit) && page.stamp.deletionEvents !== this.deletionEvents(page.result.request)) this.pages.delete(key)
+        if (unit && page.stamp.deletionEvents !== this.deletionEvents(page.result.request)) this.pages.delete(key)
       }
     })
   }
   private deletionEvents(request: EvidenceReadRequest): string {
-    return JSON.stringify(this.options.sessions.getTranslationHistory(request.sessionId)?.events.filter(event => event.unitId === request.unitId && event.type === 'revision.deleted').map(event => event.id) ?? [])
+    return JSON.stringify(this.options.sessions.getTranslationHistory(request.sessionId)?.events.filter(event => event.unitId === request.unitId && ['revision.deleted', 'manifest.deleted', 'chunks.deleted', 'source.deleted', 'document.deleted', 'unit.deleted'].includes(event.type)).map(event => event.id) ?? [])
   }
   capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult {
     if (ref.kind === 'reference') return unavailable(null, 'unloaded', 'reference_registry_required')
@@ -154,11 +154,11 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     if (sessions.getStatus(session.id) === 'conflict') return unavailable(request, 'unloaded', 'history_conflict')
     if (!unit || !isDocumentUnit(unit)) return unavailable(request, 'missing', 'document_missing')
     const source = !isFileJobUnit(unit) && unit.sourceVersions.find(source => source.version === sourceVersion)
-    if (!source) return unavailable(request, 'missing', 'source_version_missing')
+    if (!source || source.deletion) return unavailable(request, 'missing', 'source_version_missing')
     const selected = currentDocumentFinalRevision(unit)
     const manifest = target.manifestRevisionId === undefined ? (selected?.sourceVersion === sourceVersion ? selected : undefined) ?? (sourceVersion === unit.sourceVersion ? currentDocumentCandidateRevision(unit) : [...unit.revisions].reverse().find(revision => revision.sourceVersion === sourceVersion)) ?? null
       : target.manifestRevisionId === null ? null : unit.revisions.find(revision => revision.id === target.manifestRevisionId) ?? null
-    if (target.manifestRevisionId && !manifest || manifest && manifest.sourceVersion !== sourceVersion) return unavailable(request, 'missing', 'manifest_missing')
+    if (target.manifestRevisionId && !manifest || manifest && (manifest.deletion || manifest.sourceVersion !== sourceVersion)) return unavailable(request, 'missing', 'manifest_missing')
     const task = [...unit.tasks].reverse().find(task => task.sourceVersion === sourceVersion)
     const plan = manifest ? unit.plans.find(plan => sameVersionReference(plan, manifest.planRef)) ?? null
       : task ? unit.plans.find(plan => sameVersionReference(plan, task.planRef)) ?? null : null
@@ -182,7 +182,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
       if (sessions.getStatus(target.sessionId) === 'conflict') return unavailable(request, 'unloaded', 'history_conflict')
       const current = sessions.getTranslationHistory(target.sessionId)?.units.find(unit => unit.id === target.unitId)
       if (!current || !isDocumentUnit(current)) return unavailable(request, 'missing', 'document_missing')
-      const retainedSource = current.sourceVersions.find(version => version.version === sourceVersion)
+    const retainedSource = current.sourceVersions.find(version => version.version === sourceVersion && !version.deletion)
       if (!retainedSource) return unavailable(request, 'missing', 'source_version_missing')
       if (source.version !== retainedSource.version || source.body.kind !== retainedSource.body.kind ||
         (source.body.kind === 'inline' && retainedSource.body.kind === 'inline' ? source.body.text !== retainedSource.body.text
@@ -200,6 +200,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     const snapshot: Snapshot = { unit, source, scope, final: manifest, chunks: blocks.flatMap(block => block.revision ? [block.revision] : []),
       totalCodePoints: documentSourceLength(source), checkFixed: check }
     const read = async (range: TranslationSourceRange, chunk?: ChunkRevision): Promise<EvidenceReadResult> => {
+      if (chunk?.deletion) return unavailable(request, 'missing', 'chunk_deleted')
       range = { ...range }
       const fixed = { ...request, range: { ...range }, ...(chunk ? { side: 'final' as const, revisionId: manifest?.id ?? null } : {}) }
       const changed = check()

@@ -1,6 +1,7 @@
 import { parseTranslationSourceScope, type TranslationSourceScope } from './translation-sources.js'
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
 import type { VersionReference } from './translation-batch.js'
+import { parseVersionDeletion, type VersionDeletion } from './version-deletion.js'
 
 export interface DocumentReviewIssue { readonly code: string; readonly range: TranslationSourceRange; readonly message: string }
 export interface DocumentReviewEntryReference { readonly chunkId: string; readonly revisionId: string }
@@ -24,6 +25,7 @@ export interface DocumentSemanticReview {
 }
 /** One immutable check of one fixed manifest; semantic completion appends another audit. */
 export interface DocumentReviewAudit {
+  readonly deletion?: VersionDeletion
   readonly id: string
   readonly reviewId: string
   readonly operationId: string
@@ -100,34 +102,36 @@ function entry(value: unknown): DocumentReviewEntryReference { exact(value, ['ch
 export function parseDocumentReviewIssues(value: unknown, maximum = Number.MAX_SAFE_INTEGER): readonly DocumentReviewIssue[] {
   list(value, 1024); return value.map(raw => { exact(raw, ['code', 'range', 'message']); text(raw.code, 128); text(raw.message, 2048); return { code: raw.code, range: range(raw.range, maximum), message: raw.message } })
 }
-export function parseDocumentMechanicalReview(value: unknown): DocumentMechanicalReview {
+export function parseDocumentMechanicalReview(value: unknown, deleted = false): DocumentMechanicalReview {
   exact(value, ['status', 'sourceSha256', 'entries', 'issues', 'criticalIssues', 'suspicions']); hash(value.sourceSha256); list(value.entries)
   if (!['passed', 'failed'].includes(String(value.status))) throw new TypeError('Invalid mechanical review status')
   const entries = value.entries.map(raw => { exact(raw, ['chunkId', 'revisionId', 'outputRange', 'contentSha256']); hash(raw.contentSha256); return { ...entry({ chunkId: raw.chunkId, revisionId: raw.revisionId }), outputRange: range(raw.outputRange), contentSha256: raw.contentSha256 } })
   const issues = parseDocumentReviewIssues(value.issues), criticalIssues = parseDocumentReviewIssues(value.criticalIssues), suspicions = parseDocumentReviewIssues(value.suspicions)
-  if (value.status === 'passed' && issues.length || value.status === 'failed' && !issues.length) throw new TypeError('Mechanical status disagrees with findings')
+  if (value.status === 'passed' && issues.length || !deleted && value.status === 'failed' && !issues.length) throw new TypeError('Mechanical status disagrees with findings')
   return { status: value.status as DocumentMechanicalReview['status'], sourceSha256: value.sourceSha256, entries, issues, criticalIssues, suspicions }
 }
-export function parseDocumentSemanticReview(value: unknown): DocumentSemanticReview {
+export function parseDocumentSemanticReview(value: unknown, deleted = false): DocumentSemanticReview {
   exact(value, ['status', 'reviewedEntries', 'preparationRef', 'resolvedIssues', 'issues', 'summary']); list(value.reviewedEntries); text(value.summary, 4000, true)
   if (!['pending', 'passed', 'review_required'].includes(String(value.status))) throw new TypeError('Invalid semantic review status')
   const reviewedEntries = value.reviewedEntries.map(entry), preparationRef = value.preparationRef === null ? null : ref(value.preparationRef)
   const issues = parseDocumentReviewIssues(value.issues), resolvedIssues = parseDocumentReviewIssues(value.resolvedIssues)
-  if (value.status === 'pending' ? reviewedEntries.length || preparationRef !== null || resolvedIssues.length || issues.length || value.summary : preparationRef === null || !value.summary.trim()) throw new TypeError('Semantic review lacks its actual declaration')
+  if (value.status === 'pending' ? reviewedEntries.length || preparationRef !== null || resolvedIssues.length || issues.length || value.summary : preparationRef === null || !deleted && !value.summary.trim()) throw new TypeError('Semantic review lacks its actual declaration')
   if (value.status === 'passed' && issues.length) throw new TypeError('Passed semantic review has unresolved issues')
   return { status: value.status as DocumentSemanticReview['status'], reviewedEntries, preparationRef, resolvedIssues, issues, summary: value.summary }
 }
 export function parseDocumentReviewAudit(value: unknown): DocumentReviewAudit {
-  exact(value, ['id', 'reviewId', 'operationId', 'version', 'parentAuditId', 'manifestRevisionId', 'reviewedRevisionId', 'sourceVersion', 'planRef', 'preparationRef', 'checkedAt', 'mechanical', 'semantic'])
+  exact(value, ['id', 'reviewId', 'operationId', 'version', 'parentAuditId', 'manifestRevisionId', 'reviewedRevisionId', 'sourceVersion', 'planRef', 'preparationRef', 'checkedAt', 'mechanical', 'semantic'], ['deletion'])
+  const deletion = value.deletion === undefined ? undefined : parseVersionDeletion(value.deletion)
   for (const name of ['id', 'reviewId', 'operationId', 'manifestRevisionId'] as const) text(value[name])
   for (const name of ['parentAuditId', 'reviewedRevisionId'] as const) if (value[name] !== null) text(value[name])
   integer(value.version); integer(value.sourceVersion); text(value.checkedAt, 40)
   if (!Number.isFinite(Date.parse(value.checkedAt))) throw new TypeError('Invalid document review time')
-  const semantic = parseDocumentSemanticReview(value.semantic)
+  const semantic = parseDocumentSemanticReview(value.semantic, !!deletion), mechanical = parseDocumentMechanicalReview(value.mechanical, !!deletion)
+  if (deletion && (mechanical.issues.length || mechanical.criticalIssues.length || mechanical.suspicions.length || semantic.issues.length || semantic.resolvedIssues.length || semantic.summary)) throw new TypeError('Deleted audit retains body')
   if (semantic.status === 'pending' ? value.parentAuditId !== null || value.reviewedRevisionId !== null : value.parentAuditId === null || value.reviewedRevisionId === null) throw new TypeError('Document audit stage changed')
   return { id: value.id as string, reviewId: value.reviewId as string, operationId: value.operationId as string, version: value.version, parentAuditId: value.parentAuditId as string | null,
     manifestRevisionId: value.manifestRevisionId as string, reviewedRevisionId: value.reviewedRevisionId as string | null, sourceVersion: value.sourceVersion, planRef: ref(value.planRef), preparationRef: ref(value.preparationRef),
-    checkedAt: value.checkedAt, mechanical: parseDocumentMechanicalReview(value.mechanical), semantic }
+    checkedAt: value.checkedAt, mechanical, semantic, ...(deletion ? { deletion } : {}) }
 }
 export function parseDocumentManualRevisionBase(value: unknown): DocumentManualRevisionBase {
   exact(value, ['manifestRevisionId', 'chunkId', 'revisionId']); text(value.manifestRevisionId)
