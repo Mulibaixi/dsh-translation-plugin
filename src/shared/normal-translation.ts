@@ -1,4 +1,5 @@
 import { TRANSLATION_LOG_REMOTE } from './translation-log.js'
+import { parseOriginalFilePath } from './translation-sources.js'
 import { parseReferenceContextRef, type ReferenceContextRef } from './reference-memory.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type NormalTranslationTerm, type TranslationCallMetadata } from './translation-call.js'
@@ -365,10 +366,11 @@ export interface NormalTranslationExport {
   readonly segments: readonly NormalTranslationExportSegment[]
   readonly missing: readonly DirectTranslationRange[]
   readonly overlapping: readonly DirectTranslationRange[]
+  readonly originalFilePath?: string
 }
 export function parseDirectTranslationExport(value: unknown): NormalTranslationExport {
   object(value)
-  exact(value, ['mainSessionId', 'translationSessionId', 'topicId', 'materialId', 'sourceVersion', 'totalCodePoints', 'complete', 'segments', 'missing', 'overlapping'])
+  exact(value, ['mainSessionId', 'translationSessionId', 'topicId', 'materialId', 'sourceVersion', 'totalCodePoints', 'complete', 'segments', 'missing', 'overlapping', ...(Object.hasOwn(value, 'originalFilePath') ? ['originalFilePath'] : [])])
   const mainSessionId = value.mainSessionId, translationSessionId = value.translationSessionId
   const topicId = value.topicId, materialId = value.materialId, sourceVersion = value.sourceVersion
   const totalCodePoints = value.totalCodePoints, complete = value.complete
@@ -387,7 +389,8 @@ export function parseDirectTranslationExport(value: unknown): NormalTranslationE
   })
   return { mainSessionId, translationSessionId, topicId, materialId, sourceVersion: sourceVersion as number,
     totalCodePoints: totalCodePoints as number, complete, segments, missing: value.missing.map(range => parseDirectRange(range)),
-    overlapping: value.overlapping.map(range => parseDirectRange(range)) }
+    overlapping: value.overlapping.map(range => parseDirectRange(range)),
+    ...(value.originalFilePath === undefined ? {} : { originalFilePath: parseOriginalFilePath(value.originalFilePath) }) }
 }
 export function parseNormalTranslationResultRead(value: unknown): NormalTranslationResultRead {
   object(value); exact(value, ['operationId', 'range']); text(value.operationId)

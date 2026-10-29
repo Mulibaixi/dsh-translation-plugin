@@ -834,12 +834,12 @@ export class SessionStore {
     return id
   }
 
-  private addSession(ownerId: string, parent?: LocalSession, topic?: TopicSeat, reserved?: { readonly id: string; readonly sequence: number }, activate = true): LocalSession {
+  private addSession(ownerId: string, parent?: LocalSession, topic?: TopicSeat, reserved?: { readonly id: string; readonly sequence: number }, activate = true, initialMode?: LocalSession['mode']): LocalSession {
     const id = reserved?.id ?? this.freshId()
     const sequence = reserved?.sequence ?? topic?.identity.nextSequence ?? 0
     if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
     const settings = parent ? { ...this.settings, defaultMode: parent.mode, targetLanguage: parent.targetLanguage, defaultInstruction: parent.instruction, maxInputChars: parent.maxInputChars } : this.settings
-    const initial = newSession(settings, ownerId, id, topic?.name ?? '新翻译会话', parent?.id ?? null, topic?.identity.id, topic?.identity.sequenceNamespaceId, sequence)
+    const initial = newSession(initialMode ? { ...settings, defaultMode: initialMode } : settings, ownerId, id, topic?.name ?? '新翻译会话', parent?.id ?? null, topic?.identity.id, topic?.identity.sequenceNamespaceId, sequence)
     const model = parent ? parent.model : this.lastModels.has(this.namespaceId) ? this.lastModels.get(this.namespaceId)! : this.readModelPreference(ownerModelKey(this.namespaceId)) ?? null
     const session = { ...initial, model: model ? { ...model } : null }
     if (topic && !reserved) topic.identity = { ...topic.identity, nextSequence: sequence + 1, allocations: [...topic.identity.allocations, { sessionId: id, sequence }] }
@@ -879,7 +879,7 @@ export class SessionStore {
   }
 
   /** 先可靠发号；正文保存失败可留下空号。 */
-  async createSessionAsync(ownerId: string, parentId?: string, activate = true): Promise<LocalSession | undefined> {
+  async createSessionAsync(ownerId: string, parentId?: string, activate = true, initialMode?: LocalSession['mode']): Promise<LocalSession | undefined> {
     if (!this.historyReady) return undefined
     if (!ownerId.trim()) return undefined
     if (!this.readSettings()) { this.emit(); return undefined }
@@ -887,10 +887,10 @@ export class SessionStore {
     if (parentId && !await this.ensureSessionHistory(parentId)) return undefined
     const parent = parentId ? this.getSession(parentId) : undefined
     if (parentId && (!parent)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
-    return this.withStructureLock(undefined, () => this.createSessionLocked(ownerId, parentId, undefined, activate))
+    return this.withStructureLock(undefined, () => this.createSessionLocked(ownerId, parentId, undefined, activate, initialMode))
   }
 
-  private async createSessionLocked(ownerId: string, parentId?: string, topicId?: string, activate = true): Promise<LocalSession | undefined> {
+  private async createSessionLocked(ownerId: string, parentId?: string, topicId?: string, activate = true, initialMode?: LocalSession['mode']): Promise<LocalSession | undefined> {
     if (!this.historyReady) return undefined
     if (!this.readSettings()) return undefined
     this.loadHistory()
@@ -918,20 +918,20 @@ export class SessionStore {
     if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
     this.writeIdentity(topic, { sessionId: id, sequence })
     this.writeTopicName(topic)
-    const session = this.addSession(ownerId, currentParent, topic, { id, sequence }, activate)
+    const session = this.addSession(ownerId, currentParent, topic, { id, sequence }, activate, initialMode)
     this.notice = undefined
     await this.persistLocked(id)
     this.emit(); return session
   }
 
-  async createSessionForTopicAsync(ownerId: string, topicId: string, activate = true): Promise<LocalSession | undefined> {
+  async createSessionForTopicAsync(ownerId: string, topicId: string, activate = true, initialMode?: LocalSession['mode']): Promise<LocalSession | undefined> {
     this.loadHistory()
     const topic = this.topics.get(topicId)
     if (!ownerId.trim() || !topic) return undefined
     const parent = this.getAvailableSessions(ownerId).find(session => session.topicId === topicId)
-    if (parent) return this.createSessionAsync(ownerId, parent.id, activate)
+    if (parent) return this.createSessionAsync(ownerId, parent.id, activate, initialMode)
     if (!this.readSettings()) return undefined
-    return this.withStructureLock(undefined, () => this.createSessionLocked(ownerId, undefined, topicId, activate))
+    return this.withStructureLock(undefined, () => this.createSessionLocked(ownerId, undefined, topicId, activate, initialMode))
   }
   openSession(ownerId: string, id: string): void {
     const session = this.getSession(id)
@@ -1023,13 +1023,9 @@ export class SessionStore {
       if (parentId && (!parent || this.isDeleted(parentId))) return this.managementFailure('out_of_scope', '起点会话不属于当前主会话或已删除。')
       if (parent && !this.managedSessionCurrent(parent)) return this.managementFailure('conflict', '起点会话在其他窗口变化，请先核对当前记录。')
       if (topicId && (!this.topics.has(topicId) || this.deletedTopics.has(topicId) || this.topicIntents.has(topicId))) return this.managementFailure('out_of_scope', '主题不存在或已删除。')
-      const session = await this.createSessionLocked(ownerId, parentId, topicId, false)
+      const session = await this.createSessionLocked(ownerId, parentId, topicId, false, initialMode)
       if (!session) return this.managementFailure('operation_failed', this.notice ?? '新会话未创建，请核对当前记录。')
       const seat = this.seats.get(session.id)!
-      if (initialMode && seat.session.mode !== initialMode) {
-        seat.session = {...seat.session, mode:initialMode}; seat.status = 'memory'
-        await this.persistLocked(session.id)
-      }
       if (seat.status !== 'saved') return this.managementFailure('storage_error', '新会话未保存，内存可能已创建，请查询当前会话列表；未自动重试。')
       return { ok: true, sessions: [seat.session], persistence: 'saved' }
     })

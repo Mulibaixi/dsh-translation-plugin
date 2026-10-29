@@ -1,6 +1,7 @@
-/** Browser-safe identities for Host-owned opening artifacts. Paths stay on Host. */
+import { parseOriginalFilePath } from './translation-sources.js'
+/** Browser-safe identities for Host-owned opening artifacts. Output paths stay on Host. */
 export type ViewFileKind = 'source' | 'result'
-export type ViewFileFormat = 'html' | 'txt'
+export type ViewFileFormat = 'html' | 'txt' | 'md'
 export const MAX_VIEW_FILE_BYTES = 16 * 1024 * 1024
 export interface ViewFileOpen {
   readonly namespaceId: string
@@ -16,6 +17,7 @@ export interface ViewFileOpen {
   readonly fileName?: string
   /** Omission preserves the existing escaped HTML page behavior. */
   readonly format?: ViewFileFormat
+  readonly originalFilePath?: string
 }
 export interface ViewFileClear {
   readonly namespaceId: string
@@ -37,12 +39,13 @@ function kind(value: unknown): asserts value is ViewFileKind { if (!VIEW_FILE_KI
 export function parseViewFileRequest(method: 'open' | 'clear', value: unknown): ViewFileOpen | ViewFileClear {
   record(value); text(value.namespaceId)
   if (method === 'open') {
-    exact(value, ['namespaceId', 'sessionId', 'unitId', 'kind', 'title', 'text', 'revisionId', 'fileName', 'format'])
+    exact(value, ['namespaceId', 'sessionId', 'unitId', 'kind', 'title', 'text', 'revisionId', 'fileName', 'format', 'originalFilePath'])
     text(value.sessionId); text(value.unitId); kind(value.kind); text(value.title, 300)
     if (value.revisionId !== undefined) text(value.revisionId)
     if (value.fileName !== undefined) text(value.fileName, 255)
-    if (value.format !== undefined && value.format !== 'txt' && value.format !== 'html') throw new TypeError('Invalid view format')
-    // TXT is encoded exactly as supplied; HTML is escaped by the Host. Neither path normalizes newlines or BOM.
+    if (value.originalFilePath !== undefined) parseOriginalFilePath(value.originalFilePath)
+    if (value.format !== undefined && value.format !== 'txt' && value.format !== 'md' && value.format !== 'html') throw new TypeError('Invalid view format')
+    // TXT is raw; Host resolves Markdown image locations and escapes HTML. No newline or BOM normalization.
     if (typeof value.text !== 'string' || value.text.length > MAX_VIEW_FILE_BYTES || new TextEncoder().encode(value.text).byteLength > MAX_VIEW_FILE_BYTES) throw new TypeError('Invalid view text')
   } else {
     exact(value, ['namespaceId', 'sessionIds'])

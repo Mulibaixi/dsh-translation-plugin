@@ -15,6 +15,7 @@ export interface TranslationSourceImport {
   readonly scope: TranslationSourceScope
   readonly receiptId: string
   readonly idempotencyKey: string
+  readonly originalFilePath?: string
 }
 export interface SourceIdentity {
   /** Opaque identity of this immutable source asset, not a native attachment or host path. */
@@ -29,6 +30,8 @@ export interface SourceIdentity {
   readonly encoding: 'utf-8' | 'binary'
   readonly bom: boolean
   readonly sha256: string
+  /** Original desktop location, used only as the base for local Markdown resources. Never a cached-file capability. */
+  readonly originalFilePath?: string
 }
 export interface TranslationSourceAsset extends SourceIdentity { readonly persistence: 'runtime_only' }
 export interface TranslationSourceAssetRead {
@@ -93,7 +96,7 @@ function fileName(value: unknown): asserts value is string {
     /[\\/<>:"|?*\u0000-\u001f\u007f]/u.test(value)) throw new TypeError('Invalid source file name')
 }
 export function parseSourceIdentity(value: unknown): SourceIdentity {
-  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256'])
+  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256'], ['originalFilePath'])
   sourceId(value.sourceId); fileName(value.name)
   integer(value.bytes, 1, MAX_TRANSLATION_SOURCE_BYTES)
   if (value.version !== 1 || value.encoding !== 'utf-8' && value.encoding !== 'binary' || typeof value.bom !== 'boolean' ||
@@ -102,7 +105,12 @@ export function parseSourceIdentity(value: unknown): SourceIdentity {
   // A binary source is only bytes: no decoded text, no BOM fact. A text source keeps its code point count.
   if (value.encoding === 'binary' ? value.bom !== false || value.totalCodePoints !== 0 : value.totalCodePoints < 1) throw new TypeError('Invalid source encoding facts')
   return { sourceId: value.sourceId, version: value.version, name: value.name, bytes: value.bytes, totalCodePoints: value.totalCodePoints,
-    encoding: value.encoding, bom: value.bom, sha256: value.sha256 }
+    encoding: value.encoding, bom: value.bom, sha256: value.sha256,
+    ...(value.originalFilePath === undefined ? {} : { originalFilePath: parseOriginalFilePath(value.originalFilePath) }) }
+}
+export function parseOriginalFilePath(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 4096 || /[\u0000-\u001f\u007f]/u.test(value) || !/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(value)) throw new TypeError('Invalid original file path')
+  return value
 }
 export function toSourceIdentity(value: TranslationSourceAsset): SourceIdentity {
   const { persistence, ...identity } = value
@@ -110,15 +118,16 @@ export function toSourceIdentity(value: TranslationSourceAsset): SourceIdentity 
   return parseSourceIdentity(identity)
 }
 export function parseTranslationSourceAsset(value: unknown): TranslationSourceAsset {
-  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256', 'persistence'])
+  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256', 'persistence'], ['originalFilePath'])
   if (value.persistence !== 'runtime_only') throw new TypeError('Invalid runtime source persistence')
   return { ...toSourceIdentity(value as unknown as TranslationSourceAsset), persistence: 'runtime_only' }
 }
 export function parseTranslationSourceRequest(method: 'importReceipt' | 'readRange', value: unknown): TranslationSourceImport | TranslationSourceAssetRead {
   if (method === 'importReceipt') {
-    exact(value, ['scope', 'receiptId', 'idempotencyKey']); const scope = parseTranslationSourceScope(value.scope)
+    exact(value, ['scope', 'receiptId', 'idempotencyKey'], ['originalFilePath']); const scope = parseTranslationSourceScope(value.scope)
     text(value.receiptId, 256); text(value.idempotencyKey, 256)
-    return { scope, receiptId: value.receiptId, idempotencyKey: value.idempotencyKey }
+    return { scope, receiptId: value.receiptId, idempotencyKey: value.idempotencyKey,
+      ...(value.originalFilePath === undefined ? {} : { originalFilePath: parseOriginalFilePath(value.originalFilePath) }) }
   }
   exact(value, ['scope', 'sourceId', 'version', 'range']); const scope = parseTranslationSourceScope(value.scope)
   sourceId(value.sourceId); integer(value.version, 1); exact(value.range, ['start', 'end'])

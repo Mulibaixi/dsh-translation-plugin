@@ -39,9 +39,11 @@ export const styles = `
 .dsh-tp-chevron { color: var(--dsw-alias-label-caption, #888); flex: none; transition: transform .12s; }
 .dsh-tp-chevron-open { transform: rotate(180deg); }
 .dsh-tp-popup { z-index: 1100; min-width: 180px; max-width: min(320px, calc(100vw - 32px)); max-height: min(420px, calc(100vh - 96px)); overflow-y: auto; }
-.dsh-tp-popup.dsh-tp-topic-popup { overflow: visible; }
+.dsh-tp-popup.dsh-tp-context-popup { overflow: visible; }
 /* 4px 菜单内边距，加上 2px 接缝偏移。 */
-.dsh-tp-topic-popup [role=menu] { top: -4px; bottom: auto; left: calc(100% + 6px); width: ${TOPIC_SUBMENU_WIDTH}px; }
+.dsh-tp-context-popup [role=menu] { top: -4px; bottom: auto; left: calc(100% + 6px); width: ${TOPIC_SUBMENU_WIDTH}px; }
+.dsh-tp-submenu-label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dsh-tp-submenu-label [data-submenu-arrow] { display: flex; align-items: center; flex: none; padding: 2px 0 2px 8px; }
 .dsh-tp-popup .dsh-tp-menu-content { padding: 4px; }
 @container (max-width: 520px) { .dsh-tp-session-sidebar { flex-basis: 120px; } .dsh-tp-workspace-header { padding: 8px 6px; gap: 2px; } .dsh-tp-header-options { gap: 2px; } }
 .dsh-tp-transcript { flex: 1 1 0; min-height: 0; overflow-y: scroll; overflow-x: hidden; scrollbar-gutter: stable; padding: 12px 16px; overscroll-behavior: contain; }

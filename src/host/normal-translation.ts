@@ -35,7 +35,8 @@ import type { NormalTranslationResolution } from '../shared/normal-translation-v
 import type { FileJobConflict, FileJobMechanicalIssue, FileJobProposal, FileJobTerm, FileJobWorker } from '../shared/file-jobs.js'
 import { FileWorkerRuntime } from './file-worker-runtime.js'
 import { artifactExtension, parseArtifactOpen, parseArtifactSave, type TranslationArtifactCheck, type TranslationArtifactSaved } from '../shared/translation-artifact.js'
-import { TRANSLATION_SELF_REVIEW, DIRECT_REVISION_GUIDANCE, FILE_MEMORY_REVIEW_GUIDANCE } from '../shared/translation-review.js'
+import { TRANSLATION_SELF_REVIEW, DIRECT_REVISION_GUIDANCE, FILE_MEMORY_REVIEW_GUIDANCE, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
+import { resolveMarkdownImages } from './markdown-files.js'
 import { loadArtifactStorage, type ArtifactStorage } from './translation-delivery.js'
 import { assetPriority } from '../memory/asset-priority.js'
 import type { ModelSelection } from '../shared/contracts.js'
@@ -825,7 +826,7 @@ export class NormalTranslationService {
     const base = stem.replace(/\.[A-Za-z0-9]{1,8}$/u, '').replace(/[\\/<>:"|?*\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, '_').replace(/^[. ]+|[. ]+$/gu, '')
     return `${Array.from(base).slice(0, 80).join('') || 'translation'}${artifactExtension(request.format)}`
   }
-  /** Write the exact current result as a real file; success is reported per save, not per request. */
+  /** Write the current result, resolving Markdown images only in the exported copy; report success per save. */
   async saveArtifact(input: unknown, exec: ToolExecution): Promise<TranslationArtifactSaved> {
     const request = parseArtifactSave(input), target = request.target
     if (this.disposed || !this.topics?.ownsAgent(target.mainSessionId, exec.agent)) throw rejected('scope_mismatch', '产物保存工具不属于此实际主 Agent。', 'authorize')
@@ -836,12 +837,20 @@ export class NormalTranslationService {
       const overlapping = exported.overlapping.map(range => `[${range.start},${range.end})`).join('、')
       throw rejected('incomplete_result', `译文尚未覆盖完整原文，未保存产物。缺少：${missing}${overlapping ? `；重叠：${overlapping}` : ''}。`, 'export_result')
     }
-    const body = exported.segments.map(segment => segment.text).join('')
-    if (!body.trim()) throw rejected('empty_result', '当前译文为空，未保存产物。', 'export_result')
-    const checks = this.artifactChecks(request.format, body), fileName = this.artifactName(request, target)
-    let path: string
-    try { path = await (await this.artifactStorage()).write(fileName, body) }
+    const recorded = exported.segments.map(segment => segment.text).join('')
+    if (!recorded.trim()) throw rejected('empty_result', '当前译文为空，未保存产物。', 'export_result')
+    const fileName = this.artifactName(request, target)
+    let path: string, body: string
+    try {
+      const storage = await this.artifactStorage()
+      body = request.format === 'md' ? await resolveMarkdownImages(recorded, exported.originalFilePath, async (name, bytes) => {
+        const image = await storage.write(name, bytes)
+        return `./${encodeURIComponent(image.slice(Math.max(image.lastIndexOf('/'), image.lastIndexOf('\\')) + 1))}`
+      }) : recorded
+      path = await storage.write(fileName, body)
+    }
     catch { exec.signal.throwIfAborted(); throw rejected('storage_failed', '译件写入失败，未报告保存完成。', 'save_artifact') }
+    const checks = this.artifactChecks(request.format, body)
     if (exec.agent) this.savedArtifacts.set(`${exec.agent.id}\u0000${path}`, path)
     return { path, fileName, format: request.format, bytes: new TextEncoder().encode(body).byteLength,
       codePoints: Array.from(body).length, revisionIds: exported.segments.map(segment => segment.revisionId),
@@ -911,6 +920,7 @@ export class NormalTranslationService {
         STYLE_SETTINGS_GUIDANCE,
         ...(request.fileName ? [FILE_MEMORY_REVIEW_GUIDANCE] : []),
         TRANSLATION_SELF_REVIEW,
+        ...(request.fileName && /\.md$/iu.test(request.fileName) ? [MARKDOWN_REVIEW_GUIDANCE] : []),
         DIRECT_REVISION_GUIDANCE,
         JSON.stringify({ target: request.target, operationId: request.operationId, userRequirements: '', organizedNotes: '', termReferences: [] }),
         ...(directive ? [directive] : []),

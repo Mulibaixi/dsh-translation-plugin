@@ -729,8 +729,14 @@ export class MaterialSubmissionsClient {
     const value = (receipt as { value?: { receiptId?: unknown } }).value
     if (!value || typeof value.receiptId !== 'string' || !value.receiptId) throw new Error('文件上传收据无效。')
     item.reason = '正在导入并校验原稿…'; this.emit()
+    let originalFilePath: string | undefined
+    if (carrier.kind === 'selected_file' && /\.md$/iu.test(file.name)) {
+      const bridge = (globalThis as unknown as { __DSH_HOST_PATHS__?: { pathFor(file: File): string } }).__DSH_HOST_PATHS__
+      try { originalFilePath = bridge?.pathFor(file) || undefined } catch { /* Web and generated files have no native origin. */ }
+    }
     const source = await sources.importReceipt({ scope: { namespaceId: this.options.store.getNamespaceId(), ownerId: item.identity.mainSessionId, mainSessionId: item.identity.mainSessionId,
-      topicId: draft.session.topicId, translationSessionId: draft.session.id }, receiptId: value.receiptId, idempotencyKey: draft.materialId }, signal)
+      topicId: draft.session.topicId, translationSessionId: draft.session.id }, receiptId: value.receiptId, idempotencyKey: draft.materialId,
+      ...(originalFilePath ? { originalFilePath } : {}) }, signal)
     this.active(item, signal)
     if (!source.ok) throw new MaterialRejected(source.error.message, source.error.code)
     item.envelope = this.boundedEnvelope({ ...item.identity, kind: 'material', material: { ...this.config(draft), sourceRef: source.value } })

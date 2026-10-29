@@ -30,6 +30,7 @@ export interface ViewSourceSnapshot {
 }
 export interface ViewFilesSourceOptions { readonly library?: import('../shared/library-sources.js').LibrarySourcesPort; readonly sources?: TranslationSourcesPort; readonly sourceStorage?: TranslationSourceStoragePort }
 function same(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right) }
+function textFileFormat(name?: string): 'txt' | 'md' { return name && /\.md$/iu.test(name) ? 'md' : 'txt' }
 /** Host opening files mirror the Client session lifetime: capture the scope before a deletion, clear after it. */
 export class ViewFilesClient {
   private readonly operations = new Set<AbortController>()
@@ -60,36 +61,54 @@ export class ViewFilesClient {
   }
   /** Read the captured UTF-8 file without touching it; decoding retains its BOM and all newline characters. */
   async openCapturedTxt(request: ViewSourceOpenRequest, file: Blob, signal?: AbortSignal): Promise<ViewOpenOutcome> {
-    return await this.operation(async signal => this.openRequest({ ...request, text: await this.capturedText(file, signal, request.fileName), format: 'txt' }, signal), request, signal)
+    return await this.operation(async signal => this.openRequest({ ...request, text: await this.capturedText(file, signal, request.fileName), format: textFileFormat(request.fileName ?? (file as File).name) }, signal), request, signal)
   }
-  /** A saved reference opens its verified original bytes. Runtime sources produce a temporary UTF-8 projection only. */
+  /** Saved non-Markdown opens the original; Markdown uses verified text to resolve images in an opening copy. */
   async openSource(request: ViewSourceOpenRequest, snapshot: ViewSourceSnapshot, signal?: AbortSignal): Promise<ViewOpenOutcome> {
     return await this.operation(async signal => {
       const scope = parseTranslationSourceScope(snapshot.scope)
       if (request.kind !== 'source' || request.sessionId !== scope.translationSessionId) throw new Error('原稿打开范围与文件单元不一致。')
-      const source = snapshot.sourceRef && parseTranslationSourceAsset(snapshot.sourceRef)
+      const savedIdentity = snapshot.savedSource?.source ?? snapshot.librarySource?.stored.source
+      let source = snapshot.sourceRef ? parseTranslationSourceAsset(snapshot.sourceRef)
+        : savedIdentity ? parseTranslationSourceAsset({ ...savedIdentity, persistence: 'runtime_only' }) : undefined
+      const markdown = textFileFormat(request.fileName ?? source?.name ?? snapshot.savedSource?.source.name) === 'md'
       if (snapshot.librarySource) {
         if (!this.sourceOptions.library) throw new Error('资料库原稿打开服务尚未就绪。')
         if (snapshot.librarySource.namespaceId !== this.sessions.getNamespaceId() || snapshot.librarySource.stored.scope.translationSessionId !== request.sessionId) throw new Error('共享原稿范围不一致。')
-        const result = await this.sourceOptions.library.readLibrarySource({ ...snapshot.librarySource, action: 'open' }, signal)
-        return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+        if (!markdown) {
+          const result = await this.sourceOptions.library.readLibrarySource({ ...snapshot.librarySource, action: 'open' }, signal)
+          return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+        }
       }
-      if (snapshot.savedSource) {
+      if (snapshot.savedSource && !snapshot.librarySource) {
         const stored = parseTranslationSourceStorageRequest('openOriginal', snapshot.savedSource) as TranslationSourceStoredRead
         if (!same(stored.scope, scope) || source && !same(stored.source, toSourceIdentity(source))) throw new Error('已保存原稿与此源版本不一致。')
         if (!this.sourceOptions.sourceStorage) throw new Error('原稿存储打开服务未就绪，请重试。')
-        const result = await this.sourceOptions.sourceStorage.openOriginal(stored, signal)
-        signal.throwIfAborted()
-        return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+        if (!markdown) {
+          const result = await this.sourceOptions.sourceStorage.openOriginal(stored, signal)
+          signal.throwIfAborted()
+          return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+        }
+        if (!snapshot.librarySource) {
+          const restored = await this.sourceOptions.sourceStorage.restore(stored)
+          if (!restored.ok) throw new Error(restored.error.message)
+          source = parseTranslationSourceAsset(restored.value.source)
+        }
       }
       if (source) {
-        if (!this.sourceOptions.sources) throw new Error('原稿读取服务未就绪，请重试。')
+        if (!snapshot.librarySource && !this.sourceOptions.sources) throw new Error('原稿读取服务未就绪，请重试。')
         if (source.bytes > MAX_VIEW_FILE_BYTES) throw new Error('原稿超过 16 MiB 打开上限。')
         const pieces: string[] = []
         for (let start = 0; start < source.totalCodePoints; start += MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS) {
           signal.throwIfAborted()
           const range = { start, end: Math.min(start + MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, source.totalCodePoints) }
-          const raw = await this.sourceOptions.sources.readRange({ scope, sourceId: source.sourceId, version: source.version, range })
+          if (snapshot.librarySource) {
+            const result = await this.sourceOptions.library!.readLibrarySource({ ...snapshot.librarySource, action: 'page', range }, signal)
+            if (!result.ok) throw new Error(result.error.message)
+            if (result.value.kind !== 'page' || Array.from(result.value.text).length !== range.end - range.start) throw new Error('原稿分页与指定范围不一致。')
+            pieces.push(result.value.text); continue
+          }
+          const raw = await this.sourceOptions.sources!.readRange({ scope, sourceId: source.sourceId, version: source.version, range })
           signal.throwIfAborted()
           const result = parseTranslationSourceResult('readRange', raw) as TranslationSourceResult<TranslationSourceAssetPage>
           if (!result.ok) throw new Error(result.error.message)
@@ -102,21 +121,22 @@ export class ViewFilesClient {
         signal.throwIfAborted()
         if (hash !== source.sha256) throw new Error('原稿内容与固定源版本校验不一致。')
         return await this.openRequest({ ...request, revisionId: request.revisionId ?? `source:${source.sourceId}:${source.version}`,
-          fileName: request.fileName ?? source.name, text, format: 'txt' }, signal)
+          fileName: request.fileName ?? source.name, text, format: textFileFormat(request.fileName ?? source.name),
+          ...(source.originalFilePath ? { originalFilePath: source.originalFilePath } : {}) }, signal)
       }
       if (!snapshot.file) throw new Error('本次原稿文件不可用，请重新选择文件。')
-      return await this.openRequest({ ...request, text: await this.capturedText(snapshot.file, signal, request.fileName), format: 'txt' }, signal)
+      return await this.openRequest({ ...request, text: await this.capturedText(snapshot.file, signal, request.fileName), format: textFileFormat(request.fileName ?? (snapshot.file as File).name) }, signal)
     }, request, signal)
   }
   private async capturedText(file: Blob, signal: AbortSignal, fileName?: string): Promise<string> {
     const originalName = fileName ?? (file as Blob & { readonly name?: string }).name
-    if (!originalName || !/\.txt$/iu.test(originalName)) throw new Error('当前仅支持打开 UTF-8 TXT 原稿。')
-    if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > MAX_VIEW_FILE_BYTES) throw new Error('TXT 原稿超过 16 MiB 打开上限。')
+    if (!originalName || !/\.(?:txt|md)$/iu.test(originalName)) throw new Error('当前仅支持打开 UTF-8 TXT／Markdown 原稿。')
+    if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > MAX_VIEW_FILE_BYTES) throw new Error('文本原稿超过 16 MiB 打开上限。')
     const bytes = await file.arrayBuffer()
     signal.throwIfAborted()
-    if (bytes.byteLength !== file.size || bytes.byteLength > MAX_VIEW_FILE_BYTES) throw new Error('TXT 原稿字节长度发生变化，未打开。')
+    if (bytes.byteLength !== file.size || bytes.byteLength > MAX_VIEW_FILE_BYTES) throw new Error('文本原稿字节长度发生变化，未打开。')
     try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }
-    catch { throw new Error('原稿不是有效 UTF-8 TXT，未替换或猜测编码。') }
+    catch { throw new Error('原稿不是有效 UTF-8 文本，未替换或猜测编码。') }
   }
   private async openRequest(request: ViewFileOpen, signal: AbortSignal): Promise<ViewOpenOutcome> {
     request = { ...request, namespaceId: this.sessions.getNamespaceId() }

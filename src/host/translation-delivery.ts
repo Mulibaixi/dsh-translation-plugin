@@ -4,14 +4,14 @@ import type { QuickHostContext } from './quick-translation.js'
 /** Private output directory for real translated artifacts; profile-wide data clear owns it too. */
 export interface ArtifactStorage {
   readonly root: string
-  write(name: string, content: string): Promise<string>
+  write(name: string, content: string | Uint8Array): Promise<string>
 }
 export async function loadArtifactStorage(ctx: QuickHostContext): Promise<ArtifactStorage> {
   const loader = ctx.get?.('loader') as QuickHostContext['loader']
   if (!ctx.baseUrl || !loader?.internal) throw new Error('Host package loader unavailable')
   const [home, atomic] = await Promise.all([
     loader.internal.import('@deepseek-ai/dsh-home-paths', ctx.baseUrl, {}) as Promise<{ dshHomePath(...parts: string[]): string }>,
-    loader.internal.import('@deepseek-ai/dsh-atomic-write', ctx.baseUrl, {}) as Promise<{ writeFileAtomic(path: string, content: string, options: { mode: number; dirMode: number }): Promise<void> }>,
+    loader.internal.import('@deepseek-ai/dsh-atomic-write', ctx.baseUrl, {}) as Promise<{ writeFileAtomic(path: string, content: string | Uint8Array, options: { mode: number; dirMode: number }): Promise<void> }>,
   ])
   const fsName = 'node:fs/promises', pathName = 'node:path'
   const fs = await import(fsName) as { access(path: string): Promise<void> }
@@ -34,7 +34,7 @@ export async function loadArtifactStorage(ctx: QuickHostContext): Promise<Artifa
       if (!previous) {
         const exists = await fs.access(destination).then(() => true, () => false)
         if (exists) {
-          const digest = (await sourceSha256(new TextEncoder().encode(content))).slice(0, 8)
+          const digest = (await sourceSha256(typeof content === 'string' ? new TextEncoder().encode(content) : content)).slice(0, 8)
           destination = path.join(root, name.replace(/(\.[^.]+)$/u, `-${digest}$1`))
         }
       }

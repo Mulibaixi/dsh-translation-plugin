@@ -154,7 +154,7 @@ export class TranslationSourcesService {
     const controller = this.ctx.get?.('sessionController') as Controller | undefined
     if (typeof attachments?.readFileStream !== 'function' || typeof uploads?.resolve !== 'function' || !controller?.resolveAgent) return bad('unavailable', '宿主文件上传及附件读取服务尚未就绪。', 'resolve_upload')
     const bindingKey = JSON.stringify([request.scope.ownerId, request.idempotencyKey])
-    const signature = JSON.stringify([request.scope.ownerId, request.scope.mainSessionId, request.scope.topicId, request.scope.translationSessionId, request.receiptId])
+    const signature = JSON.stringify([request.scope.ownerId, request.scope.mainSessionId, request.scope.topicId, request.scope.translationSessionId, request.receiptId, request.originalFilePath ?? null])
     const binding = this.bindings.get(bindingKey)
     if (binding && binding.signature !== signature) return bad('idempotency_conflict', '此导入请求标识已绑定另一份范围或上传收据。', 'resolve_upload')
     if (binding && binding.peerId !== peerId) return bad('scope_mismatch', '此导入请求属于另一连接。', 'resolve_upload')
@@ -175,7 +175,7 @@ export class TranslationSourcesService {
     if (!pending) {
       const file = uploads.resolve(agent, request.receiptId)
       if (!file) return bad('receipt_not_found', '上传收据已失效或不属于此主会话。', 'resolve_upload')
-      const promise = this.decode(request.scope, peerId!, agent, file, attachments, signal, signature)
+      const promise = this.decode(request.scope, peerId!, agent, file, attachments, signal, signature, request.originalFilePath)
       pending = { peerId: peerId!, agent, promise }; this.pending.set(signature, pending)
       const clear = (): void => { if (this.pending.get(signature) === pending) this.pending.delete(signature) }
       void promise.then(clear, clear)
@@ -186,7 +186,7 @@ export class TranslationSourcesService {
     return result
   }
   private async decode(scope: TranslationSourceScope, peerId: string, agent: Agent, file: FileRef, attachments: Attachments,
-    signal: AbortSignal, signature: string): Promise<TranslationSourceResult<TranslationSourceAsset>> {
+    signal: AbortSignal, signature: string, originalFilePath?: string): Promise<TranslationSourceResult<TranslationSourceAsset>> {
     // Format is not decided from the extension. Valid UTF-8 becomes readable text; every other
     // file keeps its exact bytes and is never decoded, guessed or converted into TXT.
     if (typeof file.name !== 'string' || !file.name.trim() || file.name === '.' || file.name === '..' ||
@@ -218,7 +218,8 @@ export class TranslationSourcesService {
     if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', '原件准备完成前所属连接或 Agent 已失效。', 'decode_text')
     const source = parseTranslationSourceAsset({ sourceId: `source-${crypto.randomUUID()}`, version: 1, name: file.name, bytes: count,
       totalCodePoints, encoding: binary ? 'binary' : 'utf-8', bom: binary ? false : bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf,
-      sha256: [...digest].map(byte => byte.toString(16).padStart(2, '0')).join(''), persistence: 'runtime_only' })
+      sha256: [...digest].map(byte => byte.toString(16).padStart(2, '0')).join(''), persistence: 'runtime_only',
+      ...(originalFilePath ? { originalFilePath } : {}) })
     this.sources.set(source.sourceId, { scope, peerId, agent, source, text, bytes, codePointOffsets: indexText(text) }); this.receipts.set(signature, source.sourceId)
     return ok(source)
   }

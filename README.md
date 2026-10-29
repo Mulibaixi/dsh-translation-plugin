@@ -74,9 +74,9 @@ Disabling or uninstalling the plugin does not automatically delete local materia
 
 Choose **新建主题及首会话 (New topic and first session)** or **选择已有主题 (Choose existing topic)**. A topic groups memory for a story or project; translation sessions separate individual tasks. Reuse one local library across main chats, and browse saved material without an active main chat.
 
-- Use **+** in the title menu to create a new topic and first session, then rename it in the automatically opened editor; cancelling keeps the default name. Use **新建子会话 (New child session)** in a session's context menu to continue in its topic.
+- Use **+** in the title menu to create a new topic and first session, then rename it in the automatically opened editor; cancelling keeps the default name. In a session or topic context menu, click **新建 (New)** to keep the existing configuration and mode inheritance rules, or hover over it or click its right arrow to choose **新建快译会话 (New Quick session)** or **新建普通会话 (New Normal session)** within the same topic.
 - **重命名 (Rename)** changes the topic name; **备注 (Remark)** changes only that session's display name. Long-press and drag a session row to reorder it.
-- Right-click a topic, hover over **打开 (Open)**, and select a session from the list on the right. The list extends downward and adjusts near window edges to stay visible.
+- Right-click a topic, hover over **打开 (Open)** or click its right arrow, and select a session. Submenus open to the right and downward and adjust near window edges to stay visible. Use the Right arrow key to enter a submenu and Left to return to its parent item.
 - **关闭 (Close)** removes a session from the current chat's open list; **归档 (Archive)** retains it; **删除 (Delete)** removes content after confirmation.
 
 Model selection is at the input's lower right; target language and mode are at the top. A session can move from Quick to Normal; create another session to use Quick again. Unit numbers remain stable and deleted numbers are not reused.
@@ -96,7 +96,9 @@ Editing the input afterward does not alter the submitted source. To correct a so
 
 Normal text and files use the same current translation flow. Long originals can be translated by source ranges, with continuous coverage required. The main model waits for the actual result, reads the translation independently, compares it with the source, and appends justified corrections to the same unit. Automated review still needs human checking.
 
-Originals and translation versions appear as file links. Delivery stays in the session by default; opening generates a readable filename and repeated opens reuse the same version file. Separate exports are created only when explicitly requested. Text results preserve the source BOM and uniform CRLF line endings. JSON, HTML, and similar inputs prompt for an output form if unspecified.
+Originals and translation versions appear as file links. TXT and Markdown results retain their format. Delivery stays in the session by default; opening generates a readable filename and repeated opens reuse the same version file. Separate exports are created only when explicitly requested. Text results preserve the source BOM and uniform CRLF line endings. JSON, HTML, and similar inputs prompt for an output form if unspecified.
+
+Markdown translation and review instructions preserve headings, lists, tables, code and math; the main model checks the contents links and internal anchors. Manually verify rendering and navigation. Desktop uploads retain the original MD location: opening or exporting Markdown copies local images referenced by standard relative image links beside the MD copy and uses relative links, while recorded bodies keep the original references. Source images must be readable when generating the copy. Keep the accompanying images when moving or sharing the document. Web uploads without the original location keep the original references. Image contents, HTML image references and packaging of entire resource directories are not handled.
 
 Normal translation reads applicable settings and selected memory. Short text can automatically match identical expressions in reference originals; similar examples, long files, and background facts use the main model's search, accurate read, and context selection. Corrections receive the exact previous translation, and nearby dialogue uses effective finals. A search hit does not guarantee correct adoption.
 

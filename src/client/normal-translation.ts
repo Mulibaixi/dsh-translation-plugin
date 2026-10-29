@@ -407,9 +407,10 @@ export class NormalTranslationClient {
       if (cursor < totalCodePoints) missing.push({ start: cursor, end: totalCodePoints })
       complete = missing.length === 0 && overlapping.length === 0
     } else complete = segments.some(segment => segment.range === null)
+    const originalFilePath = this.materials.getFileUnits(session.id).find(file => file.unitId === base || units.some(unit => unit.material?.materialId === file.materialId))?.sourceRef?.originalFilePath
     const value: TopicBridgeValue = { kind: 'normal_exported', export: { mainSessionId: ownerId, translationSessionId: session.id,
       topicId: session.topicId, materialId: target.kind === 'material' ? target.materialId : null, sourceVersion: target.sourceVersion,
-      totalCodePoints, complete, segments, missing, overlapping } }
+      totalCodePoints, complete, segments, missing, overlapping, ...(originalFilePath ? { originalFilePath } : {}) } }
     if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) {
       return failure('export_too_large', '本次译文总长度超过单次导出上限；请分段落保存或缩小范围。')
     }

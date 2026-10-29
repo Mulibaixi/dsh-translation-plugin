@@ -1,6 +1,7 @@
 import { VIEW_FILES_REMOTE, parseViewFileRequest, type ViewFileClear, type ViewFileErrorCode, type ViewFileOpen, type ViewFileResult } from '../shared/view-files.js'
 import type { QuickHostContext } from './quick-translation.js'
 import { sourceSha256 } from './source-storage.js'
+import { resolveMarkdownImages } from './markdown-files.js'
 
 interface Controller { canOpenWorkspacePath(): boolean; openWorkspacePath(request: { path: string }, signal: AbortSignal): Promise<{ opened: true }> }
 export interface ViewFileStorage {
@@ -21,7 +22,8 @@ export function viewFileStorageName(file: string): string {
 /** The directory carries identity; the filename remains readable. */
 export function isViewFileStorageDirectory(name: string): boolean { return /^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}-(?:source|result)$/u.test(name) }
 export function isViewFileStorageName(name: string): boolean {
-  return /^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}-(?:source|result)\/[^\\/<>:"|?*\u0000-\u001f\u007f]{1,64}\.(?:txt|html)$/u.test(name) ||
+  return /^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}-(?:source|result)\/[^\\/<>:"|?*\u0000-\u001f\u007f]{1,64}\.(?:txt|md|html)$/u.test(name) ||
+    /^[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}-(?:source|result)\/image-[a-f0-9]{32}\.(?:png|jpg|jpeg|gif|webp|svg|avif|bmp|ico|apng)$/u.test(name) ||
     /^(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:[a-f0-9]{16}-)?)?(?:[a-f0-9]{16}|[a-f0-9]{64})\.html$/u.test(name) ||
     /^(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:(?:[a-f0-9]{16}|[a-f0-9]{64})-(?:[a-f0-9]{16}-)?)?(?:[a-f0-9]{16}|[a-f0-9]{64})--[^\\/<>:"|?*\u0000-\u001f\u007f]{1,64}\.txt$/u.test(name)
 }
@@ -36,8 +38,8 @@ export async function viewVersionStoragePrefix(namespaceId: string, sessionId: s
   const version = (await sourceSha256(new TextEncoder().encode(JSON.stringify(['view-version', revisionId])))).slice(0, 16)
   return `${await viewUnitStoragePrefix(namespaceId, sessionId, unitId)}${version}-`
 }
-function txtStem(name: string): string {
-  const safe = name.replace(/\.txt$/iu, '').replace(/[\\/<>:"|?*\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, '_').replace(/^[. ]+|[. ]+$/gu, '')
+function textStem(name: string): string {
+  const safe = name.replace(/\.(?:txt|md)$/iu, '').replace(/[\\/<>:"|?*\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, '_').replace(/^[. ]+|[. ]+$/gu, '')
   // Bound the UTF-16 component length even when the stem contains supplementary characters.
   let stem = ''
   for (const character of safe) { if (stem.length + character.length > 32) break; stem += character }
@@ -55,7 +57,7 @@ export async function loadViewFileStorage(ctx: QuickHostContext): Promise<ViewFi
   if (!ctx.baseUrl || !loader?.internal) throw new Error('Host package loader unavailable')
   const [home, atomic] = await Promise.all([
     loader.internal.import('@deepseek-ai/dsh-home-paths', ctx.baseUrl, {}) as Promise<{ dshHomePath(...parts: string[]): string }>,
-    loader.internal.import('@deepseek-ai/dsh-atomic-write', ctx.baseUrl, {}) as Promise<{ writeFileAtomic(path: string, content: string, options: { mode: number; dirMode: number }): Promise<void> }>,
+    loader.internal.import('@deepseek-ai/dsh-atomic-write', ctx.baseUrl, {}) as Promise<{ writeFileAtomic(path: string, content: string | Uint8Array, options: { mode: number; dirMode: number }): Promise<void> }>,
   ])
   const fsName = 'node:fs/promises', pathName = 'node:path'
   const fs = await import(fsName) as { readdir(path: string, options: { withFileTypes: true }): Promise<readonly { readonly name: string; isFile(): boolean; isDirectory(): boolean }[]>; unlink(path: string): Promise<void>; rmdir(path: string): Promise<void> }
@@ -70,11 +72,17 @@ export async function loadViewFileStorage(ctx: QuickHostContext): Promise<ViewFi
   }
   return {
     async write(request, content) {
-      const format = request.format ?? 'html'
-      const directory = `${await viewVersionStoragePrefix(request.namespaceId, request.sessionId, request.unitId, request.revisionId ?? null)}${request.kind}`
-      const destination = path.join(root, directory, `${txtStem(request.fileName ?? request.title)}.${format}`)
-      await gate(() => atomic.writeFileAtomic(destination, content, { mode: 0o600, dirMode: 0o700 }))
-      return destination
+      return await gate(async () => {
+        const format = request.format ?? 'html'
+        const directory = `${await viewVersionStoragePrefix(request.namespaceId, request.sessionId, request.unitId, request.revisionId ?? null)}${request.kind}`
+        const destination = path.join(root, directory, `${textStem(request.fileName ?? request.title)}.${format}`)
+        if (format === 'md') content = await resolveMarkdownImages(content, request.originalFilePath, async (name, bytes) => {
+          await atomic.writeFileAtomic(path.join(root, directory, name), bytes, { mode: 0o600, dirMode: 0o700 })
+          return `./${name}`
+        })
+        await atomic.writeFileAtomic(destination, content, { mode: 0o600, dirMode: 0o700 })
+        return destination
+      })
     },
     async clear(sessionIds) {
       const prefixes = await Promise.all(sessionIds.map(sessionPrefix))
@@ -152,7 +160,8 @@ export class ViewFilesService {
     if (typeof controller?.canOpenWorkspacePath !== 'function' || !controller.canOpenWorkspacePath() || typeof controller.openWorkspacePath !== 'function') return bad('unavailable', '当前宿主不支持打开本地文件。')
     signal.throwIfAborted()
     let destination: string
-    const writing = (async () => (await this.disk()).write(request, request.format === 'txt' ? request.text : renderViewPage(request.title, request.text)))()
+    const writing = (async () => (await this.disk()).write(request, request.format === 'txt' || request.format === 'md'
+      ? request.text : renderViewPage(request.title, request.text)))()
     this.writes.set(writing, { namespaceId: request.namespaceId, sessionId: request.sessionId, unitId: request.unitId, revisionId: request.revisionId ?? null })
     try { destination = await writing }
     catch (error) {

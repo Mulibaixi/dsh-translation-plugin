@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.26.1",
+  "version": "0.26.2",
   "private": true,
   "license": "MIT",
   "description": "A DeepSeek Harness translation plugin framework (early development).",
@@ -66,5 +66,10 @@
         "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
+  },
+  "dependencies": {
+    "mdast-util-from-markdown": "^2.1.0",
+    "mdast-util-math": "^3.0.0",
+    "micromark-extension-math": "^3.1.0"
   }
 }

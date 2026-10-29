@@ -17,8 +17,9 @@ export function DirectFileLink({ file, unit, revision, session, materials, viewF
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false; lifetime.current.controller?.abort() } }, [])
   react.useEffect(() => { lifetime.current.controller?.abort() }, [identity])
   const correctedSource = !revision && unit.sourceVersion > 1
-  const name = revision ? `${file.name.replace(/\.[^.]+$/u, '')}-译文-v${revision.order}.txt`
-    : correctedSource ? `${file.name.replace(/\.[^.]+$/u, '')}-原稿-v${unit.sourceVersion}.txt` : file.name
+  const format = /\.md$/iu.test(file.name) ? 'md' : 'txt'
+  const name = revision ? `${file.name.replace(/\.[^.]+$/u, '')}-译文-v${revision.order}.${format}`
+    : correctedSource ? `${file.name.replace(/\.[^.]+$/u, '')}-原稿-v${unit.sourceVersion}.${format}` : file.name
   async function open(): Promise<void> {
     if (lifetime.current.controller || !viewFiles) return
     const controller = new AbortController(), key = identity
@@ -26,10 +27,11 @@ export function DirectFileLink({ file, unit, revision, session, materials, viewF
     lifetime.current.controller = controller; setPending(true); setMessage(undefined)
     try {
       const slot = { namespaceId: viewFiles.getNamespaceId(), sessionId: session.id, unitId: unit.id,
-        title: name, revisionId: revision?.id ?? `source:${unit.sourceVersion}`, fileName: name }
+        title: name, revisionId: revision?.id ?? `source:${unit.sourceVersion}`, fileName: name,
+        ...(file.sourceRef?.originalFilePath ? { originalFilePath: file.sourceRef.originalFilePath } : {}) }
       const snapshot = revision || correctedSource ? undefined : await materials?.resolveFileSource(session.id, file.unitId)
       if (!active()) return
-      const result = revision || correctedSource ? await viewFiles.open({ ...slot, kind: revision ? 'result' : 'source', text: revision?.text ?? unit.source, format: 'txt' }, controller.signal)
+      const result = revision || correctedSource ? await viewFiles.open({ ...slot, kind: revision ? 'result' : 'source', text: revision?.text ?? unit.source, format }, controller.signal)
         : snapshot ? await viewFiles.openSource({ ...slot, kind: 'source' }, snapshot, controller.signal) : { ok: false, message: '原稿暂不可打开，可稍后重试。' }
       if (active() && !result.ok) setMessage(result.message ?? '文件打开未完成，可重试。')
     } catch { if (active()) setMessage('文件打开未完成，可重试。') }

@@ -19,7 +19,7 @@ import type { RecordObjectReference } from '../shared/record-objects.js'
 import { RecordObjectText, type RecordObjectsProps } from './record-object-view.js'
 import { type HistoryVersion, type SessionStore, type TextRevisionDeletionPlan, type TextUnitDeletionPlan } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, sessionName, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
-import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
+import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconChevronRightOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
 import { type TopicTermsViewPort } from './topic-terms-view.js'
 import { downloadExport } from './browser-download.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
@@ -91,6 +91,42 @@ function modeSelect(value: LocalSession['mode'], action: (mode: LocalSession['mo
   } }, h('option', { value: 'quick' }, '快译'), h('option', { value: 'normal' }, '普通'))
 }
 function storeNotice(store: SessionStore): unknown { return store.getNotice() ? h('div', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null }
+
+function submenuLabel(action: 'new' | 'open', text: string): unknown {
+  return h('span', { className: 'dsh-tp-submenu-label', 'data-session-submenu': action }, h('span', null, text),
+    h('span', { 'data-submenu-arrow': true, 'aria-hidden': true }, h(IconChevronRightOutlineRegular, { size: 16 })))
+}
+const newSessionChoices = [
+  { id: 'new-quick', label: '新建快译会话' },
+  { id: 'new-normal', label: '新建普通会话' },
+]
+/** Keep native hover menus, adding the default New action and horizontal keyboard navigation. */
+function ContextSubmenus({ onCreate, children }: { readonly onCreate: () => void; readonly children?: unknown }): unknown {
+  return h('div', {
+    onClickCapture: (event: MouseEvent) => {
+      const target = event.target as Element, button = target.closest<HTMLButtonElement>('button[role="menuitem"]')
+      if (!button || button.disabled || !button.querySelector('[data-session-submenu="new"]') || target.closest('[data-submenu-arrow]')) return
+      event.preventDefault(); event.stopPropagation(); onCreate()
+    },
+    onKeyDownCapture: (event: KeyboardEvent) => {
+      const button = (event.target as Element).closest<HTMLButtonElement>('button[role="menuitem"]')
+      if (!button || button.disabled) return
+      if (event.key === 'ArrowRight' && button.getAttribute('aria-haspopup') === 'menu') {
+        event.preventDefault(); event.stopPropagation()
+        button.querySelector<HTMLElement>('[data-submenu-arrow]')?.click()
+        requestAnimationFrame(() => button.parentElement?.querySelector<HTMLButtonElement>('[role="menu"] button:not(:disabled)')?.focus())
+      } else if (event.key === 'ArrowLeft') {
+        const parent = button.closest('[role="menu"]')?.parentElement?.querySelector<HTMLButtonElement>(':scope > button[aria-haspopup="menu"]')
+        if (parent) { event.preventDefault(); event.stopPropagation(); parent.focus() }
+      }
+    },
+  }, children)
+}
+function contextMenuAnchor(x: number, y: number, menuClass: string): { left: number; right: number; top: number; bottom: number; width: number; height: number } {
+  const width = document.querySelector<HTMLElement>(menuClass)?.offsetWidth ?? 180
+  const left = Math.max(12, Math.min(x, window.innerWidth - width - TOPIC_SUBMENU_WIDTH - 2 - 12))
+  return { left, right: left, top: y, bottom: y, width: 0, height: 0 }
+}
 
 interface RevisionEdit { readonly sessionId: string; readonly unitId: string; readonly baseRevisionId: string; readonly text: string; readonly failure: string | null }
 interface RevisionEditor {
@@ -742,15 +778,19 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     const rect = event.currentTarget.getBoundingClientRect()
     topicMenu(topic, { preventDefault: () => event.preventDefault(), stopPropagation: () => event.stopPropagation(), clientX: rect.left, clientY: rect.bottom, currentTarget: event.currentTarget })
   }
-  function create(parentId?: string): void {
+  function create(parentId?: string, mode?: LocalSession['mode']): void {
     closeSessionMenus()
     let created: LocalSession | undefined
     void action.run(async () => {
-      created = await store.createSessionAsync(ownerId, parentId)
+      created = await store.createSessionAsync(ownerId, parentId, true, mode)
       return Boolean(created)
     }, () => {
       if (created && !parentId) { setName(created.topicName); setDialog({ kind: 'rename', id: created.id }) }
     })
+  }
+  function createForTopic(topicId: string, mode?: LocalSession['mode']): void {
+    closeSessionMenus()
+    void action.run(async () => Boolean(await store.createSessionForTopicAsync(ownerId, topicId, true, mode)))
   }
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined); setTopicContext(undefined) }
   function openTopicAssets(topic: { readonly id: string; readonly name: string }, sessionId?: string): void {
@@ -948,8 +988,11 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
         ),
       ) : null,
     ),
-    context && target ? h(Menu, { key: context.exportFormat ?? 'actions', open: true, anchor: null, onClose: () => { setContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup',
-      getAnchorRect: () => ({ left: context.x, right: context.x, top: context.y, bottom: context.y, width: 0, height: 0 }),
+    context && target ? h(ContextSubmenus, { onCreate: () => create(target.id) }, h(Menu, { key: context.exportFormat ?? 'actions', open: true, anchor: null, onClose: () => { setContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup dsh-tp-context-popup dsh-tp-session-popup',
+      getAnchorRect: () => context.exportFormat ? { left: context.x, right: context.x, top: context.y, bottom: context.y, width: 0, height: 0 } : contextMenuAnchor(context.x, context.y, '.dsh-tp-session-popup'),
+      items: context.exportFormat ? [] : [{ id: 'new', label: submenuLabel('new', '新建'), disabled: action.pending,
+        submenu: newSessionChoices.map(item => ({ ...item, disabled: action.pending })) }],
+      onSelect: (id: string) => { if (id === 'new-quick' || id === 'new-normal') create(target.id, id === 'new-quick' ? 'quick' : 'normal') },
     }, h('div', { 'aria-label': '翻译会话右键操作', onPointerDown: (event: { stopPropagation(): void }) => event.stopPropagation(),
       onKeyDown: (event: KeyboardEvent) => {
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setContext(undefined); context.trigger?.focus() }
@@ -961,7 +1004,6 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
           onSelect: () => exportSession(target.id, context.exportFormat!, 'session') }, '当前会话'),
         h(MenuItemButton, { disabled: action.pending || exporting || !targetTopicHasRecords,
           onSelect: () => exportSession(target.id, context.exportFormat!, 'topic') }, '整个主题')) : h('div', null,
-      h(MenuItemButton, { disabled: action.pending, onSelect: () => create(target.id) }, '新建子会话'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(target.topicName); setDialog({ kind: 'rename', id: target.id }) } }, '重命名'),
       h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setRemark(target.remark); setDialog({ kind: 'remark', id: target.id }) } }, '备注'),
       onOpenAssets ? h(MenuItemButton, { onSelect: () => openSessionAssets(target) }, '记忆') : null,
@@ -972,24 +1014,24 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
         closeSessionMenus()
         void action.run(async () => { setDeletion(await captureDeleteRequest(store, terms, `删除「${target.name}」`, [target.id])); return true })
       } }, '删除'),
-    ))) : null,
-    topicContext && topicTarget ? h(Menu, { key: topicTarget.id, open: true, anchor: null, onClose: () => { setTopicContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup dsh-tp-topic-popup',
-      getAnchorRect: () => {
-        const menuWidth = document.querySelector<HTMLElement>('.dsh-tp-topic-popup')?.offsetWidth ?? 180
-        const x = Math.max(12, Math.min(topicContext.x, window.innerWidth - menuWidth - TOPIC_SUBMENU_WIDTH - 2 - 12))
-        return { left: x, right: x, top: topicContext.y, bottom: topicContext.y, width: 0, height: 0 }
-      },
-      items: [{ id: 'open', label: '打开', submenu: topicOpenable.length
+    )))) : null,
+    topicContext && topicTarget ? h(ContextSubmenus, { onCreate: () => createForTopic(topicTarget.id) }, h(Menu, { key: topicTarget.id, open: true, anchor: null, onClose: () => { setTopicContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup dsh-tp-context-popup dsh-tp-topic-popup',
+      getAnchorRect: () => contextMenuAnchor(topicContext.x, topicContext.y, '.dsh-tp-topic-popup'),
+      items: [{ id: 'open', label: submenuLabel('open', '打开'), submenu: topicOpenable.length
         ? topicOpenable.map(session => ({ id: session.id, label: `${sessionDisplayName(session)}${session.id === current?.id ? '（当前）' : ''}` }))
-        : [{ id: 'empty', label: '该主题暂无可打开的会话。', disabled: true }] }],
-      onSelect: (id: string) => { const session = topicOpenable.find(session => session.id === id); if (session) { closeSessionMenus(); store.openSession(ownerId, session.id) } },
+        : [{ id: 'empty', label: '该主题暂无可打开的会话。', disabled: true }] },
+        { id: 'new', label: submenuLabel('new', '新建'), disabled: action.pending,
+          submenu: newSessionChoices.map(item => ({ ...item, disabled: action.pending })) }],
+      onSelect: (id: string) => {
+        if (id === 'new-quick' || id === 'new-normal') { createForTopic(topicTarget.id, id === 'new-quick' ? 'quick' : 'normal'); return }
+        const session = topicOpenable.find(session => session.id === id); if (session) { closeSessionMenus(); store.openSession(ownerId, session.id) }
+      },
     }, h('div', { 'aria-label': '主题操作', onPointerDown: (event: { stopPropagation(): void }) => event.stopPropagation(),
       onKeyDown: (event: KeyboardEvent) => {
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setTopicContext(undefined); topicContext.trigger?.focus() }
       },
     },
       h('div', null,
-        h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); void action.run(async () => Boolean(await store.createSessionForTopicAsync(ownerId, topicTarget.id))) } }, '新建'),
         h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(topicTarget.name); setTopicExpected(topicTarget.name); setDialog({ kind: 'rename-topic', id: topicTarget.id }) } }, '重命名'),
         onOpenAssets ? h(MenuItemButton, { onSelect: () => openTopicAssets(topicTarget) }, '记忆') : null,
         h(MenuItemButton, { disabled: action.pending || !topicDeletion, onSelect: () => {
@@ -1000,7 +1042,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
             return !!preview
           })
         } }, '删除'),
-      ))) : null,
+      )))) : null,
   )
 }
 
