@@ -73,7 +73,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   get(name: 'remote.translationArchive'): TopicArchiveRemotePort | undefined
   get(name: 'remote.translationOtherMemory'): OtherMemoryRemotePort | undefined
   get(name: 'remote.translationOtherMemoryFiles'): OtherMemoryFilesRemotePort | undefined
-  get(name: 'remote.translationReferences'): { persistRemote?(request: import('../shared/reference-memory.js').ReferenceScope):Promise<unknown>; readRemote(request: import('../shared/reference-memory.js').ReferenceReadRequest): Promise<unknown>; clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> } | undefined
+  get(name: 'remote.translationReferences'): { clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> } | undefined
   get(name: 'remote.translationLocalData'): LocalDataRemotePort | undefined
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
   get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
@@ -99,7 +99,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
     readonly translationOtherMemory?: OtherMemoryRemotePort
     readonly translationOtherMemoryFiles?: OtherMemoryFilesRemotePort
     readonly session: ModelCatalogPort
-    readonly translationReferences?: { persistRemote?(request: import('../shared/reference-memory.js').ReferenceScope):Promise<unknown>; readRemote(request: import('../shared/reference-memory.js').ReferenceReadRequest): Promise<unknown>; clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> }
+    readonly translationReferences?: { clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> }
     readonly translationLocalData?: LocalDataRemotePort
     readonly translationQuick?: QuickRemotePort
     readonly translationTopics?: TopicBridgeRemotePort
@@ -239,8 +239,6 @@ export function apply(ctx: ClientPluginContext): void {
       return await action()
     }})
     topics.setReferences(references)
-    terms.setReferenceEvidence(references)
-    archive.setReferenceEvidence(references)
     ctx.effect(() => () => references.dispose(), 'translation references')
     async function memoryRemoteReady(): Promise<void> {
       if (ctx.remote.$mount && !await mountedRemote) throw new Error('插件连接失败，请检查宿主服务后重试。')
@@ -392,7 +390,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (frozen) return h(ClearedDataView, null)
       if (!store.isHistoryReady()) return historyLoading()
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, archive, references, otherMemory, memoryIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, terms, archive, otherMemory, memoryIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string, jobId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId, jobId },
@@ -413,7 +411,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, references, otherMemory, memoryIndex, mainSessionId: scope.ownerId === store.getNamespaceId() ? undefined : scope.ownerId, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, otherMemory, memoryIndex, mainSessionId: scope.ownerId === store.getNamespaceId() ? undefined : scope.ownerId, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })

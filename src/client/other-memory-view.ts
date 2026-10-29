@@ -70,17 +70,15 @@ export function OtherMemoryView({ client, store, topicId, mainSessionId, active 
     return deletion === 'topic' ? '本主题其他记忆已清空，用户级设定保留。' : '条目已删除。'
   }
   return h('div', { className: 'dsh-tp-other-memory', 'aria-label': '其他记忆' },
-    h('div', { className: 'dsh-tp-unit-header' },
-      h('p', { className: 'dsh-tp-muted' }, '启用的用户级和主题级设定会完整提供给本主题普通翻译。参考文件仅在本主题登记。'),
+    h('div', { className: 'dsh-tp-unit-header dsh-tp-other-memory-heading' },
+      h('h3', null, '其他记忆'),
       h('div', { className: 'dsh-tp-actions' },
-        h('button', { type: 'button', disabled: pending || status.loading, onClick: () => { void client.refresh(topicId) } }, status.loading ? '正在刷新…' : '刷新其他记忆'),
+        h('button', { type: 'button', disabled: pending || status.loading, onClick: () => { void client.refresh(topicId) } }, status.loading ? '正在刷新…' : '刷新'),
         h('button', { type: 'button', disabled: pending || !status.ready || !entries.some(entry => entry.topicId === topicId), onClick: () => setDeletion('topic') }, '清空本主题其他记忆'))),
-    !store.getSettings().rememberHistory ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '历史保存已关闭；新增与编辑仅保留在本次运行，已有保存副本保留。') : null,
     status.error ? h('p', { role: 'alert', className: 'dsh-tp-message' }, status.error) : null,
     feedback ? h('p', { role: feedback.failure ? 'alert' : 'status', className: 'dsh-tp-message' }, feedback.text) : null,
     h('section', { 'aria-label': '翻译设定' },
-      h('p', { className: 'dsh-tp-muted' }, '启用设定会在每次普通翻译及重译时完整带入。请保持精简、准确，保留必要条件；具体译例放在原文／双语对照文件中。'),
-      h('div', { className: 'dsh-tp-unit-header' }, h('h3', null, '翻译设定'), h('button', { type: 'button', disabled: pending || !status.ready, onClick: () => edit() }, '新建设定')),
+      h('div', { className: 'dsh-tp-unit-header' }, h('h3', { title: '翻译设定会在每次普通翻译及重译时完整带入' }, '翻译设定'), h('button', { type: 'button', disabled: pending || !status.ready, onClick: () => edit() }, '新建设定')),
       ...settings.map(entry => h('div', { key: entry.id, className: 'dsh-tp-other-memory-setting', 'data-memory-id': entry.id },
         h('div', { className: 'dsh-tp-unit-header' }, h('strong', null, entry.title), h('span', { className: 'dsh-tp-muted' }, `${entry.topicId === null ? '用户级' : '主题级'} · ${entry.enabled ? '启用' : '停用'} · ${persistence(entry)}`)),
         h('div', { className: 'dsh-tp-translation-text' }, entry.body),
@@ -102,14 +100,13 @@ export function OtherMemoryView({ client, store, topicId, mainSessionId, active 
           stale && settings.some(entry => entry.id === form.id) ? h('button', { type: 'button', disabled: pending, onClick: () => update({ expectedVersion: settings.find(entry => entry.id === form.id)!.version }) }, '基于最新版本继续编辑') : null,
           h('button', { type: 'button', disabled: pending, onClick: () => discard(selected) }, '取消编辑'))) : null),
     h('section', { 'aria-label': '主题参考文件' },
-      h('h3', null, '主题参考文件'),
+      h('h3', { title: '原文／双语对照文件，用于语义嵌入并建立索引' }, '主题参考文件'),
       h('div', { className: 'dsh-tp-other-memory-upload' },
-        h('label', null, '登记文件', h('input', { type: 'file', disabled: pending || !status.ready || !client.canUpload(mainSessionId), 'aria-label': '登记主题参考文件', onChange: (event: { currentTarget: { files: FileList | null; value: string } }) => {
+        h('input', { type: 'file', disabled: pending || !status.ready || !client.canUpload(mainSessionId), 'aria-label': '登记主题参考文件', onChange: (event: { currentTarget: { files: FileList | null; value: string } }) => {
           const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''
           if (file && mainSessionId) void run(async () => { await client.importFile(topicId, mainSessionId, file); return '原文／双语对照文件已登记。' })
-        } }))),
+        } })),
       !mainSessionId ? h('p', { className: 'dsh-tp-muted' }, '选择主会话后可上传参考文件；已登记原件可直接打开。') : null,
-      h('p', { className: 'dsh-tp-muted' }, '仅登记原文／双语对照文件。上传后主模型标记语义边界，全文分段完成后通过已配置的嵌入服务建立索引。原件保持不变，不自动推测双语对齐。其他学习资料请在主聊天提炼。非文本格式仍可打开原件。'),
       ...files.map(entry => h('div', { key: entry.id, className: 'dsh-tp-other-memory-file', 'data-memory-id': entry.id },
         h('div', null, h('strong', null, entry.source.name), h('span', { className: 'dsh-tp-muted' }, ` · ${fileLabel(entry)} · ${persistence(entry)}`)),
         h('div', { className: 'dsh-tp-actions' },

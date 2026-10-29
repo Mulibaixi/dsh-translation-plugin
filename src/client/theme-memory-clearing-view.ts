@@ -75,7 +75,7 @@ export function useThemeMemoryClearing({ clearing, ownerId, topicId, visible }: 
       'data-owner-id': plan.ownerId, 'data-topic-id': plan.topicId },
       h('p', null, `清空“${plan.topicName}”的所选记忆？此主题全部会话共用这些资产。`),
       option('terms', '术语'), option('archive', '结构化档案'),
-      h('p', { className: 'dsh-tp-muted' }, '同时清空所选类型的已保存内容和本次运行内容。保留主题、会话原文与译文、编号、原件关联及模型偏好。关闭历史保存仍会执行本次明确清空。'),
+      h('p', { className: 'dsh-tp-muted' }, '同时清空所选类型的已保存内容和本次运行内容。保留主题、会话原文与译文、编号、原件关联及模型偏好。'),
       !plan.terms.storageAvailable || !plan.archive.storageAvailable ? h('p', { className: 'dsh-tp-message' }, '部分本地存储不可用，只能清理对应的当前运行期记忆，本地保存副本无法确认清理。') : null,
       blocked ? h('p', { role: 'status', className: 'dsh-tp-message' }, blocked) : null,
       h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || !!blocked || !selection.terms && !selection.archive,

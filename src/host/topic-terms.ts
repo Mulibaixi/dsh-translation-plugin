@@ -202,7 +202,7 @@ export class TopicTermsService implements TermsRemotePort {
       let saved = seat.saved
       if (command.kind === 'clear') saved = result.snapshot
       else if (command.kind === 'delete') { const old = saved?.entries.find(entry => entry.id === command.id); if (saved && old) saved = deleteTopicTermEntry(saved, command.id, old.version, at).snapshot }
-      else if (request.rememberHistory) saved = result.snapshot
+      else if (command.kind !== 'reconcile') saved = result.snapshot
       if (!same(saved, seat.saved) || command.kind === 'clear' || command.kind === 'delete') {
         try {
           const db = await this.memory.databaseForArchives(true); await this.requireOpen(guard)
@@ -226,24 +226,6 @@ export class TopicTermsService implements TermsRemotePort {
       const seat = await this.current(guard, request.token), db = await this.memory.databaseForArchives(true); await this.requireOpen(guard)
       db!.transaction(() => db!.termsSave(request.namespaceId, request.ownerId, request.topicId, seat.current))
       if (!same(seat.saved, seat.current)) { seat.saved = seat.current; seat.token = token() }; return this.describe(seat)
-    }))
-  }
-  persistNamespace(raw: { readonly namespaceId: string }): Promise<{ readonly persisted: true }> {
-    const request = parseTermRemoteRequest('persistNamespace', raw) as typeof raw
-    // Namespace-wide policy changes have no topic routing or Client body payload.
-    const guard = this.authorize({ namespaceId: request.namespaceId, ownerId: request.namespaceId, topicId: '*' })
-    return this.serial(guard, () => this.writer(async () => {
-      this.check(guard)
-      const candidates: Seat[] = []
-      for (const seat of this.seats.values()) if (seat.scope.namespaceId === request.namespaceId && !same(seat.current, seat.saved) &&
-        !(seat.saved === null && seat.current.version === 0 && seat.current.entries.length === 0) && !await this.isRetired(seat.scope)) candidates.push(seat)
-      this.check(guard)
-      if (!candidates.length) return { persisted: true as const }
-      const db = await this.memory.databaseForArchives(true); this.check(guard)
-      const live = candidates.filter(seat => this.seats.get(key(seat.scope)) === seat && !this.retired.has(key(seat.scope)) && !db!.retired(seat.scope.namespaceId, seat.scope.topicId))
-      db!.transaction(() => { for (const seat of live) db!.termsSave(seat.scope.namespaceId, seat.scope.ownerId, seat.scope.topicId, seat.current) })
-      for (const seat of live) { seat.saved = seat.current; seat.token = token() }
-      return { persisted: true as const }
     }))
   }
   /** LocalData already owns the storage writer. Permanent no-body identity permits deletion retries. */

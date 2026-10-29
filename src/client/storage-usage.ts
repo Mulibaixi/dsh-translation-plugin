@@ -2,14 +2,14 @@ import type { LocalStoragePort } from './session-store.js'
 
 export const PLUGIN_STORAGE_PREFIX = 'dsh-translation-plugin:'
 export const STORAGE_USAGE_CATEGORIES = [
-  { id: 'history', label: '历史与草稿' },
   { id: 'terms', label: '术语' },
-  { id: 'archive', label: '结构化档案' },
-  { id: 'preparation', label: '准备记录' },
-  { id: 'references', label: '参考资料索引' },
-  { id: 'objects', label: '对象关联' },
-  { id: 'preferences', label: '模型及排序偏好' },
   { id: 'settings', label: '设置' },
+  { id: 'preparation', label: '准备记录' },
+  { id: 'objects', label: '对象关联' },
+  { id: 'history', label: '历史与草稿' },
+  { id: 'archive', label: '结构化档案' },
+  { id: 'references', label: '参考资料索引' },
+  { id: 'preferences', label: '模型及排序偏好' },
   { id: 'meta', label: '主题及其他元数据' },
 ] as const
 

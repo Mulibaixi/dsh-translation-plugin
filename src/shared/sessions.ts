@@ -8,7 +8,6 @@ export interface SessionSettings {
   readonly targetLanguage: string
   readonly defaultInstruction: string
   readonly maxInputChars: number
-  readonly rememberHistory: boolean
 }
 export interface ModelRoute {
   readonly provider: string
@@ -41,7 +40,7 @@ export interface LocalSession {
 }
 export const DEFAULT_SESSION_SETTINGS: SessionSettings = Object.freeze({
   schemaVersion: 2, defaultMode: 'quick', targetLanguage: '中文',
-  defaultInstruction: '', maxInputChars: 20000, rememberHistory: false,
+  defaultInstruction: '', maxInputChars: 20000,
 })
 export const SETTINGS_KEY = 'dsh-translation-plugin:settings:v2'
 export const HISTORY_PREFIX = 'dsh-translation-plugin:history:v2:'
@@ -66,20 +65,21 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): boolean
 export function validateSessionSettings(value: unknown): readonly string[] {
   if (!record(value)) return ['设置格式无效。']
   const errors: string[] = []
-  if (!exact(value, ['schemaVersion', 'defaultMode', 'targetLanguage', 'defaultInstruction', 'maxInputChars', 'rememberHistory']) || value.schemaVersion !== 2) errors.push('设置版本或字段无效。')
+  if (!exact(value, ['schemaVersion', 'defaultMode', 'targetLanguage', 'defaultInstruction', 'maxInputChars']) || value.schemaVersion !== 2) errors.push('设置版本或字段无效。')
   if (!mode(value.defaultMode)) errors.push('翻译模式无效。')
   if (!text(value.targetLanguage, 80, true)) errors.push('目标语言不能为空，且最多 80 个字符。')
   if (!text(value.defaultInstruction, 4000)) errors.push('翻译要求最多 4000 个字符。')
   if (!limit(value.maxInputChars)) errors.push('单次上限须为 1–200000 的整数。')
-  if (typeof value.rememberHistory !== 'boolean') errors.push('会话历史保存选项无效。')
   return errors
 }
 
 export function parseSettings(raw: string | null, legacyRaw: string | null = null): SessionSettings | undefined {
   if (raw !== null) {
     try {
-      const value: unknown = JSON.parse(raw)
-      return validateSessionSettings(value).length ? undefined : value as SessionSettings
+      const decoded: unknown = JSON.parse(raw)
+      if (!record(decoded)) return undefined
+      const { rememberHistory: _discarded, ...value } = decoded
+      return validateSessionSettings(value).length ? undefined : value as unknown as SessionSettings
     } catch { return undefined }
   }
   if (legacyRaw !== null) {
@@ -87,7 +87,7 @@ export function parseSettings(raw: string | null, legacyRaw: string | null = nul
       const old = decodeSettings(JSON.parse(legacyRaw))
       return old ? {
         schemaVersion: 2, defaultMode: old.defaultMode, targetLanguage: old.targetLanguage,
-        defaultInstruction: old.defaultInstruction, maxInputChars: old.maxInputChars, rememberHistory: false,
+        defaultInstruction: old.defaultInstruction, maxInputChars: old.maxInputChars,
       } : undefined
     } catch { return undefined }
   }

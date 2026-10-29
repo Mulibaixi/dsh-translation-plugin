@@ -7,7 +7,7 @@ export const HISTORY_BUNDLE_BYTES = 32 * 1024 * 1024
 export interface HistoryStatus { readonly switched: boolean; readonly token: string | null; readonly retired: boolean; readonly persistence: 'saved' | 'runtime_only'; readonly hasSaved: boolean }
 export interface HistoryList { readonly namespaceId: string; readonly topicId?: string; readonly after?: string }
 export interface HistoryListing { readonly sessions: readonly { readonly sessionId: string; readonly topicId: string; readonly state: HistoryStatus; readonly session?: LocalSession }[]; readonly next: string | null }
-export interface HistoryBegin extends HistoryScope { readonly purpose: 'create' | 'migrate' | 'replace' | 'patch'; readonly expectedToken: string | null; readonly currentPoints: number; readonly savedPoints: number | null; readonly rememberHistory: boolean }
+export interface HistoryBegin extends HistoryScope { readonly purpose: 'create' | 'migrate' | 'replace' | 'patch'; readonly expectedToken: string | null; readonly currentPoints: number; readonly savedPoints: number | null }
 export interface HistoryTransfer extends HistoryScope { readonly transferId: string }
 export interface HistoryPartUpload extends HistoryTransfer { readonly layer: 'current' | 'saved'; readonly offset: number; readonly text: string }
 export interface HistoryRead extends HistoryScope { readonly token: string; readonly layer: 'current' | 'saved'; readonly offset: number }
@@ -47,8 +47,8 @@ export function parseHistoryRequest(method: keyof HistoryRemotePort, value: unkn
   const base = ['namespaceId', 'topicId', 'sessionId']
   if (method === 'status') referenceExact(value, base)
   else if (method === 'begin') {
-    referenceExact(value, [...base, 'purpose', 'expectedToken', 'currentPoints', 'savedPoints', 'rememberHistory'])
-    if (!['create', 'migrate', 'replace', 'patch'].includes(String(value.purpose)) || typeof value.rememberHistory !== 'boolean') throw new TypeError('Invalid history transfer purpose')
+    referenceExact(value, [...base, 'purpose', 'expectedToken', 'currentPoints', 'savedPoints'])
+    if (!['create', 'migrate', 'replace', 'patch'].includes(String(value.purpose))) throw new TypeError('Invalid history transfer purpose')
     if (value.expectedToken !== null) referenceString(value.expectedToken)
     referenceInteger(value.currentPoints, 1); if ((value.currentPoints as number) > HISTORY_BUNDLE_BYTES) throw new TypeError('History batch is too large')
     if (value.savedPoints !== null) { referenceInteger(value.savedPoints, 1); if ((value.savedPoints as number) > HISTORY_BUNDLE_BYTES) throw new TypeError('History batch is too large') }

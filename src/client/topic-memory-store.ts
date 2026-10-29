@@ -1,17 +1,15 @@
 import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
-import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import { emptyTopicTerms, decodeTopicTermSnapshot, decodeTopicTermPut, decodeTopicTermUserInput, queryTopicTerms, topicTermContentsConflict, alignTopicTermLanguages,
   type TopicTermSnapshot, type TopicTermPut, type TopicTermUserInput, type TopicTermUserPut, type TermMutationResult, type TopicTermQuery } from '../memory/topic-terms.js'
 import { resolveTermEvidence, termEvidenceKey, type TermEvidenceRef, type TermEvidenceResolver, type TermEvidenceFact, type FileProposalAcceptance } from '../memory/topic-terms.js'
 import { parseTermStorageStatus, type TermRemoteScope, type TermStorageStatus, type TermCommand, type TermEvidenceState, type TermMutationReceipt } from '../shared/topic-terms-remote.js'
 import type { SessionStore, LocalStoragePort, StructureLockPort, HistoryStatus, HistoryVersion } from './session-store.js'
 import { diagnosticSpan } from '../shared/diagnostics.js'
-import { cachedTopicEvidence, captureTopicEvidenceCurrent, isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
+import { captureTopicEvidenceCurrent, isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
 import { TranslationSourceReader, type TranslationEvidenceReader } from './source-reader.js'
 import type { EvidenceReadResult } from '../shared/translation-evidence.js'
 import { currentFinalRevision, isTextUnit } from './translation-history.js'
 import { newTermId } from '../shared/term-id.js'
-import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { termReply, termScopeMatches, readTermSnapshot, transferTermMigration, type TopicTermsRemotePort } from './topic-terms-transport.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
 
@@ -47,18 +45,15 @@ export class TopicMemoryStore {
   private readonly listeners = new Set<() => void>()
   private readonly stopSession: () => void
   private readonly stopStorage: (() => void) | undefined
-  private enabled: boolean
   private disposed = false
   private epoch = 0
   private notice: string | undefined
-  private referenceEvidence: ReferenceEvidencePort | undefined
   private evidenceReader: TranslationEvidenceReader | undefined
   private readonly pausedReconciliation = new Set<string>()
   private readonly resolver: TermEvidenceResolver = (sessionId, unitId) => this.readEvidence(sessionId, unitId)
   constructor(private readonly sessions: SessionStore, private readonly storage: LocalStoragePort | undefined = browserPluginStorage(),
     listen?: (onChange: (key: string | null) => void) => () => void, private readonly locks: StructureLockPort | undefined = browserLocks(), private supplementaryEvidence?: TermEvidenceResolver,
     private readonly options: { readonly remote?: () => Promise<TopicTermsRemotePort | undefined> } = {}) {
-    this.enabled = sessions.getSettings().rememberHistory
     this.stopSession = sessions.subscribe(() => this.sessionChanged())
     const change = (key: string | null): void => { if (key === null || key.startsWith(TOPIC_TERMS_PREFIX)) this.emit() }
     if (listen) this.stopStorage = listen(change)
@@ -70,16 +65,6 @@ export class TopicMemoryStore {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   getNotice(): string | undefined { return this.notice }
-  private savingEnabled(): boolean {
-    if (!this.sessions.getSettings().rememberHistory) return false
-    if (!this.storage) return true
-    try {
-      const settings = parseSettings(this.storage.getItem(SETTINGS_KEY), this.storage.getItem(LEGACY_SETTINGS_KEY))
-      if (!settings) throw new Error('invalid settings')
-      return settings.rememberHistory
-    } catch { this.notice = '历史保存设置无法读取，主题术语仅保留在本次运行。'; return false }
-  }
-  setReferenceEvidence(port: ReferenceEvidencePort): void { this.referenceEvidence = port }
   setEvidenceReader(reader: TranslationEvidenceReader | undefined): void { this.evidenceReader = reader }
   setSupplementaryEvidenceResolver(resolver: TermEvidenceResolver): void { this.supplementaryEvidence = resolver }
   isSnapshotCurrent(snapshot: TopicTermSnapshot): boolean {
@@ -113,7 +98,6 @@ export class TopicMemoryStore {
     try { return await reader.read(captured) }
     catch { return { status: 'unloaded', request: captured, reason: 'transport_unavailable' } }
   }
-  readReferenceAsync(ownerId:string,topicId:string,ref:import('../shared/reference-memory.js').ReferenceEvidenceRef){return this.referenceEvidence?.view?.({ownerId,topicId},ref) ?? Promise.resolve(undefined)}
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined {
     const supplementary = this.supplementaryEvidence?.(sessionId, unitId)
     if (supplementary) return supplementary
@@ -233,9 +217,9 @@ export class TopicMemoryStore {
         if (!this.sessions.isTopicDeleting(topicId)) {
           // Reading old evidence may invalidate the runtime projection, never its saved historical copy.
           const refs = [...new Map(this.commandRefs(snapshot, { kind: 'reconcile' }).map(ref => [termEvidenceKey(snapshot!, ref), ref])).values()]
-          const resolver = cachedTopicEvidence(this.resolver, this.referenceEvidence), evidenceCurrent = captureTopicEvidenceCurrent(this.sessions, snapshot, refs, resolver)
+          const resolver = this.resolver, evidenceCurrent = captureTopicEvidenceCurrent(this.sessions, snapshot, refs, resolver)
           const evidence: TermEvidenceState[] = refs.map(ref => ({ ref, status: resolveTermEvidence(snapshot!, ref, resolver) !== undefined ? 'ready' : isTopicEvidenceUnloaded(this.sessions, snapshot!, ref) ? 'unloaded' : 'missing' }))
-          const receipt = termReply<TermMutationReceipt>(await remote.mutate({ ...seat.scope, token: status.token, command: { kind: 'reconcile' }, evidence, rememberHistory: false }))
+          const receipt = termReply<TermMutationReceipt>(await remote.mutate({ ...seat.scope, token: status.token, command: { kind: 'reconcile' }, evidence }))
           if (!current() || !evidenceCurrent()) throw new Error('术语依据在读取期间变化，请重新读取。')
           if (receipt.token !== status.token) {
             status = parseTermStorageStatus(termReply(await remote.status(seat.scope)))
@@ -260,7 +244,7 @@ export class TopicMemoryStore {
   async reload(ownerId: string, topicId: string): Promise<boolean> { try { await this.refresh(ownerId, topicId); return true } catch { return false } }
   query(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): TopicTermSnapshot {
     const snapshot = this.getSnapshot(ownerId, topicId)
-    return { ...snapshot, entries: queryTopicTerms(snapshot, { ...query, ownerId: snapshot.ownerId, topicId }, cachedTopicEvidence(this.resolver, this.referenceEvidence)) }
+    return { ...snapshot, entries: queryTopicTerms(snapshot, { ...query, ownerId: snapshot.ownerId, topicId }, this.resolver) }
   }
   queryAsync(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): Promise<TopicTermSnapshot> { return this.enqueue(ownerId, topicId, async () => { await this.waitForRead(ownerId, topicId); return this.queryCurrent(ownerId, topicId, query) }) }
   private async queryCurrent(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): Promise<TopicTermSnapshot> {
@@ -268,7 +252,7 @@ export class TopicMemoryStore {
     const seat = this.seat(ownerId, topicId), token = seat.storage?.token, epoch = this.epoch
     const fixed = structuredClone(query)
     if (fixed.mode !== 'normal') return { ...snapshot, entries: [] }
-    const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry => entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader, this.referenceEvidence)
+    const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry => entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader)
     if (this.disposed || reader !== this.evidenceReader || !prepared.isCurrent() || this.getSnapshot(ownerId, topicId) !== snapshot) throw new Error('术语或证据已经变化，请重新查询。')
     const remote = await this.remote(), latest = parseTermStorageStatus(termReply(await remote.status(seat.scope)))
     if (this.epoch !== epoch || latest.token !== token || !prepared.isCurrent() || reader !== this.evidenceReader || this.getSnapshot(ownerId, topicId) !== snapshot) {
@@ -308,14 +292,14 @@ export class TopicMemoryStore {
     if (expectedVersion !== undefined && snapshot.version !== expectedVersion) return failure('stale')
     const fixed = structuredClone(command), reader = this.evidenceReader
     const refs = [...new Map(this.commandRefs(snapshot, fixed).map(ref => [termEvidenceKey(snapshot, ref), ref])).values()]
-    const prepared = await prepareTopicEvidence(this.sessions, snapshot, refs, this.resolver, reader, this.referenceEvidence)
+    const prepared = await prepareTopicEvidence(this.sessions, snapshot, refs, this.resolver, reader)
     const evidence: TermEvidenceState[] = refs.map(ref => ({ ref, status: resolveTermEvidence(snapshot, ref, prepared.resolver) !== undefined ? 'ready' : prepared.isUnloaded(ref) ? 'unloaded' : 'missing' }))
     if (this.epoch !== epoch || !this.available(topicId) || reader !== this.evidenceReader || !prepared.isCurrent() || seat.snapshot !== snapshot || !storage.token) return failure('stale')
     const remote = await this.remote()
     if (this.epoch !== epoch || !this.available(topicId) || !prepared.isCurrent() || seat.snapshot !== snapshot) return failure('stale')
     if (fixed.kind !== 'clear' && this.sessions.isTopicDeleting(topicId)) return failure('stale')
     let result: TermMutationReceipt
-    try { result = termReply<TermMutationReceipt>(await remote.mutate({ ...seat.scope, token: storage.token, command: fixed, evidence, rememberHistory: fixed.kind !== 'reconcile' && this.savingEnabled() })) }
+    try { result = termReply<TermMutationReceipt>(await remote.mutate({ ...seat.scope, token: storage.token, command: fixed, evidence })) }
     catch (error) {
       // Gateway may normalize a service error code. Confirm an actual version change instead of parsing its message.
       if (this.epoch === epoch && this.available(topicId)) {
@@ -332,10 +316,10 @@ export class TopicMemoryStore {
       try {
         const latestReader = this.evidenceReader
         const nextRefs = [...new Map([...this.commandRefs(snapshot, { kind: 'reconcile' }), ...refs].map(ref => [termEvidenceKey(snapshot, ref), ref])).values()]
-        const verified = await prepareTopicEvidence(this.sessions, snapshot, nextRefs, this.resolver, latestReader, this.referenceEvidence)
+        const verified = await prepareTopicEvidence(this.sessions, snapshot, nextRefs, this.resolver, latestReader)
         if (this.epoch !== epoch || !this.available(topicId) || !verified.isCurrent()) return failure('stale')
         const states: TermEvidenceState[] = nextRefs.map(ref => ({ ref, status: resolveTermEvidence(snapshot, ref, verified.resolver) !== undefined ? 'ready' : verified.isUnloaded(ref) ? 'unloaded' : 'missing' }))
-        termReply(await remote.mutate({ ...seat.scope, token: result.token, command: { kind: 'reconcile' }, evidence: states, rememberHistory: false }))
+        termReply(await remote.mutate({ ...seat.scope, token: result.token, command: { kind: 'reconcile' }, evidence: states }))
         if (latestReader === this.evidenceReader && verified.isCurrent() && this.epoch === epoch && this.available(topicId)) await this.refresh(ownerId, topicId)
       } catch { /* A stale response remains unavailable until a confirmed read succeeds. */ }
       return failure('stale')
@@ -433,9 +417,6 @@ export class TopicMemoryStore {
   }
   private sessionChanged(): void {
     if (this.disposed) return
-    const enabled = this.sessions.getSettings().rememberHistory, justEnabled = enabled && !this.enabled
-    this.enabled = enabled
-    if (justEnabled) void this.persistNamespace()
     for (const [topicId, seat] of this.seats) {
       if (!this.available(topicId)) { seat.revision++; this.seats.delete(topicId); continue }
       if (seat.state.status !== 'ready' || seat.reconcileQueued || this.pausedReconciliation.has(topicId) || this.sessions.isTopicDeleting(topicId)) continue
@@ -444,7 +425,7 @@ export class TopicMemoryStore {
       queueMicrotask(() => {
         if (!this.available(topicId) || this.seats.get(topicId) !== seat || this.pausedReconciliation.has(topicId) || this.sessions.isTopicDeleting(topicId)) { seat.reconcileQueued = false; return }
         void Promise.resolve().then(() => this.reconcileAsync(seat.scope.ownerId, topicId)).then(snapshot => {
-          if (snapshot.version !== baseline.version && this.sessions.getSettings().rememberHistory) return this.persistReconciled(seat, snapshot)
+          if (snapshot.version !== baseline.version) return this.persistReconciled(seat, snapshot)
         }).catch(error => { if (!this.disposed) { diagnosticSpan({}, 'terms.reconcile', {}, topicId)('failed', {}, error); this.notice = `主题术语依据检查未完成：${(error as Error).message}`; this.emit() } }).finally(() => { seat.reconcileQueued = false })
       })
     }
@@ -452,27 +433,12 @@ export class TopicMemoryStore {
   }
   private persistReconciled(seat: Seat, snapshot: TopicTermSnapshot): Promise<void> {
     return this.enqueue(seat.scope.ownerId, seat.scope.topicId, async () => {
-      if (seat.snapshot !== snapshot || !this.savingEnabled() || this.sessions.isTopicDeleting(seat.scope.topicId) || !seat.storage?.token) return
+      if (seat.snapshot !== snapshot || this.sessions.isTopicDeleting(seat.scope.topicId) || !seat.storage?.token) return
       const remote = await this.remote(), token = seat.storage.token
-      if (seat.snapshot !== snapshot || !this.savingEnabled() || this.sessions.isTopicDeleting(seat.scope.topicId)) return
+      if (seat.snapshot !== snapshot || this.sessions.isTopicDeleting(seat.scope.topicId)) return
       termReply(await remote.persist({ ...seat.scope, token }))
       await this.refresh(seat.scope.ownerId, seat.scope.topicId)
     })
-  }
-  private async persistNamespace(): Promise<void> {
-    const epoch = this.epoch
-    try {
-      await Promise.all([...this.seats.values()].map(seat => seat.tail?.catch(() => {})))
-      const remote = await this.remote()
-      if (this.epoch !== epoch || !this.savingEnabled() || this.disposed) return
-      const result = termReply<{ readonly persisted: true }>(await remote.persistNamespace({ namespaceId: this.sessions.getNamespaceId() }))
-      if (result.persisted !== true || this.epoch !== epoch || this.disposed) throw new Error('主题术语保存尚未确认。')
-      for (const seat of this.seats.values()) if (seat.state.status === 'ready' && this.available(seat.scope.topicId)) {
-        await this.enqueue(seat.scope.ownerId, seat.scope.topicId, async () => { await this.waitForRead(seat.scope.ownerId, seat.scope.topicId); await this.refresh(seat.scope.ownerId, seat.scope.topicId); delete seat.saveFailed })
-      }
-      if (![...this.seats.values()].some(seat => seat.legacyCleanupPending)) this.notice = undefined
-      this.emit()
-    } catch (error) { if (!this.disposed) { this.notice = `主题术语尚未保存：${(error as Error).message}`; this.emit() } }
   }
   reset(): void { this.epoch++; for (const seat of this.seats.values()) { seat.revision++; delete seat.snapshot; delete seat.loading; seat.state = { status: 'idle' }; if (seat.refs > 0) void this.ensureLoaded(seat.scope.ownerId, seat.scope.topicId).catch(() => {}) }; this.emit() }
   dispose(): void { this.disposed = true; this.epoch++; this.stopSession(); this.stopStorage?.(); this.seats.clear(); this.listeners.clear() }

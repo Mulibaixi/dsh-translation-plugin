@@ -57,7 +57,6 @@ export function fileRevisionEvidence(evidence: readonly TermEvidenceRef[], old: 
   const result = [...evidence]
   for (const ref of [...old].reverse()) {
     if (result.length >= 100) break
-    if (ref.kind === 'reference' && origin === 'source_checked') continue
     const example = { ...ref, role: 'example' as const }
     if (!result.some(value => JSON.stringify({ ...value, role: 'example' }) === JSON.stringify(example))) result.push(example)
   }

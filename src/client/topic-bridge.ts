@@ -253,7 +253,6 @@ export class TopicBridgeClient {
     catch { console.error('[dsh-translation-plugin] Topic bridge stream cleanup failed.') }
   }
   private accessibleEvidence(ownerId: string, topicId: string, ref: TermEvidenceRef): boolean {
-    if (ref.kind === 'reference') return this.references?.isPublished(ownerId, topicId, ref) === true
     const session = this.sessions.getSession(ref.sessionId), history = this.sessions.getTranslationHistory(ref.sessionId)
     const unit = history?.units.find(unit => unit.id === ref.unitId)
     if (!session || session.topicId !== topicId || !unit || !this.sessions.canAccessUnit(ownerId, session.id, unit.id)) return false
@@ -381,7 +380,7 @@ export class TopicBridgeClient {
       const result = await this.preparation.reviewCorrection(command.request, { ...facts, topicTerms })
       if (!result.ok) return error(request.requestId, result.error.code, result.error.message)
       if (!this.sessions.updateTranslationHistory(session.id, history => applyDocumentMutation(history, unit.id, { kind: 'preparation', preparation: { id: result.value.preparationId, version: result.value.version, sourceVersion: source.version } }, result.value.updatedAt))) return error(request.requestId, 'history_update_failed', '新复核准备引用未登记到准确文档。')
-      if (this.sessions.getSettings().rememberHistory) await this.sessions.saveTranslationHistoryAsync(session.id)
+      await this.sessions.saveTranslationHistoryAsync(session.id)
       return success({ kind: 'preparation_receipt', receipt: result.value })
     }
     if (command.kind === 'preparation_capture') {
@@ -500,8 +499,7 @@ export class TopicBridgeClient {
     if (command.kind === 'settings_scope') {
       if (command.topicId !== null && !this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId))
         return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
-      return success({ kind: 'settings_scope', scope: { namespaceId: this.sessions.getNamespaceId(), topicId: command.topicId },
-        rememberHistory: this.sessions.getSettings().rememberHistory })
+      return success({ kind: 'settings_scope', scope: { namespaceId: this.sessions.getNamespaceId(), topicId: command.topicId } })
     }
     if (command.kind === 'list_sessions') return success({ kind: 'sessions',
       sessions: this.sessions.getDisplaySessions(ownerId)

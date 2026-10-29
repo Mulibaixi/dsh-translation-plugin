@@ -4,7 +4,6 @@ import {
   type RecordObjectMutationResult, type RecordObjectReference, type RecordObjectReferenceInput, type RecordObjectSnapshot, type RecordObjectTarget,
 } from '../shared/record-objects.js'
 import { SessionStore, type HistoryStatus, type LocalStoragePort, type StructureLockPort } from './session-store.js'
-import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
 import { canEditTextRevision, isTextUnit } from './translation-history.js'
 
@@ -27,18 +26,13 @@ export class RecordObjectStore {
   private readonly pending = new Map<string, Promise<boolean>>()
   private readonly stopSession: () => void
   private readonly stopStorage: (() => void) | undefined
-  private enabled: boolean
   private notice: string | undefined
   private disposed = false
 
   constructor(private readonly sessions: SessionStore, private readonly storage: LocalStoragePort | undefined = browserStorage(),
     listen?: (onChange: (key: string | null) => void) => () => void, private readonly locks: StructureLockPort | undefined = browserLocks()) {
-    this.enabled = sessions.getSettings().rememberHistory
     this.load()
     this.stopSession = sessions.subscribe(() => {
-      const enabled = sessions.getSettings().rememberHistory, justEnabled = enabled && !this.enabled
-      this.enabled = enabled
-      if (justEnabled) for (const seat of this.seats.values()) if (seat.dirty && seat.status !== 'conflict') this.queuePersist(seat)
       for (const seat of this.seats.values()) this.pruneDeletedUnits(seat)
       this.emit()
     })
@@ -148,21 +142,12 @@ export class RecordObjectStore {
     const body = this.body(reference)
     return body === undefined ? 'record_unavailable' : reference.offset > Array.from(body).length ? 'position_unavailable' : 'available'
   }
-  private savingEnabled(): boolean {
-    if (!this.storage) return false
-    try {
-      const settings = parseSettings(this.storage.getItem(SETTINGS_KEY), this.storage.getItem(LEGACY_SETTINGS_KEY))
-      if (!settings) throw new Error('invalid settings')
-      return settings.rememberHistory
-    } catch { this.notice = '历史保存设置无法读取，对象引用仅保留在本次运行。'; return false }
-  }
   private currentRaw(seat: Seat): boolean {
     if ((this.storage?.getItem(recordObjectsKey(seat.snapshot.sessionId)) ?? null) === seat.stored) return true
     seat.status = 'conflict'; this.notice = '记录对象引用已在其他窗口变化，当前内容保留，请读取最新副本后重试。'; return false
   }
   private persistLocked(seat: Seat): boolean {
     if (!seat.dirty) return true
-    if (!this.savingEnabled()) { seat.status = 'memory'; return true }
     if (!this.storage || !this.locks) { seat.status = 'error'; this.notice = '对象引用保存需要本地存储和 Web Locks，当前内容仍保留。'; return false }
     try {
       if (!this.currentRaw(seat)) return false
@@ -170,14 +155,6 @@ export class RecordObjectStore {
       this.storage.setItem(recordObjectsKey(seat.snapshot.sessionId), raw)
       seat.stored = raw; seat.dirty = false; seat.status = 'saved'; return true
     } catch { seat.status = 'error'; this.notice = '对象资源可能已登记，但记录引用未保存；当前引用仍保留在本次运行，可重试保存。'; return false }
-  }
-  private queuePersist(seat: Seat): void {
-    const id = seat.snapshot.sessionId
-    if (this.pending.has(id) || !this.storage || !this.locks || !seat.dirty) return
-    const pending = this.locks.request(TOPIC_LOCK_NAME, () => this.disposed ? false : this.persistLocked(seat)).catch(() => {
-      seat.status = 'error'; this.notice = '对象引用保存未完成，当前引用仍保留。'; return false
-    }).finally(() => { if (this.pending.get(id) === pending) { this.pending.delete(id); this.emit() } })
-    this.pending.set(id, pending)
   }
   async addReference(input: RecordObjectReferenceInput, expectedVersion: number): Promise<RecordObjectMutationResult> {
     const seat = this.seat(input.ownerId, input.topicId, input.sessionId)

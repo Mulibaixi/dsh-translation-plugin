@@ -165,17 +165,12 @@ export class MaterialSubmissionsClient {
   private loading: Promise<void> | undefined
   private generation = 0
   private disposed = false
-  private rememberHistory: boolean
   constructor(private readonly options: Options) {
-    this.rememberHistory = options.store.getSettings().rememberHistory
     this.fileIntakes = new FileIntakeStore(options.store.createFileIntakeStoreOptions(), () => this.emitListeners())
     this.restoreFileSubmissions()
     this.stopStore = options.store.subscribe(() => {
       if (options.store.isHistoryReady()) this.restoreFileSubmissions()
-      const enabled = options.store.getSettings().rememberHistory, becameEnabled = enabled && !this.rememberHistory
-      this.rememberHistory = enabled
       this.fileIntakes.reconcile(); this.reconcile(); this.emit()
-      if (becameEnabled) for (const record of this.fileIntakes.all()) void this.fileIntakes.saveSource(record.unitId, options.sourceStorage)
     })
     this.stopTopics = options.topics.subscribe(() => this.emit())
     this.setComposerBridge(options.registry, options.composerReason)

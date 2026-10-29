@@ -24,7 +24,6 @@ export class OtherMemoryClient {
   private readonly states = new Map<string | null, OtherMemoryStatus>()
   private readonly revisions = new Map<string | null, number>()
   private readonly retained = new Map<string, number>()
-  private saveError: string | undefined
   private readonly listeners = new Set<() => void>()
   private readonly operations = new Map<AbortController, string>()
   private epoch = 0
@@ -32,13 +31,9 @@ export class OtherMemoryClient {
   private readonly stopSession: () => void
   constructor(private readonly sessions: SessionStore, private readonly remote: () => Promise<OtherMemoryRemotePort | undefined>,
     private readonly options: { readonly uploads?: NativeFileUploadPort; readonly filesRemote?: () => Promise<OtherMemoryFilesRemotePort | undefined> } = {}) {
-    let remember = sessions.getSettings().rememberHistory
     this.stopSession = sessions.subscribe(() => {
       for (const topicId of this.cache.keys()) if (topicId !== null && !this.available(topicId)) this.discard(topicId)
       for (const [operation, topicId] of this.operations) if (!this.available(topicId)) operation.abort()
-      const next = sessions.getSettings().rememberHistory
-      if (next && !remember) void this.persistPending()
-      remember = next
     })
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
@@ -64,7 +59,7 @@ export class OtherMemoryClient {
     }
   }
   entries(topicId: string): readonly OtherMemoryEntry[] { return this.available(topicId) ? structuredClone(this.cache.get(topicId) ?? []) : [] }
-  getStatus(topicId: string): OtherMemoryStatus { const status = this.states.get(topicId) ?? { loading: false, ready: false }; return this.saveError && !status.error ? { ...status, error: this.saveError } : status }
+  getStatus(topicId: string): OtherMemoryStatus { return this.states.get(topicId) ?? { loading: false, ready: false } }
   async refresh(topicId: string | null): Promise<void> {
     if (!this.available(topicId)) return
     const epoch = this.epoch, revision = (this.revisions.get(topicId) ?? 0) + 1
@@ -110,7 +105,7 @@ export class OtherMemoryClient {
     const operation = this.begin(input.topicId), remote = await this.remote()
     if (!operation.current()) throw new Error('其他记忆连接已变化，请重试。')
     if (!remote) throw new Error('其他记忆服务未就绪，请重试。')
-    const entry = parseOtherMemoryEntry(unwrap(await remote.putSetting({ ...input, namespaceId: this.sessions.getNamespaceId(), rememberHistory: this.sessions.getSettings().rememberHistory })))
+    const entry = parseOtherMemoryEntry(unwrap(await remote.putSetting({ ...input, namespaceId: this.sessions.getNamespaceId() })))
     if (entry.kind !== 'setting' || entry.namespaceId !== this.sessions.getNamespaceId() || entry.topicId !== input.topicId) throw new Error('设定保存回执不匹配。')
     if (!operation.current()) throw new Error('其他记忆连接已变化，请刷新核对保存结果。')
     this.replace(entry); return entry
@@ -135,19 +130,6 @@ export class OtherMemoryClient {
     this.revisions.set(topicId, (this.revisions.get(topicId) ?? 0) + 1)
     this.states.set(topicId, { loading: false, ready: true }); this.emit()
   }
-  private async persistPending(): Promise<void> {
-    const epoch = this.epoch
-    try {
-      const remote = await this.remote()
-      if (this.epoch !== epoch || this.disposed || !this.sessions.getSettings().rememberHistory) return
-      if (!remote) throw new Error('其他记忆服务未就绪，请重试。')
-      const result = unwrap<{ readonly persisted: true }>(await remote.persistNamespace({ namespaceId: this.sessions.getNamespaceId() }))
-      if (result.persisted !== true) throw new Error('持久保存尚未确认。')
-      if (this.epoch !== epoch || this.disposed) return
-      this.saveError = undefined
-      for (const topicId of this.retained.keys()) await this.refresh(topicId)
-    } catch (error) { if (this.epoch === epoch && !this.disposed) { this.saveError = `其他记忆尚未保存：${(error as Error).message}`; this.emit() } }
-  }
   canUpload(mainSessionId?: string): boolean { return !!mainSessionId && !!this.options.uploads && !!this.options.filesRemote && !this.disposed }
   async importFile(topicId: string, mainSessionId: string, file: File): Promise<void> {
     const operation = this.begin(topicId)
@@ -164,7 +146,7 @@ export class OtherMemoryClient {
       const receipt = unwrap<{ readonly receiptId: string }>(await this.options.uploads!.upload(mainSessionId, file, file.name, controller.signal, () => {}))
       if (!receipt || typeof receipt.receiptId !== 'string' || !receipt.receiptId) throw new Error('文件上传未取得回执，请重试。')
       if (!operation.current() || controller.signal.aborted) throw new Error('文件登记已取消。')
-      const result = fileValue<OtherMemoryReference>('importReceipt', await remote.importReceipt({ namespaceId: this.sessions.getNamespaceId(), topicId, mainSessionId, category: 'full_text', receiptId: receipt.receiptId, rememberHistory: this.sessions.getSettings().rememberHistory }, controller.signal))
+      const result = fileValue<OtherMemoryReference>('importReceipt', await remote.importReceipt({ namespaceId: this.sessions.getNamespaceId(), topicId, mainSessionId, category: 'full_text', receiptId: receipt.receiptId }, controller.signal))
       if (result.namespaceId !== this.sessions.getNamespaceId() || result.topicId !== topicId) throw new Error('文件登记回执的主题不匹配。')
       if (!operation.current()) throw new Error('主题或连接已变化，请刷新核对文件登记结果。')
       this.replace(result)

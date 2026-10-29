@@ -22,7 +22,7 @@ export interface OtherMemoryReference extends OtherMemoryBase {
 export type OtherMemoryEntry = OtherMemorySetting | OtherMemoryReference
 export interface OtherMemoryPutSetting extends OtherMemoryScope {
   readonly id: string | null; readonly expectedVersion: number | null
-  readonly title: string; readonly body: string; readonly enabled: boolean; readonly rememberHistory: boolean
+  readonly title: string; readonly body: string; readonly enabled: boolean
 }
 export interface OtherMemoryRemove extends OtherMemoryScope { readonly id: string; readonly expectedVersion: number }
 export interface OtherMemoryList extends OtherMemoryScope { readonly after?: string }
@@ -32,8 +32,6 @@ export interface OtherMemoryRemotePort {
   putSetting(request: OtherMemoryPutSetting): Promise<OtherMemorySetting>
   removeEntry(request: OtherMemoryRemove): Promise<{ readonly removed: true }>
   clearTopic(request: { readonly namespaceId: string; readonly topicId: string }): Promise<{ readonly cleared: true }>
-  persist(request: OtherMemoryScope): Promise<{ readonly persisted: true }>
-  persistNamespace(request: { readonly namespaceId: string }): Promise<{ readonly persisted: true }>
 }
 export function parseOtherMemoryScope(value: unknown): OtherMemoryScope {
   referenceObject(value); referenceString(value.namespaceId)
@@ -61,15 +59,14 @@ export function parseOtherMemoryEntry(value: unknown): OtherMemoryEntry {
 export type OtherMemoryMethod = keyof OtherMemoryRemotePort
 export function parseOtherMemoryRequest(method: OtherMemoryMethod, value: unknown): unknown {
   referenceObject(value)
-  if (method === 'persistNamespace') { referenceExact(value, ['namespaceId']); referenceString(value.namespaceId); return structuredClone(value) }
   parseOtherMemoryScope(value)
   if (method === 'putSetting') {
-    referenceExact(value, ['namespaceId', 'topicId', 'id', 'expectedVersion', 'title', 'body', 'enabled', 'rememberHistory'])
+    referenceExact(value, ['namespaceId', 'topicId', 'id', 'expectedVersion', 'title', 'body', 'enabled'])
     if (value.id !== null) referenceString(value.id)
     if (value.expectedVersion !== null) referenceInteger(value.expectedVersion, 1)
     if ((value.id === null) !== (value.expectedVersion === null)) throw new TypeError('Invalid setting edit identity')
     referenceString(value.title, 200); referenceString(value.body, OTHER_MEMORY_SETTING_BYTES)
-    if (referenceBytes(value.body) > OTHER_MEMORY_SETTING_BYTES || typeof value.enabled !== 'boolean' || typeof value.rememberHistory !== 'boolean') throw new TypeError('Invalid setting input')
+    if (referenceBytes(value.body) > OTHER_MEMORY_SETTING_BYTES || typeof value.enabled !== 'boolean') throw new TypeError('Invalid setting input')
   } else if (method === 'removeEntry') {
     referenceExact(value, ['namespaceId', 'topicId', 'id', 'expectedVersion']); referenceString(value.id); referenceInteger(value.expectedVersion, 1)
   } else if (method === 'list') {
@@ -98,11 +95,11 @@ export function parseOtherMemoryResult(method: OtherMemoryMethod, value: unknown
   if (method === 'list') return parseOtherMemoryPage(value)
   if (method === 'putSetting') { const entry = parseOtherMemoryEntry(value); if (entry.kind !== 'setting') throw new TypeError('Invalid setting result'); return entry }
   referenceObject(value)
-  const field = method === 'removeEntry' ? 'removed' : method === 'persist' || method === 'persistNamespace' ? 'persisted' : 'cleared'
+  const field = method === 'removeEntry' ? 'removed' : 'cleared'
   referenceExact(value, [field]); if (value[field] !== true) throw new TypeError('Invalid memory removal receipt')
   return value
 }
-const methods: readonly OtherMemoryMethod[] = ['list', 'putSetting', 'removeEntry', 'clearTopic', 'persist', 'persistNamespace']
+const methods: readonly OtherMemoryMethod[] = ['list', 'putSetting', 'removeEntry', 'clearTopic']
 export const OTHER_MEMORY_REMOTE = {
   package: 'dsh-translation-plugin',
   descriptors: methods.map(method => ({

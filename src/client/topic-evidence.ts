@@ -1,5 +1,4 @@
 import { isFileJobUnit } from './translation-history.js'
-import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import { resolveTermEvidence, termEvidenceKey, type TermEvidenceRef, type TermEvidenceResolver } from '../memory/topic-terms.js'
 import type { EvidenceReadRequest, EvidenceReadResult } from '../shared/translation-evidence.js'
 import { TranslationSourceReader, type TranslationEvidenceReader } from './source-reader.js'
@@ -8,12 +7,6 @@ import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 import { isTextUnit } from './translation-history.js'
 
 type Scope = { readonly ownerId: string; readonly topicId: string }
-/** Synchronous consumers use only current, already resolved reference pages. */
-export function cachedTopicEvidence(fallback: TermEvidenceResolver, references?: ReferenceEvidencePort): TermEvidenceResolver {
-  return Object.assign((sessionId:string,unitId:string) => fallback(sessionId,unitId), {
-    resolveRef: (scope:Scope,ref:TermEvidenceRef) => ref.kind === 'reference' ? references?.cached?.(scope,ref) : resolveTermEvidence(scope,ref,fallback),
-  })
-}
 function requestKey(request: EvidenceReadRequest | null): string {
   return JSON.stringify(request && [request.ownerId, request.topicId, request.sessionId, request.unitId, request.sourceVersion,
     request.side, request.revisionId, request.selectionEventId, request.range?.start ?? null, request.range?.end ?? null])
@@ -29,7 +22,6 @@ function sameFact(left: unknown, right: unknown): boolean {
   return keys.length === Object.keys(right).length && keys.every(key => Object.hasOwn(rightFields, key) && sameFact(leftFields[key], rightFields[key]))
 }
 function referencedFacts(sessions: SessionStore, ref: TermEvidenceRef): unknown {
-  if (ref.kind === 'reference') return ref
   const history = sessions.getTranslationHistory(ref.sessionId), unit = history?.units.find(unit => unit.id === ref.unitId)
   if (unit && isFileJobUnit(unit)) return { sourceVersion: unit.sourceVersion }
   const source = unit?.sourceVersions.find(source => source.version === unit.sourceVersion)
@@ -58,7 +50,6 @@ export interface PreparedTopicEvidence {
 
 /** An authorization/structure conflict is not evidence that the original content is gone. */
 export function isTopicEvidenceUnloaded(sessions: SessionStore, scope: Scope, ref: TermEvidenceRef): boolean {
-  if (ref.kind === 'reference') return true
   const session = sessions.getSession(ref.sessionId)
   return !!session && (session.topicId !== scope.topicId ||
     sessions.getStatus(session.id) === 'conflict') || isDocumentEvidenceUnloaded(sessions, scope, ref)
@@ -77,8 +68,8 @@ function matchingReady(request: EvidenceReadRequest, value: EvidenceReadResult):
 
 /** Freeze every identity before starting I/O, then expose only exact resolved references to pure domain code. */
 export async function prepareTopicEvidence(sessions: SessionStore, scope: Scope, refs: readonly TermEvidenceRef[],
-  fallback: TermEvidenceResolver, reader?: TranslationEvidenceReader, references?: ReferenceEvidencePort): Promise<PreparedTopicEvidence> {
-  if (!reader && !references) {
+  fallback: TermEvidenceResolver, reader?: TranslationEvidenceReader): Promise<PreparedTopicEvidence> {
+  if (!reader) {
     const isUnloaded = (ref: TermEvidenceRef): boolean => isTopicEvidenceUnloaded(sessions, scope, ref)
     const resolver: TermEvidenceResolver = Object.assign((sessionId: string, unitId: string) => fallback(sessionId, unitId), {
       ...(fallback.resolveRef ? { resolveRef: fallback.resolveRef } : {}),
@@ -87,12 +78,7 @@ export async function prepareTopicEvidence(sessions: SessionStore, scope: Scope,
     return { resolver, isUnloaded, isCurrent: () => true }
   }
   reader ??= new TranslationSourceReader({sessions})
-  const referenceResults = new Map<string, Awaited<ReturnType<ReferenceEvidencePort['resolve']>>>()
-  for (const ref of refs) if (ref.kind === 'reference') {
-    const result = references ? await references.resolve(scope, ref) : {unloaded: true, isCurrent: () => true}
-    referenceResults.set(termEvidenceKey(scope, ref), result)
-  }
-  const unique = [...new Map(refs.filter(ref => ref.kind !== 'reference').map(ref => [termEvidenceKey(scope, ref), structuredClone(ref)])).values()]
+  const unique = [...new Map(refs.map(ref => [termEvidenceKey(scope, ref), structuredClone(ref)])).values()]
   const captures = unique.map(ref => {
     const unit = sessions.getTranslationHistory(ref.sessionId)?.units.find(unit => unit.id === ref.unitId)
     return { ref, captured: reader.capture(scope.ownerId, scope.topicId, ref), inline: !!unit && isTextUnit(unit),
@@ -114,14 +100,12 @@ export async function prepareTopicEvidence(sessions: SessionStore, scope: Scope,
   }
   const isUnloaded = (ref: TermEvidenceRef): boolean => {
     const key = termEvidenceKey(scope, ref)
-    if (ref.kind === 'reference') return referenceResults.get(key)?.unloaded ?? true
     if (inline.has(key)) return isTopicEvidenceUnloaded(sessions, scope, ref)
     const result = results.get(key); return !result || result.status === 'unloaded' || result.status === 'forbidden'
   }
   const resolver: TermEvidenceResolver = Object.assign((sessionId: string, unitId: string) => fallback(sessionId, unitId), {
     resolveRef: (requestedScope: Scope, ref: TermEvidenceRef): string | undefined => {
       const key = termEvidenceKey(requestedScope, ref)
-      if (ref.kind === 'reference') return referenceResults.get(key)?.text
       if (inline.has(key)) return resolveTermEvidence(requestedScope, ref, fallback)
       const result = results.get(key)
       return result?.status === 'ready' ? result.text : undefined
@@ -129,7 +113,7 @@ export async function prepareTopicEvidence(sessions: SessionStore, scope: Scope,
     isUnloaded: (requestedScope: Scope, ref: TermEvidenceRef) => requestedScope.ownerId === scope.ownerId && requestedScope.topicId === scope.topicId && isUnloaded(ref),
   })
   return { resolver, isUnloaded,
-    isCurrent: () => [...referenceResults.values()].every(result => result.isCurrent()) && captures.every(({ ref, captured, facts }) => {
+    isCurrent: () => captures.every(({ ref, captured, facts }) => {
       const current = reader.capture(scope.ownerId, scope.topicId, ref)
       return sameFact(referencedFacts(sessions, ref), facts) && captureKey(current) === captureKey(captured) &&
         ('status' in captured || reader.isCurrent(captured))

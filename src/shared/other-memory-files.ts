@@ -7,7 +7,7 @@ export interface OtherMemoryFilesCapability {
 }
 export interface OtherMemoryFileImport {
   readonly namespaceId: string; readonly topicId: string; readonly mainSessionId: string
-  readonly receiptId: string; readonly category: 'full_text'; readonly rememberHistory: boolean
+  readonly receiptId: string; readonly category: 'full_text'
 }
 export interface OtherMemoryFileOpen { readonly namespaceId: string; readonly topicId: string; readonly id: string; readonly version: number }
 export interface OtherMemorySegmentationRequest extends OtherMemoryFileOpen { readonly mainSessionId: string }
@@ -24,9 +24,9 @@ export type OtherMemoryFilesRemotePort = { [K in keyof OtherMemoryFilesPort]: (.
 export function parseOtherMemoryFilesRequest(method: 'importReceipt' | 'open' | 'requestSegmentation', value: unknown): OtherMemoryFileImport | OtherMemoryFileOpen | OtherMemorySegmentationRequest {
   referenceObject(value); referenceString(value.namespaceId); referenceString(value.topicId, 3000)
   if (method === 'importReceipt') {
-    referenceExact(value, ['namespaceId', 'topicId', 'mainSessionId', 'receiptId', 'category', 'rememberHistory'])
+    referenceExact(value, ['namespaceId', 'topicId', 'mainSessionId', 'receiptId', 'category'])
     referenceString(value.mainSessionId); referenceString(value.receiptId, 256)
-    if (value.category !== 'full_text' || typeof value.rememberHistory !== 'boolean') throw new TypeError('Only original/bilingual files can be registered')
+    if (value.category !== 'full_text') throw new TypeError('Only original/bilingual files can be registered')
   } else {
     referenceExact(value, ['namespaceId', 'topicId', 'id', 'version', ...(method === 'requestSegmentation' ? ['mainSessionId'] : [])]); referenceString(value.id); referenceInteger(value.version, 1)
     if (method === 'requestSegmentation') referenceString(value.mainSessionId)

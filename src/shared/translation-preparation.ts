@@ -318,7 +318,7 @@ export interface PreparationFrozenTerm {
   readonly userFixed: boolean
   readonly confirmation: TermUserAdoption | null
   readonly acceptance?: FileProposalAcceptance
-  readonly origin: 'model_inferred' | 'main_model_adjusted' | 'inferred' | 'source_checked' | 'reference_derived' | 'user_explicit'
+  readonly origin: 'model_inferred' | 'main_model_adjusted' | 'inferred' | 'source_checked' | 'user_explicit'
   /** Topic evidence remains its real reference; analysis never invents a unit. */
   readonly evidence: readonly TermEvidenceRef[]
   readonly candidateRefs: readonly { readonly id: string; readonly version: 1; readonly callId: string }[]
@@ -585,7 +585,7 @@ function parseFrozenPreparationTerm(value: unknown): PreparationFrozenTerm {
   if (ref.kind === 'candidate') {
     if (!['model_inferred', 'main_model_adjusted'].includes(String(value.origin)) || value.userFixed || value.confirmation !== null || value.acceptance !== undefined || value.evidence.length || !candidateRefs.length || sourceForms.length !== 1 || aliases.length || value.sourceLanguage !== null || value.sense !== '' || forbidden.length) throw new TypeError('Candidate cannot fabricate topic or fixed evidence')
   } else {
-    const auditTime = '2000-01-01T00:00:00.000Z', decoded = decodeTopicTermSnapshot({ schemaVersion: value.acceptance !== undefined ? 3 : value.origin === 'reference_derived' ? 2 : 1, ownerId: 'audit', topicId: 'audit', version: ref.entryVersion,
+    const auditTime = '2000-01-01T00:00:00.000Z', decoded = decodeTopicTermSnapshot({ schemaVersion: value.acceptance !== undefined ? 3 : 1, ownerId: 'audit', topicId: 'audit', version: ref.entryVersion,
       activeVersion: ref.entryVersion, updatedAt: auditTime, entries: [{ id: ref.id, version: ref.entryVersion, sourceLanguage: value.sourceLanguage, targetLanguage: value.targetLanguage,
         sourceForms, aliases, sense: value.sense, preferred: value.preferred, forbidden, evidence: value.evidence, status: 'active', origin: value.origin, confirmation: value.confirmation,
         ...(value.acceptance === undefined ? {} : { acceptance: value.acceptance }), createdAt: auditTime, updatedAt: auditTime }] })

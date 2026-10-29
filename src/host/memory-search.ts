@@ -10,7 +10,8 @@ import type { LocalDataService } from './local-data.js'
 import type { MemoryVectorRow } from './memory-database.js'
 import type { TopicHostContext, TopicToolsService } from './topic-tools.js'
 import type { HistoryService } from './history.js'
-import { isDeletedUnit } from '../memory/translation-history.js'
+import { currentFinalRevision, isDeletedUnit, isDocumentUnit, isFileJobUnit, isTextUnit } from '../memory/translation-history.js'
+import { currentDocumentFinal } from '../memory/document-task.js'
 import { currentHistoryPair, historyIndexSourceId, historyRecordExcerpt, historyRecordText, type CurrentHistoryPair } from './history-retrieval.js'
 import type { TranslationSourcesService } from './translation-sources.js'
 import type { TranslationRecordSelection } from '../shared/reference-memory.js'
@@ -25,13 +26,13 @@ interface Chunk extends Omit<MemoryVectorRow, 'vector'> {
     | { readonly kind: 'translation_record'; readonly selection: TranslationRecordSelection; readonly targetLanguage: string }
   readonly origin: string
 }
-interface Collection { readonly chunks: readonly Chunk[]; readonly saved: readonly Omit<MemoryVectorRow, 'vector'>[]; readonly unsupported: number; readonly unavailable: number; readonly unavailableRecords: number }
+interface Collection { readonly chunks: readonly Chunk[]; readonly saved: readonly Omit<MemoryVectorRow, 'vector'>[]; readonly unsupported: number; readonly unsegmented: number; readonly unavailable: number; readonly unavailableRecords: number }
 interface IndexSeat {
   readonly namespaceId: string; peer: string; enabled: boolean; dirty: boolean; epoch: number
   config: string; vectors: Map<string, readonly number[]>; status: MemoryIndexStatus
   job?: Promise<void> | undefined; controller?: AbortController | undefined
 }
-const empty = (): MemoryIndexStatus => ({ enabled: false, building: false, total: 0, indexed: 0, unsupported: 0, unavailable: 0, unavailableRecords: 0 })
+const empty = (): MemoryIndexStatus => ({ enabled: false, building: false, total: 0, indexed: 0, unsupported: 0, unsegmented: 0, unavailable: 0, unavailableRecords: 0 })
 const identity = (row: Omit<MemoryVectorRow, 'vector'>): string => JSON.stringify([row.topicId, row.sourceId, row.hash, row.start, row.end])
 const hash = async (text: string): Promise<string> => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))].map(n => n.toString(16).padStart(2, '0')).join('')
 const configKey = (config: { readonly endpoint: string; readonly model: string }): string => JSON.stringify([REFERENCE_SEGMENTATION_VERSION, config.endpoint, config.model])
@@ -90,9 +91,18 @@ export class MemorySearchService {
     return seat
   }
   async status(raw: MemoryIndexScope): Promise<MemoryIndexStatus> {
-    const request = parseMemoryIndexRequest('status', raw), peer = this.ctx.invocation?.peer.id
+    const request = parseMemoryIndexRequest('status', raw) as MemoryIndexScope, peer = this.ctx.invocation?.peer.id
     if (!peer) throw failure('索引状态缺少宿主连接。')
-    return { ...(await this.seat(request.namespaceId, peer)).status }
+    const seat = await this.seat(request.namespaceId, peer)
+    if (request.topicId === undefined) return { ...seat.status }
+    this.searches++
+    try {
+      const collection = await this.collect(request.namespaceId, peer, new AbortController().signal, request.topicId)
+      const config = await this.embedding.configuration(); this.check(request.namespaceId, peer)
+      return { ...seat.status, total: collection.chunks.length,
+        indexed: config && seat.config === configKey(config) ? collection.chunks.filter(row => seat.vectors.has(identity(row))).length : 0,
+        unsupported: collection.unsupported, unsegmented: collection.unsegmented, unavailable: collection.unavailable, unavailableRecords: collection.unavailableRecords }
+    } finally { this.searches-- }
   }
   /** Resume an already-enabled index on library connection, before any search/settings visit. */
   resumeLibrary(namespaceId: string, peer: string): void {
@@ -126,7 +136,7 @@ export class MemorySearchService {
     const epoch = seat.epoch, controller = new AbortController(); seat.controller = controller
     const report = diagnosticSpan(this.ctx, 'memory.index', {}, seat.namespaceId)
     const job = this.tail.catch(() => {}).then(() => this.run(seat, epoch, controller.signal)).then(() => {
-      report('completed', { indexed: seat.status.indexed, total: seat.status.total, unsupported: seat.status.unsupported, unavailable: seat.status.unavailable, unavailableRecords: seat.status.unavailableRecords })
+      report('completed', { indexed: seat.status.indexed, total: seat.status.total, unsupported: seat.status.unsupported, unsegmented: seat.status.unsegmented, unavailable: seat.status.unavailable, unavailableRecords: seat.status.unavailableRecords })
     }).catch(error => {
       report(controller.signal.aborted ? 'cancelled' : 'failed', { indexed: seat.status.indexed, total: seat.status.total }, error)
       if (!this.disposed && epoch === seat.epoch) seat.status = { ...seat.status, reason: error instanceof MemoryIndexFailure || (error as { code?: string }).code?.startsWith('embedding_') ? (error as Error).message : '记忆索引未完成；可读取原内容，检查服务后补齐或重建。' }
@@ -149,14 +159,14 @@ export class MemorySearchService {
         chunks.push({ ...row, saved: savedKeys.has(identity(row)), ref: { kind: entry.kind, id: entry.id, version: entry.version, purpose: 'background' }, origin: entry.origin })
       }
     }
-    let unsupported = 0, unavailable = 0, unavailableRecords = 0
+    let unsupported = 0, unsegmented = 0, unavailable = 0, unavailableRecords = 0
     for (const ref of await this.memory.retrievalReferences(namespaceId, peer)) {
       if (topicId !== undefined && ref.topicId !== topicId) continue
       signal.throwIfAborted()
       try {
         const { text } = await this.files.readText({ namespaceId, topicId: ref.topicId, id: ref.id, version: ref.version }, peer, signal)
         const segments = segmentReferenceText(text, ref.segmentation)
-        if (!segments.length) { unavailable++; continue }
+        if (!segments.length) { unsegmented++; continue }
         for (const segment of segments) {
           const part = { ...segment, hash: await hash(segment.text) }
           const row = { ...part, topicId: ref.topicId, sourceId: `reference:${ref.id}`, saved: ref.persistence === 'saved', origin: ref.category,
@@ -180,12 +190,14 @@ export class MemorySearchService {
       }
       return result
     }
-    for (const snapshot of await history?.retrievalSnapshots(namespaceId, peer, topicId, topicId === undefined ? undefined : sessionIds ?? []) ?? []) {
+    for (const snapshot of await history?.retrievalSnapshots(namespaceId, peer, topicId, sessionIds) ?? []) {
       const savedRows: Chunk[] = []
       const load = async (bundle: typeof snapshot.current, countUnavailable: boolean): Promise<Chunk[]> => {
         const result: Chunk[] = []
         for (const unit of bundle.history.units) if (!isDeletedUnit(unit)) {
           signal.throwIfAborted()
+          if (isTextUnit(unit) && !currentFinalRevision(unit) || isDocumentUnit(unit) && !currentDocumentFinal(unit)) continue
+          if (isFileJobUnit(unit) && !bundle.fileJobs.some(record => record.summary.unitId === unit.id && record.summary.sourceVersion === unit.sourceVersion && record.final)) continue
           try {
             const pair = await currentHistoryPair(bundle, snapshot.scope, snapshot.token, unit.id, peer, this.ctx.get?.('translationSources') as TranslationSourcesService | undefined, signal)
             if (!pair) { if (countUnavailable) unavailableRecords++; continue }
@@ -202,7 +214,7 @@ export class MemorySearchService {
     }
     this.check(namespaceId, peer); signal.throwIfAborted()
     if (epoch !== this.contentEpoch) throw failure('记忆内容在读取期间变化，请重试检索。')
-    return { chunks, saved, unsupported, unavailable, unavailableRecords }
+    return { chunks, saved, unsupported, unsegmented, unavailable, unavailableRecords }
   }
   private async cache(seat: IndexSeat, config: string): Promise<void> {
     if (seat.config === config) return
@@ -212,7 +224,7 @@ export class MemorySearchService {
   }
   private coverage(seat: IndexSeat, collection: Collection): void {
     seat.status = { enabled: seat.enabled, building: !!seat.job, total: collection.chunks.length, indexed: collection.chunks.filter(row => seat.vectors.has(identity(row))).length,
-      unsupported: collection.unsupported, unavailable: collection.unavailable, unavailableRecords: collection.unavailableRecords }
+      unsupported: collection.unsupported, unsegmented: collection.unsegmented, unavailable: collection.unavailable, unavailableRecords: collection.unavailableRecords }
   }
   private async run(seat: IndexSeat, epoch: number, signal: AbortSignal): Promise<void> {
     const check = (): void => { this.check(seat.namespaceId, seat.peer); signal.throwIfAborted(); if (seat.epoch !== epoch) throw failure('索引内容已变化。') }
@@ -286,10 +298,10 @@ export class MemorySearchService {
         matches.push(item); counts.set(object, (counts.get(object) ?? 0) + 1)
       }
       const indexed = seat.config === space ? collection.chunks.filter(row => seat.vectors.has(identity(row))).length : 0
-      report(reason ? 'degraded' : 'completed', { matches: matches.length, keywordMatches: keyword.length, vectorMatches: semantic.length, indexed, total: collection.chunks.length, unavailableFiles: collection.unavailable, unsupportedFiles: collection.unsupported, unavailableRecords: collection.unavailableRecords, dimensionsChanged, fallback: !!reason })
+      report(reason ? 'degraded' : 'completed', { matches: matches.length, keywordMatches: keyword.length, vectorMatches: semantic.length, indexed, total: collection.chunks.length, unavailableFiles: collection.unavailable, unsegmentedFiles: collection.unsegmented, unsupportedFiles: collection.unsupported, unavailableRecords: collection.unavailableRecords, dimensionsChanged, fallback: !!reason })
       return { matches, method: semantic.length ? 'keyword+vector' : 'keyword', ...(reason === undefined ? {} : { reason }), resultsLimited: ranked.length > matches.length,
         coverage: { categories: ['entity', 'fact', 'relation', 'reference_file', 'translation_record'], excluded: ['old_translation_revisions', 'unadopted_candidates', 'legacy_reference_segments', 'terms', 'settings'], totalSegments: collection.chunks.length, vectorSegments: indexed,
-          unsupportedFiles: collection.unsupported, unavailableFiles: collection.unavailable, unavailableRecords: collection.unavailableRecords, complete: indexed === collection.chunks.length && collection.unsupported === 0 && collection.unavailable === 0 && collection.unavailableRecords === 0 && !reason } }
+          unsupportedFiles: collection.unsupported, unsegmentedFiles: collection.unsegmented, unavailableFiles: collection.unavailable, unavailableRecords: collection.unavailableRecords, complete: indexed === collection.chunks.length && collection.unsupported === 0 && collection.unsegmented === 0 && collection.unavailable === 0 && collection.unavailableRecords === 0 && !reason } }
     } catch (error) { report(signal.aborted ? 'cancelled' : 'failed', {}, error); throw error }
     finally { this.searches-- }
   }

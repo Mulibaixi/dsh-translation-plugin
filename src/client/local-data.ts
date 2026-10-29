@@ -100,11 +100,14 @@ export function ClearedDataView():unknown{return h('section',{className:'dsh-tp'
 export function LocalDataClearView({data}:{readonly data:LocalDataClient}):unknown{
   useLocalDataFrozen(data)
   const [confirm,setConfirm]=react.useState(false)
-  return h('section',{className:'dsh-tp dsh-tp-settings-section'},h('style',null,styles),h('h3',null,'本地数据'),
+  return h('section',{className:'dsh-tp dsh-tp-settings-section'},h('style',null,styles),
+    h('div',{className:'dsh-tp-settings-header dsh-tp-settings-section-header'},h('h3',null,'本地数据'),
+      h('div',{className:'dsh-tp-actions'},data.isCleared()?null:h('button',{type:'button',className:'dsh-tp-danger',disabled:data.isClearing(),title:'永久清除本插件数据，需再次确认',onClick:()=>setConfirm(true)},data.isFrozen()?'重试清除本地数据':'清除本地数据'))),
     h('p',{className:'dsh-tp-muted'},'清除当前浏览器来源中的本插件数据，以及当前 DSH 数据目录中的插件自有原稿和参考资料。包含会话、记忆资产、准备记录、偏好、设置，以及本插件的嵌入 API 配置和密钥。用户原文件、主聊天附件与聊天历史保留。清除后需重新启用插件。'),
-    data.isCleared()?null:h('button',{type:'button',disabled:data.isClearing(),onClick:()=>setConfirm(true)},data.isFrozen()?'重试清除本地数据':'清除本地数据'),
-    confirm?h('div',{role:'alertdialog','aria-label':'清除本地数据确认'},h('p',null,'确定永久清除上述本地数据？此操作无法撤销。'),
-      h('button',{type:'button',disabled:data.isClearing(),onClick:()=>{setConfirm(false);void data.clear()}},'确认清除'),
-      h('button',{type:'button',disabled:data.isClearing(),onClick:()=>setConfirm(false)},'取消')):null,
+    confirm?h('div',{className:'dsh-tp-dialog',role:'alertdialog','aria-label':'清除本地数据确认'},
+      h('p',null,'确定永久清除上述本地数据？所有主题、会话、记忆资产和插件设置（含嵌入 API 配置与密钥）将被删除，无法撤销。'),
+      h('div',{className:'dsh-tp-actions'},
+        h('button',{type:'button',autoFocus:true,disabled:data.isClearing(),onClick:()=>setConfirm(false)},'取消'),
+        h('button',{type:'button',disabled:data.isClearing(),onClick:()=>{setConfirm(false);void data.clear()}},'确认永久清除'))):null,
     data.getMessage()?h('p',{role:'status',className:'dsh-tp-message'},data.getMessage()):null)
 }

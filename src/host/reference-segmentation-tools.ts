@@ -45,8 +45,7 @@ export function registerReferenceSegmentationTools(ctx: TopicHostContext, memory
         const allEnds = [...oldEnds, ...ends], points = Array.from(original.text)
         let previous = 0
         for (const end of allEnds) { if (!points.slice(previous, end).join('').trim()) throw new Error('分段包含空白片段或重复／倒序边界，请重新标记。'); previous = end }
-        const saved = await memory.putReferenceSegmentation({ ...request, expectedPlanVersion: raw.expectedPlanVersion as number, mode: raw.mode as 'append' | 'replace', ends,
-          rememberHistory: scope.rememberHistory }, check(), () => { check() })
+        const saved = await memory.putReferenceSegmentation({ ...request, expectedPlanVersion: raw.expectedPlanVersion as number, mode: raw.mode as 'append' | 'replace', ends }, check(), () => { check() })
         const summary = referencePlanSummary(original.text, saved.segmentation)
         let indexing = 'waiting_for_complete', reason: string | undefined
         if (summary.complete) {

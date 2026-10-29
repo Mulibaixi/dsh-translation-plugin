@@ -15,7 +15,7 @@ export type TermCommand = { readonly kind: 'put'; readonly input: TopicTermPut }
 export interface TermEvidenceState { readonly ref: TermEvidenceRef; readonly status: 'ready' | 'unloaded' | 'missing' }
 export interface TermReadRequest extends TermRemoteScope { readonly token: string; readonly layer: 'current' | 'saved'; readonly offset: number }
 export interface TermReadPage { readonly text: string; readonly nextOffset: number | null }
-export interface TermMutationRequest extends TermRemoteScope { readonly token: string; readonly rememberHistory: boolean; readonly command: TermCommand; readonly evidence: readonly TermEvidenceState[] }
+export interface TermMutationRequest extends TermRemoteScope { readonly token: string; readonly command: TermCommand; readonly evidence: readonly TermEvidenceState[] }
 export interface TermMutationReceipt { readonly status: TermMutationResult['status']; readonly token: string; readonly entryId: string | null }
 export interface TermMigrateBegin extends TermRemoteScope { readonly currentPoints: number; readonly storedPoints: number | null }
 export interface TermMigrateCommit extends TermRemoteScope { readonly transferId: string }
@@ -29,7 +29,6 @@ export interface TermsRemotePort {
   migrateCancel(request: TermMigrateCommit): Promise<{ readonly cancelled: true }>
   mutate(request: TermMutationRequest): Promise<TermMutationReceipt>
   persist(request: TermRemoteScope & { readonly token: string }): Promise<TermStorageStatus>
-  persistNamespace(request: { readonly namespaceId: string }): Promise<{ readonly persisted: true }>
 }
 export function parseTermScope(value: unknown): TermRemoteScope {
   referenceObject(value); referenceString(value.namespaceId); referenceString(value.ownerId); referenceString(value.topicId)
@@ -54,7 +53,6 @@ export function parseTermCommand(value: unknown): TermCommand {
 type Method = keyof TermsRemotePort
 export function parseTermRemoteRequest(method: Method, value: unknown): unknown {
   referenceObject(value)
-  if (method === 'persistNamespace') { referenceExact(value, ['namespaceId']); referenceString(value.namespaceId); return structuredClone(value) }
   parseTermScope(value)
   const scope = ['namespaceId', 'ownerId', 'topicId']
   if (method === 'status') referenceExact(value, scope)
@@ -65,8 +63,8 @@ export function parseTermRemoteRequest(method: Method, value: unknown): unknown 
     referenceExact(value, [...scope, 'transferId', ...(method === 'migratePart' ? ['layer', 'offset', 'text'] : [])]); referenceString(value.transferId)
     if (method === 'migratePart') { referenceInteger(value.offset); referenceString(value.text, TERM_TRANSFER_POINTS, true); if (!value.text.length || value.layer !== 'current' && value.layer !== 'saved') throw new TypeError('Invalid term layer') }
   } else {
-    referenceExact(value, [...scope, 'token', 'rememberHistory', 'command', 'evidence']); referenceString(value.token); parseTermCommand(value.command)
-    if (typeof value.rememberHistory !== 'boolean' || !Array.isArray(value.evidence)) throw new TypeError('Invalid term mutation')
+    referenceExact(value, [...scope, 'token', 'command', 'evidence']); referenceString(value.token); parseTermCommand(value.command)
+    if (!Array.isArray(value.evidence)) throw new TypeError('Invalid term mutation')
     const keys = new Set<string>()
     for (const item of value.evidence) {
       referenceObject(item); referenceExact(item, ['ref', 'status'])
@@ -101,12 +99,11 @@ export function parseTermRemoteResult(method: Method, value: unknown): unknown {
   else if (method === 'migrateBegin') { referenceExact(value, ['transferId']); referenceString(value.transferId) }
   else if (method === 'migratePart') { referenceExact(value, ['nextOffset']); referenceInteger(value.nextOffset, 1) }
   else if (method === 'migrateCancel') { referenceExact(value, ['cancelled']); if (value.cancelled !== true) throw new TypeError('Invalid term cancellation') }
-  else if (method === 'persistNamespace') { referenceExact(value, ['persisted']); if (value.persisted !== true) throw new TypeError('Invalid term persistence') }
   else { referenceExact(value, ['status', 'token', 'entryId']); referenceString(value.token); if (value.entryId !== null) referenceString(value.entryId); if (!['updated', 'unchanged', 'stale', 'invalid', 'requires_user_action', 'conflict', 'save_failed'].includes(String(value.status))) throw new TypeError('Invalid term receipt') }
   if (referenceBytes({ ok: true, value }) > TERM_TRANSFER_BYTES) throw new RangeError('术语回包超过完整传输预算。')
   return structuredClone(value)
 }
-const methods: readonly Method[] = ['status', 'read', 'migrateBegin', 'migratePart', 'migrateCommit', 'migrateCancel', 'mutate', 'persist', 'persistNamespace']
+const methods: readonly Method[] = ['status', 'read', 'migrateBegin', 'migratePart', 'migrateCommit', 'migrateCancel', 'mutate', 'persist']
 export const TOPIC_TERMS_REMOTE = { package: 'dsh-translation-plugin', descriptors: methods.map(method => ({
   id: `dsh-translation-plugin#translationTerms/${method}`, service: 'translationTerms', namespace: 'translationTerms', method, invocation: { kind: 'direct' as const },
   parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: { mode: 'strict' as const, typeSymbol: `dsh-translation-plugin#term-${method}-request`, create: () => ({ parse: (value: unknown) => parseTermRemoteRequest(method, value) }) } }],

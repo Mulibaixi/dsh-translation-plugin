@@ -99,7 +99,7 @@ export class NormalTranslationClient {
     this.stopStore = store.subscribe(() => {
       for (const [key, item] of this.operations) {
         const unit = store.getTranslationHistory(item.operation.translationSessionId)?.units.find(unit => unit.id === item.operation.unitId)
-        if (unit && isTextUnit(unit) && unit.revisions.some(revision => revision.status === 'deleted' &&
+        if (unit?.deletion || unit && isTextUnit(unit) && unit.revisions.some(revision => revision.status === 'deleted' &&
           (revision.id === item.callId || item.v2Attempts.has(revision.id)))) {
           item.release?.(); this.operations.delete(key)
         }
@@ -645,7 +645,7 @@ export class NormalTranslationClient {
       const history = this.store.getTranslationHistory(session.id)
       const event = [...history?.events ?? []].reverse().find(event => event.operationId === operationId)
       const unit = history?.units.find(unit => unit.id === event?.unitId)
-      if (!unit || !isTextUnit(unit)) continue
+      if (!unit || !isTextUnit(unit) || unit.deletion) continue
       const material = unit.material
       const accepted = history?.events.find(event => event.operationId === operationId && ['operation.accepted', 'operation.retranslation_accepted'].includes(event.type) && event.revisionId === null)
       if (!unit || event?.type === 'source.corrected' || this.store.getOperationMainSessionId(session.id, operationId) !== ownerId || this.store.isSessionDeleted(session.id)) continue

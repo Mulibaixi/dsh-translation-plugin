@@ -81,8 +81,8 @@ export class DocumentReviewClient {
     const candidate = unit.revisions.find(item => item.id === manifestRevisionId)!
     return { target, operationId, reviewVersion: documentReviewVersion(unit), audit: audit ? { id: audit.id, reviewId: audit.reviewId, version: audit.version, mechanicalStatus: audit.mechanical.status, semanticStatus: audit.semantic.status } : null,
       manifestRevisionId, status: candidate.review.status === 'passed' ? 'passed' : candidate.review.status === 'failed' ? 'review_required' : 'pending',
-      finalEligible: documentManifestFinalEligibility(unit, manifestRevisionId).eligible, storage: this.store.getSettings().rememberHistory && this.store.getStatus(target.scope.translationSessionId) === 'saved' ? 'saved' : 'runtime_only',
-      storageError: this.store.getSettings().rememberHistory && this.store.getStatus(target.scope.translationSessionId) === 'saved' ? null : '当前复核事实仅在运行期或保存尚未确认。' }
+      finalEligible: documentManifestFinalEligibility(unit, manifestRevisionId).eligible, storage: this.store.getStatus(target.scope.translationSessionId) === 'saved' ? 'saved' : 'runtime_only',
+      storageError: this.store.getStatus(target.scope.translationSessionId) === 'saved' ? null : '当前复核事实仅在运行期或保存尚未确认。' }
   }
   async page(ownerId: string, raw: DocumentReviewPageRequest): Promise<AnalysisResult<DocumentReviewPage>> {
     try {
@@ -150,7 +150,7 @@ export class DocumentReviewClient {
       if (documentReviewVersion(unit) !== request.expectedReviewVersion) throw error('stale_review_version', '复核版本已变化，请读取当前候选再提交。')
       if (requireLatest && [...unit.revisions].reverse().find(item => item.sourceVersion === unit.sourceVersion)?.id !== manifest.id) throw error('stale_candidate', '已有更新的整篇候选，请复核当前候选。')
       const revisionId = await action(unit, manifest, handle)
-      if (this.store.getSettings().rememberHistory) await this.store.saveTranslationHistoryAsync(request.target.scope.translationSessionId)
+      await this.store.saveTranslationHistoryAsync(request.target.scope.translationSessionId)
       this.emit(); return good(this.receipt(request.target, request.operationId, revisionId))
     } catch (failure) { const known = failure as { code?: string; message?: string }; return bad(known.code ?? 'review_write_failed', known.message ?? '复核写入未完成；请查询原操作。') }
     finally { release() }

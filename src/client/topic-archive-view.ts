@@ -6,7 +6,7 @@ import { TopicEvidenceView, type TopicTermsViewPort } from './topic-terms-view.j
 
 const kinds = { entity: '实体', fact: '事实', relation: '关系' } as const
 const statuses = { proposal: '待确认', active: '生效', review_required: '待复核', disabled: '已停用' } as const
-const origins = { inferred: '模型提案', source_checked: '原文依据', reference_derived: '参考资料（主模型解读）', user_explicit: '用户采用' } as const
+const origins = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突', error: '保存失败' } as const
 type TextEvent = { readonly currentTarget: { readonly value: string } }
 interface ArchiveForm {
@@ -76,7 +76,6 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
   const pending = actionPending || readState.status !== 'ready'
   const note = [
     '同主题共用；快译不使用。关联实体须为生效条目。',
-    sessions.getSettings().rememberHistory ? '已开启历史保存。' : '已保存的档案保留；后续修改仅保留在本次运行。',
     `保存状态：${readState.status === 'loading' ? '正在刷新' : storageLabels[archive.getStatus(ownerId, topicId)]}`,
   ].join(' ')
   const entities = snapshot.entries.filter(entry => entry.kind === 'entity'), needle = query.trim().toLocaleLowerCase()

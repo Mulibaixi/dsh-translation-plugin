@@ -41,10 +41,10 @@ export function registerSettingTools(memory: OtherMemoryService, topics: TopicTo
         if (definition.action === 'list') {
           const page = await memory.listSettings({ ...reply.scope, ...(raw.after === undefined ? {} : { after: raw.after as string }) }, peer)
           checked(); report('completed', { entries: page.entries.length, hasNext: page.next !== null })
-          return { ...page, rememberHistory: reply.rememberHistory }
+          return page
         }
         if (definition.action === 'putSetting') {
-          const entry = await memory.putSettingForAgent({ ...raw, ...reply.scope, rememberHistory: reply.rememberHistory } as unknown as OtherMemoryPutSetting, peer)
+          const entry = await memory.putSettingForAgent({ ...raw, ...reply.scope } as unknown as OtherMemoryPutSetting, peer)
           report('completed', { persistence: entry.persistence, version: entry.version, enabled: entry.enabled })
           return entry
         }

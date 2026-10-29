@@ -20,7 +20,6 @@ function applicable(entry: OtherMemoryEntry, scope: OtherMemoryScope): boolean {
 /** Host authority for new other_memory assets; Client caches never become a fallback store. */
 export class OtherMemoryService implements OtherMemoryRemotePort {
   readonly typertRemote: { readonly service: OtherMemoryService; readonly serviceKey: 'translationOtherMemory'; readonly namespace: 'translationOtherMemory' } = { service: this, serviceKey: 'translationOtherMemory', namespace: 'translationOtherMemory' }
-  private readonly runtime = new Map<string, OtherMemoryEntry>()
   private readonly epochs = new Map<string, number>()
   private readonly retired = new Set<string>()
   private db: MemoryDatabase | undefined
@@ -65,11 +64,10 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
   }
   private entries(namespaceId: string): readonly OtherMemoryEntry[] {
     const entries = new Map((this.db?.all(namespaceId) ?? []).map(entry => [entry.id, entry]))
-    for (const entry of this.runtime.values()) if (entry.namespaceId === namespaceId) entries.set(entry.id, entry)
     return [...entries.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
   }
   private current(id: string, namespaceId: string): OtherMemoryEntry | undefined {
-    const entry = this.runtime.get(id) ?? this.db?.entry(id)
+    const entry = this.db?.entry(id)
     return entry?.namespaceId === namespaceId ? entry : undefined
   }
   private writer<T>(action: () => Promise<T>): Promise<T> {
@@ -116,33 +114,30 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
   private putSettingForPeer(raw: OtherMemoryPutSetting, peerId: string | undefined): Promise<OtherMemorySetting> {
     const request = parseOtherMemoryRequest('putSetting', raw) as OtherMemoryPutSetting, guard = this.authorize(request, peerId)
     return this.serial(guard, () => this.writer(async () => {
-      let db = await this.database(); this.check(guard)
+      const db = await this.database(true); this.check(guard)
       const old = request.id === null ? undefined : this.current(request.id, request.namespaceId)
       if (request.id !== null && (!old || old.kind !== 'setting' || old.version !== request.expectedVersion)) throw failure('other_memory_stale', '此设定已变化或已删除，请重新读取后重试。')
       const entry = parseOtherMemoryEntry({ id: old?.id ?? `memory-${crypto.randomUUID()}`, namespaceId: request.namespaceId, topicId: request.topicId,
         version: (old?.version ?? 0) + 1, kind: 'setting', title: request.title, body: request.body, enabled: request.enabled,
-        persistence: request.rememberHistory ? 'saved' : 'runtime_only' }) as OtherMemorySetting
-      if (request.rememberHistory) { db = await this.database(true); this.check(guard); db!.save(entry); this.runtime.delete(entry.id) } else this.runtime.set(entry.id, entry)
+        persistence: 'saved' }) as OtherMemorySetting
+      db!.save(entry)
       return structuredClone(entry)
     }))
   }
   /** Only the file service can supply an actual Host-verified immutable original. */
-  putReference(request: { readonly namespaceId: string; readonly topicId: string; readonly category: 'full_text' | 'reference'; readonly source: SourceIdentity; readonly rememberHistory: boolean }, peerId: string): Promise<OtherMemoryReference> {
+  putReference(request: { readonly namespaceId: string; readonly topicId: string; readonly category: 'full_text' | 'reference'; readonly source: SourceIdentity }, peerId: string): Promise<OtherMemoryReference> {
     referenceString(request.topicId, 3000)
     if (request.category !== 'full_text') throw new TypeError('其他参考资料已关闭，仅支持原文／双语对照文件。')
-    if (typeof request.rememberHistory !== 'boolean') throw new TypeError('Invalid reference persistence')
     const guard = this.authorize(request, peerId)
     const entry = parseOtherMemoryEntry({ id: `memory-${crypto.randomUUID()}`, namespaceId: request.namespaceId, topicId: request.topicId, version: 1, kind: 'reference',
-      category: request.category, source: request.source, persistence: request.rememberHistory ? 'saved' : 'runtime_only' }) as OtherMemoryReference
+      category: request.category, source: request.source, persistence: 'saved' }) as OtherMemoryReference
     return this.serial(guard, async () => {
       await this.database(); this.check(guard)
-      if (request.rememberHistory) {
-        if (!this.hooks) throw failure('other_memory_original_unavailable', '参考原件保存服务尚未就绪。')
-        await this.hooks.persistSource(entry); this.check(guard)
-      }
+      if (!this.hooks) throw failure('other_memory_original_unavailable', '参考原件保存服务尚未就绪。')
+      await this.hooks.persistSource(entry); this.check(guard)
       return this.writer(async () => {
-        const db = await this.database(request.rememberHistory); this.check(guard)
-        if (request.rememberHistory) db!.save(entry); else this.runtime.set(entry.id, entry)
+        const db = await this.database(true); this.check(guard)
+        db!.save(entry);
         return structuredClone(entry)
       })
     })
@@ -153,7 +148,7 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
     const entry = this.current(request.id, request.namespaceId)
     return entry?.kind === 'reference' && entry.topicId === request.topicId && entry.version === request.version ? structuredClone(entry) : undefined
   }
-  async putReferenceSegmentation(request: { readonly namespaceId: string; readonly topicId: string; readonly id: string; readonly version: number; readonly expectedPlanVersion: number; readonly ends: readonly number[]; readonly mode: 'append' | 'replace'; readonly rememberHistory: boolean }, peerId: string, validate: () => void): Promise<OtherMemoryReference> {
+  async putReferenceSegmentation(request: { readonly namespaceId: string; readonly topicId: string; readonly id: string; readonly version: number; readonly expectedPlanVersion: number; readonly ends: readonly number[]; readonly mode: 'append' | 'replace' }, peerId: string, validate: () => void): Promise<OtherMemoryReference> {
     const guard = this.authorize(request, peerId)
     return this.serial(guard, async () => {
       await this.database(); this.check(guard); validate()
@@ -162,10 +157,10 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
         throw failure('other_memory_stale', '文件或分段方案已变化，请读取最新状态后继续。')
       const ends = request.mode === 'append' ? [...old.segmentation?.ends ?? [], ...request.ends] : [...request.ends]
       const segmentation = parseReferenceSegmentation({ version: request.expectedPlanVersion + 1, ends }, old.source.totalCodePoints)
-      const entry = parseOtherMemoryEntry({ ...old, segmentation, persistence: request.rememberHistory ? 'saved' : 'runtime_only' }) as OtherMemoryReference
+      const entry = parseOtherMemoryEntry({ ...old, segmentation, persistence: 'saved' }) as OtherMemoryReference
       return this.writer(async () => {
-        const db = await this.database(request.rememberHistory); this.check(guard); validate()
-        if (request.rememberHistory) { db!.save(entry); this.runtime.delete(entry.id) } else this.runtime.set(entry.id, entry)
+        const db = await this.database(true); this.check(guard); validate()
+        db!.save(entry)
         ;(this.ctx.get?.('translationMemorySearch') as { contentChanged(): void } | undefined)?.contentChanged()
         return structuredClone(entry)
       })
@@ -196,20 +191,18 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
       const db = await this.database(); this.check(guard)
       const entry = this.current(request.id, request.namespaceId)
       if (!entry || entry.topicId !== request.topicId || entry.version !== request.expectedVersion || settingsOnly && entry.kind !== 'setting') throw failure('other_memory_stale', '此条目已变化、已删除或不是指定范围的设定，请重新读取后重试。')
-      db?.transaction(() => { db.remove(entry.id); if (entry.kind === 'reference') db.indexRemoveSource(entry.namespaceId, entry.topicId, `reference:${entry.id}`) }); this.runtime.delete(entry.id)
+      db?.transaction(() => { db.remove(entry.id); if (entry.kind === 'reference') db.indexRemoveSource(entry.namespaceId, entry.topicId, `reference:${entry.id}`) })
       if (entry.kind === 'reference') this.hooks?.release(entry)
       return { removed: true as const }
     }))
   }
   private removeTopic(namespaceId: string, topicId: string): void {
     const durable = this.db?.all(namespaceId).filter(entry => entry.topicId === topicId) ?? []
-    const runtime = [...this.runtime.values()].filter(entry => entry.namespaceId === namespaceId && entry.topicId === topicId)
     this.db?.transaction(() => {
       for (const entry of durable) this.db!.remove(entry.id)
-      for (const entry of [...durable, ...runtime]) if (entry.kind === 'reference') this.db!.indexRemoveSource(namespaceId, topicId, `reference:${entry.id}`)
+      for (const entry of durable) if (entry.kind === 'reference') this.db!.indexRemoveSource(namespaceId, topicId, `reference:${entry.id}`)
     })
-    for (const entry of runtime) this.runtime.delete(entry.id)
-    for (const entry of [...durable, ...runtime]) if (entry.kind === 'reference') this.hooks?.release(entry)
+    for (const entry of durable) if (entry.kind === 'reference') this.hooks?.release(entry)
   }
   clearTopic(raw: { readonly namespaceId: string; readonly topicId: string }): Promise<{ readonly cleared: true }> {
     const request = parseOtherMemoryRequest('clearTopic', raw) as typeof raw, guard = this.authorize(request, this.ctx.invocation?.peer.id)
@@ -220,47 +213,6 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
       this.epochs.set(scopeKey(request), guard.epoch + 1)
       return { cleared: true as const }
     }))
-  }
-  persist(raw: OtherMemoryScope): Promise<{ readonly persisted: true }> {
-    const request = parseOtherMemoryRequest('persist', raw) as OtherMemoryScope, guard = this.authorize(request, this.ctx.invocation?.peer.id)
-    return this.serial(guard, async () => {
-      await this.database(); this.check(guard)
-      const entries = [...this.runtime.values()].filter(entry => applicable(entry, request))
-      for (const entry of entries) if (entry.kind === 'reference') {
-        if (!this.hooks) throw failure('other_memory_original_unavailable', '参考原件保存服务尚未就绪。')
-        await this.hooks.persistSource(entry); this.check(guard)
-      }
-      if (!entries.length) return { persisted: true as const }
-      return this.writer(async () => {
-        const db = await this.database(true); this.check(guard)
-        const saved = entries.filter(entry => this.runtime.get(entry.id) === entry &&
-          (entry.topicId === null || !this.retired.has(scopeKey(entry)) && !db!.retired(entry.namespaceId, entry.topicId))).map(entry => parseOtherMemoryEntry({ ...entry, persistence: 'saved' }))
-        db!.transaction(() => { for (const entry of saved) db!.save(entry) })
-        for (const entry of saved) this.runtime.delete(entry.id)
-        return { persisted: true as const }
-      })
-    })
-  }
-  persistNamespace(raw: { readonly namespaceId: string }): Promise<{ readonly persisted: true }> {
-    const request = parseOtherMemoryRequest('persistNamespace', raw) as typeof raw, guard = this.authorize({ ...request, topicId: null }, this.ctx.invocation?.peer.id)
-    return this.serial(guard, async () => {
-      await this.database(); this.check(guard)
-      const entries = [...this.runtime.values()].filter(entry => entry.namespaceId === request.namespaceId &&
-        (entry.topicId === null || !this.retired.has(scopeKey(entry)) && !this.db?.retired(entry.namespaceId, entry.topicId)))
-      for (const entry of entries) if (entry.kind === 'reference') {
-        if (!this.hooks) throw failure('other_memory_original_unavailable', '参考原件保存服务尚未就绪。')
-        await this.hooks.persistSource(entry); this.check(guard)
-      }
-      if (!entries.length) return { persisted: true as const }
-      return this.writer(async () => {
-        const db = await this.database(true); this.check(guard)
-        const saved = entries.filter(entry => this.runtime.get(entry.id) === entry &&
-          (entry.topicId === null || !this.retired.has(scopeKey(entry)) && !db!.retired(entry.namespaceId, entry.topicId))).map(entry => parseOtherMemoryEntry({ ...entry, persistence: 'saved' }))
-        db!.transaction(() => { for (const entry of saved) db!.save(entry) })
-        for (const entry of saved) this.runtime.delete(entry.id)
-        return { persisted: true as const }
-      })
-    })
   }
   async effectiveSettings(namespaceId: string, topicId: string): Promise<readonly OtherMemorySetting[]> {
     const scope = parseOtherMemoryScope({ namespaceId, topicId })
@@ -273,27 +225,25 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
     const key = scopeKey(scope); this.epochs.set(key, (this.epochs.get(key) ?? 0) + 1); this.retired.add(key)
     const db = await this.database(true)
     const durable = db!.all(namespaceId).filter(entry => entry.topicId === topicId)
-    const runtime = [...this.runtime.values()].filter(entry => entry.namespaceId === namespaceId && entry.topicId === topicId)
     db!.transaction(() => {
       for (const entry of durable) db!.remove(entry.id)
       db!.retire(namespaceId, topicId)
     })
-    for (const entry of runtime) this.runtime.delete(entry.id)
-    for (const entry of [...durable, ...runtime]) if (entry.kind === 'reference') this.hooks?.release(entry)
+    for (const entry of durable) if (entry.kind === 'reference') this.hooks?.release(entry)
   }
-  /** Includes durable copies hidden by a runtime overlay; provenance alone never holds bytes. */
+  /** Provenance alone never holds bytes; only saved registrations retain originals. */
   async topicSourcesLocked(namespaceId: string, topicId: string): Promise<readonly SourceIdentity[]> {
     await this.database()
-    return [...(this.db?.all(namespaceId) ?? []), ...this.runtime.values()].filter((entry): entry is OtherMemoryReference => entry.namespaceId === namespaceId && entry.topicId === topicId && entry.kind === 'reference').map(entry => entry.source)
+    return [...(this.db?.all(namespaceId) ?? [])].filter((entry): entry is OtherMemoryReference => entry.namespaceId === namespaceId && entry.topicId === topicId && entry.kind === 'reference').map(entry => entry.source)
   }
   async heldSourceDigests(): Promise<ReadonlySet<string>> {
     await this.database()
-    return new Set([...(this.db?.all() ?? []), ...this.runtime.values()].filter((entry): entry is OtherMemoryReference => entry.kind === 'reference').map(entry => entry.source.sha256))
+    return new Set([...(this.db?.all() ?? [])].filter((entry): entry is OtherMemoryReference => entry.kind === 'reference').map(entry => entry.source.sha256))
   }
   async dispose(): Promise<void> {
     this.disposed = true; this.generation++
     await this.tail
     try { await this.opening } catch { /* A stopped opening has already closed its connection. */ }
-    this.db?.close(); this.db = undefined; this.runtime.clear()
+    this.db?.close(); this.db = undefined
   }
 }

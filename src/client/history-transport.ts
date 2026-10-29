@@ -93,12 +93,12 @@ export class HistorySessionTransport {
     return this.serial(async epoch => { const remote = await this.port(epoch), state = unwrap('status', await remote.status(scope)); this.check(epoch); return this.receipt(remote, scope, state, epoch) })
   }
   list(request: HistoryList): Promise<HistoryListing> { return this.serial(async epoch => { const remote = await this.port(epoch), result = unwrap('list', await remote.list(request)); this.check(epoch); return result }) }
-  private async send(remote: HistoryRemoteClientPort, scope: HistoryScope, current: HistoryBundle, saved: HistoryBundle | null, expectedToken: string | null, rememberHistory: boolean, isCurrent: () => boolean, epoch: number, create = false, before?: HistoryTransferReceipt): Promise<HistoryTransferReceipt> {
+  private async send(remote: HistoryRemoteClientPort, scope: HistoryScope, current: HistoryBundle, saved: HistoryBundle | null, expectedToken: string | null, isCurrent: () => boolean, epoch: number, create = false, before?: HistoryTransferReceipt): Promise<HistoryTransferReceipt> {
     const currentText = encodeHistoryBundle(current), savedText = saved === null ? null : encodeHistoryBundle(saved)
     const upload = before?.current ? JSON.stringify(diffHistoryBundle(before.current, current)) : currentText
     for (const text of [currentText, savedText]) if (text !== null && new TextEncoder().encode(text).length > HISTORY_BUNDLE_BYTES) throw new Error('完整会话批次超过 32 MiB，旧副本保留。')
     this.check(epoch)
-    const opened = unwrap('begin', await remote.begin({ ...scope, purpose: before?.current ? 'patch' : create ? 'create' : expectedToken === null ? 'migrate' : 'replace', expectedToken, currentPoints: Array.from(upload).length, savedPoints: savedText === null ? null : Array.from(savedText).length, rememberHistory }))
+    const opened = unwrap('begin', await remote.begin({ ...scope, purpose: before?.current ? 'patch' : create ? 'create' : expectedToken === null ? 'migrate' : 'replace', expectedToken, currentPoints: Array.from(upload).length, savedPoints: savedText === null ? null : Array.from(savedText).length }))
     const active = { remote, scope, transferId: opened.transferId }; this.active.add(active)
     try {
       this.check(epoch)
@@ -121,11 +121,11 @@ export class HistorySessionTransport {
       }
       this.check(epoch)
       if (acknowledged && before) {
-        const confirmed = parseHistoryBundle(JSON.parse(currentText), scope, rememberHistory ? 'saved' : 'current')
-        return { state, current: confirmed, saved: rememberHistory ? confirmed : before.saved, cleanupPending: false }
+        const confirmed = parseHistoryBundle(JSON.parse(currentText), scope, 'saved')
+        return { state, current: confirmed, saved: confirmed, cleanupPending: false }
       }
       const receipt = await this.receipt(remote, scope, state, epoch)
-      if (!receipt.current || encodeHistoryBundle(receipt.current) !== currentText || !create && expectedToken === null && (receipt.saved === null ? null : encodeHistoryBundle(receipt.saved)) !== savedText || (create || expectedToken !== null) && rememberHistory && (!receipt.saved || encodeHistoryBundle(receipt.saved) !== currentText))
+      if (!receipt.current || encodeHistoryBundle(receipt.current) !== currentText || !receipt.saved || encodeHistoryBundle(receipt.saved) !== currentText)
         throw new Error('宿主已接管此会话，但完整正文回读核对未完成；不得恢复旧端，请重新读取宿主状态。')
       return receipt
     } finally { this.active.delete(active); try { await remote.cancel({ ...scope, transferId: opened.transferId }) } catch { /* The Host also releases staging on library disconnect. */ } }
@@ -151,7 +151,7 @@ export class HistorySessionTransport {
         if (this.disposed || this.epoch !== epoch || encodeHistoryBundle(parseHistoryBundle(current(), scope)) !== encoded) return false
         return captured.copies.every(copy => this.legacy?.getItem(copy.key) === copy.value)
       }
-      const receipt = await this.send(remote, scope, candidate, captured.saved, null, false, unchanged, epoch)
+      const receipt = await this.send(remote, scope, persistableHistoryBundle(candidate), captured.saved, null, unchanged, epoch)
       this.check(epoch)
       let cleanupPending: boolean
       try { cleanupPending = !await this.cleanup(scope, captured.copies, epoch) } catch { cleanupPending = true }
@@ -188,17 +188,17 @@ export class HistorySessionTransport {
     if (complete && this.legacy.getItem(marker) === encoded) { this.legacy.removeItem(marker); if (this.legacy.getItem(marker) !== null) complete = false }
     return complete
   }
-  replace(scope: HistoryScope, state: HistoryStatus, current: () => HistoryBundle, rememberHistory: boolean, before?: HistoryTransferReceipt): Promise<HistoryTransferReceipt> {
+  replace(scope: HistoryScope, state: HistoryStatus, current: () => HistoryBundle, before?: HistoryTransferReceipt): Promise<HistoryTransferReceipt> {
     return this.serial(async epoch => {
       if (!state.token || state.retired) throw new Error('此会话尚未由宿主接管或已退役。')
       const remote = await this.port(epoch), snapshot = parseHistoryBundle(current(), scope), encoded = encodeHistoryBundle(snapshot)
-      return this.send(remote, scope, rememberHistory ? persistableHistoryBundle(snapshot) : snapshot, null, state.token, rememberHistory, () => encodeHistoryBundle(parseHistoryBundle(current(), scope)) === encoded, epoch, false, before)
+      return this.send(remote, scope, persistableHistoryBundle(snapshot), null, state.token, () => encodeHistoryBundle(parseHistoryBundle(current(), scope)) === encoded, epoch, false, before)
     })
   }
-  create(scope: HistoryScope, current: () => HistoryBundle, rememberHistory: boolean): Promise<HistoryTransferReceipt> {
+  create(scope: HistoryScope, current: () => HistoryBundle): Promise<HistoryTransferReceipt> {
     return this.serial(async epoch => {
       const remote = await this.port(epoch), snapshot = parseHistoryBundle(current(), scope), encoded = encodeHistoryBundle(snapshot)
-      return this.send(remote, scope, rememberHistory ? persistableHistoryBundle(snapshot) : snapshot, null, null, rememberHistory, () => encodeHistoryBundle(parseHistoryBundle(current(), scope)) === encoded, epoch, true)
+      return this.send(remote, scope, persistableHistoryBundle(snapshot), null, null, () => encodeHistoryBundle(parseHistoryBundle(current(), scope)) === encoded, epoch, true)
     })
   }
   mutate(request: HistoryMutation): Promise<Awaited<ReturnType<HistoryRemotePort['mutate']>>> { return this.serial(async epoch => { const remote = await this.port(epoch), result = unwrap('mutate', await remote.mutate(request)); this.check(epoch); return result }) }

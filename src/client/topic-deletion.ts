@@ -9,7 +9,6 @@ export interface TopicDeletionPreview {
   readonly memory: ThemeMemoryClearPlan
   readonly termsCount: number
   readonly archiveCount: number
-  readonly referenceCount: number
 }
 
 export interface TopicDeletionPorts {
@@ -29,8 +28,7 @@ export class TopicDeletionClient {
     const plan = this.ports.sessions.captureTopicDeletion(callerOwnerId, topicId)
     if (!plan) return undefined
     const memory = this.ports.clearing.capture(plan.ownerId, topicId)
-    return { plan, memory, termsCount: memory.terms.currentCount, archiveCount: memory.archive.currentCount,
-      referenceCount: this.ports.references.getTopicDocumentCount(plan.ownerId, topicId) }
+    return { plan, memory, termsCount: memory.terms.currentCount, archiveCount: memory.archive.currentCount }
   }
   async captureAsync(callerOwnerId: string, topicId: string): Promise<TopicDeletionPreview | undefined> {
     const memory = await this.ports.clearing.captureAsync(callerOwnerId, topicId)
@@ -62,7 +60,7 @@ export class TopicDeletionClient {
     if (!await this.ports.sessions.deleteTopicSessionsAsync(plan)) return result('partial', '主题会话未全部删除，主题仍保留；请重试同一删除操作。', ['会话'])
     const memory = await this.ports.clearing.clear(preview.memory)
     if (memory.status !== 'cleared') return result('partial', `会话已删除，但主题记忆未清空：${memory.message}`, ['主题记忆'])
-    if (preview.referenceCount > 0 && !await this.ports.references.clearTopic(plan.ownerId, plan.topicId))
+    if (!this.ports.localData && !await this.ports.references.clearTopic(plan.ownerId, plan.topicId))
       return result('partial', '会话与主题记忆已删除，但参考资料未清理；请重试。', ['参考资料'])
     this.ports.references.discardTopic(plan.ownerId, plan.topicId)
     if (this.ports.viewFiles && !this.ports.localData) {

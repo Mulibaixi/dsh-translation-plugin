@@ -31,7 +31,7 @@ The project is still in development. Text/TXT translation can support a workflow
 
 ## Requirements
 
-- DSH `0.2.0-rc.2` or `0.2.1-rc.2`, with local plugin support and a configured model.
+- DSH `0.2.0-rc.2`, `0.2.1-rc.2`, or `0.2.1-rc.3`, with local plugin support and a configured model.
 - **Quick mode** does not require the Composer extension. **Normal mode** requires the matching `dsh-composer-extension` and a Composer submission patch for your DSH version. Installing the extension alone does not add material submission to an unpatched official build.
 - The paired sources use content protocol 3 and task-phase protocol 2. Keep the translation plugin, Composer extension, and Host patch compatible; reapply the matching patch after a DSH upgrade.
 - File asset extraction uses native DSH subagents through the supported run/Activation interfaces. Missing capabilities are reported; the main model can still read and translate text originals directly.
@@ -61,8 +61,9 @@ Save and back up material you need, update both source directories, build the Co
 
 When upgrading to this version:
 
+- Session history and memory assets now save automatically; existing settings that disabled saving no longer apply.
 - Legacy browser test history is not imported automatically; export important content first. To translate legacy file/document tasks again, resend the original through the current file input.
-- Reference registration now accepts original/bilingual files. Legacy “other reference” entries retain original opening and deletion only; existing full-text files need a complete main-model segmentation plan before new semantic indexing.
+- Register original/bilingual reference files under **Other memory**; existing full-text files need a complete main-model segmentation plan before semantic indexing. Legacy excerpt registration tools and evidence dependencies have been removed; old registration fields are discarded when existing records load.
 - Older versions may not read newly saved data. Do not run old and new versions against the same library. Exports currently cannot be imported for restoration and do not replace a complete backup.
 
 Disabling or uninstalling the plugin does not automatically delete local material. See [CHANGELOG](CHANGELOG.md) for version changes.
@@ -73,8 +74,9 @@ Disabling or uninstalling the plugin does not automatically delete local materia
 
 Choose **新建主题及首会话 (New topic and first session)** or **选择已有主题 (Choose existing topic)**. A topic groups memory for a story or project; translation sessions separate individual tasks. Reuse one local library across main chats, and browse saved material without an active main chat.
 
-- Use **+** in the title menu for a new topic, or **新建子会话 (New child session)** in a session's context menu to continue in its topic.
+- Use **+** in the title menu to create a new topic and first session, then rename it in the automatically opened editor; cancelling keeps the default name. Use **新建子会话 (New child session)** in a session's context menu to continue in its topic.
 - **重命名 (Rename)** changes the topic name; **备注 (Remark)** changes only that session's display name. Long-press and drag a session row to reorder it.
+- Right-click a topic, hover over **打开 (Open)**, and select a session from the list on the right. The list extends downward and adjusts near window edges to stay visible.
 - **关闭 (Close)** removes a session from the current chat's open list; **归档 (Archive)** retains it; **删除 (Delete)** removes content after confirmation.
 
 Model selection is at the input's lower right; target language and mode are at the top. A session can move from Quick to Normal; create another session to use Quick again. Unit numbers remain stable and deleted numbers are not reused.
@@ -103,6 +105,8 @@ Withdrawing material notifies the main model's following steps; use cancellation
 ### 4. Memory assets: maintain shared topic knowledge
 
 Open **记忆资产 (Memory assets)** from the title menu or a session's context menu. Browsing another topic does not change the workspace's active session. You can also provide material in the main chat and ask to learn it or establish topic memory: the main model reads actual material, retains evidence, checks existing entries, and creates assets without requiring a translation first.
+
+Manage reference files under **Other memory**. Unit evidence for terms and archives links to actual source or final versions. Entries learned from main-chat attachments are saved as proposals for review before adoption.
 
 | Category | Content |
 | --- | --- |
@@ -141,11 +145,13 @@ Set new-session defaults for mode, target language, instructions, and per-call l
 
 **Embedding API** accepts a complete OpenAI Embeddings-compatible HTTP(S) endpoint, including its `/embeddings` path, a model name, and an optional key. The Host credential service stores configuration and keys without displaying the key; changing service hosts requires a new key. Connection testing sends only fixed short text and reports dimensions and elapsed time.
 
-Choose **Save and build index**, or open **语义索引 (Semantic index)** from memory assets, to build, fill gaps, or rebuild. Indexes cover active entities, facts, relations, completely segmented reference text, and current-source/effective-final translation examples. Terms and enabled settings are read directly. The main model searches accessible material in the current topic, with translation examples limited to opened sessions, then reads exact hits and selects context. Literal search remains available without an index or when the API fails; incomplete coverage is reported.
+Choose **建立索引 (Build index)**, or open **语义索引 (Semantic index)** from memory assets, to build, fill gaps, or rebuild. Indexes cover active entities, facts, relations, completely segmented reference text, and current-source/effective-final translation examples. Terms and enabled settings are read directly. The main model searches accessible material in the current topic, with translation examples limited to opened sessions, then reads exact hits and selects context. Literal search remains available without an index or when the API fails; incomplete coverage is reported.
+
+The memory assets page shows index coverage and file status for the selected topic; Settings shows the library total. Incomplete segmentation and read failures are counted separately. Units without an effective final translation are excluded from both examples and read-failure counts.
 
 Indexing sends the corresponding text to your configured embedding service. Once enabled, it follows active content changes; changing the endpoint or model requires rebuilding. Runtime vectors stay in memory, saved-content vectors stay on the Host, and content deletion also releases indexes.
 
-**允许保存会话历史到本地 (Allow local history saving)** controls automatic history and memory persistence. When enabled, save status requires Host confirmation. Turning it off retains saved copies while later changes remain runtime-only and may be lost on restart. Model preferences and embedding configuration save independently. Local bodies are unencrypted; this switch does not control DSH main chats, model-call records, or attachments.
+Session history and memory assets save automatically, with save status confirmed by the Host. Manage retained content through version, unit, session, topic, or plugin cleanup. Model preferences and embedding configuration save independently. Local bodies are unencrypted; DSH manages main chats, model-call records, and attachments separately. Existing settings that disabled history saving now use automatic saving.
 
 Startup reads a session directory, loading bodies when opening, browsing, or exporting. Saves transfer changes; failures retain current edits for retry or explicit reload. Deleting the main chat that first created material does not delete saved translation data.
 
@@ -155,9 +161,9 @@ Startup reads a session directory, loading bodies when opening, browsing, or exp
 | Unit | Remove all version bodies, dependent records, and resource references, retaining the number and call statistics. |
 | Session | Remove session content and dependent resources, retaining topic memory by default. |
 | Topic | Remove the topic, sessions, topic assets, and reference registrations, retaining user settings and shared files used elsewhere. |
-| Plugin | **清除本地数据 (Clear local data)** removes plugin material, settings, indexes, and owned embedding credentials, retaining user originals and DSH main chats. |
+| Plugin | **清除本地数据 (Clear local data)** on the right of the **本地数据 (Local data)** heading requires a second confirmation before removing plugin material, settings, indexes, and owned embedding credentials. User originals and DSH main chats are retained. |
 
-Cleanup requires confirmation. Content becomes unavailable before exclusive files are released; shared originals remain while in use. **存储与空间 (Storage and space)** shows usage, unreadable history copies, orphan records, and **回收未引用原稿 (Reclaim unreferenced sources)**. Failed file cleanup does not restore deleted bodies, and residual cleanup can continue after restart. Documents also offer unused translation-block cleanup.
+Cleanup requires confirmation. Content becomes unavailable before exclusive files are released; shared originals remain while in use. **存储与空间 (Storage and space)** shows usage, unreadable history copies, and orphan records. **回收未引用原稿 (Reclaim unreferenced sources)** and **刷新统计 (Refresh statistics)** appear on the right of its heading. Failed file cleanup does not restore deleted bodies, and residual cleanup can continue after restart. Documents also offer unused translation-block cleanup.
 
 Check running or unknown-outcome tasks first. Local deletion does not retract exports, user originals, or content already sent to the main model.
 

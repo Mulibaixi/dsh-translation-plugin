@@ -140,7 +140,7 @@ export type TopicBridgeCommand =
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
 export type TopicBridgeValue =
   | { readonly kind: 'direct_proposals'; readonly receipt: DirectProposalReceipt }
-  | { readonly kind: 'settings_scope'; readonly scope: OtherMemoryScope; readonly rememberHistory: boolean }
+  | { readonly kind: 'settings_scope'; readonly scope: OtherMemoryScope }
   | { readonly kind: 'unit_directory'; readonly directory: UnitDirectory }
   | { readonly kind: 'unit_contents'; readonly contents: readonly UnitContent[] }
   | { readonly kind: 'file_history'; readonly value: FileHistoryValue }
@@ -365,7 +365,7 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
         exact(value, ['kind', 'translationSessionId', 'expectedVersion', 'entry']); integer(value.expectedVersion)
         text(value.translationSessionId)
         const entry = decodeTopicTermPut(value.entry)
-        if (!entry || protocol < 3 && entry.evidence.some(ref => ref.kind === 'reference')) throw new TypeError('Invalid model term proposal')
+        if (!entry) throw new TypeError('Invalid model term proposal')
         return { kind: 'upsert_term', translationSessionId: value.translationSessionId, expectedVersion: value.expectedVersion, entry }
       }
       case 'query_archive':
@@ -376,7 +376,7 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
       case 'upsert_archive': {
         exact(value, ['kind', 'topicId', 'expectedVersion', 'entry']); text(value.topicId); integer(value.expectedVersion)
         const entry = decodeTopicArchivePut(value.entry)
-        if (!entry || protocol < 3 && entry.evidence.some(ref => ref.kind === 'reference')) throw new TypeError('Invalid model archive proposal')
+        if (!entry) throw new TypeError('Invalid model archive proposal')
         return { kind: 'upsert_archive', topicId: value.topicId, expectedVersion: value.expectedVersion, entry }
       }
       default: throw new TypeError('Unknown topic bridge command')
@@ -434,9 +434,9 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
   switch (value.kind) {
     case 'settings_scope':
       if (protocol < 4) throw new TypeError('Settings maintenance requires topic bridge v4')
-      exact(value, ['kind', 'scope', 'rememberHistory']); boolean(value.rememberHistory)
+      exact(value, ['kind', 'scope'])
       object(value.scope); exact(value.scope, ['namespaceId', 'topicId'])
-      return { kind: 'settings_scope', scope: parseOtherMemoryScope(value.scope), rememberHistory: value.rememberHistory }
+      return { kind: 'settings_scope', scope: parseOtherMemoryScope(value.scope) }
     case 'direct_proposals': {
       if (protocol < 4) throw new TypeError('Direct proposals require topic bridge v4')
       exact(value, ['kind', 'receipt']); object(value.receipt); exact(value.receipt, ['count', 'skipped', 'persistence'])

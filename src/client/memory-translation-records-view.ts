@@ -141,7 +141,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
       if (!topic) throw new Error('Topic no longer available')
       const targets = scope === 'topic' ? sessions : selectedSession ? [selectedSession] : []
       for (const session of targets) if (!await store.ensureSessionHistory(session.id)) throw new Error('History unavailable')
-      if (!targets.some(session => store.getTranslationHistory(session.id)?.units.length || fileJobs?.all(session.id).length)) { setMessage('当前范围尚无译文记录。'); return }
+      if (!targets.some(session => store.getTranslationHistory(session.id)?.units.length || fileJobs?.all(session.id).length)) { setMessage('　　当前范围尚无译文记录。'); return }
       for (const session of targets) if (!quick.finalizeForExport(session.id)) throw new Error('Cannot finalize export')
       const entries = targets.map(session => {
         const history = store.getTranslationHistory(session.id)
@@ -160,25 +160,24 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     } catch { if (active()) setMessage('导出失败，当前内容仍保留。') }
     finally { if (lifetime.current.exportId === exportId) { lifetime.current.busy = false; if (lifetime.current.mounted) setExporting(false) } }
   }
-  const note = '原文只读；人工修改保存为新版本，再明确设为最终。'
   return h('section', { className: 'dsh-tp-terms dsh-tp-records', 'aria-label': '译文记录', 'data-records-scope': scope, 'data-records-session-id': sessionId },
     exportFeedback.toast,
     h('div', { className: 'dsh-tp-asset-toolbar' },
       h('div', { className: 'dsh-tp-unit-header' },
-        h('div', { className: 'dsh-tp-asset-heading' }, h('h3', null, '译文记录'), h('small', { className: 'dsh-tp-muted dsh-tp-asset-note', title: note }, note)),
+        h('div', { className: 'dsh-tp-asset-heading dsh-tp-records-scope' },
+          h('h3', null, '译文记录'),
+          h('select', { 'aria-label': '译文查阅范围', value: scope, onChange: (event: { currentTarget: { value: string } }) => {
+            rememberScroll(); const next = event.currentTarget.value; if (next !== 'session' && next !== 'topic') return
+            if (next === 'session' && !selectedSession) setSessionId(sessions[0]?.id)
+            setScope(next)
+          } }, h('option', { value: 'session', disabled: !sessions.length }, '当前会话'), h('option', { value: 'topic' }, '当前主题全部会话')),
+          scope === 'session' ? h('select', { 'aria-label': '查阅会话', value: sessionId ?? '', onChange: (event: { currentTarget: { value: string } }) => {
+            rememberScroll(); setSessionId(event.currentTarget.value)
+          } }, !selectedSession ? h('option', { value: sessionId ?? '', disabled: true }, sessionId ? '原会话已不可用' : '选择会话') : null,
+          ...sessions.map(session => h('option', { key: session.id, value: session.id }, `${session.remark || session.name}${session.archivedAt !== null ? '（已归档）' : ''}`))) : null),
         h('div', { className: 'dsh-tp-actions' },
           h('button', { type: 'button', disabled: exporting, title: `导出${scope === 'topic' ? '当前主题全部会话（含归档）' : '当前查阅会话'}的最终译文；未定稿项会先提示。`, onClick: () => { void exportRecords('txt') } }, '导出 TXT'),
           h('button', { type: 'button', disabled: exporting, title: `导出${scope === 'topic' ? '当前主题全部会话（含归档）' : '当前查阅会话'}的原文与最终译文对照；不含草稿、修订历史或调用信息。`, onClick: () => { void exportRecords('json') } }, '导出 JSON'))),
-      h('div', { className: 'dsh-tp-records-scope' },
-        h('select', { 'aria-label': '译文查阅范围', value: scope, onChange: (event: { currentTarget: { value: string } }) => {
-          rememberScroll(); const next = event.currentTarget.value; if (next !== 'session' && next !== 'topic') return
-          if (next === 'session' && !selectedSession) setSessionId(sessions[0]?.id)
-          setScope(next)
-        } }, h('option', { value: 'session', disabled: !sessions.length }, '当前会话'), h('option', { value: 'topic' }, '当前主题全部会话')),
-        scope === 'session' ? h('select', { 'aria-label': '查阅会话', value: sessionId ?? '', onChange: (event: { currentTarget: { value: string } }) => {
-          rememberScroll(); setSessionId(event.currentTarget.value)
-        } }, !selectedSession ? h('option', { value: sessionId ?? '', disabled: true }, sessionId ? '原会话已不可用' : '选择会话') : null,
-        ...sessions.map(session => h('option', { key: session.id, value: session.id }, `${session.remark || session.name}${session.archivedAt !== null ? '（已归档）' : ''}`))) : null),
       h('div', { className: 'dsh-tp-record-search', role: 'search', 'aria-label': '查找译文记录正文' },
         h('input', { type: 'search', maxLength: 4000, 'aria-label': '查找原文或最终译文', placeholder: '查找原文或最终译文', value: query,
           onChange: (event: { currentTarget: { value: string } }) => setQuery(event.currentTarget.value),
@@ -200,7 +199,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
     ) : null,
     h('div', { className: 'dsh-tp-records-reader', 'aria-label': '连续译文记录', ref: reader,
       onScroll: (event: { currentTarget: { scrollTop: number } }) => { if (visible) scrollPositions.current.set(scrollKey, event.currentTarget.scrollTop) } },
-      loadingBodies ? h('div', { role: 'status' }, store.getNotice() ?? '正在读取所选范围的译文记录…', h('button', { type: 'button', onClick: () => { for (const session of viewedSessions) void store.ensureSessionHistory(session.id) } }, '重试读取译文记录')) : groups.length === 0 ? h('p', { className: 'dsh-tp-muted', role: 'status' }, scope === 'session' && !selectedSession ? '此会话已不可用，请选择其他会话或主题范围。' : '当前范围尚无译文记录。') : null,
+      loadingBodies ? h('div', { role: 'status' }, store.getNotice() ?? '正在读取所选范围的译文记录…', h('button', { type: 'button', onClick: () => { for (const session of viewedSessions) void store.ensureSessionHistory(session.id) } }, '重试读取译文记录')) : groups.length === 0 ? h('p', { className: 'dsh-tp-muted', role: 'status' }, scope === 'session' && !selectedSession ? '此会话已不可用，请选择其他会话或主题范围。' : '　　当前范围尚无译文记录。') : null,
       ...groups.map(({ session, units, jobs }) => h('section', { key: session.id, className: 'dsh-tp-records-session', 'aria-label': `会话译文：${session.remark || session.name}`, 'data-session-id': session.id },
         h('h3', null, session.remark || session.name),
         session.archivedAt !== null ? h('p', { className: 'dsh-tp-muted' }, '会话已归档，请先在翻译工作区恢复后编辑。') : null,

@@ -6,11 +6,11 @@ import { buildTopicTermsMarkdownExport, type TopicEvidenceAvailability } from '.
 export interface TopicArchiveExport { readonly content: string; readonly fileName: string; readonly mimeType: string }
 export interface TopicArchiveExportSnapshot {
   readonly topicName: string; readonly terms: TopicTermSnapshot; readonly archive: TopicArchiveSnapshot; readonly exportedAt: string
-  readonly rememberHistory: boolean; readonly termsStorageStatus: HistoryStatus; readonly archiveStorageStatus: HistoryStatus
+  readonly termsStorageStatus: HistoryStatus; readonly archiveStorageStatus: HistoryStatus
   readonly termEvidenceAvailability: readonly TopicEvidenceAvailability[]; readonly archiveEvidenceAvailability: readonly TopicEvidenceAvailability[]
 }
 const statusLabels = { proposal: '待确认', active: '生效', review_required: '待复核', disabled: '已停用' } as const
-const originLabels = { inferred: '模型提案', source_checked: '原文依据', reference_derived: '参考资料（主模型解读）', user_explicit: '用户采用' } as const
+const originLabels = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
 const kindLabels = { entity: '实体', fact: '事实', relation: '关系' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突，当前快照可能与已保存副本不同', error: '保存失败，当前快照不代表已可靠落盘' } as const
 function scope(input: TopicArchiveExportSnapshot): void {
@@ -28,7 +28,7 @@ export function buildTopicArchiveJsonExport(input: TopicArchiveExportSnapshot): 
     ownerId: input.archive.ownerId, topicId: input.archive.topicId, topicName: input.topicName,
     scope: 'existing_topic_structured_snapshots', automaticExtractionTriggered: false, organizationTriggered: false,
     excludes: ['evidence_bodies', 'main_chat', 'complete_topic_backup'],
-    storage: { rememberHistory: input.rememberHistory, terms: input.termsStorageStatus, archive: input.archiveStorageStatus },
+    storage: { terms: input.termsStorageStatus, archive: input.archiveStorageStatus },
     terms: input.terms, archive: input.archive,
     evidenceAvailability: { terms: input.termEvidenceAvailability, archive: input.archiveEvidenceAvailability },
   }, null, 2) }
@@ -47,7 +47,6 @@ function semanticLines(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry)
       [`- 源实体：${entityLabel(snapshot, entry.sourceEntityId)}`, `- 关系：${md(entry.relation)}`, `- 目标实体：${entityLabel(snapshot, entry.targetEntityId)}`, `- 描述：${md(entry.description) || '未提供'}`]
 }
 function referenceLines(ref: TermEvidenceRef): readonly string[] {
-  if (ref.kind === 'reference') return ['- 参考资料：' + md(ref.referenceId), '- 片段：' + md(ref.segmentId) + '；来源为主模型解读；不等于用户确认']
   return [`- 类型：${ref.kind === 'source' ? '原文' : '最终译文'}；用途：${ref.role === 'basis' ? '依据' : '示例'}`,
     `- 会话 ID：${md(ref.sessionId)}；单元 ID：${md(ref.unitId)}`,
     `- 版本 ID：${ref.revisionId === null ? '无' : md(ref.revisionId)}；最终选择事件 ID：${ref.selectionEventId === null ? '无' : md(ref.selectionEventId)}`,
@@ -59,11 +58,10 @@ export function buildTopicArchiveMarkdownExport(input: TopicArchiveExportSnapsho
   const lines = [`# ${md(input.topicName)} · 主题结构化档案快照`, '',
     '导出现有术语、实体、事实和关系的所有状态与版本，未触发自动提炼或整理。不包含证据正文、主聊天或完整主题备份。', '',
     `- 导出时间：${md(input.exportedAt)}`, `- 主题创建来源 ID：${md(archive.ownerId)}`, `- 主题 ID：${md(archive.topicId)}`,
-    `- 历史保存开关：${input.rememberHistory ? '开启' : '关闭'}`,
     `- 术语实际保存状态：${storageLabels[input.termsStorageStatus]}`, `- 档案实际保存状态：${storageLabels[input.archiveStorageStatus]}`,
     '- 本文件记录冻结时的内存快照，不提供导入。', '',
     buildTopicTermsMarkdownExport({ topicName: input.topicName, snapshot: input.terms, exportedAt: input.exportedAt,
-      rememberHistory: input.rememberHistory, storageStatus: input.termsStorageStatus, evidenceAvailability: input.termEvidenceAvailability }).content.replace(/^(#{1,4}) /gm, '$1# '), '',
+      storageStatus: input.termsStorageStatus, evidenceAvailability: input.termEvidenceAvailability }).content.replace(/^(#{1,4}) /gm, '$1# '), '',
     '## 实体、事实和关系', '', `- 档案版本：${archive.version}；生效集版本：${archive.activeVersion}`, `- 档案更新时间：${md(archive.updatedAt)}`, '']
   if (!archive.entries.length) lines.push('暂无实体、事实或关系。', '')
   for (const entry of archive.entries) {

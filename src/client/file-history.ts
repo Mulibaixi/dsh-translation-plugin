@@ -21,7 +21,6 @@ export class FileHistoryClient {
   ensureUnitNumbers(sessionId: string): void { this.jobs.units(sessionId, true) }
   submitProposals(ownerId: string, request: DirectProposalSubmission): Promise<DirectProposalReceipt> { return this.jobs.submitDirectProposals(ownerId, request) }
   hasEvidence(main: string, topicId: string, ref: TermEvidenceRef): boolean {
-    if (ref.kind === 'reference') return false
     const captured = this.jobs.capture(main, topicId, ref)
     return !('status' in captured) && this.jobs.isCurrent(captured)
   }

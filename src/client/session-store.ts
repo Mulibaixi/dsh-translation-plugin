@@ -272,14 +272,14 @@ export class SessionStore {
   hasDocumentLease(sessionId: string): boolean { return this.executionLeases.has(sessionId) }
   /** Await the current history write without treating queued work as saved. */
   async saveTranslationHistoryAsync(sessionId: string): Promise<boolean> {
-    if (!this.readSettings() || !this.settings.rememberHistory) return false
+    if (!this.readSettings()) return false
     await this.pendingSaves.get(sessionId)
     const queued = this.pendingSaves.get(sessionId)
     if (queued) await queued
     if (this.seats.get(sessionId)?.status === 'saved') return true
     return this.saveSessionAsync(sessionId)
   }
-  /** Separate preparation audit storage shares history settings and the existing structure lock. */
+  /** Separate preparation audit storage shares history persistence and the existing structure lock. */
   createPreparationStoreOptions(): PreparationStoreOptions {
     const validKey = (key: string): void => { if (!key.startsWith(PREPARATION_STORAGE_PREFIX)) throw new Error('Preparation storage key is outside its namespace') }
     return {
@@ -296,14 +296,14 @@ export class SessionStore {
       withLock: async <T>(action: () => T | Promise<T>): Promise<T> => this.storage && this.locks
         ? this.locks.request(TOPIC_LOCK_NAME, async () => { if (this.disposed) throw new Error('Session store is disposed'); return await action() })
         : await action(),
-      isEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
+      isEnabled: () => !this.disposed && this.readSettings(),
       isScopeCurrent: scope => {
         const session = this.getSession(scope.translationSessionId)
         return !this.disposed && !!session && !this.isSessionDeleted(session.id) && session.topicId === scope.topicId && this.getTopics(scope.ownerId).some(topic => topic.id === scope.topicId)
       },
     }
   }
-  /** File rows share the history switch, identity checks and structure lock, without storing a File body. */
+  /** File rows share history persistence, identity checks and structure lock, without storing a File body. */
   createFileIntakeStoreOptions(): FileIntakeStoreOptions {
     return this.createFileRecordStoreOptions(FILE_INTAKE_STORAGE_PREFIX)
   }
@@ -324,7 +324,7 @@ export class SessionStore {
       } } : {})),
       withLock: async <T>(action: () => T | Promise<T>): Promise<T> => this.storage && this.locks
         ? this.locks.request(TOPIC_LOCK_NAME, async () => { if (this.disposed) throw new Error('Session store is disposed'); return await action() }) : await action(),
-      isEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
+      isEnabled: () => !this.disposed && this.readSettings(),
       isScopeCurrent: scope => {
         const session = this.getSession(scope.translationSessionId)
         return !this.disposed && !!session && !this.isSessionDeleted(session.id) &&
@@ -342,14 +342,14 @@ export class SessionStore {
     const scope = parseTranslationSourceScope(retainedScope ?? preparedScope ?? { namespaceId: this.namespaceId, ownerId: this.getTopicStorageScope(session.topicId)!, mainSessionId: this.getTopicStorageScope(session.topicId)!, topicId: session.topicId, translationSessionId: session.id })
     this.sourceHistoryVersion(fixed, scope)
     return {
-      isHistoryEnabled: () => !this.disposed && this.readSettings() && this.settings.rememberHistory,
+      isHistoryEnabled: () => !this.disposed && this.readSettings(),
       persistPreparedReference: async (value, confirmOperationId) => {
         const reference = parseTranslationSourceReference(value)
         if (reference.state !== 'prepared') throw new Error('History requires a prepared source reference')
         parseTranslationSourceStorageRequest('confirmReference', { scope: reference.scope, referenceKey: reference.referenceKey,
           prepareToken: reference.prepareToken, historyToken: 'validation', operationId: confirmOperationId })
         const result = await this.withStructureLock<TranslationSourceHistoryCommit | undefined>(undefined, async () => {
-          if (this.disposed || !this.storage || !this.readSettings() || !this.settings.rememberHistory) return undefined
+          if (this.disposed || !this.storage || !this.readSettings()) return undefined
           const source = this.sourceHistoryVersion(fixed, scope)
           if (JSON.stringify(reference.scope) !== JSON.stringify(scope) || JSON.stringify(reference.source) !== JSON.stringify(source.body.reference)) throw new Error('Prepared reference does not match the document source')
           const query = { scope, referenceKey: reference.referenceKey }, retained = this.readSourceHistoryCommit(fixed, scope, query)
@@ -509,23 +509,11 @@ export class SessionStore {
     const errors = validateSessionSettings(next)
     if (errors.length) { this.notice = errors.join(' '); this.emit(); return false }
     if (!this.storage) { this.notice = '本地存储不可用，设置尚未保存。'; this.emit(); return false }
-    if (!this.locks && !this.settings.rememberHistory && next.rememberHistory) {
-      this.notice = '当前环境无法协调历史保存，暂不能开启；现有内容仍保留在当前窗口。'; this.emit(); return false
-    }
     try {
-      const wasEnabled = this.settings.rememberHistory
       this.storage.setItem(SETTINGS_KEY, JSON.stringify(next))
       this.settings = next; this.notice = undefined
-      if (!wasEnabled && next.rememberHistory) this.queueHistorySaves()
       this.emit(); return true
     } catch (error) { this.notice = storageSaveFailureMessage(error, '设置', '设置保存失败，编辑值仍保留，请检查本地存储后重试修改。'); this.emit(); return false }
-  }
-
-  private queueHistorySaves(): void {
-    for (const [id, seat] of this.seats) {
-      const topic = this.topics.get(seat.session.topicId)
-      if (seat.status !== 'saved' || !topic?.stored || topic.nameDirty || JSON.stringify(seat.translationHistory) !== JSON.stringify(seat.savedTranslationHistory)) this.persist(id)
-    }
   }
 
   private loadHistory(): void {
@@ -830,11 +818,11 @@ export class SessionStore {
     const parent = parentId ? this.getSession(parentId) : undefined
     if (parentId && (!parent)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
     const topic = parent ? this.topics.get(parent.topicId) : undefined
-    if (topic?.durable || (parent && this.settings.rememberHistory)) {
+    if (topic?.durable || parent) {
       this.notice = '持久主题的新编号需要异步主题锁，请使用新建子会话操作。'; this.emit(); return undefined
     }
     const session = this.addSession(ownerId, parent, topic, undefined, activate)
-    if (this.settings.rememberHistory || this.historyBackend) this.persist(session.id)
+    this.persist(session.id)
     this.emit(); return session
   }
 
@@ -890,7 +878,7 @@ export class SessionStore {
     finally { if (timer) clearTimeout(timer) }
   }
 
-  /** 有历史保存或既有持久身份时，先可靠发号；正文保存失败可留下空号。 */
+  /** 先可靠发号；正文保存失败可留下空号。 */
   async createSessionAsync(ownerId: string, parentId?: string, activate = true): Promise<LocalSession | undefined> {
     if (!this.historyReady) return undefined
     if (!ownerId.trim()) return undefined
@@ -899,7 +887,6 @@ export class SessionStore {
     if (parentId && !await this.ensureSessionHistory(parentId)) return undefined
     const parent = parentId ? this.getSession(parentId) : undefined
     if (parentId && (!parent)) { this.notice = '当前会话无法作为新会话的起点。'; this.emit(); return undefined }
-    if (!this.settings.rememberHistory && (!parent || !this.topics.get(parent.topicId)?.durable)) return this.createSession(ownerId, parentId, activate)
     return this.withStructureLock(undefined, () => this.createSessionLocked(ownerId, parentId, undefined, activate))
   }
 
@@ -923,10 +910,6 @@ export class SessionStore {
       }
       this.topics.set(topic.identity.id, topic)
     }
-    if (!this.settings.rememberHistory && !topic.durable) {
-      const session = this.addSession(ownerId, currentParent, topic, { id, sequence: topic.identity.nextSequence }, activate)
-      this.notice = undefined; this.emit(); return session
-    }
     if (!this.storage || !this.locks) {
       this.notice = '当前环境无法协调持久主题编号，新建未执行。'; this.emit(); return undefined
     }
@@ -934,10 +917,10 @@ export class SessionStore {
     const sequence = topic.identity.nextSequence
     if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
     this.writeIdentity(topic, { sessionId: id, sequence })
-    if (this.settings.rememberHistory) this.writeTopicName(topic)
+    this.writeTopicName(topic)
     const session = this.addSession(ownerId, currentParent, topic, { id, sequence }, activate)
     this.notice = undefined
-    if (this.settings.rememberHistory || this.historyBackend) await this.persistLocked(id)
+    await this.persistLocked(id)
     this.emit(); return session
   }
 
@@ -948,7 +931,6 @@ export class SessionStore {
     const parent = this.getAvailableSessions(ownerId).find(session => session.topicId === topicId)
     if (parent) return this.createSessionAsync(ownerId, parent.id, activate)
     if (!this.readSettings()) return undefined
-    if (!topic.durable && !this.settings.rememberHistory) return this.createSessionLocked(ownerId, undefined, topicId, activate)
     return this.withStructureLock(undefined, () => this.createSessionLocked(ownerId, undefined, topicId, activate))
   }
   openSession(ownerId: string, id: string): void {
@@ -983,7 +965,7 @@ export class SessionStore {
     seat.session = { ...seat.session, archivedAt: archived ? time : null, updatedAt: time }
     if (seat.status !== 'conflict') seat.status = 'memory'
     this.notice = undefined
-    if (this.settings.rememberHistory || this.historyBackend) this.persist(id)
+    this.persist(id)
     for (const entry of this.workspaces.keys()) this.reconcileWorkspace(entry)
     if (!archived && activate) this.openSession(ownerId, id)
     this.emit(); return true
@@ -993,7 +975,7 @@ export class SessionStore {
     this.notice = message; this.emit(); return { ok: false, code, message }
   }
 
-  /** Expected metadata and the actual retention setting are checked under the existing topic lock. */
+  /** Expected metadata and settings are checked under the existing topic lock. */
   private async manageSessions(action: () => SessionManagementResult | Promise<SessionManagementResult>): Promise<SessionManagementResult> {
     const run = async (): Promise<SessionManagementResult> => {
       if (!this.historyReady) return this.managementFailure('history_loading', this.notice ?? '正在读取宿主会话历史，请稍候。')
@@ -1018,21 +1000,18 @@ export class SessionStore {
   }
 
   private async finishManagedSession(seat: Seat): Promise<SessionManagementResult> {
-    if (this.settings.rememberHistory) {
-      try {
-        const topic = this.topics.get(seat.session.topicId)!
-        this.writeIdentity(topic); this.writeTopicName(topic); this.adoptTopic(seat)
-        if (seat.status !== 'saved' && !await this.persistLocked(seat.session.id)) {
-          return this.managementFailure(seat.status === 'conflict' ? 'conflict' : 'storage_error', '会话修改未保存，内存可能已变化，请查询当前记录。')
-        }
-      } catch {
-        seat.status = 'error'
-        return this.managementFailure('storage_error', '会话修改未保存，内存可能已变化，请查询当前记录。')
+    try {
+      const topic = this.topics.get(seat.session.topicId)!
+      this.writeIdentity(topic); this.writeTopicName(topic); this.adoptTopic(seat)
+      if (seat.status !== 'saved' && !await this.persistLocked(seat.session.id)) {
+        return this.managementFailure(seat.status === 'conflict' ? 'conflict' : 'storage_error', '会话修改未保存，内存可能已变化，请查询当前记录。')
       }
+    } catch {
+      seat.status = 'error'
+      return this.managementFailure('storage_error', '会话修改未保存，内存可能已变化，请查询当前记录。')
     }
-    if (this.historyBackend && !this.settings.rememberHistory) await this.persistLocked(seat.session.id)
     this.notice = undefined; this.emit()
-    return { ok: true, sessions: [seat.session], persistence: this.settings.rememberHistory ? 'saved' : 'runtime_only' }
+    return { ok: true, sessions: [seat.session], persistence: 'saved' }
   }
 
   async createManagedSessionAsync(ownerId: string, start: TopicSessionStart, initialMode?: 'normal'): Promise<SessionManagementResult> {
@@ -1049,10 +1028,10 @@ export class SessionStore {
       const seat = this.seats.get(session.id)!
       if (initialMode && seat.session.mode !== initialMode) {
         seat.session = {...seat.session, mode:initialMode}; seat.status = 'memory'
-        if (this.settings.rememberHistory) await this.persistLocked(session.id)
+        await this.persistLocked(session.id)
       }
-      if (this.settings.rememberHistory && seat.status !== 'saved') return this.managementFailure('storage_error', '新会话未保存，内存可能已创建，请查询当前会话列表；未自动重试。')
-      return { ok: true, sessions: [seat.session], persistence: this.settings.rememberHistory ? 'saved' : 'runtime_only' }
+      if (seat.status !== 'saved') return this.managementFailure('storage_error', '新会话未保存，内存可能已创建，请查询当前会话列表；未自动重试。')
+      return { ok: true, sessions: [seat.session], persistence: 'saved' }
     })
   }
 
@@ -1168,23 +1147,21 @@ export class SessionStore {
       if (topic.name !== expectedName || (raw !== null && (!saved || (topic.persistedName !== undefined && saved.name !== topic.persistedName)))) {
         return this.managementFailure('conflict', '主题名称已变化，未采用陈旧修改，请查询当前名称。')
       }
-      if (this.settings.rememberHistory) {
-        if (!this.storage || !this.locks) return this.managementFailure('storage_error', '当前环境无法协调名称保存，未执行修改。')
-        this.writeIdentity(topic)
-        if (saved?.name !== name.trim()) {
-          const version = (saved?.version ?? 0) + 1
-          if (!Number.isSafeInteger(version)) throw new Error('version exhausted')
-          this.storage.setItem(topicNameKey(topicId), JSON.stringify({ schemaVersion: 1, topicId, sequenceNamespaceId: topic.identity.sequenceNamespaceId, name: name.trim(), version }))
-        }
-        if (topic.name !== name.trim() || topic.nameDirty) this.projectName(topic, name.trim(), true)
-        else topic.persistedName = name.trim()
-      } else if (topic.name !== name.trim()) this.projectName(topic, name.trim(), false)
+      if (!this.storage || !this.locks) return this.managementFailure('storage_error', '当前环境无法协调名称保存，未执行修改。')
+      this.writeIdentity(topic)
+      if (saved?.name !== name.trim()) {
+        const version = (saved?.version ?? 0) + 1
+        if (!Number.isSafeInteger(version)) throw new Error('version exhausted')
+        this.storage.setItem(topicNameKey(topicId), JSON.stringify({ schemaVersion: 1, topicId, sequenceNamespaceId: topic.identity.sequenceNamespaceId, name: name.trim(), version }))
+      }
+      if (topic.name !== name.trim() || topic.nameDirty) this.projectName(topic, name.trim(), true)
+      else topic.persistedName = name.trim()
       if (this.historyBackend) for (const seat of this.seats.values()) if (seat.session.topicId === topicId) {
         const saved = await this.persistLocked(seat.session.id)
-        if (this.settings.rememberHistory && !saved) return this.managementFailure('storage_error', '主题名称尚未全部保存到宿主，请重试。')
+        if (!saved) return this.managementFailure('storage_error', '主题名称尚未全部保存到宿主，请重试。')
       }
       this.notice = undefined; this.emit()
-      return { ok: true, sessions: this.getAvailableSessions(ownerId).filter(session => session.topicId === topicId && !this.isDeleted(session.id)), persistence: this.settings.rememberHistory ? 'saved' : 'runtime_only' }
+      return { ok: true, sessions: this.getAvailableSessions(ownerId).filter(session => session.topicId === topicId && !this.isDeleted(session.id)), persistence: 'saved' }
     })
   }
 
@@ -1194,7 +1171,7 @@ export class SessionStore {
       if (!seat || this.isDeleted(id)) return this.managementFailure('out_of_scope', '翻译会话不属于当前主会话或已删除。')
       if (!this.managedSessionCurrent(seat) || seat.session.remark !== expectedRemark) return this.managementFailure('conflict', '会话备注已变化，未采用陈旧修改，请查询当前记录。')
       if (Array.from(remark).length > 1000) return this.managementFailure('invalid_input', '备注最多 1000 个字符。')
-      if (this.settings.rememberHistory && (!this.storage || !this.locks)) return this.managementFailure('storage_error', '当前环境无法协调会话保存，未执行修改。')
+      if (!this.storage || !this.locks) return this.managementFailure('storage_error', '当前环境无法协调会话保存，未执行修改。')
       if (seat.session.remark !== remark) {
         seat.session = { ...seat.session, remark, updatedAt: new Date().toISOString() }; seat.status = 'memory'
       }
@@ -1207,7 +1184,7 @@ export class SessionStore {
       const seat = this.seats.get(id)
       if (!seat || this.isDeleted(id)) return this.managementFailure('out_of_scope', '翻译会话不属于当前主会话或已删除。')
       if (!this.managedSessionCurrent(seat) || (seat.session.archivedAt !== null) !== expectedArchived) return this.managementFailure('conflict', '会话归档状态已变化，未采用陈旧修改，请查询当前记录。')
-      if (this.settings.rememberHistory && (!this.storage || !this.locks)) return this.managementFailure('storage_error', '当前环境无法协调会话保存，未执行修改。')
+      if (!this.storage || !this.locks) return this.managementFailure('storage_error', '当前环境无法协调会话保存，未执行修改。')
       if (expectedArchived !== archived) {
         const time = new Date().toISOString()
         seat.session = { ...seat.session, archivedAt: archived ? time : null, updatedAt: time }; seat.status = 'memory'
@@ -1229,7 +1206,7 @@ export class SessionStore {
     if (seat.status !== 'conflict') seat.status = 'memory'
     this.notice = undefined
     if (Object.hasOwn(patch, 'model')) this.rememberModel(seat)
-    if (this.settings.rememberHistory || this.historyBackend) this.persist(id)
+    this.persist(id)
     this.emit(); return true
   }
   /** The conversion runs against current memory; persistence shares the existing session lock and conflict checks. */
@@ -1252,7 +1229,7 @@ export class SessionStore {
       seat.session = { ...seat.session, updatedAt: new Date().toISOString() }
       if (seat.status !== 'conflict') seat.status = 'memory'
       this.notice = undefined
-      if (this.settings.rememberHistory || this.historyBackend) this.persist(id)
+      this.persist(id)
       this.emit(); return true
     } catch { this.notice = '翻译记录更新失败，之前的材料与版本仍保留。'; this.emit(); return false }
   }
@@ -1503,17 +1480,6 @@ export class SessionStore {
     if (!this.historyBackend || reason) return { status: 'blocked', operationId: plan.eventId, message: reason ?? '翻译块清理需要宿主历史服务。' }
     return this.deleteHostUnitPart(plan, { kind: 'delete_document_chunks', unitId: plan.unitId }, blocked)
   }
-  renameSession(id: string, name: string): boolean {
-    const seat = this.seats.get(id)
-    if (!seat) return false
-    if (!this.readSettings()) { this.emit(); return false }
-    if (this.settings.rememberHistory) { this.notice = '已开启历史保存，请使用异步主题重命名操作。'; this.emit(); return false }
-    const topic = this.topics.get(seat.session.topicId)
-    if (!topic || !this.validTopicName(name)) return false
-    this.projectName(topic, name.trim(), false)
-    this.notice = undefined
-    this.emit(); return true
-  }
 
   private validTopicName(name: string): boolean {
     if (!name.trim() || Array.from(name.trim()).length > 120) { this.notice = '主题名称不能为空，且最多 120 个字符。'; this.emit(); return false }
@@ -1533,7 +1499,7 @@ export class SessionStore {
 
   async renameSessionAsync(id: string, name: string): Promise<boolean> {
     if (!this.validTopicName(name) || !this.readSettings()) return false
-    if (!this.settings.rememberHistory) return this.renameSession(id, name)
+
     const seat = this.seats.get(id), topic = seat && this.topics.get(seat.session.topicId)
     if (!seat || !topic) return false
     let expectedName: string | null
@@ -1545,7 +1511,7 @@ export class SessionStore {
     }
     return this.withStructureLock(false, async () => {
       if (!this.readSettings()) return false
-      if (!this.settings.rememberHistory) return this.renameSession(id, name)
+
       if (this.isDeleted(id) || this.storage?.getItem(topicNameKey(topic.identity.id)) !== expectedName) {
         this.notice = '会话或主题名称已在其他窗口变化，请核对后重试。'; this.emit(); return false
       }
@@ -1588,7 +1554,7 @@ export class SessionStore {
   }
 
   private writeTopicName(topic: TopicSeat): void {
-    if (!this.storage || !this.readSettings() || !this.settings.rememberHistory) return
+    if (!this.storage || !this.readSettings()) return
     const key = topicNameKey(topic.identity.id), raw = this.storage.getItem(key)
     const old = raw === null ? undefined : decodeTopicName(raw, topic.identity)
     if (raw !== null && !old) throw new Error('topic name unavailable')
@@ -1611,15 +1577,14 @@ export class SessionStore {
     const seat = this.seats.get(id)
     if (!seat) return Promise.resolve(false)
     const promise = this.withStructureLock(false, async () => {
-      if (!this.readSettings() || !this.settings.rememberHistory && !this.historyBackend) return false
+      if (!this.readSettings()) return false
       const current = this.seats.get(id), topic = current && this.topics.get(current.session.topicId)
       if (!current || !topic || this.isDeleted(id)) {
         if (current) current.status = 'conflict'
         this.notice = '会话已删除或主题身份不可用，当前输入保留。'; this.emit(); return false
       }
       try {
-        if (!this.historyBackend || this.settings.rememberHistory) { this.writeIdentity(topic); this.writeTopicName(topic) }
-        else if (topic.durable) this.writeIdentity(topic)
+        this.writeIdentity(topic); this.writeTopicName(topic)
         this.adoptTopic(current)
         const result = await this.persistLocked(id, overwrite)
         this.emit(); return result
@@ -1634,7 +1599,7 @@ export class SessionStore {
       this.pendingSaves.delete(id)
       // A mutation can arrive after the lock wrote its snapshot but before this promise settles.
       // Schedule that new dirty state once; failed/conflicting writes await explicit user action.
-      if (this.dirtySaves.delete(id) && !this.disposed && (this.settings.rememberHistory || this.historyBackend) && this.seats.get(id)?.status === 'memory') this.persist(id)
+      if (this.dirtySaves.delete(id) && !this.disposed && this.seats.get(id)?.status === 'memory') this.persist(id)
     })
     this.pendingSaves.set(id, promise)
     return promise
@@ -1648,7 +1613,7 @@ export class SessionStore {
       if (!this.historyReady) throw new Error('宿主会话历史尚未读取完成。')
       if (!this.readSettings()) throw new Error('invalid settings')
       if (this.historyBackend) {
-        const captured = currentVersion(seat), receipt = await this.historyBackend.save(seat.session, seat.translationHistory, this.settings.rememberHistory)
+        const captured = currentVersion(seat), receipt = await this.historyBackend.save(seat.session, seat.translationHistory)
         if (this.disposed || this.isDeleted(id)) return false
         seat.savedSession = receipt.saved?.session; seat.savedTranslationHistory = receipt.saved?.history ?? emptyTranslationHistory()
         seat.stored = this.historyBackend.snapshot(id)
@@ -1656,7 +1621,7 @@ export class SessionStore {
         delete seat.storageError
         return receipt.state.persistence === 'saved'
       }
-      if (!this.settings.rememberHistory) return false
+
       if (this.isDeleted(id)) { seat.status = 'conflict'; this.notice = '会话已在其他窗口删除，当前输入保留，不能覆盖恢复已删除身份。'; return false }
       if (this.deletedTopics.has(seat.session.topicId) || this.topicIntents.has(seat.session.topicId)) {
         seat.status = 'conflict'; this.notice = '主题正在删除或已删除，当前输入保留，不能写入已关闭的主题。'; return false
@@ -1687,7 +1652,7 @@ export class SessionStore {
       if (this.notice === seat.storageError) this.notice = undefined
       delete seat.storageError
       return true
-    } catch (error) { diagnosticSpan({}, 'history.save', { persistenceRequested: this.settings.rememberHistory }, id)('failed', {}, error); seat.status = 'error'; seat.storageError = this.notice = storageSaveFailureMessage(error, '会话历史', '会话历史保存失败，当前输入仍保留在窗口内存中。'); return false }
+    } catch (error) { diagnosticSpan({}, 'history.save', {}, id)('failed', {}, error); seat.status = 'error'; seat.storageError = this.notice = storageSaveFailureMessage(error, '会话历史', '会话历史保存失败，当前输入仍保留在窗口内存中。'); return false }
   }
   overwriteSession(id: string): boolean { this.notice = '覆盖保存需要等待主题锁，请使用异步覆盖操作。'; this.emit(); return false }
   async overwriteSessionAsync(id: string): Promise<boolean> { this.notice = undefined; return this.saveSessionAsync(id, true) }
@@ -1839,7 +1804,7 @@ export class SessionStore {
     })
     if (!requiresStorage) return this.deleteHistoryLocked(ids, false, unreadable, frozen, companion)
     return this.withStructureLock(false, () => {
-      // 只保存身份与既有发号记录，不把关闭保存期间的新名称/正文写入磁盘。
+      // 清理前保留身份与既有发号记录，避免编号重用。
       for (const id of ids) {
         const seat = this.seats.get(id), topic = seat && this.topics.get(seat.session.topicId)
         if (topic?.durable) this.writeIdentity(topic)
@@ -1981,8 +1946,7 @@ export class SessionStore {
       }
     }
     if (key === null || key === SETTINGS_KEY || key === LEGACY_SETTINGS_KEY) {
-      const wasEnabled = this.settings.rememberHistory
-      if (this.readSettings() && !wasEnabled && this.settings.rememberHistory) this.queueHistorySaves()
+      this.readSettings()
     }
     if (key === null || key?.startsWith(HISTORY_PREFIX) || key?.startsWith(LEGACY_DRAFT_PREFIX) ||
       key?.startsWith(TOPIC_IDENTITY_PREFIX) || key?.startsWith(TOPIC_NAME_PREFIX) || key?.startsWith(DELETED_SESSION_PREFIX)) {

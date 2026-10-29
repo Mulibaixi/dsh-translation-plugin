@@ -108,6 +108,6 @@ export function RecordObjectEditor({ session, unit, objects, objectAssets, execu
       h('button', { type: 'button', disabled: pending || session.archivedAt !== null || (!retry && (invalidPosition || (action === 'reuse' ? !selectedRef || target.side !== 'revision' : !file || action === 'result' && (!selectedRef || target.side !== 'revision')))), onClick: () => { void associate() } }, pending ? '正在关联…' : retry ? '重试保存关联' : '关联'),
       retry ? h('button', { type: 'button', disabled: pending, onClick: () => { setRetry(undefined); setMessage(undefined) } }, '取消重试') : null),
     action !== 'reuse' && (action === 'result' ? selectedRef?.asset.kind : kind) === 'formula' ? h('label', { className: 'dsh-tp-field' }, '公式源（TeX，可选）', h('textarea', { 'aria-label': '公式源', value: formulaSource, rows: 2, disabled: controlsDisabled, onChange: (event: { currentTarget: { value: string } }) => setFormulaSource(event.currentTarget.value) })) : null,
-    h('small', { className: 'dsh-tp-muted' }, '默认置于正文末尾；已有位置只读。原件及打开索引留存在 DSH；记录中的关联位置随会话历史保存开关。'),
+    h('small', { className: 'dsh-tp-muted' }, '默认置于正文末尾；已有位置只读。原件及打开索引留存在 DSH；记录中的关联位置自动保存。'),
     message ? h('p', { role: retry ? 'alert' : 'status', className: 'dsh-tp-muted' }, message) : null) : null
 }

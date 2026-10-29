@@ -10,6 +10,7 @@ import type { TopicArchiveService } from './topic-archive.js'
 import type { TopicTermsService } from './topic-terms.js'
 import type { EmbeddingService } from './embedding.js'
 import type { HistoryService } from './history.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 
 type Files = { scan(): Promise<readonly {path:string;bytes:number}[]>; read(path:string):Promise<string>; remove(path:string):Promise<void> }
 type Service = { dispose?():void|Promise<void>; hasActiveJobs?():boolean }
@@ -67,10 +68,15 @@ export class LocalDataService {
     }
   }
   private authorize():void{if(!this.ctx.invocation?.peer.id)throw stopped('本地数据操作缺少宿主连接身份。')}
-  /** Conservative cross-window guard: any unsettled Host job defers scoped cleanup. */
+  /** Library-wide cleanup checks every service; topic cleanup uses its own scope. */
   private hasActiveJobs():boolean{
     const services=['translationFileJobs','translationQuick','translationNormal','translationBatch','translationReview','translationMaterials','translationSources','translationReferences','translationOtherMemoryFiles','translationOtherMemory','translationArchive','translationTerms','translationEmbedding','translationMemorySearch','translationHistory']
     return services.some(name=>(this.ctx.get?.(name) as Service|undefined)?.hasActiveJobs?.())
+  }
+  private async hasActiveTopicJobs(scope:HistoryScope):Promise<boolean>{
+    const services=['translationFileJobs','translationNormal','translationBatch','translationAnalysis','translationCorrection','translationPlanning','translationReview','translationSources']
+    if(services.some(name=>(this.ctx.get?.(name) as {historyUnitBusy?(scope:HistoryScope,unitId:string):boolean}|undefined)?.historyUnitBusy?.(scope,'*')))return true
+    return await (this.ctx.get?.('translationHistory') as HistoryService|undefined)?.hasActiveTopicJobs?.(scope.namespaceId,scope.topicId)??false
   }
   private async withSourceCleanup<T>(action:()=>Promise<T>):Promise<T>{
     const sources=this.ctx.get?.('translationSources') as TranslationSourcesService|undefined
@@ -117,7 +123,7 @@ export class LocalDataService {
     const views = this.ctx.get?.('translationViews') as { invalidateHistoryUnit(scope: HistoryCleanup['scope'], unitId: string): boolean; invalidateHistorySession(scope: HistoryCleanup['scope']): boolean } | undefined
     if (!task.sourceVersions && views && !(task.unitId === '*' ? task.scope.sessionId === '*' || views.invalidateHistorySession(task.scope) : views.invalidateHistoryUnit(task.scope, task.unitId))) result.complete = false
     try {
-      await this.withSourceCleanup(async () => {
+      const cleanup = async (): Promise<void> => {
         const store = await this.files(), files = await store.scan(), wanted = new Set(task.references.map(sourceReferenceKey)), liveRefs = new Set(held.references.map(sourceReferenceKey))
         const digests = new Set(task.sources.map(source => source.sha256)), retained = new Set([...held.sources.map(source => source.sha256), ...sources?.heldSourceDigests(new Set(materials?.heldSourceIds?.() ?? [])) ?? []])
         for (const digest of await (this.ctx.get?.('translationOtherMemory') as OtherMemoryService | undefined)?.heldSourceDigests() ?? []) retained.add(digest)
@@ -131,7 +137,7 @@ export class LocalDataService {
               if (value.ownerId === task.topicOwnerId && value.topicId === task.scope.topicId || value.scope?.topicId === task.scope.topicId && (value.scope.namespaceId === task.scope.namespaceId || value.scope.namespaceId === undefined && value.scope.ownerId === task.topicOwnerId)) { await store.remove(file.path); count('removed', file.path) }
             } catch { result.complete = false }
           }
-          if (/\/sources\/v1\/references\/[a-f0-9]{64}\.json$/u.test(path)) {
+          if (digests.size && /\/sources\/v1\/references\/[a-f0-9]{64}\.json$/u.test(path)) {
             let raw: unknown
             try {
               raw = JSON.parse(await store.read(file.path)); const record = parseStoredSourceReference(raw), key = sourceReferenceKey(record.reference)
@@ -155,7 +161,9 @@ export class LocalDataService {
           if (unknownHolder || blocked.has(digest)) continue
           try { await store.remove(file.path); count('removed', file.path) } catch { result.complete = false }
         }
-      })
+      }
+      if (task.sources.length || task.references.length) await this.withSourceCleanup(cleanup)
+      else await cleanup()
     } catch { result.complete = false }
     return result
   }
@@ -181,10 +189,11 @@ export class LocalDataService {
     const peer=this.ctx.invocation?.peer.id
     if(!peer||!topics?.ownsAssetConnection||!topics.ownsAssetConnection({namespaceId:request.namespaceId??request.ownerId,ownerId:request.ownerId},peer))
       return {operationId:request.operationId,cleared:false,error:{code:'scope_mismatch',message:'主题清理不属于此客户端连接。'}}
-    if(this.hasActiveJobs())return {operationId:request.operationId,cleared:false,error:{code:'busy',message:'仍有运行中、等待处理或结果未知的翻译任务，请先结束或确认。'}}
+    const scope={namespaceId:request.namespaceId??request.ownerId,topicId:request.topicId,sessionId:'*'}
     try {
+      if(await this.hasActiveTopicJobs(scope))return {operationId:request.operationId,cleared:false,error:{code:'busy',message:'本主题仍有未结算的翻译或未完成的保存操作，请先结束或确认。'}}
       const result = await this.storageWriter()(async()=>{
-        if(this.hasActiveJobs())throw stopped('仍有运行中、等待处理或结果未知的任务，请先结束或确认。')
+        if(await this.hasActiveTopicJobs(scope))throw stopped('本主题仍有未结算的翻译或未完成的保存操作，请先结束或确认。')
         const namespaceId=request.namespaceId??request.ownerId, history=this.ctx.get?.('translationHistory') as HistoryService|undefined, memory=this.ctx.get?.('translationOtherMemory') as OtherMemoryService|undefined
         const db=await memory?.databaseForArchives(true), originals=await memory?.topicSourcesLocked(namespaceId,request.topicId)??[]
         let task=await this.scopeResourcesLocked({scope:{namespaceId,topicId:request.topicId,sessionId:'*'},unitId:'*',topicOwnerId:request.ownerId,sources:originals.map(source=>({sourceId:source.sourceId,sha256:source.sha256})),references:[]})

@@ -1,5 +1,4 @@
 import { isFileJobUnit } from './translation-history.js'
-import { ReferenceEvidenceView } from './reference-view.js'
 import { h, react } from './react.js'
 import { resolveTermEvidence, type TopicTermSnapshot, type TopicTerm, type TopicTermUserInput, type TermMutationResult, type TermEvidenceRef, type UnitEvidenceRef, type TermEvidenceFact } from '../memory/topic-terms.js'
 import type { SessionStore, HistoryStatus } from './session-store.js'
@@ -16,7 +15,6 @@ export interface TopicTermsViewPort {
   getReadState(ownerId: string, topicId: string): TopicTermReadState
   retain(ownerId: string, topicId: string): () => void
   subscribe(listener: () => void): () => void
-  readReferenceAsync?(ownerId:string,topicId:string,ref:import('../shared/reference-memory.js').ReferenceEvidenceRef):Promise<import('../shared/reference-memory.js').ReferenceText|undefined>
   readEvidence(sessionId: string, unitId: string): TermEvidenceFact | undefined
   readEvidenceAsync?(ownerId: string, topicId: string, reference: TermEvidenceRef): Promise<EvidenceReadResult>
   getNotice(): string | undefined
@@ -27,7 +25,7 @@ export interface TopicTermsViewPort {
     command: { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }): Promise<TermMutationResult>
 }
 const labels = { proposal: '待确认', active: '生效', conflict: '有冲突', review_required: '待复核', disabled: '已停用' } as const
-const origins = { inferred: '模型提案', source_checked: '原文依据', reference_derived: '参考资料（主模型解读）', user_explicit: '用户采用' } as const
+const origins = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突', error: '保存失败' } as const
 function evidenceBody(terms: TopicTermsViewPort, snapshot: TopicTermSnapshot, ref: TermEvidenceRef): string | undefined {
   return resolveTermEvidence(snapshot, ref, (sessionId, unitId) => terms.readEvidence(sessionId, unitId))
@@ -173,7 +171,6 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
     sessions.getAvailableSessions(ownerId).find(session => session.topicId === topicId)?.targetLanguage) ?? sessions.getSettings().targetLanguage
   const note = [
     '同主题共用；快译不使用。',
-    sessions.getSettings().rememberHistory ? '已开启历史保存；主题术语保存在此设备。' : '已保存的术语保留；后续修改仅保留在本次运行。',
     `保存状态：${storageLabels[terms.getStatus(ownerId, topicId)]}`,
   ].join(' ')
   const needle = query.trim().toLocaleLowerCase()
@@ -206,9 +203,8 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
       const frozen = structuredClone(terms.getSnapshot(ownerId, topicId))
       const input: TopicTermsExportSnapshot = {
         topicName: sessions.getTopics(ownerId).find(topic => topic.id === topicId)?.name ?? topicName,
-        snapshot: frozen, exportedAt: new Date().toISOString(), rememberHistory: sessions.getSettings().rememberHistory, storageStatus: terms.getStatus(ownerId, topicId),
+        snapshot: frozen, exportedAt: new Date().toISOString(), storageStatus: terms.getStatus(ownerId, topicId),
         evidenceAvailability: frozen.entries.flatMap(entry => entry.evidence.map((ref, evidenceIndex) => {
-          if (ref.kind === 'reference') return {entryId: entry.id, evidenceIndex, sessionName: null, unitOrder: null, revisionOrder: null, readable: false, sourceLabel:'参考资料：'+ref.referenceId+' / '+ref.segmentId, readability:'not_loaded' as const}
           const candidate = sessions.getSession(ref.sessionId)
           const session = candidate?.topicId === topicId && !sessions.isSessionDeleted(candidate.id) ? candidate : undefined
           const unit = session ? sessions.getTranslationHistory(session.id)?.units.find(unit => unit.id === ref.unitId) : undefined
@@ -236,7 +232,9 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
     h('div', { className: 'dsh-tp-asset-toolbar' },
       h('div', { className: 'dsh-tp-unit-header' },
         h('div', { className: 'dsh-tp-asset-heading' }, h('h3', null, '主题术语'), h('small', { className: 'dsh-tp-muted dsh-tp-asset-note', title: note }, note)),
-        h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || Boolean(form), onClick: () => startEdit() }, '新增术语'),
+        h('div', { className: 'dsh-tp-actions' },
+          h('button', { type: 'button', disabled: actionPending || readState.status === 'loading', onClick: () => { void terms.reload(ownerId, topicId).then(loaded => { if (!loaded && alive.current) setFailure('最新主题术语无法读取，编辑稿保留。') }) } }, '刷新术语'),
+          h('button', { type: 'button', disabled: pending || Boolean(form), onClick: () => startEdit() }, '新增术语'),
           hideExport ? null : h('button', { type: 'button', onClick: () => exportTerms('json') }, '导出 JSON'), hideExport ? null : h('button', { type: 'button', onClick: () => exportTerms('markdown') }, '导出 Markdown'))),
       h('div', { className: 'dsh-tp-asset-filters' },
         h('input', { type: 'search', 'aria-label': '搜索术语', placeholder: '搜索术语', value: query, onChange: (event: { currentTarget: { value: string } }) => setQuery(event.currentTarget.value) }),
@@ -247,7 +245,6 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
       bridgeReason && onReconnect ? h('button', { type: 'button', onClick: onReconnect }, '重新连接主会话') : null,
       terms.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, terms.getNotice()) : null,
       readState.status !== 'ready' ? h('p', { role: readState.status === 'error' ? 'alert' : 'status', className: 'dsh-tp-muted' }, readState.error ?? '正在刷新主题术语，编辑稿保留。') : null,
-      h('button', { type: 'button', disabled: actionPending || readState.status === 'loading', onClick: () => { void terms.reload(ownerId, topicId).then(loaded => { if (!loaded && alive.current) setFailure('最新主题术语无法读取，编辑稿保留。') }) } }, '读取最新术语'),
       failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, failure) : null,
       retry && snapshot.entries.some(entry => entry.id === retry.id) ? h('button', { type: 'button', disabled: pending, onClick: () => {
         const entry = snapshot.entries.find(entry => entry.id === retry.id)
@@ -314,5 +311,5 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
 }
 
 export function TopicEvidenceView(props: { readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly snapshot: {readonly ownerId: string; readonly topicId: string}; readonly reference: TermEvidenceRef; readonly active?: boolean; readonly contextKey?: string }): unknown {
-  return props.reference.kind === 'reference' ? h(ReferenceEvidenceView, {reference:props.reference,active:props.active,read:props.terms.readReferenceAsync ? ()=>props.terms.readReferenceAsync!(props.snapshot.ownerId,props.snapshot.topicId,props.reference as import('../shared/reference-memory.js').ReferenceEvidenceRef) : undefined}) : h(UnitEvidenceView, props)
+  return h(UnitEvidenceView, props)
 }

@@ -13,22 +13,22 @@ import { loadTranslationSourceStorage, sourceSha256, type TranslationSourceHostO
 
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
 interface Agent { readonly id: string; readonly session: { readonly id: string }; followup?(message: unknown): void }
-interface Attachments { readFileStream(file: FileRef, signal?: AbortSignal): AsyncIterable<Uint8Array>; fileHostPath(file: FileRef): string | undefined }
+interface Attachments { readFileStream(file: FileRef, signal?: AbortSignal): AsyncIterable<Uint8Array> }
 interface Uploads { resolve(agent: Agent, receiptId: string): FileRef | undefined }
 interface Controller {
   resolveAgent(id: string): Promise<{ readonly agent: Agent } | { readonly error: unknown }>
   canOpenWorkspacePath(): boolean
   openWorkspacePath(request: { path: string }, signal: AbortSignal): Promise<{ readonly opened: true }>
 }
-interface RuntimeFile { readonly namespaceId: string; readonly topicId: string; readonly source: SourceIdentity; readonly file: FileRef; readonly bytes: Uint8Array }
+interface StagedFile { readonly namespaceId: string; readonly topicId: string; readonly source: SourceIdentity; readonly bytes: Uint8Array }
 function ok<T>(value: T): OtherMemoryFilesResult<T> { return { ok: true, value: structuredClone(value) } }
 function bad<T>(code: OtherMemoryFilesError, message: string): OtherMemoryFilesResult<T> { return { ok: false, error: { code, message } } }
 function unavailable(message: string): Error { return Object.assign(new Error(message), { code: 'scope_mismatch' }) }
 
-/** File bytes are held by independent topic entries. Runtime entries never create plugin files. */
+/** Verified originals are saved before their topic registrations are committed. */
 export class OtherMemoryFilesService {
   readonly typertRemote: { readonly service: OtherMemoryFilesService; readonly serviceKey: 'translationOtherMemoryFiles'; readonly namespace: 'translationOtherMemoryFiles' }
-  private readonly runtime = new Map<string, RuntimeFile>()
+  private readonly stagedFiles = new Map<string, StagedFile>()
   private readonly receipts = new Map<string, OtherMemoryReference>()
   private storage: Promise<TranslationSourceStorage> | undefined
   private active = 0
@@ -66,7 +66,7 @@ export class OtherMemoryFilesService {
     const topics = this.ctx.get?.('translationTopics') as { namespaceForAgent(mainSessionId: string): string | undefined } | undefined
     if (topics?.namespaceForAgent(request.mainSessionId) !== request.namespaceId) return bad('scope_mismatch', '上传主会话未连接此资料库。')
     this.active++
-    let staged: RuntimeFile | undefined
+    let staged: StagedFile | undefined
     try {
       signal.throwIfAborted()
       const found = await this.resolveAgent(controller, request.mainSessionId)
@@ -75,7 +75,7 @@ export class OtherMemoryFilesService {
       if ('error' in found) return bad('unavailable', '无法解析所属主会话的上传服务。')
       const agent = found.agent
       if (!this.current(request.namespaceId, peer, generation) || topics.namespaceForAgent(request.mainSessionId) !== request.namespaceId || agent.id !== request.mainSessionId || agent.session.id !== request.mainSessionId) return bad('scope_mismatch', '上传主会话或资料库连接已变化。')
-      const signature = JSON.stringify([request.namespaceId, request.topicId, request.mainSessionId, request.receiptId, request.category, request.rememberHistory])
+      const signature = JSON.stringify([request.namespaceId, request.topicId, request.mainSessionId, request.receiptId, request.category])
       const prior = this.receipts.get(signature)
       if (prior) {
         const entry = await this.memory.getReference({ namespaceId: prior.namespaceId, topicId: prior.topicId, id: prior.id, version: prior.version }, peer!)
@@ -88,21 +88,20 @@ export class OtherMemoryFilesService {
       if (!decoded.ok) return decoded
       signal.throwIfAborted()
       if (!this.current(request.namespaceId, peer, generation) || topics.namespaceForAgent(request.mainSessionId) !== request.namespaceId) return bad('scope_mismatch', '参考文件准备完成前资料库连接已变化。')
-      staged = { namespaceId: request.namespaceId, topicId: request.topicId, source: decoded.value.source, file, bytes: decoded.value.bytes }
-      this.runtime.set(staged.source.sourceId, staged)
+      staged = { namespaceId: request.namespaceId, topicId: request.topicId, source: decoded.value.source, bytes: decoded.value.bytes }
+      this.stagedFiles.set(staged.source.sourceId, staged)
       const entry = await this.memory.putReference({ namespaceId: request.namespaceId, topicId: request.topicId, category: request.category,
-        source: staged.source, rememberHistory: request.rememberHistory }, peer!)
+        source: staged.source }, peer!)
       // The metadata commit is the completion boundary; a late cancellation must not report it as absent.
       this.receipts.set(signature, entry)
       try { await this.notifySegmentation(entry, agent, peer!) }
       catch (error) { diagnosticSpan(this.ctx, 'memory.segmentation', { action: 'notify' }, entry.id)('failed', { saved: true }, error) }
       return ok(entry)
     } catch (error) {
-      if (staged) this.runtime.delete(staged.source.sourceId)
       signal.throwIfAborted()
       const known = error as { code?: string }
       return bad(known.code === 'scope_mismatch' || !this.current(request.namespaceId, peer, generation) ? 'scope_mismatch' : 'storage_failed', '参考文件登记未完成，请刷新后重试。')
-    } finally { this.active-- }
+    } finally { if (staged) this.stagedFiles.delete(staged.source.sourceId); this.active-- }
   }
   private async notifySegmentation(entry: OtherMemoryReference, agent: Agent, peer: string): Promise<void> {
     if (entry.category !== 'full_text' || entry.source.encoding !== 'utf-8' || !/\.(?:txt|text|md|markdown|csv|tsv|json|jsonl|log|rst)$/iu.test(entry.source.name)) return
@@ -175,7 +174,7 @@ export class OtherMemoryFilesService {
     if (this.disposed || this.cleanup) throw unavailable('参考文件存储已关闭或正在清理。')
     const generation = this.generation; this.active++
     try {
-      const disk = await this.disk(), resident = this.runtime.get(entry.source.sourceId)
+      const disk = await this.disk(), resident = this.stagedFiles.get(entry.source.sourceId)
       if (resident && (resident.namespaceId !== entry.namespaceId || resident.topicId !== entry.topicId || JSON.stringify(resident.source) !== JSON.stringify(entry.source))) throw unavailable('参考文件范围不一致。')
       const bytes = resident?.bytes ?? await disk.readContent(entry.source)
       if (!bytes || bytes.byteLength !== entry.source.bytes || await sourceSha256(bytes) !== entry.source.sha256) throw new Error('Reference original unavailable')
@@ -185,7 +184,7 @@ export class OtherMemoryFilesService {
     } finally { this.active-- }
   }
   private release(entry: OtherMemoryReference): void {
-    this.runtime.delete(entry.source.sourceId)
+    this.stagedFiles.delete(entry.source.sourceId)
     for (const [key, value] of this.receipts) if (value.id === entry.id) this.receipts.delete(key)
   }
   /** Read-only extraction from the held original. No duplicate text file or persistent cache is created. */
@@ -201,9 +200,7 @@ export class OtherMemoryFilesService {
       if (entry.category !== 'full_text') throw Object.assign(new Error('其他参考资料已关闭，不再提供正文读取或检索。'), { code: 'reference_format_unsupported' })
       if (entry.source.encoding !== 'utf-8' || !/\.(?:txt|text|md|markdown|csv|tsv|json|jsonl|log|rst)$/iu.test(entry.source.name))
         throw Object.assign(new Error('此格式尚不支持全文提取；仍可打开原始文件。'), { code: 'reference_format_unsupported' })
-      const resident = this.runtime.get(entry.source.sourceId)
-      if (resident && (resident.namespaceId !== request.namespaceId || resident.topicId !== request.topicId || JSON.stringify(resident.source) !== JSON.stringify(entry.source))) throw unavailable('参考文件所属范围已变化。')
-      const bytes = entry.persistence === 'saved' || !resident ? await (await this.disk()).readContent(entry.source) : resident.bytes
+      const bytes = await (await this.disk()).readContent(entry.source)
       signal.throwIfAborted()
       if (!bytes || bytes.byteLength !== entry.source.bytes || await sourceSha256(bytes) !== entry.source.sha256)
         throw Object.assign(new Error('参考原件缺失或完整性校验失败。'), { code: 'reference_integrity_failed' })
@@ -231,20 +228,9 @@ export class OtherMemoryFilesService {
       if (!entry) return bad('not_found', '此主题的参考文件登记已失效或版本已变化。')
       const controller = this.ctx.get?.('sessionController') as Controller | undefined
       if (!controller?.canOpenWorkspacePath?.() || typeof controller.openWorkspacePath !== 'function') return bad('unavailable', '当前宿主不支持在系统应用中打开参考文件。')
-      let path: string | undefined
-      const resident = this.runtime.get(entry.source.sourceId)
-      if (entry.persistence === 'saved' || !resident) {
-        const disk = await this.disk(), bytes = await disk.readContent(entry.source)
-        if (!bytes || bytes.byteLength !== entry.source.bytes || await sourceSha256(bytes) !== entry.source.sha256) return bad('integrity_failed', '参考原件不存在或摘要校验失败。')
-        path = disk.originalPath(entry.source)
-      } else {
-        const attachments = this.ctx.get?.('attachments') as Attachments | undefined
-        if (!resident || !attachments) return bad('not_found', '运行期参考原件已不可用，请重新选择文件。')
-        if (typeof attachments.fileHostPath !== 'function') return bad('unavailable', '宿主没有提供可打开的参考原件。')
-        const checked = await this.readUpload(resident.file, attachments, signal)
-        if (!checked.ok || checked.value.source.sha256 !== entry.source.sha256) return bad('integrity_failed', '参考原件不存在或摘要校验失败。')
-        path = attachments.fileHostPath(resident.file)
-      }
+      const disk = await this.disk(), bytes = await disk.readContent(entry.source)
+      if (!bytes || bytes.byteLength !== entry.source.bytes || await sourceSha256(bytes) !== entry.source.sha256) return bad('integrity_failed', '参考原件不存在或摘要校验失败。')
+      const path = disk.originalPath(entry.source)
       signal.throwIfAborted()
       if (!this.current(request.namespaceId, peer, generation)) return bad('scope_mismatch', '打开参考原件前资料库连接已变化。')
       if (!await this.memory.getReference(request, peer!)) return bad('not_found', '此参考文件登记已删除或版本已变化。')
@@ -262,5 +248,5 @@ export class OtherMemoryFilesService {
     this.cleanup = true; this.generation++
     return () => { this.cleanup = false }
   }
-  dispose(): void { this.disposed = true; this.generation++; this.runtime.clear(); this.receipts.clear(); this.storage = undefined }
+  dispose(): void { this.disposed = true; this.generation++; this.stagedFiles.clear(); this.receipts.clear(); this.storage = undefined }
 }

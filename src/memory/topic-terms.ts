@@ -1,9 +1,8 @@
-import { parseReferenceEvidence, type ReferenceEvidenceRef } from '../shared/reference-memory.js'
 import { languageMatches } from '../shared/language-tag.js'
 /** Topic terminology contains references, never a second copy of source/final bodies. */
 export type TopicTermStatus = 'proposal' | 'active' | 'conflict' | 'review_required' | 'disabled'
-export type TopicTermOrigin = 'inferred' | 'source_checked' | 'reference_derived' | 'user_explicit'
-export type TermEvidenceRef = UnitEvidenceRef | ReferenceEvidenceRef
+export type TopicTermOrigin = 'inferred' | 'source_checked' | 'user_explicit'
+export type TermEvidenceRef = UnitEvidenceRef
 export interface UnitEvidenceRef {
   readonly kind: 'source' | 'final'
   readonly sessionId: string
@@ -77,7 +76,6 @@ export type TermEvidenceResolver = ((sessionId: string, unitId: string) => TermE
 }
 /** Includes scope and every evidence identity field; legacy source refs explicitly identify version 1. */
 export function termEvidenceKey(scope: Pick<TopicTermSnapshot, 'ownerId' | 'topicId'>, ref: TermEvidenceRef): string {
-  if (ref.kind === 'reference') return JSON.stringify([scope.ownerId, scope.topicId, ref])
   return JSON.stringify([scope.ownerId, scope.topicId, ref.sessionId, ref.unitId, ref.kind,
     ref.kind === 'source' ? ref.sourceVersion ?? 1 : null, ref.revisionId, ref.selectionEventId,
     ref.range?.start ?? null, ref.range?.end ?? null])
@@ -86,7 +84,7 @@ export interface TopicTermPut extends TopicTermContent {
   /** null creates a new term; the write owner allocates the id. Existing terms always carry their stored id. */
   readonly id: string | null
   readonly expectedEntryVersion: number | null
-  readonly origin: 'inferred' | 'source_checked' | 'reference_derived'
+  readonly origin: 'inferred' | 'source_checked'
   readonly status: 'proposal' | 'active'
 }
 /** An explicit Client form edits semantic fields; existing evidence is retained as examples. */
@@ -121,7 +119,6 @@ function strings(value: unknown, maximum: number, required = false): value is re
   return Array.isArray(value) && value.length <= 100 && (!required || value.length > 0) && value.every(item => text(item, maximum)) && new Set(value).size === value.length
 }
 function evidence(value: unknown): value is TermEvidenceRef {
-  if (value && typeof value === 'object' && 'kind' in value && value.kind === 'reference') { try { parseReferenceEvidence(value); return true } catch { return false } }
   if (!record(value) || !(exact(value, ['kind', 'sessionId', 'unitId', 'revisionId', 'selectionEventId', 'range', 'role']) ||
       (value.kind === 'source' && exact(value, ['kind', 'sessionId', 'unitId', 'sourceVersion', 'revisionId', 'selectionEventId', 'range', 'role']))) ||
     !text(value.sessionId, 2048) || !text(value.unitId, 2048) || !['basis', 'example'].includes(value.role as string)) return false
@@ -135,11 +132,7 @@ function content(value: TopicTermContent): boolean {
     strings(value.sourceForms, 500, true) && strings(value.aliases, 500) && text(value.sense, 4000, false) && text(value.preferred, 4000) &&
     strings(value.forbidden, 4000) && !value.forbidden.includes(value.preferred) && Array.isArray(value.evidence) && value.evidence.length <= 100 && value.evidence.every(evidence)
 }
-function hasSourceBasis(entry: TopicTermContent): boolean { return entry.evidence.some(ref => (ref.kind === 'source' || ref.kind === 'reference') && ref.role === 'basis') }
-function referenceOriginValid(value: { readonly origin: unknown; readonly evidence: readonly TermEvidenceRef[] }): boolean {
-  const references = value.evidence.filter(ref => ref.kind === 'reference')
-  return value.origin === 'reference_derived' ? references.some(ref => ref.role === 'basis') : value.origin !== 'source_checked' || references.length === 0
-}
+function hasSourceBasis(entry: TopicTermContent): boolean { return entry.evidence.some(ref => ref.kind === 'source' && ref.role === 'basis') }
 function adoption(value: unknown): value is TermUserAdoption {
   return record(value) && exact(value, ['eventId', 'at', 'adoptedEntryVersion', ...(Object.hasOwn(value, 'edited') ? ['edited'] : [])]) &&
     (value.edited === undefined || typeof value.edited === 'boolean') && text(value.eventId, 2048) && time(value.at) && integer(value.adoptedEntryVersion, 1)
@@ -153,9 +146,8 @@ export function decodeTopicTermPut(value: unknown): TopicTermPut | undefined {
   if (!record(value) || !exact(value, ['id', 'expectedEntryVersion', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', 'evidence', 'origin', 'status']) ||
     !(value.id === null || text(value.id, 2048)) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
     (value.id === null && value.expectedEntryVersion !== null) || !content(value as unknown as TopicTermContent) ||
-    !['inferred', 'source_checked', 'reference_derived'].includes(value.origin as string) || !['proposal', 'active'].includes(value.status as string) ||
-    (value.status === 'active' && (!['source_checked', 'reference_derived'].includes(String(value.origin)) || !hasSourceBasis(value as unknown as TopicTermContent)))) return undefined
-  if (!referenceOriginValid(value as unknown as TopicTerm)) return undefined
+    !['inferred', 'source_checked'].includes(value.origin as string) || !['proposal', 'active'].includes(value.status as string) ||
+    (value.status === 'active' && (!['source_checked'].includes(String(value.origin)) || !hasSourceBasis(value as unknown as TopicTermContent)))) return undefined
   return { ...copyContent(value as unknown as TopicTermContent), id: value.id as string | null, expectedEntryVersion: value.expectedEntryVersion,
     origin: value.origin as TopicTermPut['origin'], status: value.status as TopicTermPut['status'] }
 }
@@ -176,14 +168,12 @@ export function decodeTopicTermSnapshot(value: unknown): TopicTermSnapshot | und
   for (const raw of value.entries) {
     if (!record(raw) || !exact(raw, ['id', 'version', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', 'evidence', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt', ...(Object.hasOwn(raw, 'acceptance') ? ['acceptance'] : [])]) ||
       !text(raw.id, 2048) || ids.has(raw.id) || !integer(raw.version, 1) || raw.version > value.version || !time(raw.createdAt) || !time(raw.updatedAt) ||
-      !statuses.includes(raw.status as TopicTermStatus) || !['inferred', 'source_checked', 'reference_derived', 'user_explicit'].includes(raw.origin as string) || !content(raw as unknown as TopicTermContent)) return undefined
+      !statuses.includes(raw.status as TopicTermStatus) || !['inferred', 'source_checked', 'user_explicit'].includes(raw.origin as string) || !content(raw as unknown as TopicTermContent)) return undefined
     if (raw.origin === 'user_explicit' ? (!adoption(raw.confirmation) || raw.confirmation.adoptedEntryVersion >= raw.version || (raw.evidence as TermEvidenceRef[]).some(ref => ref.role === 'basis')) : raw.confirmation !== null) return undefined
     if (raw.acceptance !== undefined && (value.schemaVersion !== 3 || raw.origin === 'user_explicit' || !fileProposalAcceptance(raw.acceptance))) return undefined
     if (raw.status === 'active' && ((raw.origin === 'inferred' && !raw.acceptance) || (raw.origin !== 'user_explicit' && !hasSourceBasis(raw as unknown as TopicTermContent)))) return undefined
-    if (!referenceOriginValid(raw as unknown as TopicTerm)) return undefined
     ids.add(raw.id); entries.push(structuredClone(raw) as unknown as TopicTerm)
   }
-  if (value.schemaVersion === 1 && entries.some(entry => entry.origin === 'reference_derived' || entry.evidence.some(ref => ref.kind === 'reference'))) return undefined
   return { schemaVersion: value.schemaVersion as 1 | 2 | 3, ownerId: value.ownerId, topicId: value.topicId, version: value.version, activeVersion: value.activeVersion, updatedAt: value.updatedAt, entries }
 }
 
@@ -197,7 +187,6 @@ export function resolveTermEvidence(snapshot: Pick<TopicTermSnapshot, 'ownerId' 
     const body = resolver.resolveRef(snapshot, ref)
     return typeof body === 'string' && body.trim() ? body : undefined
   }
-  if (ref.kind === 'reference') return undefined
   const fact = resolver(ref.sessionId, ref.unitId)
   if (!fact || fact.topicId !== snapshot.topicId || !integer(fact.sourceVersion, 1)) return undefined
   let body: string
@@ -221,7 +210,7 @@ function validBasis(snapshot: TopicTermSnapshot, entry: TopicTermContent, resolv
   return hasSourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined)
 }
 function effective(snapshot: TopicTermSnapshot, entry: TopicTerm, resolver: TermEvidenceResolver): boolean {
-  return entry.status === 'active' && (entry.origin === 'user_explicit' || ((!!entry.acceptance || ['source_checked', 'reference_derived'].includes(entry.origin)) && validBasis(snapshot, entry, resolver)))
+  return entry.status === 'active' && (entry.origin === 'user_explicit' || ((!!entry.acceptance || ['source_checked'].includes(entry.origin)) && validBasis(snapshot, entry, resolver)))
 }
 /** Shared candidate selection for bounded evidence preparation and the pure conflict check. */
 export function topicTermContentsConflict(left: TopicTermContent, right: TopicTermContent): boolean {
@@ -231,7 +220,7 @@ export function topicTermContentsConflict(left: TopicTermContent, right: TopicTe
 }
 function hasConflict(snapshot: TopicTermSnapshot, entry: TopicTermContent & { readonly id: string }, resolver?: TermEvidenceResolver): boolean {
   return snapshot.entries.some(old => old.id !== entry.id && old.status === 'active' && topicTermContentsConflict(old, entry) &&
-    (!resolver || effective(snapshot, old, resolver) || (['source_checked', 'reference_derived'].includes(old.origin) && hasSourceBasis(old) &&
+    (!resolver || effective(snapshot, old, resolver) || (['source_checked'].includes(old.origin) && hasSourceBasis(old) &&
       old.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined || resolver.isUnloaded?.(snapshot, ref)))))
 }
 function activeProjection(entry: TopicTerm): unknown {
@@ -241,7 +230,7 @@ function activeProjection(entry: TopicTerm): unknown {
 }
 function copyContent(entry: TopicTermContent): TopicTermContent {
   return { sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sourceForms: [...entry.sourceForms], aliases: [...entry.aliases],
-    sense: entry.sense, preferred: entry.preferred, forbidden: [...entry.forbidden], evidence: entry.evidence.map(ref => ref.kind === 'reference' ? structuredClone(ref) : ({ kind: ref.kind, sessionId: ref.sessionId, unitId: ref.unitId,
+    sense: entry.sense, preferred: entry.preferred, forbidden: [...entry.forbidden], evidence: entry.evidence.map(ref => ({ kind: ref.kind, sessionId: ref.sessionId, unitId: ref.unitId,
       ...(ref.kind === 'source' && ref.sourceVersion !== undefined ? { sourceVersion: ref.sourceVersion } : {}),
       revisionId: ref.revisionId, selectionEventId: ref.selectionEventId, range: ref.range ? { ...ref.range } : null, role: ref.role })) }
 }
@@ -275,9 +264,9 @@ export function putTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermPut, r
   if (id === null) return result(snapshot, 'invalid', null)
   const old = snapshot.entries.find(entry => entry.id === id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
-  if (old && time(at) && referenceOriginValid(input) && content(input) && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
+  if (old && time(at) && content(input) && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
   if (old) input = { ...input, status: 'proposal' }
-  if (!referenceOriginValid(input) || !text(id, 2048) || !time(at) || !content(input) || !['inferred', 'source_checked', 'reference_derived'].includes(input.origin) ||
+  if (!text(id, 2048) || !time(at) || !content(input) || !['inferred', 'source_checked'].includes(input.origin) ||
     !['proposal', 'active'].includes(input.status) || (input.origin === 'inferred' && input.status === 'active')) return result(snapshot, 'invalid', old)
   let status: TopicTermStatus = input.status
   if (status === 'active' && !validBasis(snapshot, input, resolver)) return result(snapshot, 'invalid', old)

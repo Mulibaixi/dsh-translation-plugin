@@ -1,4 +1,6 @@
 import { parseLibrarySourceRequest, type LibrarySourceRequest, type LibrarySourceValue } from '../shared/library-sources.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
+import { historyTargetMatches } from './history-resources.js'
 import { MAX_TRANSLATION_SOURCE_BYTES, TRANSLATION_SOURCES_REMOTE, parseTranslationSourceAsset, parseTranslationSourceRequest, parseTranslationSourceScope, toSourceIdentity,
   translationSourceResultBytes, type TranslationSourceAsset, type TranslationSourceAssetPage, type TranslationSourceAssetRead,
   type TranslationSourceCapability, type TranslationSourceErrorCode, type TranslationSourceImport, type TranslationSourceResult,
@@ -497,6 +499,13 @@ export class TranslationSourcesService {
     })
   }
   hasActiveJobs(): boolean { return this.pending.size > 0 || this.referenceQueues.size > 0 || this.libraryReads > 0 }
+  historyUnitBusy(scope: HistoryScope, unitId: string): boolean {
+    if (unitId !== '*') return false
+    return [...this.pending.keys()].some(signature => {
+      const [, , topicId, translationSessionId] = JSON.parse(signature) as string[]
+      return historyTargetMatches(scope, unitId, { topicId, translationSessionId })
+    }) || [...this.referenceQueues.keys()].some(signature => historyTargetMatches(scope, unitId, JSON.parse(signature)[0]))
+  }
   heldSourceDigests(ids: ReadonlySet<string>): readonly string[] { return [...this.sources].filter(([id]) => ids.has(id)).map(([, record]) => record.source.sha256) }
   forgetSourceIds(ids: ReadonlySet<string>, retained: ReadonlySet<string>): void {
     for (const id of ids) if (!retained.has(id)) {

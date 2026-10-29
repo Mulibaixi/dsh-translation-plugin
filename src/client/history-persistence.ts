@@ -12,7 +12,7 @@ export interface HistoryRecordRegistration {
 }
 export interface SessionHistoryBackend {
   snapshot(id: string): string | null
-  save(session: LocalSession, history: TranslationHistory, remember: boolean): Promise<HistoryTransferReceipt>
+  save(session: LocalSession, history: TranslationHistory): Promise<HistoryTransferReceipt>
   mutate(session: LocalSession, history: TranslationHistory, command: HistoryMutation['command'], operationId: string): Promise<HistoryTransferReceipt>
   retire(session: LocalSession, history: TranslationHistory, operationId: string): Promise<import('../shared/history-cleanup.js').HistoryCleanupResult | undefined>
   reload(session: LocalSession): Promise<HistoryTransferReceipt>
@@ -80,7 +80,7 @@ export class HistoryPersistenceClient implements SessionHistoryBackend {
     }
     return parseHistoryBundle({ schemaVersion: 1, session, history, fileJobs: records('fileJobs'), intakes: records('intakes'), preparations: records('preparations') }, this.scope(session))
   }
-  private async commit(session: LocalSession, history: TranslationHistory, remember: boolean, override?: { kind: HistoryRecordKind; key: string; value: string }): Promise<HistoryTransferReceipt> {
+  private async commit(session: LocalSession, history: TranslationHistory, override?: { kind: HistoryRecordKind; key: string; value: string }): Promise<HistoryTransferReceipt> {
     this.check()
     const scope = this.scope(session), before = this.seats.get(session.id), snapshot = structuredClone(this.bundle(session, history, override))
     const current = (): HistoryBundle => {
@@ -94,15 +94,15 @@ export class HistoryPersistenceClient implements SessionHistoryBackend {
     }
     const encoded = encodeHistoryBundle(snapshot)
     if (encodeHistoryBundle(current()) !== encoded) throw new Error('会话在保存前变化，请重试保存。')
-    if (before?.current && encodeHistoryBundle(before.current) === encoded && (!remember || before.state.persistence === 'saved')) return before
+    if (before?.current && encodeHistoryBundle(before.current) === encoded && before.state.persistence === 'saved') return before
     const receipt = before?.state.switched
-      ? await this.transport.replace(scope, before.state, current, remember, before)
-      : await this.transport.create(scope, current, remember)
+      ? await this.transport.replace(scope, before.state, current, before)
+      : await this.transport.create(scope, current)
     this.check(); this.seats.set(session.id, receipt); this.sessions.confirmHostHistory(receipt); return receipt
   }
-  save(session: LocalSession, history: TranslationHistory, remember: boolean): Promise<HistoryTransferReceipt> { return this.commit(session, history, remember) }
+  save(session: LocalSession, history: TranslationHistory): Promise<HistoryTransferReceipt> { return this.commit(session, history) }
   async mutate(session: LocalSession, history: TranslationHistory, command: HistoryMutation['command'], operationId: string): Promise<HistoryTransferReceipt> {
-    await this.commit(session, history, false)
+    await this.commit(session, history)
     const state = this.seats.get(session.id)!.state
     const result = await this.transport.mutate({ ...this.scope(session), token: state.token!, command, operationId })
     if (result.status !== 'updated') throw new Error(result.reason ?? '会话已变化，请重新读取后删除。')
@@ -130,7 +130,7 @@ export class HistoryPersistenceClient implements SessionHistoryBackend {
   async retire(session: LocalSession, history: TranslationHistory, operationId: string): Promise<import('../shared/history-cleanup.js').HistoryCleanupResult | undefined> {
     let cleanup: import('../shared/history-cleanup.js').HistoryCleanupResult | undefined
     try {
-      await this.commit(session, history, false)
+      await this.commit(session, history)
       const result = await this.transport.retire({ ...this.scope(session), token: this.seats.get(session.id)!.state.token!, operationId })
       if (result.status !== 'updated') throw new Error(result.reason ?? '会话已变化，未删除。')
       cleanup = result.resourceCleanup
@@ -150,7 +150,7 @@ export class HistoryPersistenceClient implements SessionHistoryBackend {
       setItem: async (key, value) => {
         const record = JSON.parse(value), id = recordSession(kind, record), session = this.sessions.getSession(id), history = this.sessions.getTranslationHistory(id)
         if (!session || !history || recordKey(kind, record) !== key) throw new Error('从属记录缺少准确的所属会话。')
-        await this.commit(session, history, true, { kind, key, value })
+        await this.commit(session, history, { kind, key, value })
       },
       removeItem: async () => { throw new Error('请通过宿主单元或会话删除入口释放从属记录。') },
     }

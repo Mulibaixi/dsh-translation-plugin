@@ -2,7 +2,7 @@ import { isDocumentUnit, isFileJobUnit } from './translation-history.js'
 import { DirectFileLink, type DirectFile } from './direct-file-view.js'
 import { MemoryAssetsView } from './memory-assets-view.js'
 import { LocalDataClearView, type LocalDataClient } from './local-data.js'
-import { styles } from './view-styles.js'
+import { styles, TOPIC_SUBMENU_WIDTH } from './view-styles.js'
 import { h, react } from './react.js'
 import { EmbeddingSettingsView } from './embedding-settings-view.js'
 import type { EmbeddingClient } from './embedding-client.js'
@@ -41,7 +41,6 @@ interface StoreProps { readonly store: SessionStore }
 interface TopicUiProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps {
   readonly memoryIndex?: MemoryIndexClient | undefined
   readonly archive?: import('./topic-archive-store.js').TopicArchiveStore | undefined
-  readonly references?: import('./reference-store.js').ReferenceStore | undefined
   readonly otherMemory?: import('./other-memory-client.js').OtherMemoryClient | undefined
   readonly memoryClearing?: import('./theme-memory-clearing.js').ThemeMemoryClearing | undefined
   readonly normal?: NormalTranslationClient | undefined
@@ -103,7 +102,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, terms, archive, references, otherMemory, memoryIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, terms, archive, otherMemory, memoryIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [assetTopic, setAssetTopic] = react.useState<string | undefined>(undefined)
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
@@ -140,7 +139,7 @@ export function PanelRouter({ store, models, quick, normal, sessionId, topics, m
     },
   }
   if (assetTopic && terms && archive) return h('section', { className: 'dsh-tp dsh-tp-panel' }, button('返回翻译资料库', () => setAssetTopic(undefined)),
-    h(MemoryAssetsView, { store, terms, archive, references, otherMemory, memoryIndex, mainSessionId: sessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing,
+    h(MemoryAssetsView, { store, terms, archive, otherMemory, memoryIndex, mainSessionId: sessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing,
       ownerId: sessionId ?? store.getNamespaceId(), topicId: assetTopic, onSelectTopic: setAssetTopic, onDeleteTerm: onDeleteTerm ?? (async () => false) }))
   const openAssets = onOpenAssets ?? (terms && archive ? (_entryId: string, topicId: string) => setAssetTopic(topicId) : undefined)
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
@@ -161,7 +160,7 @@ function projectTranslationExport(request: FrozenTranslationExport, documents: D
 type WorkspaceDialog = { readonly kind: 'rename' | 'remark' | 'reload' | 'rename-topic'; readonly id: string }
 type ContextEvent = { preventDefault(): void; stopPropagation(): void; readonly clientX: number; readonly clientY: number; readonly currentTarget?: HTMLElement }
 interface TopicEntry { readonly id: string; readonly name: string; readonly nextSequence: number }
-interface TopicContextRequest { readonly id: string; readonly x: number; readonly y: number; readonly trigger?: HTMLElement | undefined; readonly view?: 'open' | undefined }
+interface TopicContextRequest { readonly id: string; readonly x: number; readonly y: number; readonly trigger?: HTMLElement | undefined }
 
 function sessionTitle(session: LocalSession): string {
   const label = session.remark ? `${session.name} · ${session.remark}` : session.name
@@ -714,14 +713,12 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     // 容器尚未参与布局（scrollHeight 为 0）时保留定位意图，等下一次内容变化再试。
     if (timeline.length > 0 && element.scrollHeight > 0) entry.pending = false
   }, [current?.id, timeline.length])
-  const historyNote = store.getSettings().rememberHistory ? undefined
-    : store.getHistory().length ? '已保存的历史保留；后续内容仅保留在本次运行。' : '本次内容仅保留在本次运行。'
   const materialStatus = current?.mode === 'normal' ? materials?.getStatus(current.id, ownerId) : undefined
   const blocked = current?.mode === 'normal' ? materialStatus?.blocked ?? (materials ? undefined : '普通模式暂不可用：当前 DSH 缺少同步发送材料接口。') : current ? quick.blockedReason(current) : undefined
   const busy = current?.mode === 'normal' ? materialStatus?.busy ?? false : current ? quick.isBusy(current.id) : false
   const readiness = quick.getReadiness()
   const checking = readiness.status === 'loading' || readiness.status === 'idle'
-  const serviceStatus = current?.mode === 'normal' ? blocked : readiness.status !== 'ready'
+  const serviceStatus = current?.mode === 'normal' ? (blocked === '请输入待译材料。' ? undefined : blocked) : readiness.status !== 'ready'
     ? checking ? '正在检查翻译服务…' : readiness.reason : undefined
   function contextMenu(session: LocalSession, event: ContextEvent): void {
     sorting.gesture.cancel()
@@ -747,7 +744,13 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   }
   function create(parentId?: string): void {
     closeSessionMenus()
-    void action.run(async () => Boolean(await store.createSessionAsync(ownerId, parentId)))
+    let created: LocalSession | undefined
+    void action.run(async () => {
+      created = await store.createSessionAsync(ownerId, parentId)
+      return Boolean(created)
+    }, () => {
+      if (created && !parentId) { setName(created.topicName); setDialog({ kind: 'rename', id: created.id }) }
+    })
   }
   function closeSessionMenus(): void { setSessionPickerOpen(false); setContext(undefined); setTopicContext(undefined) }
   function openTopicAssets(topic: { readonly id: string; readonly name: string }, sessionId?: string): void {
@@ -862,7 +865,6 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       topicDeletionPreview && topicDeletion ? h(TopicDeletionDialog, { preview: topicDeletionPreview, client: topicDeletion,
         onClose: () => setTopicDeletionPreview(undefined), onPreview: setTopicDeletionPreview }) : null,
       h('div', { className: 'dsh-tp-transcript', tabIndex: 0, ref: transcript, 'aria-label': '翻译会话内容' },
-        historyNote && (units.length || records.length) ? h('p', { className: 'dsh-tp-history-note' }, historyNote) : null,
         current?.legacyManualText ? h('div', null, h('p', { className: 'dsh-tp-muted' }, '旧版保存的人工译文'), h('div', { className: 'dsh-tp-legacy' }, current.legacyManualText)) : null,
         ...timeline.map(entry => entry.view),
         !current && store.getUnloadedActiveSession(ownerId) ? h('div', { role: 'status', className: 'dsh-tp-empty' }, '正在读取会话正文…',
@@ -889,14 +891,14 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       action.failure ? h('div', { role: 'alert', className: 'dsh-tp-message' }, action.failure) : null,
       current && status === 'conflict' ? h('div', { className: 'dsh-tp-actions dsh-tp-message' },
         button('读取本地副本', () => setDialog({ kind: 'reload', id: current.id }), action.pending),
-        button('用当前会话覆盖本地副本', () => { void action.run(() => store.overwriteSessionAsync(current.id)) }, action.pending || !store.getSettings().rememberHistory),
+        button('用当前会话覆盖本地副本', () => { void action.run(() => store.overwriteSessionAsync(current.id)) }, action.pending),
       ) : null,
       dialog?.kind === 'reload' && dialogSession ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '读取会话历史确认' },
         h('p', null, '读取本地副本会替换本窗口该会话内容。确认继续？'),
         button('确认读取', () => { void store.reloadSessionAsync(dialog.id).then(done => { if (done) setDialog(undefined) }) }, action.pending), button('取消', () => setDialog(undefined), action.pending),
       ) : null,
       current ? h('div', { className: 'dsh-tp-composer-area' },
-        current.mode === 'normal' ? h('p', { className: 'dsh-tp-muted', role: 'status' }, materialStatus?.message ?? '材料会进入主会话及模型请求记录；发送确认后转为已发送记录。') : null,
+        current.mode === 'normal' && materialStatus?.message ? h('p', { className: 'dsh-tp-muted', role: 'status' }, materialStatus.message) : null,
         current.mode === 'normal' && materialStatus?.unknown ? button('检查提交状态', () => { void materials?.query(current.id) }) : null,
         serviceStatus ? h('div', { className: 'dsh-tp-service-status' },
           h('span', { className: 'dsh-tp-service-status-text', role: 'status' }, serviceStatus),
@@ -971,22 +973,22 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
         void action.run(async () => { setDeletion(await captureDeleteRequest(store, terms, `删除「${target.name}」`, [target.id])); return true })
       } }, '删除'),
     ))) : null,
-    topicContext && topicTarget ? h(Menu, { key: topicContext.view ?? 'topic-actions', open: true, anchor: null, onClose: () => { setTopicContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup',
-      getAnchorRect: () => ({ left: topicContext.x, right: topicContext.x, top: topicContext.y, bottom: topicContext.y, width: 0, height: 0 }),
+    topicContext && topicTarget ? h(Menu, { key: topicTarget.id, open: true, anchor: null, onClose: () => { setTopicContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup dsh-tp-topic-popup',
+      getAnchorRect: () => {
+        const menuWidth = document.querySelector<HTMLElement>('.dsh-tp-topic-popup')?.offsetWidth ?? 180
+        const x = Math.max(12, Math.min(topicContext.x, window.innerWidth - menuWidth - TOPIC_SUBMENU_WIDTH - 2 - 12))
+        return { left: x, right: x, top: topicContext.y, bottom: topicContext.y, width: 0, height: 0 }
+      },
+      items: [{ id: 'open', label: '打开', submenu: topicOpenable.length
+        ? topicOpenable.map(session => ({ id: session.id, label: `${sessionDisplayName(session)}${session.id === current?.id ? '（当前）' : ''}` }))
+        : [{ id: 'empty', label: '该主题暂无可打开的会话。', disabled: true }] }],
+      onSelect: (id: string) => { const session = topicOpenable.find(session => session.id === id); if (session) { closeSessionMenus(); store.openSession(ownerId, session.id) } },
     }, h('div', { 'aria-label': '主题操作', onPointerDown: (event: { stopPropagation(): void }) => event.stopPropagation(),
       onKeyDown: (event: KeyboardEvent) => {
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setTopicContext(undefined); topicContext.trigger?.focus() }
       },
     },
-      topicContext.view === 'open' ? h('div', { 'aria-label': '打开主题子会话' },
-        h(MenuItemButton, { onSelect: () => setTopicContext({ ...topicContext, view: undefined }) }, '返回'),
-        ...topicOpenable.map(session => h(MenuItemButton, {
-          key: session.id,
-          onSelect: () => { closeSessionMenus(); store.openSession(ownerId, session.id) },
-        }, `${sessionDisplayName(session)}${session.id === current?.id ? '（当前）' : ''}`)),
-        topicOpenable.length === 0 ? h('small', { className: 'dsh-tp-muted' }, '该主题暂无可打开的会话。') : null,
-      ) : h('div', null,
-        h(MenuItemButton, { onSelect: () => setTopicContext({ ...topicContext, view: 'open' }) }, '打开'),
+      h('div', null,
         h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); void action.run(async () => Boolean(await store.createSessionForTopicAsync(ownerId, topicTarget.id))) } }, '新建'),
         h(MenuItemButton, { disabled: action.pending, onSelect: () => { closeSessionMenus(); setName(topicTarget.name); setTopicExpected(topicTarget.name); setDialog({ kind: 'rename-topic', id: topicTarget.id }) } }, '重命名'),
         onOpenAssets ? h(MenuItemButton, { onSelect: () => openTopicAssets(topicTarget) }, '记忆') : null,
@@ -1062,7 +1064,7 @@ function TopicDeletionDialog({ preview, client, onClose, onPreview }: {
   return h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除主题确认', 'aria-busy': pending },
     h('p', null, `删除主题「${preview.plan.topicName}」？`),
     h('p', { className: 'dsh-tp-muted' },
-      `会话 ${preview.plan.sessionCount} 个${other ? `（其他主会话 ${other}）` : ''}${preview.plan.archivedCount ? `，其中归档 ${preview.plan.archivedCount}` : ''} · 术语 ${preview.termsCount} 条 · 结构化档案 ${preview.archiveCount} 条 · 参考资料 ${preview.referenceCount} 份`),
+      `会话 ${preview.plan.sessionCount} 个${other ? `（其他主会话 ${other}）` : ''}${preview.plan.archivedCount ? `，其中归档 ${preview.plan.archivedCount}` : ''} · 术语 ${preview.termsCount} 条 · 结构化档案 ${preview.archiveCount} 条`),
     h('p', null, '将删除主题、其会话、术语、结构化档案与参考资料；共享原稿正文不在此处回收。已导出文件和主模型已经收到的内容无法撤回。'),
     other ? h('label', { className: 'dsh-tp-field' }, h('input', { type: 'checkbox', checked: confirmOther, onChange: (event: CheckEvent) => setConfirmOther(event.currentTarget.checked) }),
       h('span', null, `我确认删除其他主会话的 ${other} 个会话`)) : null,
@@ -1132,24 +1134,12 @@ export function SettingsView({ store, onClose, terms, localData, embedding, memo
     h('header', { className: 'dsh-tp-settings-header' }, h('h2', null, '翻译设置'),
       h('div', { className: 'dsh-tp-actions' }, button('恢复默认设置', reset, saving), onClose ? button('返回工作区', onClose) : null),
     ),
-    h('p', { className: 'dsh-tp-muted' }, '有效修改即时保存到此设备。“+”新建主题采用默认设置；同主题子会话继承起点会话的配置。'),
     h('div', { className: 'dsh-tp-settings-section' },
       h('h3', null, '新会话默认值'),
       field('翻译模式', modeSelect(form.defaultMode, defaultMode => change({ defaultMode }))),
       field('目标语言', h('input', { value: form.targetLanguage, onChange: (event: TextEvent) => change({ targetLanguage: event.currentTarget.value }) })),
       field('翻译要求', h('textarea', { value: form.defaultInstruction, rows: 3, placeholder: '可留空', onChange: (event: TextEvent) => change({ defaultInstruction: event.currentTarget.value }) })),
       field('单次上限', h('input', { type: 'number', value: form.maxInputChars, min: 1, max: 200000, step: 1, onChange: (event: TextEvent) => change({ maxInputChars: Number(event.currentTarget.value) }) }), '原文字符数：1–200000。降低默认值不会裁剪已有输入。'),
-    ),
-    h('div', { className: 'dsh-tp-settings-section' },
-      h('h3', null, '会话历史保存'),
-      h('label', { className: 'dsh-tp-history-row' }, h('input', {
-        type: 'checkbox', checked: form.rememberHistory, disabled: saving, 'aria-label': '允许保存会话历史到本地',
-        onChange: (event: CheckEvent) => change({ rememberHistory: event.currentTarget.checked }),
-      }), '允许保存会话历史到本地'),
-      h('p', { className: 'dsh-tp-muted' }, '模型与推理等级选择独立保存在此设备，不受此开关影响。开启后自动保存主题名称、会话配置和当前原文草稿，以及已受理的原文、各版译文与定稿选择，数据以明文保存在此设备。已保存的历史保留；关闭后的后续内容仅保留在本次运行。'),
-      h('p', { className: 'dsh-tp-muted' }, '关闭保存后，已保存过的主题仍会写入身份与编号元数据，以避免重用编号；其中不含主题名称、备注、原文或译文。完全临时主题的编号仅在本次运行中保留。'),
-      store.getStructureCapability() === 'runtime-only' ? h('p', { className: 'dsh-tp-muted' }, '当前环境无法协调历史保存；开启保存与相关持久操作暂不可用。') : null,
-
     ),
     embedding ? h(EmbeddingSettingsView, { client: embedding, index: memoryIndex }) : null,
     localData ? h(LocalDataClearView, {data:localData}) : null,

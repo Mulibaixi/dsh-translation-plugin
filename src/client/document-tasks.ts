@@ -142,8 +142,8 @@ export class DocumentTasksClient {
     const request = task.request, record = this.unit(task)!.tasks.find(item => item.taskId === task.scope.taskId)!, status = record.status, facts = record.executionFacts
     return { ...task.scope, operationId: request.operationId, sourceVersion: record.sourceVersion,
       planRef: { id: request.plan.id, version: request.plan.version }, preparationRef: request.preparationRef,
-      taskSequence: task.sequence, status, storage: task.storage === 'saved' && this.store.getSettings().rememberHistory && this.store.getStatus(task.scope.scope.translationSessionId) === 'saved' ? 'saved' : 'runtime_only',
-      storageError: task.storage === 'saved' && !this.store.getSettings().rememberHistory ? '历史保存已关闭；后续事实仅保留在当前运行期。' : task.storageError,
+      taskSequence: task.sequence, status, storage: task.storage === 'saved' && this.store.getStatus(task.scope.scope.translationSessionId) === 'saved' ? 'saved' : 'runtime_only',
+      storageError: task.storageError,
       restartExecutable: Boolean(facts && task.storage === 'saved'), ...(facts ? { taskVersion: facts.taskVersion, hostGeneration: [...facts.controls].reverse().find(control => control.baseline)?.baseline?.hostGeneration ?? facts.baseline.hostGeneration } : {}) }
   }
   private facts(task: Task): DocumentExecutionFacts | undefined { return this.unit(task)?.tasks.find(item => item.taskId === task.scope.taskId)?.executionFacts }
@@ -197,7 +197,7 @@ export class DocumentTasksClient {
     if (this.disposed || scope.ownerId !== ownerId || scope.mainSessionId !== ownerId || !session || session.topicId !== scope.topicId || !unit || !isDocumentUnit(unit) || this.store.isSessionDeleted(session.id)) return bad('scope_mismatch', '纠错查询不属于当前授权范围。')
     const fact = unit.corrections?.find(fact => fact.operationId === request.operationId)
     if (!fact) return ok(null)
-    const source = unit.sourceVersions.find(source => source.version === fact.toSourceVersion)!, saved = this.store.getSettings().rememberHistory && this.store.getStatus(session.id) === 'saved' && await this.sourceConfirmed(session.id, unit.id, source)
+    const source = unit.sourceVersions.find(source => source.version === fact.toSourceVersion)!, saved = this.store.getStatus(session.id) === 'saved' && await this.sourceConfirmed(session.id, unit.id, source)
     return ok({ scope, unitId: unit.id, operationId: request.operationId, sourceVersion: source.version, storage: saved ? 'saved' : 'runtime_only', storageError: saved ? null : '纠错已记录，保存状态未确认。' })
   }
   private async sourceConfirmed(sessionId: string, unitId: string, source: DocumentUnit['sourceVersions'][number]): Promise<boolean> {
@@ -221,16 +221,13 @@ export class DocumentTasksClient {
     const retainKey = JSON.stringify([ownerId, session.id, unit.id])
     if (!this.correctedRetains.has(retainKey)) this.correctedRetains.set(retainKey, this.retain(ownerId))
     for (const task of this.tasks.values()) if (task.scope.unitId === unit.id && task.scope.scope.translationSessionId === session.id && task.request.plan.sourceVersion === request.expectedSourceVersion) task.release()
-    let saved = false, storageError: string | null = '历史保存已关闭，新原稿仅保留在当前运行期。'
-    if (this.store.getSettings().rememberHistory) {
-      saved = await this.store.saveTranslationHistoryAsync(session.id)
-      if (saved && request.source.body.kind === 'asset' && this.options.sourceStorage) {
-        const result = await this.options.sourceStorage.save({ prepare: { scope, sourceRef: { ...request.source.body.reference, persistence: 'runtime_only' }, referenceKey: `document-source:${unit.id}:${request.source.version}`, operationId: `document-source-prepare:${request.fact.operationId}` },
-          confirmOperationId: `document-source-confirm:${request.fact.operationId}` }, this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: unit.id, sourceVersion: request.source.version }, scope))
-        saved = result.state === 'confirmed'
-      }
-      storageError = saved ? null : '新原稿或历史保存未确认；当前运行期仍可读取。'
+    let saved = await this.store.saveTranslationHistoryAsync(session.id)
+    if (saved && request.source.body.kind === 'asset' && this.options.sourceStorage) {
+      const result = await this.options.sourceStorage.save({ prepare: { scope, sourceRef: { ...request.source.body.reference, persistence: 'runtime_only' }, referenceKey: `document-source:${unit.id}:${request.source.version}`, operationId: `document-source-prepare:${request.fact.operationId}` },
+        confirmOperationId: `document-source-confirm:${request.fact.operationId}` }, this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: unit.id, sourceVersion: request.source.version }, scope))
+      saved = result.state === 'confirmed'
     }
+    const storageError = saved ? null : '新原稿或历史保存未确认；当前运行期仍可读取。'
     return ok({ scope, unitId: unit.id, operationId: request.fact.operationId, sourceVersion: request.source.version, storage: saved ? 'saved' : 'runtime_only', storageError })
   }
   async acceptUnit(ownerId: string, raw: DocumentUnitAcceptRequest): Promise<AnalysisResult<DocumentTaskReceipt>> {
@@ -273,7 +270,7 @@ export class DocumentTasksClient {
     })) { task.release(); return bad('history_update_failed', '新版本任务或复用事实未完成准确受理。') }
     this.tasks.set(key, task)
     const retainKey = JSON.stringify([ownerId, session.id, unit.id]); this.correctedRetains.get(retainKey)?.(); this.correctedRetains.delete(retainKey)
-    task.historySaved = this.store.getSettings().rememberHistory && await this.store.saveTranslationHistoryAsync(session.id); this.refreshStorage(task)
+    task.historySaved = await this.store.saveTranslationHistoryAsync(session.id); this.refreshStorage(task)
     return ok(this.receipt(task))
   }
   accept(ownerId: string, raw: DocumentAcceptRequest): Promise<AnalysisResult<DocumentTaskReceipt>> {
@@ -339,27 +336,23 @@ export class DocumentTasksClient {
       preparationSaved: snapshot.storage === 'saved', preparationStorageError: snapshot.storageError, storage: 'runtime_only', storageError: null }
     task.release = () => { task.releaseLease(); task.releaseBridge() }
     this.tasks.set(this.key(ownerId, request.taskId), task)
-    if (this.store.getSettings().rememberHistory) {
-      const historySaved = await this.store.saveTranslationHistoryAsync(session.id)
-      let sourceSaved = !material!.sourceRef
-      if (material!.sourceRef && this.options.sourceStorage) {
-        try {
-          const saved = source.historyCommit ? await this.options.sourceStorage.confirmPersistedReference(source.historyCommit,
-            this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 }, scope.scope)) : await this.options.sourceStorage.save({ prepare: { scope: scope.scope, sourceRef: material!.sourceRef,
-          referenceKey: `document-source:${request.unitId}:1`, operationId: `document-source-prepare:${request.taskId}` }, confirmOperationId: `document-source-confirm:${request.taskId}` },
-        this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 }, scope.scope))
-          sourceSaved = saved.state === 'confirmed'
-        } catch { sourceSaved = false }
-      }
-      task.historySaved = historySaved
-      task.sourceSaved = sourceSaved
-      task.preparationSaved = snapshot.storage === 'saved'
-      this.refreshStorage(task)
+    const historySaved = await this.store.saveTranslationHistoryAsync(session.id)
+    let sourceSaved = !material!.sourceRef
+    if (material!.sourceRef && this.options.sourceStorage) {
+      try {
+        const saved = source.historyCommit ? await this.options.sourceStorage.confirmPersistedReference(source.historyCommit,
+          this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 }, scope.scope)) : await this.options.sourceStorage.save({ prepare: { scope: scope.scope, sourceRef: material!.sourceRef,
+        referenceKey: `document-source:${request.unitId}:1`, operationId: `document-source-prepare:${request.taskId}` }, confirmOperationId: `document-source-confirm:${request.taskId}` },
+      this.store.createSourceHistoryCallbacks({ sessionId: session.id, unitId: request.unitId, sourceVersion: 1 }, scope.scope))
+        sourceSaved = saved.state === 'confirmed'
+      } catch { sourceSaved = false }
     }
+    task.historySaved = historySaved
+    task.sourceSaved = sourceSaved
+    task.preparationSaved = snapshot.storage === 'saved'
+    this.refreshStorage(task)
     this.materials.consumeSubmittedMaterial(envelope)
-    if (this.store.getSettings().rememberHistory) {
-      task.historySaved = await this.store.saveTranslationHistoryAsync(session.id)
-    } else task.historySaved = false
+    task.historySaved = await this.store.saveTranslationHistoryAsync(session.id)
     this.refreshStorage(task)
     return ok(this.receipt(task))
   }
@@ -468,9 +461,9 @@ export class DocumentTasksClient {
     task.sequence = event.taskSequence; block.sequence = event.sequence; task.events.set(event.taskSequence, signature); task.outputBytes += newBytes
     block.phase = nextPhase
     if (event.kind === 'dispatch_intent' || event.kind === 'dispatched' || event.kind === 'settled' || event.kind === 'copy') {
-      task.historySaved = this.store.getSettings().rememberHistory && await this.store.saveTranslationHistoryAsync(event.scope.translationSessionId)
+      task.historySaved = await this.store.saveTranslationHistoryAsync(event.scope.translationSessionId)
       this.refreshStorage(task)
-      if (event.kind === 'dispatch_intent' && task.sourceSaved && task.preparationSaved && this.store.getSettings().rememberHistory && !task.historySaved) return bad('history_save_failed', '派发认领未确认保存，未授权此块模型派发。')
+      if (event.kind === 'dispatch_intent' && task.sourceSaved && task.preparationSaved && !task.historySaved) return bad('history_save_failed', '派发认领未确认保存，未授权此块模型派发。')
     }
     return ok(this.receipt(task))
   }
@@ -501,11 +494,7 @@ export class DocumentTasksClient {
     })) return bad('history_update_failed', '整篇清单与状态未完成写回。')
     task.sequence = request.taskSequence; task.events.set(request.taskSequence, signature)
     if (request.status !== 'unknown') task.finishSequence = request.taskSequence
-    if (this.store.getSettings().rememberHistory) {
-      task.historySaved = await this.store.saveTranslationHistoryAsync(request.scope.translationSessionId)
-    } else {
-      task.historySaved = false
-    }
+    task.historySaved = await this.store.saveTranslationHistoryAsync(request.scope.translationSessionId)
     this.refreshStorage(task)
     if (request.status !== 'unknown') task.releaseLease()
     return ok(this.receipt(task))
@@ -638,7 +627,7 @@ export class DocumentTasksClient {
       task.releaseLease = this.store.claimDocumentLease(request.scope.translationSessionId, request.taskId) ?? (() => {})
       const retainNext = this.retain(ownerId); task.releaseBridge(); task.releaseBridge = retainNext
     }
-    task.historySaved = this.store.getSettings().rememberHistory && await this.store.saveTranslationHistoryAsync(request.scope.translationSessionId)
+    task.historySaved = await this.store.saveTranslationHistoryAsync(request.scope.translationSessionId)
     this.refreshStorage(task)
     if (request.kind === 'cancel') { task.finishSequence = request.taskSequence; task.releaseLease() }
     return ok(this.receipt(task))

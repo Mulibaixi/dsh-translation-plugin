@@ -15,7 +15,7 @@ export type ArchiveCommand = { readonly kind: 'put'; readonly input: TopicArchiv
 export interface ArchiveEvidenceState { readonly ref: TermEvidenceRef; readonly status: 'ready' | 'unloaded' | 'missing' }
 export interface ArchiveReadRequest extends ArchiveRemoteScope { readonly token: string; readonly layer: 'current' | 'saved'; readonly offset: number }
 export interface ArchiveReadPage { readonly text: string; readonly nextOffset: number | null }
-export interface ArchiveMutationRequest extends ArchiveRemoteScope { readonly token: string; readonly rememberHistory: boolean; readonly command: ArchiveCommand; readonly evidence: readonly ArchiveEvidenceState[] }
+export interface ArchiveMutationRequest extends ArchiveRemoteScope { readonly token: string; readonly command: ArchiveCommand; readonly evidence: readonly ArchiveEvidenceState[] }
 export interface ArchiveMutationReceipt { readonly status: ArchiveMutationResult['status']; readonly token: string; readonly entryId: string | null }
 export interface ArchiveMigrateBegin extends ArchiveRemoteScope { readonly currentPoints: number; readonly storedPoints: number | null }
 export interface ArchiveMigrateCommit extends ArchiveRemoteScope { readonly transferId: string }
@@ -29,7 +29,6 @@ export interface ArchiveRemotePort {
   migrateCancel(request: ArchiveMigrateCommit): Promise<{ readonly cancelled: true }>
   mutate(request: ArchiveMutationRequest): Promise<ArchiveMutationReceipt>
   persist(request: ArchiveRemoteScope & { readonly token: string }): Promise<ArchiveStorageStatus>
-  persistNamespace(request: { readonly namespaceId: string }): Promise<{ readonly persisted: true }>
 }
 export function parseArchiveScope(value: unknown): ArchiveRemoteScope {
   referenceObject(value); referenceString(value.namespaceId); referenceString(value.ownerId); referenceString(value.topicId)
@@ -54,7 +53,6 @@ export function parseArchiveCommand(value: unknown): ArchiveCommand {
 type Method = keyof ArchiveRemotePort
 export function parseArchiveRemoteRequest(method: Method, value: unknown): unknown {
   referenceObject(value)
-  if (method === 'persistNamespace') { referenceExact(value, ['namespaceId']); referenceString(value.namespaceId); return structuredClone(value) }
   parseArchiveScope(value)
   const scope = ['namespaceId', 'ownerId', 'topicId']
   if (method === 'status') referenceExact(value, scope)
@@ -65,8 +63,8 @@ export function parseArchiveRemoteRequest(method: Method, value: unknown): unkno
     referenceExact(value, [...scope, 'transferId', ...(method === 'migratePart' ? ['layer', 'offset', 'text'] : [])]); referenceString(value.transferId)
     if (method === 'migratePart') { referenceInteger(value.offset); referenceString(value.text, ARCHIVE_TRANSFER_POINTS, true); if (!value.text.length || value.layer !== 'current' && value.layer !== 'saved') throw new TypeError('Invalid archive layer') }
   } else {
-    referenceExact(value, [...scope, 'token', 'rememberHistory', 'command', 'evidence']); referenceString(value.token); parseArchiveCommand(value.command)
-    if (typeof value.rememberHistory !== 'boolean' || !Array.isArray(value.evidence)) throw new TypeError('Invalid archive mutation')
+    referenceExact(value, [...scope, 'token', 'command', 'evidence']); referenceString(value.token); parseArchiveCommand(value.command)
+    if (!Array.isArray(value.evidence)) throw new TypeError('Invalid archive mutation')
     const keys = new Set<string>()
     for (const item of value.evidence) {
       referenceObject(item); referenceExact(item, ['ref', 'status'])
@@ -101,12 +99,11 @@ export function parseArchiveRemoteResult(method: Method, value: unknown): unknow
   else if (method === 'migrateBegin') { referenceExact(value, ['transferId']); referenceString(value.transferId) }
   else if (method === 'migratePart') { referenceExact(value, ['nextOffset']); referenceInteger(value.nextOffset, 1) }
   else if (method === 'migrateCancel') { referenceExact(value, ['cancelled']); if (value.cancelled !== true) throw new TypeError('Invalid archive cancellation') }
-  else if (method === 'persistNamespace') { referenceExact(value, ['persisted']); if (value.persisted !== true) throw new TypeError('Invalid archive persistence') }
   else { referenceExact(value, ['status', 'token', 'entryId']); referenceString(value.token); if (value.entryId !== null) referenceString(value.entryId); if (!['updated', 'unchanged', 'stale', 'invalid', 'requires_user_action', 'save_failed'].includes(String(value.status))) throw new TypeError('Invalid archive receipt') }
   if (referenceBytes({ ok: true, value }) > ARCHIVE_TRANSFER_BYTES) throw new RangeError('档案回包超过完整传输预算。')
   return structuredClone(value)
 }
-const methods: readonly Method[] = ['status', 'read', 'migrateBegin', 'migratePart', 'migrateCommit', 'migrateCancel', 'mutate', 'persist', 'persistNamespace']
+const methods: readonly Method[] = ['status', 'read', 'migrateBegin', 'migratePart', 'migrateCommit', 'migrateCancel', 'mutate', 'persist']
 export const TOPIC_ARCHIVE_REMOTE = { package: 'dsh-translation-plugin', descriptors: methods.map(method => ({
   id: `dsh-translation-plugin#translationArchive/${method}`, service: 'translationArchive', namespace: 'translationArchive', method, invocation: { kind: 'direct' as const },
   parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: { mode: 'strict' as const, typeSymbol: `dsh-translation-plugin#archive-${method}-request`, create: () => ({ parse: (value: unknown) => parseArchiveRemoteRequest(method, value) }) } }],

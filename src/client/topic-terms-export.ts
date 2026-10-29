@@ -23,13 +23,13 @@ export interface TopicTermsExportSnapshot {
   readonly topicName: string
   readonly snapshot: TopicTermSnapshot
   readonly exportedAt: string
-  readonly rememberHistory: boolean
+
   readonly storageStatus: HistoryStatus
   readonly evidenceAvailability: readonly TopicEvidenceAvailability[]
 }
 
 const statusLabels = { proposal: '待确认', active: '生效', conflict: '有冲突', review_required: '待复核', disabled: '已停用' } as const
-const originLabels = { inferred: '模型提案', source_checked: '原文依据', reference_derived: '参考资料（主模型解读）', user_explicit: '用户采用' } as const
+const originLabels = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突，当前快照可能与已保存副本不同', error: '保存失败，当前快照不代表已可靠落盘' } as const
 
 function fileName(input: TopicTermsExportSnapshot, extension: string): string {
@@ -48,7 +48,7 @@ export function buildTopicTermsJsonExport(input: TopicTermsExportSnapshot): Topi
       scope: 'existing_topic_terms_snapshot',
       automaticExtractionTriggered: false, organizationTriggered: false,
       excludes: ['evidence_bodies', 'main_chat', 'complete_topic_backup'],
-      storage: { rememberHistory: input.rememberHistory, status: input.storageStatus },
+      storage: { status: input.storageStatus },
       snapshot, evidenceAvailability: input.evidenceAvailability,
     }, null, 2),
   }
@@ -58,7 +58,6 @@ function md(value: string): string {
   return value.replace(/[\\`*_{}\[\]()<>#+!|~\-]/g, '\\$&').replace(/\r?\n/g, '  \n  ')
 }
 function referenceLines(ref: TermEvidenceRef): string[] {
-  if (ref.kind === 'reference') return ['参考资料：' + md(ref.referenceId), '片段：' + md(ref.segmentId) + '；来源为主模型解读；不等于用户确认', `范围：${ref.range ? `[${ref.range.start}, ${ref.range.end})（Unicode 码点）` : '完整片段'}`]
   return [
     `类型：${ref.kind === 'source' ? '原文' : '最终译文'}；用途：${ref.role === 'basis' ? '依据' : '示例'}`,
     `会话 ID：${md(ref.sessionId)}；单元 ID：${md(ref.unitId)}`,
@@ -77,8 +76,8 @@ export function buildTopicTermsMarkdownExport(input: TopicTermsExportSnapshot): 
     `- 主题 ID：${md(snapshot.topicId)}`,
     `- 档案版本：${snapshot.version}；生效集版本：${snapshot.activeVersion}`,
     `- 档案更新时间：${md(snapshot.updatedAt)}`,
-    `- 历史保存开关：${input.rememberHistory ? '开启' : '关闭'}；实际保存状态：${storageLabels[input.storageStatus]}`,
-    '- 保存开关表示保存策略；本文件记录点击导出时的内存快照。', '',
+    `- 实际保存状态：${storageLabels[input.storageStatus]}`,
+    '- 本文件记录点击导出时的内存快照。', '',
   ]
   if (snapshot.entries.length === 0) lines.push('暂无术语。', '')
   for (const entry of snapshot.entries) {

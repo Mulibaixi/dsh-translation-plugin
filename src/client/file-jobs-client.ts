@@ -133,7 +133,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     }
     const result = await putAssetProposals(this.assets.terms, this.assets.archive, { ownerId, topicId: session.topicId, sessionId: session.id,
       unitId: unit.id, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage }, proposals, check)
-    return { ...result, persistence: this.sessions.getSettings().rememberHistory ? 'saved' : 'runtime_only' }
+    return { ...result, persistence: 'saved' }
   }
   units(sessionId?: string, includeRemoved = false): readonly FileJobRecord[] {
     const groups = new Map<string, FileJobRecord[]>()
@@ -606,7 +606,6 @@ export class FileJobsClient implements TranslationEvidenceReader {
     return source ? { ownerId: this.sessions.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sourceVersion: source.version, source: source.text, final: null } : undefined
   }
   capture(ownerId: string, topicId: string, ref: TermEvidenceRef): EvidenceReadRequest | EvidenceUnavailableResult {
-    if (ref.kind === 'reference') return this.fallback.capture(ownerId, topicId, ref)
     const record = this.forUnit(ref.sessionId, ref.unitId)
     if (!record) return this.fallback.capture(ownerId, topicId, ref)
     const request: EvidenceReadRequest = { ownerId: record.summary.mainSessionId, topicId, sessionId: ref.sessionId, unitId: ref.unitId,

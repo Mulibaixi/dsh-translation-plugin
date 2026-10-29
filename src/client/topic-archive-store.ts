@@ -1,15 +1,13 @@
 import { browserPluginStorage, isPluginStorageEvent } from './storage-fence.js'
-import type { ReferenceEvidencePort } from '../shared/reference-memory.js'
 import { emptyTopicArchive, decodeTopicArchiveSnapshot, decodeTopicArchivePut, decodeTopicArchiveUserInput, queryTopicArchive, referencedEntityIds,
   type TopicArchiveSnapshot, type TopicArchivePut, type TopicArchiveUserInput, type TopicArchiveUserPut, type ArchiveMutationResult, type TopicArchiveQuery } from '../memory/topic-archive.js'
 import { resolveTermEvidence, termEvidenceKey, type TermEvidenceRef, type TermEvidenceResolver, type FileProposalAcceptance } from '../memory/topic-terms.js'
 import { parseArchiveStorageStatus, type ArchiveRemoteScope, type ArchiveStorageStatus, type ArchiveCommand, type ArchiveEvidenceState, type ArchiveMutationReceipt } from '../shared/topic-archive-remote.js'
 import type { SessionStore, LocalStoragePort, StructureLockPort, HistoryStatus } from './session-store.js'
-import { cachedTopicEvidence, captureTopicEvidenceCurrent, isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
+import { captureTopicEvidenceCurrent, isTopicEvidenceUnloaded, prepareTopicEvidence } from './topic-evidence.js'
 import type { TranslationEvidenceReader } from './source-reader.js'
 import { archiveReply, archiveScopeMatches, readArchiveSnapshot, transferArchiveMigration, type TopicArchiveRemotePort } from './topic-archive-transport.js'
 import { TOPIC_LOCK_NAME } from './topics.js'
-import { SETTINGS_KEY, LEGACY_SETTINGS_KEY, parseSettings } from './sessions.js'
 
 export type { TopicArchiveRemotePort } from './topic-archive-transport.js'
 export const TOPIC_ARCHIVE_PREFIX = 'dsh-translation-plugin:topic-archive:v1:'
@@ -43,16 +41,13 @@ export class TopicArchiveStore {
   private readonly listeners = new Set<() => void>()
   private readonly stopSession: () => void
   private readonly stopStorage: (() => void) | undefined
-  private enabled: boolean
   private disposed = false
   private epoch = 0
   private notice: string | undefined
-  private referenceEvidence: ReferenceEvidencePort | undefined
   private evidenceReader: TranslationEvidenceReader | undefined
   constructor(private readonly sessions: SessionStore, private readonly resolver: TermEvidenceResolver, private readonly storage: LocalStoragePort | undefined = browserPluginStorage(),
     listen?: (onChange: (key: string | null) => void) => () => void, private readonly locks: StructureLockPort | undefined = browserLocks(),
     private readonly options: { readonly remote?: () => Promise<TopicArchiveRemotePort | undefined> } = {}) {
-    this.enabled = sessions.getSettings().rememberHistory
     this.stopSession = sessions.subscribe(() => this.sessionChanged())
     const change = (key: string | null): void => { if (key === null || key.startsWith(TOPIC_ARCHIVE_PREFIX)) this.emit() }
     if (listen) this.stopStorage = listen(change)
@@ -64,7 +59,6 @@ export class TopicArchiveStore {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   getNotice(): string | undefined { return this.notice }
-  setReferenceEvidence(port: ReferenceEvidencePort): void { this.referenceEvidence = port }
   setEvidenceReader(reader: TranslationEvidenceReader | undefined): void { this.evidenceReader = reader }
   private available(topicId: string): boolean { return !this.disposed && !this.sessions.isTopicDeleted(topicId) && this.sessions.getTopics().some(topic => topic.id === topicId) }
   private seat(ownerId: string, topicId: string): Seat {
@@ -102,12 +96,6 @@ export class TopicArchiveStore {
     const remote = await this.options.remote?.()
     if (!remote || this.disposed) throw new Error('主题档案服务尚未就绪，请检查资料库连接后重试。')
     return remote
-  }
-  private savingEnabled(): boolean {
-    if (!this.sessions.getSettings().rememberHistory) return false
-    if (!this.storage) return true
-    try { return parseSettings(this.storage.getItem(SETTINGS_KEY), this.storage.getItem(LEGACY_SETTINGS_KEY))?.rememberHistory === true }
-    catch { this.notice = '历史保存设置无法读取，主题档案修改仅保留在本次运行。'; return false }
   }
   private cleanupLegacy(topicId: string, raw: string | null): boolean {
     if (raw === null || !this.storage) return true
@@ -179,9 +167,9 @@ export class TopicArchiveStore {
         if (!this.sessions.isTopicDeleting(topicId)) {
           // Reading old evidence may invalidate the runtime projection, never its saved historical copy.
           const refs = [...new Map(this.commandRefs(snapshot, { kind: 'reconcile' }).map(ref => [termEvidenceKey(snapshot!, ref), ref])).values()]
-          const resolver = cachedTopicEvidence(this.resolver, this.referenceEvidence), evidenceCurrent = captureTopicEvidenceCurrent(this.sessions, snapshot, refs, resolver)
+          const resolver = this.resolver, evidenceCurrent = captureTopicEvidenceCurrent(this.sessions, snapshot, refs, resolver)
           const evidence: ArchiveEvidenceState[] = refs.map(ref => ({ ref, status: resolveTermEvidence(snapshot!, ref, resolver) !== undefined ? 'ready' : isTopicEvidenceUnloaded(this.sessions, snapshot!, ref) ? 'unloaded' : 'missing' }))
-          const receipt = archiveReply<ArchiveMutationReceipt>(await remote.mutate({ ...seat.scope, token: status.token, command: { kind: 'reconcile' }, evidence, rememberHistory: false }))
+          const receipt = archiveReply<ArchiveMutationReceipt>(await remote.mutate({ ...seat.scope, token: status.token, command: { kind: 'reconcile' }, evidence }))
           if (!current() || !evidenceCurrent()) throw new Error('档案依据在读取期间变化，请重新读取。')
           if (receipt.token !== status.token) {
             status = parseArchiveStorageStatus(archiveReply(await remote.status(seat.scope)))
@@ -206,7 +194,7 @@ export class TopicArchiveStore {
   async reload(ownerId: string, topicId: string): Promise<boolean> { try { await this.refresh(ownerId, topicId); return true } catch { return false } }
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot {
     const snapshot = this.getSnapshot(ownerId, topicId)
-    return { ...snapshot, entries: queryTopicArchive(snapshot, { ...query, ownerId: snapshot.ownerId, topicId }, cachedTopicEvidence(this.resolver, this.referenceEvidence)) }
+    return { ...snapshot, entries: queryTopicArchive(snapshot, { ...query, ownerId: snapshot.ownerId, topicId }, this.resolver) }
   }
   queryAsync(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot> { return this.enqueue(ownerId, topicId, async () => { await this.waitForRead(ownerId, topicId); return this.queryCurrent(ownerId, topicId, query) }) }
   private async queryCurrent(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot> {
@@ -214,7 +202,7 @@ export class TopicArchiveStore {
     const seat = this.seat(ownerId, topicId), token = seat.storage?.token, epoch = this.epoch
     const fixed = structuredClone(query)
     if (fixed.mode !== 'normal') return { ...snapshot, entries: [] }
-    const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry => entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader, this.referenceEvidence)
+    const prepared = await prepareTopicEvidence(this.sessions, snapshot, snapshot.entries.filter(entry => entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis')), this.resolver, reader)
     if (this.disposed || reader !== this.evidenceReader || !prepared.isCurrent() || this.getSnapshot(ownerId, topicId) !== snapshot) throw new Error('档案或证据已经变化，请重新查询。')
     const remote = await this.remote(), latest = parseArchiveStorageStatus(archiveReply(await remote.status(seat.scope)))
     if (this.epoch !== epoch || latest.token !== token || !prepared.isCurrent() || reader !== this.evidenceReader || this.getSnapshot(ownerId, topicId) !== snapshot) {
@@ -249,14 +237,14 @@ export class TopicArchiveStore {
     if (expectedVersion !== undefined && snapshot.version !== expectedVersion) return failure('stale')
     const fixed = structuredClone(command), reader = this.evidenceReader
     const refs = [...new Map(this.commandRefs(snapshot, fixed).map(ref => [termEvidenceKey(snapshot, ref), ref])).values()]
-    const prepared = await prepareTopicEvidence(this.sessions, snapshot, refs, this.resolver, reader, this.referenceEvidence)
+    const prepared = await prepareTopicEvidence(this.sessions, snapshot, refs, this.resolver, reader)
     const evidence: ArchiveEvidenceState[] = refs.map(ref => ({ ref, status: resolveTermEvidence(snapshot, ref, prepared.resolver) !== undefined ? 'ready' : prepared.isUnloaded(ref) ? 'unloaded' : 'missing' }))
     if (this.epoch !== epoch || !this.available(topicId) || reader !== this.evidenceReader || !prepared.isCurrent() || seat.snapshot !== snapshot || !storage.token) return failure('stale')
     const remote = await this.remote()
     if (this.epoch !== epoch || !this.available(topicId) || !prepared.isCurrent() || seat.snapshot !== snapshot) return failure('stale')
     if (fixed.kind !== 'clear' && this.sessions.isTopicDeleting(topicId)) return failure('stale')
     let result: ArchiveMutationReceipt
-    try { result = archiveReply<ArchiveMutationReceipt>(await remote.mutate({ ...seat.scope, token: storage.token, command: fixed, evidence, rememberHistory: fixed.kind !== 'reconcile' && this.savingEnabled() })) }
+    try { result = archiveReply<ArchiveMutationReceipt>(await remote.mutate({ ...seat.scope, token: storage.token, command: fixed, evidence })) }
     catch (error) {
       // Gateway may normalize a service error code. Confirm an actual version change instead of parsing its message.
       if (this.epoch === epoch && this.available(topicId)) {
@@ -273,10 +261,10 @@ export class TopicArchiveStore {
       try {
         const latestReader = this.evidenceReader
         const nextRefs = [...new Map([...this.commandRefs(snapshot, { kind: 'reconcile' }), ...refs].map(ref => [termEvidenceKey(snapshot, ref), ref])).values()]
-        const verified = await prepareTopicEvidence(this.sessions, snapshot, nextRefs, this.resolver, latestReader, this.referenceEvidence)
+        const verified = await prepareTopicEvidence(this.sessions, snapshot, nextRefs, this.resolver, latestReader)
         if (this.epoch !== epoch || !this.available(topicId) || !verified.isCurrent()) return failure('stale')
         const states: ArchiveEvidenceState[] = nextRefs.map(ref => ({ ref, status: resolveTermEvidence(snapshot, ref, verified.resolver) !== undefined ? 'ready' : verified.isUnloaded(ref) ? 'unloaded' : 'missing' }))
-        archiveReply(await remote.mutate({ ...seat.scope, token: result.token, command: { kind: 'reconcile' }, evidence: states, rememberHistory: false }))
+        archiveReply(await remote.mutate({ ...seat.scope, token: result.token, command: { kind: 'reconcile' }, evidence: states }))
         if (latestReader === this.evidenceReader && verified.isCurrent() && this.epoch === epoch && this.available(topicId)) await this.refresh(ownerId, topicId)
       } catch { /* A stale response remains unavailable until a confirmed read succeeds. */ }
       return failure('stale')
@@ -335,9 +323,6 @@ export class TopicArchiveStore {
   }
   private sessionChanged(): void {
     if (this.disposed) return
-    const enabled = this.sessions.getSettings().rememberHistory, justEnabled = enabled && !this.enabled
-    this.enabled = enabled
-    if (justEnabled) void this.persistNamespace()
     for (const [topicId, seat] of this.seats) {
       if (!this.available(topicId)) { seat.revision++; this.seats.delete(topicId); continue }
       if (seat.state.status !== 'ready' || seat.reconcileQueued || this.sessions.isTopicDeleting(topicId)) continue
@@ -346,7 +331,7 @@ export class TopicArchiveStore {
       queueMicrotask(() => {
         if (!this.available(topicId) || this.seats.get(topicId) !== seat || this.sessions.isTopicDeleting(topicId)) { seat.reconcileQueued = false; return }
         void Promise.resolve().then(() => this.reconcileAsync(seat.scope.ownerId, topicId)).then(snapshot => {
-          if (snapshot.version !== baseline.version && this.savingEnabled()) return this.persistReconciled(seat, snapshot)
+          if (snapshot.version !== baseline.version) return this.persistReconciled(seat, snapshot)
         }).catch(error => { if (!this.disposed) { this.notice = `主题档案依据检查未完成：${(error as Error).message}`; this.emit() } }).finally(() => { seat.reconcileQueued = false })
       })
     }
@@ -354,27 +339,12 @@ export class TopicArchiveStore {
   }
   private persistReconciled(seat: Seat, snapshot: TopicArchiveSnapshot): Promise<void> {
     return this.enqueue(seat.scope.ownerId, seat.scope.topicId, async () => {
-      if (seat.snapshot !== snapshot || !this.savingEnabled() || this.sessions.isTopicDeleting(seat.scope.topicId) || !seat.storage?.token) return
+      if (seat.snapshot !== snapshot || this.sessions.isTopicDeleting(seat.scope.topicId) || !seat.storage?.token) return
       const remote = await this.remote(), token = seat.storage.token
-      if (seat.snapshot !== snapshot || !this.savingEnabled() || this.sessions.isTopicDeleting(seat.scope.topicId)) return
+      if (seat.snapshot !== snapshot || this.sessions.isTopicDeleting(seat.scope.topicId)) return
       archiveReply(await remote.persist({ ...seat.scope, token }))
       await this.refresh(seat.scope.ownerId, seat.scope.topicId)
     })
-  }
-  private async persistNamespace(): Promise<void> {
-    const epoch = this.epoch
-    try {
-      await Promise.all([...this.seats.values()].map(seat => seat.tail?.catch(() => {})))
-      const remote = await this.remote()
-      if (this.epoch !== epoch || !this.savingEnabled() || this.disposed) return
-      const result = archiveReply<{ readonly persisted: true }>(await remote.persistNamespace({ namespaceId: this.sessions.getNamespaceId() }))
-      if (result.persisted !== true || this.epoch !== epoch || this.disposed) throw new Error('主题档案保存尚未确认。')
-      for (const seat of this.seats.values()) if (seat.state.status === 'ready' && this.available(seat.scope.topicId)) {
-        await this.enqueue(seat.scope.ownerId, seat.scope.topicId, async () => { await this.waitForRead(seat.scope.ownerId, seat.scope.topicId); await this.refresh(seat.scope.ownerId, seat.scope.topicId); delete seat.saveFailed })
-      }
-      if (![...this.seats.values()].some(seat => seat.legacyCleanupPending)) this.notice = undefined
-      this.emit()
-    } catch (error) { if (!this.disposed) { this.notice = `主题档案尚未保存：${(error as Error).message}`; this.emit() } }
   }
   reset(): void { this.epoch++; for (const seat of this.seats.values()) { seat.revision++; delete seat.snapshot; delete seat.loading; seat.state = { status: 'idle' }; if (seat.refs > 0) void this.ensureLoaded(seat.scope.ownerId, seat.scope.topicId).catch(() => {}) }; this.emit() }
   dispose(): void { this.disposed = true; this.epoch++; this.stopSession(); this.stopStorage?.(); this.seats.clear(); this.listeners.clear() }

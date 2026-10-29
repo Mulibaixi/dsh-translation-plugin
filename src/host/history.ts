@@ -250,8 +250,8 @@ export class HistoryService {
       if (input.purpose === 'migrate' && (historyUnsettled(current) || importedSaved && historyUnsettled(importedSaved))) throw failure('history_busy', '此会话仍有运行中、等待处理或结果未知的任务，暂不迁移。')
       if (importedSaved) this.preserve(importedSaved, current)
       if (before?.current) this.preserve(before.current, current); if (before?.saved) this.preserve(before.saved, current)
-      const saved = input.purpose === 'migrate' ? importedSaved : input.rememberHistory ? parseHistoryBundle(persistableHistoryBundle(current), guard.scope, 'saved') : before?.saved ?? null
-      if (input.purpose !== 'migrate' && input.rememberHistory) current = saved!
+      const saved = parseHistoryBundle(persistableHistoryBundle(current), guard.scope, 'saved')
+      current = saved
       const next: Seat = { scope: guard.scope, current, saved, token: token() }
       if (saved !== null) {
         const db = await this.memory.databaseForArchives(true); this.check(guard); this.transfer(guard, request)
@@ -589,6 +589,16 @@ export class HistoryService {
     } })
     for (const sessionId of ids) this.seats.set(key({ namespaceId, sessionId }), { scope: { namespaceId, topicId, sessionId }, current: null, saved: null, token: token() })
     for (const [id, transfer] of this.transfers) if (transfer.guard.scope.namespaceId === namespaceId && transfer.guard.scope.topicId === topicId) this.transfers.delete(id)
+  }
+  async hasActiveTopicJobs(namespaceId: string, topicId: string): Promise<boolean> {
+    if ([...this.transfers.values()].some(transfer => transfer.guard.scope.namespaceId === namespaceId && transfer.guard.scope.topicId === topicId && !transfer.committed)) return true
+    const db = await this.memory.databaseForArchives()
+    const seats = [...this.seats.values()].filter(seat => seat.scope.namespaceId === namespaceId && seat.scope.topicId === topicId)
+    const ids = new Set([...db?.historySessions(namespaceId, topicId) ?? [], ...seats.map(seat => seat.scope.sessionId)])
+    return [...ids].some(sessionId => {
+      const seat = this.seats.get(key({ namespaceId, sessionId })), saved = seat ? seat.saved : db?.historyState(namespaceId, sessionId)?.bundle
+      return !!(seat?.current && historyUnsettled(seat.current) || saved && historyUnsettled(saved))
+    })
   }
   hasActiveJobs(): boolean { return this.pending > 0 || [...this.transfers.values()].some(transfer => !transfer.committed) || [...this.seats.values()].some(seat => seat.current && historyUnsettled(seat.current)) }
   async dispose(): Promise<void> { this.disposed = true; this.generation++; await this.tail; this.transfers.clear(); this.seats.clear() }
