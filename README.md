@@ -80,6 +80,7 @@ For TXT and Markdown file history, choose **嵌入原文 (Embed source)** next t
 
 ## Current limitations and data
 
+- **Proactive information requests**: Normal translation currently uses direct calls and does not yet let the translation model proactively request information from the main model. Specified information can be delivered to the translation model through the main model.
 - **Limited file support**: the current focus is UTF-8 TXT and Markdown. Complete parsing, recognition, and delivery in the original format are not yet supported for PDF, images, DOCX, and similar formats.
 - **Translation efficiency**: some optimizations have been made, but final completion time is affected by the models and material.
 - **Semantic indexing**: enabling it sends relevant text to the configured embedding service.
