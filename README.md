@@ -66,7 +66,11 @@ After building, install this directory in DSH's plugin manager or run `pnpm pack
 
 ### Update
 
-Back up important material, install the newer Composer extension and translation plugin distributions in that order through the plugin manager, and follow any restart or linked-component installation instructions. For source installations, update both repositories and rebuild them in the same order first. After upgrading DSH, check linked-component status. A new version number alone does not block loading; changes to required interfaces or patch target modules may need adaptation. See the [migration notes (简体中文)](docs/user-guide.zh-CN.md#已有资料的升级与迁移) for existing material and [CHANGELOG](CHANGELOG.md) for version changes.
+Wait for current tasks to finish and confirm that material is saved. Enter the new version's full `.tgz` path or versioned download URL in the plugin manager; **no prior uninstall is required**. Use a new versioned filename or URL. Usually only the changed plugin needs updating. If the release notes require companion updates, install Composer first, then the translation plugin. Hot loading is available when supported by the host; otherwise follow the manager's refresh, reload, or restart instructions.
+
+Composer requires a normal full exit and reopen when a host patch actually needs replacement. Updating its extension package does not necessarily reinstall that patch. For source installations, update the original directories, rebuild in the order above, and refresh or reload.
+
+See the user guide for [backup and restoration](docs/user-guide.zh-CN.md#资料库备份与恢复), [data migration](docs/user-guide.zh-CN.md#已有资料的升级与迁移), and [detailed update steps](docs/user-guide.zh-CN.md#发行包与源码更新) (简体中文). See [CHANGELOG](CHANGELOG.md) for version changes.
 
 ## Usage
 

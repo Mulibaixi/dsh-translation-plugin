@@ -590,9 +590,8 @@ export class MaterialSubmissionsClient {
     if (latest?.withdrawn) message = latest.reason ?? '文本已撤回；原文保留在会话记录中，可重新发送。'
     else if (this.getSentFiles(sessionId).length && !session?.input.trim() && !this.files.has(sessionId)) message = undefined
     else if (latest?.sent && latest.draft?.carrier?.kind !== 'selected_file' && !session?.input.trim() && !this.files.has(sessionId))
-      message = latest.consumed ? '翻译业务已受理；原提交文本已记录。' : '文本已发送并冻结；待处理文本见会话记录。'
-    else if (latest?.consumed) message = session && latest.draft && this.draftVersion(session) !== latest.draft.draftVersion
-      ? '翻译业务已受理；当前草稿的后续修改保留。' : '翻译业务已受理；原提交材料已记录。'
+      message = undefined
+    else if (latest?.consumed) message = undefined
     else if (latest?.draft && ['submitted', 'attached'].includes(latest.stage)) {
       const sent = latest.draft.draftVersion, current = session ? this.draftVersion(session) : sent
       message = current === sent ? `已向主会话提交草稿版本 ${sent}；待译草稿保留。`
