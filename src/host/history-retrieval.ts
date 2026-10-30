@@ -13,6 +13,23 @@ export interface CurrentHistoryPair {
 }
 export const historyIndexSourceId = (sessionId: string, unitId: string, side: 'source' | 'translation' | 'bilingual'): string => `history:${JSON.stringify([sessionId, unitId, side])}`
 export const historyIndexSourceIds = (sessionId: string, unitId: string): readonly string[] => (['source', 'translation', 'bilingual'] as const).map(side => historyIndexSourceId(sessionId, unitId, side))
+/** File identity comes from its admitted carrier, never a filename guessed from body text. */
+export function historyFileName(bundle: HistoryBundle, unitId: string): string | undefined {
+  const intake = bundle.intakes.find(entry => entry.unitId === unitId)
+  if (intake) return intake.name
+  const job = bundle.fileJobs.find(entry => entry.summary.unitId === unitId && entry.summary.sourceRef?.name)
+  if (job) return job.summary.sourceRef!.name
+  const unit = bundle.history.units.find(entry => entry.id === unitId)
+  if (unit && isDocumentUnit(unit)) {
+    const source = unit.sourceVersions.find(entry => entry.version === unit.sourceVersion)
+    if (source?.body.kind === 'asset') return source.body.reference.name
+  }
+  return undefined
+}
+export function isFileHistoryUnit(bundle: HistoryBundle, unitId: string): boolean {
+  const unit = bundle.history.units.find(entry => entry.id === unitId)
+  return !!unit && (!isTextUnit(unit) || bundle.intakes.some(entry => entry.unitId === unitId))
+}
 /** Only the effective pair participates in a call fence; streaming/new unadopted candidates do not. */
 export function currentHistoryStamp(bundle: HistoryBundle | null, unitId: string): readonly unknown[] | null {
   const unit = bundle?.history.units.find(unit => unit.id === unitId)

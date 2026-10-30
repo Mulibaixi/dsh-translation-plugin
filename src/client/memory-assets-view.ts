@@ -33,9 +33,12 @@ import type { FileJobViewProps } from './file-job-view.js'
 import { adoptTopicAssets, type TopicAssetKind } from './topic-asset-actions.js'
 import { MemoryIndexView } from './memory-index-view.js'
 import type { MemoryIndexClient } from './memory-index-client.js'
+import type { RecordIndexProps } from './record-index-view.js'
+import type { MaterialSubmissionsClient } from './material-submissions.js'
 
-interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps {
+interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps, RecordIndexProps {
   readonly memoryIndex?: MemoryIndexClient | undefined
+  readonly materials?: MaterialSubmissionsClient | undefined
   readonly store: SessionStore; readonly terms: TopicTermsViewPort; readonly quick: QuickTranslationClient
   readonly otherMemory?: OtherMemoryClient | undefined
   readonly mainSessionId?: string | undefined
@@ -46,7 +49,7 @@ interface MemoryAssetsProps extends RecordObjectsProps, DocumentViewProps, FileJ
 }
 
 /** One resource owns a fixed main conversation; topic selection only changes this asset view. */
-export function MemoryAssetsView({ store, terms, archive, otherMemory, memoryIndex, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, jobId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
+export function MemoryAssetsView({ store, terms, archive, otherMemory, memoryIndex, recordIndex, materials, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, associatedSessionId, requestedTopicId, jobId, navigationRevision, onDeleteTerm, onSelectTopic }: MemoryAssetsProps & {
   readonly associatedSessionId?: string | undefined; readonly requestedTopicId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly jobId?: string | undefined
   readonly onSelectTopic?: ((topicId: string) => void) | undefined
@@ -87,7 +90,7 @@ export function MemoryAssetsView({ store, terms, archive, otherMemory, memoryInd
     ...visited.map(id => {
       const visitedTopic = availableTopics.find(topic => topic.id === id)
       return visitedTopic ? h('div', { key: `${ownerId}:${id}`, className: 'dsh-tp-assets-topic', hidden: id !== selectedTopicId },
-        h(MemoryAssetsTopicView, { store, terms, archive, otherMemory, memoryIndex, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm, jobId: id === selectedTopicId ? jobId : undefined,
+        h(MemoryAssetsTopicView, { store, terms, archive, otherMemory, memoryIndex, recordIndex, materials, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId: id, topicName: visitedTopic.name, onDeleteTerm, jobId: id === selectedTopicId ? jobId : undefined,
           active: id === selectedTopicId, associatedSessionId: id === selectedTopicId ? associatedSessionId : undefined,
           navigationRevision: id === selectedTopicId ? navigationRevision : undefined })) : null
     }),
@@ -126,7 +129,7 @@ function AssetAdoptionControl({ terms, archive, ownerId, topicId, kind, active, 
     notice ? h('span', { role: 'status', className: 'dsh-tp-message' }, notice) : null)
 }
 
-function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, jobId, navigationRevision }: MemoryAssetsProps & {
+function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex, recordIndex, materials, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, jobId, navigationRevision }: MemoryAssetsProps & {
   readonly topicName: string; readonly active: boolean
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined
   readonly jobId?: string | undefined
@@ -213,6 +216,6 @@ function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex
         otherVisited ? h('div', { className: 'dsh-tp-assets-module dsh-tp-other-memory-module', hidden: category !== 'other' },
           otherMemory ? h(OtherMemoryView, { client: otherMemory, store, topicId, mainSessionId, active: active && category === 'other' }) : h('p', { className: 'dsh-tp-message', role: 'status' }, '其他记忆服务暂不可用。')) : null,
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },
-          h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations',
+          h(MemoryTranslationRecordsView, { store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, materials, mainSessionId, ownerId, topicId, associatedSessionId, navigationRevision, visible: active && category === 'translations',
             onOpenAssets: fileJobs ? () => { setCategory('terms') } : undefined }))))
 }

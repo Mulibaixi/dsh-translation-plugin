@@ -17,6 +17,8 @@ import { TopicMemoryStore, type TopicTermsRemotePort } from './topic-memory-stor
 import { EmbeddingClient } from './embedding-client.js'
 import type { EmbeddingRemotePort } from '../shared/embedding.js'
 import { MemoryIndexClient } from './memory-index-client.js'
+import { RecordIndexClient } from './record-index-client.js'
+import type { RecordIndexRemotePort } from '../shared/record-index.js'
 import type { MemorySearchRemotePort } from '../shared/memory-search.js'
 import { TopicArchiveStore, type TopicArchiveRemotePort } from './topic-archive-store.js'
 import { isTextUnit } from './translation-history.js'
@@ -68,6 +70,7 @@ interface SidebarRightTabDefinition {
 type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] & {
   get(name: 'remote.translationHistory'): HistoryRemoteClientPort | undefined
   get(name: 'remote.translationMemorySearch'): MemorySearchRemotePort | undefined
+  get(name: 'remote.translationRecordIndex'): RecordIndexRemotePort | undefined
   get(name: 'remote.translationEmbedding'): EmbeddingRemotePort | undefined
   get(name: 'remote.translationTerms'): TopicTermsRemotePort | undefined
   get(name: 'remote.translationArchive'): TopicArchiveRemotePort | undefined
@@ -93,6 +96,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   readonly remote: {
     readonly translationHistory?: HistoryRemoteClientPort
     readonly translationMemorySearch?: MemorySearchRemotePort
+    readonly translationRecordIndex?: RecordIndexRemotePort
     readonly translationEmbedding?: EmbeddingRemotePort
     readonly translationTerms?: TopicTermsRemotePort
     readonly translationArchive?: TopicArchiveRemotePort
@@ -256,6 +260,11 @@ export function apply(ctx: ClientPluginContext): void {
       return ctx.get?.('remote.translationMemorySearch') ?? ctx.remote.translationMemorySearch
     })
     ctx.effect(() => () => memoryIndex.dispose(), 'translation memory index')
+    const recordIndex = new RecordIndexClient(async () => {
+      await memoryRemoteReady()
+      return ctx.get?.('remote.translationRecordIndex') ?? ctx.remote.translationRecordIndex
+    })
+    ctx.effect(() => () => recordIndex.dispose(), 'translation file original index')
     const otherMemory = new OtherMemoryClient(store, async () => {
       await memoryRemoteReady()
       return ctx.get?.('remote.translationOtherMemory') ?? ctx.remote.translationOtherMemory
@@ -362,7 +371,7 @@ export function apply(ctx: ClientPluginContext): void {
     }, 'translation remote clients')
     ctx.effect(() => ctx.remote.$on('llm/adapters-updated', () => models.invalidate()), 'translation catalog invalidation')
     ctx.effect(() => ctx.remote.$on('settings/document-updated', () => models.invalidate()), 'translation catalog settings')
-    ctx.effect(() => ctx.on('connection/reset', () => { evidence.clearCache(); models.invalidate(true); quick.reset(); normal.reset(); materials.reset(); otherMemory.reset(); embedding.reset(); memoryIndex.reset(); terms.reset(); archive.reset(); void topics.reset() }), 'translation catalog connection')
+    ctx.effect(() => ctx.on('connection/reset', () => { evidence.clearCache(); models.invalidate(true); quick.reset(); normal.reset(); materials.reset(); otherMemory.reset(); embedding.reset(); memoryIndex.reset(); recordIndex.reset(); terms.reset(); archive.reset(); void topics.reset() }), 'translation catalog connection')
 
     const localData = new LocalDataClient(async () => {
       if (ctx.remote.$mount) await mountedRemote
@@ -370,7 +379,7 @@ export function apply(ctx: ClientPluginContext): void {
     }, async () => {
       history.dispose()
       materials.dispose(); documents.dispose(); fileJobs.dispose(); documentReviews.dispose(); preparations.dispose()
-      normal.dispose(); quick.dispose(); references.dispose(); otherMemory.dispose(); embedding.dispose(); memoryIndex.dispose(); terms.dispose(); archive.dispose()
+      normal.dispose(); quick.dispose(); references.dispose(); otherMemory.dispose(); embedding.dispose(); memoryIndex.dispose(); recordIndex.dispose(); terms.dispose(); archive.dispose()
       evidence.dispose(); objects.dispose(); objectAssets.dispose(); viewFiles.dispose(); models.dispose(); store.dispose()
       await topics.dispose()
     }, () => store.hasUnsettledWork() || store.getAllSessions().some(session => quick.isBusy(session.id) || normal.isBusy(session.id)))
@@ -390,7 +399,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (frozen) return h(ClearedDataView, null)
       if (!store.isHistoryReady()) return historyLoading()
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, archive, otherMemory, memoryIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, terms, archive, otherMemory, memoryIndex, recordIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string, jobId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId, jobId },
@@ -411,7 +420,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, otherMemory, memoryIndex, mainSessionId: scope.ownerId === store.getNamespaceId() ? undefined : scope.ownerId, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, otherMemory, memoryIndex, recordIndex, materials, mainSessionId: scope.ownerId === store.getNamespaceId() ? undefined : scope.ownerId, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })

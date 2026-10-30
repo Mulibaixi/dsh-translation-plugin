@@ -1,9 +1,9 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.26.2",
+  "version": "0.26.3",
   "private": true,
   "license": "MIT",
-  "description": "A DeepSeek Harness translation plugin framework (early development).",
+  "description": "Translation and refinement workspace for DeepSeek Harness, with topic memory, revision history, and main-model collaboration.",
   "type": "module",
   "main": "./dist/host/index.js",
   "types": "./dist/host/index.d.ts",
@@ -23,6 +23,7 @@
     "cordis.patch.yml",
     "README.md",
     "README.zh-CN.md",
+    "docs/user-guide.zh-CN.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "LICENSE"
@@ -69,7 +70,9 @@
   },
   "dependencies": {
     "mdast-util-from-markdown": "^2.1.0",
+    "mdast-util-gfm": "^3.1.0",
     "mdast-util-math": "^3.0.0",
+    "micromark-extension-gfm": "^3.0.0",
     "micromark-extension-math": "^3.1.0"
   }
 }

@@ -18,8 +18,9 @@ import type { TopicBridgeClient } from './topic-bridge.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import type { SessionStore, TextUnitDeletionPlan } from './session-store.js'
 import { Menu, MenuItemButton } from './native-ui.js'
+import { RecordIndexControl, RecordIndexStatus, supportsRecordIndex, type RecordIndexProps } from './record-index-view.js'
 
-export interface DocumentViewProps { readonly documents?: TranslationDocumentReader | undefined; readonly documentTasks?: DocumentTasksClient | undefined; readonly documentReviews?: DocumentReviewClient | undefined }
+export interface DocumentViewProps extends RecordIndexProps { readonly documents?: TranslationDocumentReader | undefined; readonly documentTasks?: DocumentTasksClient | undefined; readonly documentReviews?: DocumentReviewClient | undefined }
 type Failure = Pick<EvidenceUnavailableResult, 'status' | 'reason'>
 function readNotice(failure: Failure): string {
   if (failure.reason === 'document_incomplete') return '此版本包含缺项，尚无可打开的译文。请在详情中核对处理状态。'
@@ -235,7 +236,7 @@ function DocumentSourceDeletionControl({ store, unit, session, busy }: { readonl
     message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, message) : null)
 }
 
-export function DocumentUnitView({ unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, topics, materials, visible = true, navigationRevision, executionOwner }: RecordObjectsProps & DocumentViewProps & {
+export function DocumentUnitView({ unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, topics, materials, recordIndex, visible = true, navigationRevision, executionOwner }: RecordObjectsProps & DocumentViewProps & {
   readonly unit: DocumentUnit; readonly session: LocalSession; readonly store?: SessionStore | undefined; readonly topics?: TopicBridgeClient | undefined; readonly materials?: MaterialSubmissionsClient | undefined; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
@@ -272,6 +273,8 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
       ? `正文已清除；保留 ${unit.deletion.calls} 次实际调用事实。编号保留，不再参与导出或记忆依据。`
       : '正文已清除；编号保留，不再参与导出或记忆依据。'))
   const name = source?.body.kind === 'asset' ? source.body.reference.name : '长原稿'
+  const fileName = materials?.getFileUnits(session.id).find(file => file.unitId === unit.id || file.documentUnitId === unit.id)?.name ?? name
+  const indexTarget = store && supportsRecordIndex(fileName) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
   const identity = JSON.stringify([session.topicId, session.topicId, session.id, unit.id, unit.sourceVersion, manifest?.id ?? null])
   lifetime.current.identity = identity
   const readable = handle && !('status' in handle) ? handle : undefined
@@ -377,12 +380,13 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
   let targetOffset: number | null = 0
   return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'data-source-version': unit.sourceVersion, 'data-manifest-id': manifest?.id, 'aria-label': `文件 ${unit.order}：${name}` },
     h('div', { className: 'dsh-tp-unit-header' },
-      h('span', { role: 'status', className: 'dsh-tp-muted' }, `单元 ${unit.order} · 文件 · ${status}`),
+      h('span', { role: 'status', className: 'dsh-tp-muted' }, `单元 ${unit.order} · 文件 · ${status}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, visible, prefix: ' · ' })),
       h('div', { className: 'dsh-tp-actions' },
         store ? h(DocumentUnitDeletionControl, { store, unit, session, documentTasks, materials, topics }) : null,
         store ? h(DocumentSourceDeletionControl, { store, unit, session, busy: pending || !!draft }) : null,
         store ? h(DocumentChunkCleanupControl, { store, unit, session, busy: pending || !!draft }) : null,
         h('button', { type: 'button', disabled: Boolean(retranslationBlocked) || Boolean(draft) || pending, title: retranslationBlocked ?? '沿用此原稿、目标语言与翻译要求，交由主模型准备新的整篇任务。', onClick: () => { void documentTasks?.requestRetranslation(session.id, unit.id, executionOwner) } }, '重译'),
+        h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, visible, disabled: !final || !!draft || pending || session.archivedAt !== null }),
         retranslation?.unknown ? h('button', { type: 'button', disabled: retranslation.pending, onClick: () => { void documentTasks?.queryRetranslation(session.id, unit.id) } }, '检查重译状态') : null,
         task && controls && ['failed', 'cancelled', 'interrupted', 'unknown'].includes(actualStatus ?? '') ?
           actualStatus === 'unknown' ? h('button', { type: 'button', disabled: controls.pending, onClick: () => void documentTasks!.requestControl(session.id, task.taskId, 'status') }, '检查状态')

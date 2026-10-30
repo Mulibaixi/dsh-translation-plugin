@@ -2,44 +2,48 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A dedicated translation workspace for DeepSeek Harness (DSH), with room for translation, discussion, and reusable knowledge.
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Use the main chat for background and instructions, the translation workspace for source material, revisions, and delivery, and memory assets for terminology and topic knowledge. It suits stories, game scripts, and academic material that need consistent wording and context across sessions.
+**Keep long translations moving, and give every revision something to build on.**
 
-## Why use it
+Bring first drafts, discussion, refinement, and final selection into one workspace for novels, game scripts, and academic material that need consistent context and expression over time.
 
-- **Separate translation from discussion**: keep sources and translations in the workspace, with instructions and explanations in the main chat.
-- **Build knowledge within a topic**: share terms, entities, facts, relations, and reference originals across translation sessions.
-- **Compare and revise translations**: retain versions, request retranslation, edit text, and choose a final version.
-- **Keep memory visible and editable**: inspect evidence, edit or adopt entries, disable rules, and clean up material.
-- **Use DSH's model configuration**: choose an existing model and reasoning effort; configure an embedding API separately if needed.
+When you reach the next chapter, keep established names and terminology within reach. When a sentence needs more work, discuss it with the source and earlier translations available. When you switch main chats or restart DSH, return to the work you have saved.
 
-## What it can do today
+[Why choose it](#why-choose-it) · [Installation and updates](#installation-and-updates) · [User guide (简体中文)](docs/user-guide.zh-CN.md) · [Projects and documentation](#projects-and-documentation)
 
-| Capability | Current scope |
+## Why choose it
+
+- **Keep translating long projects with less repeated explanation.** Collect confirmed terminology, character details, style requirements, and references within a topic for later chapters and sessions, giving consistent wording and context a foundation.
+- **Keep refining until the translation fits your intent.** Discuss accuracy, tone, rhythm, and character voice around a specific translation. Turn “this sounds unnatural” into actionable feedback and work toward the result you want.
+- **Let the models do more organizing and checking, with less copying and relaying for you.** Describe your goal in the main chat; let the main model organize context, coordinate translation, and review revisions. The companion integration submits source material with instructions, reducing repeated copying between inputs.
+- **Try different expressions and keep control of the final choice.** Sources and translation versions stay in the same session, ready to revisit, compare, and refine before you choose the version you prefer.
+- **Turn the DSH you already know into a lasting translation workspace.** Reuse your model configuration and choose a translation model and reasoning effort for the task. History and memory save locally, so material organized today remains available for your next session.
+
+## Main capabilities
+
+| Capability | Purpose |
 | --- | --- |
-| Quick translation | Translate plain text directly for independent sentences and occasional lookups. |
-| Normal translation | Let the main model organize requirements and context before calling the translation model; discuss, retranslate, and correct sources. |
-| File translation | Read text or recognize file content, translate ranges when needed, and deliver reviewed versions through the session. |
-| Topics and sessions | Create topics and child sessions, add remarks, reorder and archive them, and reuse them across main chats in one local library. |
-| Memory assets | Maintain four structured archives, topic/user settings, and topic original/bilingual files. |
-| Memory retrieval | Find current bilingual text with ordinary search; use an embedding API for active archives, reference text, and current translation examples. |
-| Versions and export | Retain older versions, select finals, and export translation TXT or bilingual JSON by session or topic. |
-| Storage and cleanup | Save history and memory on the Host, load content on demand, and clean up versions, units, sessions, topics, or the plugin. |
+| Quick translation | Translate independent plain text directly for short passages and occasional lookups. |
+| Translation and refinement | Use Normal mode for main-model coordination and repeated discussion, revision, and review with requirements and context. |
+| File delivery | Work primarily with TXT/Markdown sources, process ranges when needed, and open results through the session or export them. |
+| Topic memory | Share terms, entities, facts, relations, settings, and references across topic sessions, with optional semantic retrieval. |
+| Versions and local saving | Retain sources and translation versions, select finals, and save history and memory automatically for reuse across chats and app restarts. |
 
-The project is still in development. Text/TXT translation can support a workflow with human review; translation quality and memory adoption still need checking, and completion time is not guaranteed. Builds, synthetic model checks, and browser tests do not replace real-model quality or native desktop verification.
+## A translation and refinement workflow
+
+1. **Prepare material and context.** Create a topic and session, add sources, and describe the audience, style, and background.
+2. **Produce a first translation.** Use Quick mode for independent short text, or Normal mode when context and memory matter.
+3. **Discuss and refine.** Identify a unit or version in the main chat and adjust meaning, phrasing, voice, or terminology.
+4. **Review and finalize.** Compare the source and translation versions, revise further, choose a final, and open or export it.
+5. **Reuse knowledge.** Review and adopt useful memory for later passages and sessions.
 
 ## Requirements
 
 - DSH `0.2.0-rc.2`, `0.2.1-rc.2`, or `0.2.1-rc.3`, with local plugin support and a configured model.
-- **Quick mode** does not require the Composer extension. **Normal mode** requires the matching `dsh-composer-extension` and a Composer submission patch for your DSH version. Installing the extension alone does not add material submission to an unpatched official build.
-- The paired sources use content protocol 3 and task-phase protocol 2. Keep the translation plugin, Composer extension, and Host patch compatible; reapply the matching patch after a DSH upgrade.
-- File asset extraction uses native DSH subagents through the supported run/Activation interfaces. Missing capabilities are reported; the main model can still read and translate text originals directly.
-- The Host must load built-in `node:sqlite`. Building from source requires Node.js 22 or newer, pnpm, and the Composer extension source directory alongside this repository.
-
-Source files can use any format, up to 2 MiB each. UTF-8 text is directly readable; other files require recognition or OCR by the main model. TXT, Markdown, JSON, and HTML results can be saved directly; other output formats depend on model capabilities. Readable reference formats are listed below.
-
-Model calls may incur charges; local storage does not make translation offline. The memory window floats or docks inside DSH.
+- **Quick mode** needs no Composer extension. **Normal mode** requires a matching `dsh-composer-extension` and Composer submission host patch.
+- Source builds require Node.js 22 or newer, pnpm, and the Composer extension source directory alongside this repository. The DSH Host must load built-in `node:sqlite`.
+- Current TXT/Markdown text files must use UTF-8 and can be up to 2 MiB each. Support boundaries for other formats are described below.
 
 ## Installation and updates
 
@@ -52,142 +56,43 @@ Model calls may incur charges; local storage does not make translation offline. 
    pnpm build
    ```
 
-2. Install and enable this directory as the local `dsh-translation-plugin` in DSH's plugin manager. Normal mode also needs the paired Composer extension and Host patch.
-3. Restart DSH and open **翻译 (Translation)** in the main chat's right sidebar. Follow dependency messages to check the paired builds.
+2. In DSH's plugin manager, install and enable this directory as the local `dsh-translation-plugin`. Normal mode also needs the companion extension and host patch.
+3. Fully restart DSH, open **翻译 (Translation)** in the main chat's right sidebar, and create a topic and session.
 
 ### Update
 
-Save and back up material you need, update both source directories, build the Composer extension followed by the translation plugin, then fully restart DSH. A build or page refresh alone does not replace running Host code.
+Back up important material, update both source directories, build the Composer extension followed by the translation plugin, and fully restart DSH. When upgrading DSH, check that the extension and host patch match. See the [migration notes (简体中文)](docs/user-guide.zh-CN.md#已有资料的升级与迁移) for existing material and [CHANGELOG](CHANGELOG.md) for version changes.
 
-When upgrading to this version:
+## Usage
 
-- Session history and memory assets now save automatically; existing settings that disabled saving no longer apply.
-- Legacy browser test history is not imported automatically; export important content first. To translate legacy file/document tasks again, resend the original through the current file input.
-- Register original/bilingual reference files under **Other memory**; existing full-text files need a complete main-model segmentation plan before semantic indexing. Legacy excerpt registration tools and evidence dependencies have been removed; old registration fields are discarded when existing records load.
-- Older versions may not read newly saved data. Do not run old and new versions against the same library. Exports currently cannot be imported for restoration and do not replace a complete backup.
+The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics and sessions, material submission, Markdown delivery, memory management, refinement and finals, storage cleanup, and issue reports.
 
-Disabling or uninstalling the plugin does not automatically delete local material. See [CHANGELOG](CHANGELOG.md) for version changes.
+**Put sources in the translation input, and requirements or revision feedback in the main chat.** Use Quick mode for a direct translation, or Normal mode for main-chat coordination, discussion, and repeated refinement.
 
-## User guide
+Translation actions identify the current task and exact material. Interrupted history does not authorize automatic continuation. When the intended task or target remains genuinely conflicting or unclear, the main model is instructed to ask you before proceeding; it can still load tools and check relevant context. Material accompanying a chat message follows that message's stated purpose, including learning or discussion.
 
-### 1. Create a topic and translation session
+For TXT and Markdown file history, choose **嵌入原文 (Embed source)** next to **重译 (Retranslate)** or on the source row in translation records. The main model marks semantic chunks and exclusions; only that original's retained prose is embedded. Code, Markdown structure and metadata remain available through exact record search. File translations are read on demand rather than embedded, and changing the final translation reuses the original's vectors. Existing file history must be selected explicitly; unselected files are not automatically indexed.
 
-Choose **新建主题及首会话 (New topic and first session)** or **选择已有主题 (Choose existing topic)**. A topic groups memory for a story or project; translation sessions separate individual tasks. Reuse one local library across main chats, and browse saved material without an active main chat.
+## Current limitations and data
 
-- Use **+** in the title menu to create a new topic and first session, then rename it in the automatically opened editor; cancelling keeps the default name. In a session or topic context menu, click **新建 (New)** to keep the existing configuration and mode inheritance rules, or hover over it or click its right arrow to choose **新建快译会话 (New Quick session)** or **新建普通会话 (New Normal session)** within the same topic.
-- **重命名 (Rename)** changes the topic name; **备注 (Remark)** changes only that session's display name. Long-press and drag a session row to reorder it.
-- Right-click a topic, hover over **打开 (Open)** or click its right arrow, and select a session. Submenus open to the right and downward and adjust near window edges to stay visible. Use the Right arrow key to enter a submenu and Left to return to its parent item.
-- **关闭 (Close)** removes a session from the current chat's open list; **归档 (Archive)** retains it; **删除 (Delete)** removes content after confirmation.
+- **Limited file support**: the current focus is UTF-8 TXT and Markdown. Complete parsing, recognition, and delivery in the original format are not yet supported for PDF, images, DOCX, and similar formats.
+- **Translation efficiency**: some optimizations have been made, but final completion time is affected by the models and material.
+- **Semantic indexing**: enabling it sends relevant text to the configured embedding service.
+- Restart does not automatically resume model tasks; check the original task when its outcome is unknown. Exports do not replace a complete backup and cannot currently be imported for restoration.
+- Disabling or uninstalling the plugin does not automatically delete local material. Clean up versions, units, sessions, topics, or plugin data as needed.
 
-Model selection is at the input's lower right; target language and mode are at the top. A session can move from Quick to Normal; create another session to use Quick again. Unit numbers remain stable and deleted numbers are not reused.
+## Projects and documentation
 
-### 2. Quick: get a translation directly
+The GitHub links below use the planned publication URLs.
 
-Select Quick mode, a target language, and a model, then enter and send plain text. Quick mode does not read main-chat context, topic memory, or references, and does not accept files. Use Normal mode when terminology or background matters.
-
-### 3. Normal: translate with requirements and background
-
-**Put the source in the translation input, and instructions or discussion in the main chat.** Open the translation session in the current chat, then choose how to send:
-
-- **Send with instructions**: prepare text or a file in the workspace, write this submission's instructions in the main chat, and send. Material requests translation unless this submission explicitly asks for learning, discussion, or no translation yet.
-- **Send material directly**: use the workspace's send button to ask the current main model to translate. Unsent text in the main-chat input is not included.
-
-Editing the input afterward does not alter the submitted source. To correct a source or revise a translation, identify the unit and requirement in the main chat, for example, “Use units 2 and 4 as wording references, and revise unit 5.” Include the session name for another session. The main model can read source, final text, or a specified version in opened sessions as needed.
-
-Normal text and files use the same current translation flow. Long originals can be translated by source ranges, with continuous coverage required. The main model waits for the actual result, reads the translation independently, compares it with the source, and appends justified corrections to the same unit. Automated review still needs human checking.
-
-Originals and translation versions appear as file links. TXT and Markdown results retain their format. Delivery stays in the session by default; opening generates a readable filename and repeated opens reuse the same version file. Separate exports are created only when explicitly requested. Text results preserve the source BOM and uniform CRLF line endings. JSON, HTML, and similar inputs prompt for an output form if unspecified.
-
-Markdown translation and review instructions preserve headings, lists, tables, code and math; the main model checks the contents links and internal anchors. Manually verify rendering and navigation. Desktop uploads retain the original MD location: opening or exporting Markdown copies local images referenced by standard relative image links beside the MD copy and uses relative links, while recorded bodies keep the original references. Source images must be readable when generating the copy. Keep the accompanying images when moving or sharing the document. Web uploads without the original location keep the original references. Image contents, HTML image references and packaging of entire resource directories are not handled.
-
-Normal translation reads applicable settings and selected memory. Short text can automatically match identical expressions in reference originals; similar examples, long files, and background facts use the main model's search, accurate read, and context selection. Corrections receive the exact previous translation, and nearby dialogue uses effective finals. A search hit does not guarantee correct adoption.
-
-Withdrawing material notifies the main model's following steps; use cancellation for executing tasks. After reload, check interrupted or unknown tasks through query, cancel, or retranslate controls before retrying. Restart does not automatically replay model calls, and tasks do not transfer automatically to another main chat.
-
-### 4. Memory assets: maintain shared topic knowledge
-
-Open **记忆资产 (Memory assets)** from the title menu or a session's context menu. Browsing another topic does not change the workspace's active session. You can also provide material in the main chat and ask to learn it or establish topic memory: the main model reads actual material, retains evidence, checks existing entries, and creates assets without requiring a translation first.
-
-Manage reference files under **Other memory**. Unit evidence for terms and archives links to actual source or final versions. Entries learned from main-chat attachments are saved as proposals for review before adoption.
-
-| Category | Content |
+| Entry | Link |
 | --- | --- |
-| Terms | Source forms, preferred translations, and necessary meaning or usage conditions. |
-| Entities | People, places, organizations, aliases, and descriptions. |
-| Facts | Important facts about the topic, optionally linked to entities. |
-| Relations | Connections between entities, including forms of address and their conditions. |
-| Other memory | Topic/user translation settings beyond the source, plus topic original/bilingual files. |
-
-Inspect evidence, add, edit, adopt, disable, or delete archive entries. The main model can edit existing entries; changed content returns to pending review, while unchanged content retains its state. Conflicts or changed evidence need review. Sessions share memory within a topic; topics remain separate.
-
-Candidates live in their corresponding categories. **一键采用 (Adopt this category)** processes all pending and review-required entries in the current topic/category, regardless of page filters. Adopt linked entities before facts or relations. Entries that cannot be adopted remain pending with an unfinished count; candidates do not block translation delivery.
-
-Translation priority is **user instructions = user-edited entries > user-reviewed entries > pending entries = model interpretation**. Conflicting user instructions and user-edited entries require clarification. Candidates do not automatically overwrite active assets, and model-authored explanations do not become user instructions.
-
-**Translation settings** can be created, edited, enabled, disabled, or deleted, including by the main model. Normal translation and retranslation read all applicable enabled entries in full. User scope applies across this local library; other requirements default to the topic. Keep rules concise and accurate, preserving conditions; single edits, incidental renderings, and model self-checks do not automatically become lasting rules. Budget errors ask you to shorten or disable entries.
-
-**Topic reference files** accept original/bilingual files only, up to 2 MiB each. The list shows names, segmentation progress, and original-file links without text previews. Upload notifies the current main model to mark segment boundaries, with incremental submission and continuation after interruption. The program extracts original text at those boundaries without rewriting files, automatically aligning bilingual text, or inventing translations.
-
-Once the full segmentation plan is complete, the configured embedding service queues indexing. Before completion, originals can still be opened, read, and searched literally. Readable formats are UTF-8 TXT, Markdown, CSV, TSV, JSON, JSONL, LOG, and RST. Other formats provide original-file links; their useful content can be distilled into assets or settings in the main chat.
-
-**Translation records** show source and translation side by side for a session or topic. The ordinary search box matches only current source and effective final translation bodies, ignoring English letter case, with counts, highlighting, and previous/next navigation. Fixed page labels, older versions, and unselected candidates are excluded. Incomplete searches are reported; search does not call models or select finals. Images, tables, and similar objects can link to originals without implying automatic parsing or translation.
-
-### 5. Revise, finalize, and export
-
-- **重译 (Retranslate)** appends a version while retaining the source and previous output. **编辑 (Edit)** adds a manual version for short text. Request file changes through the main chat; external file edits do not write back automatically.
-- A complete translation establishes an automatic final that follows later corrections. **设为最终 (Set final)** fixes a human choice, which new versions do not replace automatically. Incomplete or cancelled output does not become final.
-- Search, export, and semantic retrieval use the same effective final for a file; translations from different source versions are not mixed, and old versions are excluded from default retrieval.
-- Choose **导出译文 TXT (Export translation TXT)** or **导出对照 JSON (Export bilingual JSON)** from a session's context menu, then select the session or topic. Records also offer export. Missing finals are reported, with explicit partial export available. Topic archives have separate JSON/Markdown exports.
-
-Exports are not complete project backups and cannot currently be imported for restoration. Confirm the file was saved after starting a download.
-
-### 6. Save history, inspect storage, and clean up
-
-Set new-session defaults for mode, target language, instructions, and per-call limit under **DSH Settings → Translation**. Valid settings save immediately; restoring defaults does not clear history or change existing sessions.
-
-**Embedding API** accepts a complete OpenAI Embeddings-compatible HTTP(S) endpoint, including its `/embeddings` path, a model name, and an optional key. The Host credential service stores configuration and keys without displaying the key; changing service hosts requires a new key. Connection testing sends only fixed short text and reports dimensions and elapsed time.
-
-Choose **建立索引 (Build index)**, or open **语义索引 (Semantic index)** from memory assets, to build, fill gaps, or rebuild. Indexes cover active entities, facts, relations, completely segmented reference text, and current-source/effective-final translation examples. Terms and enabled settings are read directly. The main model searches accessible material in the current topic, with translation examples limited to opened sessions, then reads exact hits and selects context. Literal search remains available without an index or when the API fails; incomplete coverage is reported.
-
-The memory assets page shows index coverage and file status for the selected topic; Settings shows the library total. Incomplete segmentation and read failures are counted separately. Units without an effective final translation are excluded from both examples and read-failure counts.
-
-Indexing sends the corresponding text to your configured embedding service. Once enabled, it follows active content changes; changing the endpoint or model requires rebuilding. Runtime vectors stay in memory, saved-content vectors stay on the Host, and content deletion also releases indexes.
-
-Session history and memory assets save automatically, with save status confirmed by the Host. Manage retained content through version, unit, session, topic, or plugin cleanup. Model preferences and embedding configuration save independently. Local bodies are unencrypted; DSH manages main chats, model-call records, and attachments separately. Existing settings that disabled history saving now use automatic saving.
-
-Startup reads a session directory, loading bodies when opening, browsing, or exporting. Saves transfer changes; failures retain current edits for retry or explicit reload. Deleting the main chat that first created material does not delete saved translation data.
-
-| Cleanup level | Effect |
-| --- | --- |
-| Old version | Remove eligible old source/translation bodies and exclusive resources, retaining version numbers and call facts. Final/latest results, bases of retained revisions, and unsettled work are protected. |
-| Unit | Remove all version bodies, dependent records, and resource references, retaining the number and call statistics. |
-| Session | Remove session content and dependent resources, retaining topic memory by default. |
-| Topic | Remove the topic, sessions, topic assets, and reference registrations, retaining user settings and shared files used elsewhere. |
-| Plugin | **清除本地数据 (Clear local data)** on the right of the **本地数据 (Local data)** heading requires a second confirmation before removing plugin material, settings, indexes, and owned embedding credentials. User originals and DSH main chats are retained. |
-
-Cleanup requires confirmation. Content becomes unavailable before exclusive files are released; shared originals remain while in use. **存储与空间 (Storage and space)** shows usage, unreadable history copies, and orphan records. **回收未引用原稿 (Reclaim unreferenced sources)** and **刷新统计 (Refresh statistics)** appear on the right of its heading. Failed file cleanup does not restore deleted bodies, and residual cleanup can continue after restart. Documents also offer unused translation-block cleanup.
-
-Check running or unknown-outcome tasks first. Local deletion does not retract exports, user originals, or content already sent to the main model.
-
-## Runtime diagnostics and issue reports
-
-Machine-generated normal text versions offer **导出调用日志 (Export call log)** with that version's prompts, input, output, and execution events. Logs contain translation text, check the exact session/version, and are available only during the original Host lifetime. Export them before restart if needed, and review sensitive content before sharing.
-
-Search DSH Host logs for `[dsh-translation]` and correlate operations by `traceId`. Client-side save and evidence-check failures also emit browser-console summaries.
-
-| Stage | Description |
-| --- | --- |
-| `model.prepare` / `model.stream` | Model preparation, output length, completion/cancellation, and failure stages. |
-| `embedding.request` | Input counts, HTTP status, returned dimensions, and API errors. |
-| `memory.index` / `memory.search` | Coverage, lexical/vector matches, and fallback. |
-| `history.write` / `history.cleanup` | Save status, removal, shared retention, and residual cleanup. |
-
-Summaries include status, timing, error codes, and stack locations, excluding bodies, prompts, queries, endpoints, and keys. DSH model-session records are separate and may contain request text. A successful connection, index, or status alone does not prove translation or retrieval quality.
-
-For issue reports, include DSH/plugin versions, reproduction time, actions, expected and observed behavior, and related summaries. Quality issues also need the affected passages and reasons.
+| Translation plugin | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin) |
+| Composer extension | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension) |
+| User guide (简体中文) | [Detailed operations and issue reports](docs/user-guide.zh-CN.md) |
+| Changes | [CHANGELOG](CHANGELOG.md) |
+| Contributions | [CONTRIBUTING](CONTRIBUTING.md) |
 
 ## Contributing and license
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution instructions and [AGENTS.md](AGENTS.md) for project rules.
-
-Licensed under [MIT](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution instructions and [AGENTS.md](AGENTS.md) for project rules. Licensed under [MIT](LICENSE).

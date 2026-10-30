@@ -2,16 +2,18 @@ import { h, react } from './react.js'
 import { FileJobsClient, type FileJobRecord } from './file-jobs-client.js'
 import type { ViewFilesClient } from './view-files-client.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
+import { RecordIndexControl, RecordIndexStatus, supportsRecordIndex, type RecordIndexProps } from './record-index-view.js'
 
-export interface FileJobViewProps { readonly fileJobs?: FileJobsClient | undefined }
+export interface FileJobViewProps extends RecordIndexProps { readonly fileJobs?: FileJobsClient | undefined }
 const phases = { accepted: '已受理', preparing: '准备中', awaiting_baseline_review: '待确认关键语境', translating: '翻译中', checking: '检查中', awaiting_review: '集中验收中', completed: '译文已完成', failed: '任务失败', cancelled: '已取消', unknown: '结果待确认' } as const
 
 /** A compact delivery row owns version controls and links to the topic assets. */
-export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, ownerId, unitNumber }: {
+export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, ownerId, unitNumber, recordIndex, visible = true }: RecordIndexProps & {
   readonly jobs: FileJobsClient; readonly record: FileJobRecord; readonly viewFiles?: ViewFilesClient | undefined
   readonly materials?: MaterialSubmissionsClient | undefined
   readonly ownerId?: string | undefined
   readonly unitNumber?: number | undefined
+  readonly visible?: boolean | undefined
   readonly onOpenAssets?: ((ownerId: string, topicId: string, sessionId?: string, jobId?: string) => void) | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
@@ -32,6 +34,8 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
   const resultLanguage = result && records.find(record => record.summary.sourceVersion === result.sourceVersion && record.results.some(value => value.version === result.version && value.text === result.text))?.summary.targetLanguage || job.targetLanguage
   const storage = jobs.status(job.jobId)
   const name = job.sourceRef?.name ?? '原稿.txt', resultName = `${name.replace(/\.txt$/iu, '')}-${resultLanguage}-v${resultVersion ?? 1}.txt`
+  const indexTarget = supportsRecordIndex(name) ? { namespaceId: jobs.getNamespaceId(), topicId: job.topicId, sessionId: job.translationSessionId, unitId: job.unitId, sourceVersion: job.sourceVersion } : undefined
+  const mainSessionId = ownerId && ownerId !== jobs.getNamespaceId() ? ownerId : undefined
   const terminal = ['completed', 'failed', 'cancelled'].includes(job.phase) || jobs.hostUnavailable(job.jobId)
   const failedWithoutResult = ['failed', 'cancelled'].includes(job.phase) && !current.results.length
   const canExecute = jobs.canExecute(ownerId)
@@ -48,8 +52,9 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
     onClick: () => onOpenAssets(ownerId ?? jobs.getNamespaceId(), job.topicId, job.translationSessionId) }, '记忆资产') : null
   return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit dsh-tp-file-job', 'data-unit-id': job.unitId, 'data-file-job-id': job.jobId, 'data-file-job-phase': job.phase },
     h('div', { className: 'dsh-tp-unit-header' },
-      h('span', { role: 'status', className: 'dsh-tp-muted' }, `${unitNumber ? `单元 ${unitNumber} · 文件` : '文件材料'} · ${phases[job.phase]}${job.progress.total ? ` · ${job.progress.completed}/${job.progress.total}` : ''}`),
+      h('span', { role: 'status', className: 'dsh-tp-muted' }, `${unitNumber ? `单元 ${unitNumber} · 文件` : '文件材料'} · ${phases[job.phase]}${job.progress.total ? ` · ${job.progress.completed}/${job.progress.total}` : ''}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, visible, prefix: ' · ' })),
       h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: true, title: '旧文件任务不再启动重译；请重新发送原稿，使用当前翻译流程。', onClick: () => { void jobs.retranslate(job.jobId, ownerId) } }, '重译'),
+        h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId, visible, disabled: busy || !current.final }),
         awaitingRetranslation ? h('button', { type: 'button', disabled: busy, onClick: () => { void jobs.queryRetranslation(job.jobId) } }, '检查重译状态') : null,
         failedWithoutResult ? h('button', { type: 'button', disabled: true, title: '请重新发送原稿，使用当前翻译流程。', onClick: () => { void jobs.retranslate(job.jobId, ownerId) } }, '重新发送') : null,
         h('button', { type: 'button', disabled: busy || deleting || !!deletionBlocked || Boolean(awaitingRetranslation), title: deletionBlocked, onClick: () => setDeletePlan(jobs.captureUnitDeletion(job.jobId)) }, '删除单元'),

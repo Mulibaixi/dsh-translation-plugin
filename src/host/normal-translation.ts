@@ -1,5 +1,6 @@
 import { parseTranslationLogRead, type TranslationLogRead, type TranslationLogPage } from '../shared/translation-log.js'
 import { SOURCE_LAYOUT_GUIDANCE } from '../shared/translation-call.js'
+import { translationTaskBoundary } from '../shared/translation-task.js'
 import { STYLE_SETTINGS_GUIDANCE } from '../shared/style-settings.js'
 import { historyContextRefs, type DirectHistoryRefs } from '../shared/direct-history-context.js'
 import { diagnosticSpan } from '../shared/diagnostics.js'
@@ -913,6 +914,7 @@ export class NormalTranslationService {
       const directive = uiLanguageDirective(request.uiLocale)
       this.topics.activateForMaterial(agent, request.fileName ? 'file' : 'short')
       agent.followup(helpers.createUserMessage({ content: [{ type: 'text', text: [
+        translationTaskBoundary(agent, 'retranslate', { ...request.target, operationId: request.operationId, ...(request.fileName ? { fileName: request.fileName } : {}) }),
         'The user explicitly requests a new translation of this exact unit. Call translation_translate with the target and operationId below, wait for its actual complete result, review it and deliver it in this turn. This is not an asynchronous acceptance/handoff. Do not call retired execution or file-job tools. The program reads the authoritative source and current Session model; do not change the editable draft.',
         'This is a full user-requested retranslation, not an automatic retry or a request to preserve every old wording. The previous translation is reference data. Read current applicable settings and query the relevant active terms, including disputed expressions. Do not copy earlier model-authored notes or obsolete interpretations as current user requirements. Use organizedNotes for your organization; userRequirements contains only actual current user wording, empty when none.',
         SOURCE_LAYOUT_GUIDANCE,

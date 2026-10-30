@@ -10,9 +10,10 @@ import type { LocalDataService } from './local-data.js'
 import type { MemoryVectorRow } from './memory-database.js'
 import type { TopicHostContext, TopicToolsService } from './topic-tools.js'
 import type { HistoryService } from './history.js'
+import type { HistoryScope } from '../shared/history-bundle.js'
 import { currentFinalRevision, isDeletedUnit, isDocumentUnit, isFileJobUnit, isTextUnit } from '../memory/translation-history.js'
 import { currentDocumentFinal } from '../memory/document-task.js'
-import { currentHistoryPair, historyIndexSourceId, historyRecordExcerpt, historyRecordText, type CurrentHistoryPair } from './history-retrieval.js'
+import { currentHistoryPair, historyFileName, isFileHistoryUnit, historyIndexSourceId, historyIndexSourceIds, historyRecordExcerpt, historyRecordText, type CurrentHistoryPair } from './history-retrieval.js'
 import type { TranslationSourcesService } from './translation-sources.js'
 import type { TranslationRecordSelection } from '../shared/reference-memory.js'
 import { languageMatches } from '../shared/language-tag.js'
@@ -20,6 +21,7 @@ import { REFERENCE_SEGMENTATION_VERSION, segmentReferenceText } from './referenc
 
 interface Chunk extends Omit<MemoryVectorRow, 'vector'> {
   readonly text: string; readonly saved: boolean
+  readonly embeddingText?: string
   readonly keywordText?: string
   readonly ref: { readonly kind: 'entity' | 'fact' | 'relation'; readonly id: string; readonly version: number; readonly purpose: 'background' }
     | { readonly kind: 'reference_file'; readonly selection: ReferenceFileSelection }
@@ -31,6 +33,10 @@ interface IndexSeat {
   readonly namespaceId: string; peer: string; enabled: boolean; dirty: boolean; epoch: number
   config: string; vectors: Map<string, readonly number[]>; status: MemoryIndexStatus
   job?: Promise<void> | undefined; controller?: AbortController | undefined
+}
+interface RecordSegments {
+  selected(scope: HistoryScope, unitId: string, sourceVersion: number, peer: string): Promise<boolean>
+  segments(scope: HistoryScope, unitId: string, sourceVersion: number, source: string, peer: string, signal: AbortSignal): Promise<{ readonly selected: boolean; readonly complete: boolean; readonly parts: readonly { readonly start: number; readonly end: number; readonly text: string }[] }>
 }
 const empty = (): MemoryIndexStatus => ({ enabled: false, building: false, total: 0, indexed: 0, unsupported: 0, unsegmented: 0, unavailable: 0, unavailableRecords: 0 })
 const identity = (row: Omit<MemoryVectorRow, 'vector'>): string => JSON.stringify([row.topicId, row.sourceId, row.hash, row.start, row.end])
@@ -70,6 +76,7 @@ export class MemorySearchService {
   private disposed = false
   private searches = 0
   private contentEpoch = 0
+  private readonly recordJobs = new Map<string, { readonly controller: AbortController; readonly promise: Promise<void> }>()
   constructor(private readonly ctx: TopicHostContext, private readonly memory: OtherMemoryService, private readonly archive: TopicArchiveService,
     private readonly files: OtherMemoryFilesService, private readonly embedding: EmbeddingService) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationMemorySearch', property: 'ctx' } })
@@ -78,7 +85,7 @@ export class MemorySearchService {
     if (this.disposed || !(this.ctx.get?.('translationTopics') as TopicToolsService | undefined)?.ownsLibrary(namespaceId, peer)) throw failure('记忆检索连接已关闭或不属于此资料库。')
   }
   private writer<T>(action: () => Promise<T>): Promise<T> { return ((this.ctx.get?.('translationLocalData') as LocalDataService | undefined)?.storageWriter() ?? (async <R>(run: () => Promise<R>): Promise<R> => run()))(action) }
-  private async seat(namespaceId: string, peer: string): Promise<IndexSeat> {
+  private async seat(namespaceId: string, peer: string, resume = true): Promise<IndexSeat> {
     this.check(namespaceId, peer)
     let seat = this.seats.get(namespaceId)
     if (!seat) {
@@ -87,21 +94,22 @@ export class MemorySearchService {
       seat = this.seats.get(namespaceId)
       if (!seat) { seat = { namespaceId, peer, enabled, dirty: enabled, epoch: 0, config: '', vectors: new Map(), status: { ...empty(), enabled } }; this.seats.set(namespaceId, seat) }
     }
-    seat.peer = peer; if (seat.dirty) this.kick(seat)
+    seat.peer = peer; if (resume && seat.dirty) this.kick(seat)
     return seat
   }
   async status(raw: MemoryIndexScope): Promise<MemoryIndexStatus> {
     const request = parseMemoryIndexRequest('status', raw) as MemoryIndexScope, peer = this.ctx.invocation?.peer.id
     if (!peer) throw failure('索引状态缺少宿主连接。')
-    const seat = await this.seat(request.namespaceId, peer)
-    if (request.topicId === undefined) return { ...seat.status }
+    const seat = await this.seat(request.namespaceId, peer, false)
     this.searches++
     try {
       const collection = await this.collect(request.namespaceId, peer, new AbortController().signal, request.topicId)
       const config = await this.embedding.configuration(); this.check(request.namespaceId, peer)
-      return { ...seat.status, total: collection.chunks.length,
+      const status = { ...seat.status, total: collection.chunks.length,
         indexed: config && seat.config === configKey(config) ? collection.chunks.filter(row => seat.vectors.has(identity(row))).length : 0,
         unsupported: collection.unsupported, unsegmented: collection.unsegmented, unavailable: collection.unavailable, unavailableRecords: collection.unavailableRecords }
+      if (request.topicId === undefined) seat.status = status
+      return status
     } finally { this.searches-- }
   }
   /** Resume an already-enabled index on library connection, before any search/settings visit. */
@@ -145,10 +153,10 @@ export class MemorySearchService {
     })
     seat.job = job; this.tail = job
   }
-  private async collect(namespaceId: string, peer: string, signal: AbortSignal, topicId?: string, sessionIds?: readonly string[]): Promise<Collection> {
+  private async collect(namespaceId: string, peer: string, signal: AbortSignal, topicId?: string, sessionIds?: readonly string[], unitId?: string): Promise<Collection> {
     const epoch = this.contentEpoch
     this.check(namespaceId, peer); signal.throwIfAborted()
-    const snapshots = await this.archive.retrievalSnapshots(namespaceId, peer, topicId), chunks: Chunk[] = [], saved: Omit<MemoryVectorRow, 'vector'>[] = []
+    const snapshots = unitId === undefined ? await this.archive.retrievalSnapshots(namespaceId, peer, topicId) : [], chunks: Chunk[] = [], saved: Omit<MemoryVectorRow, 'vector'>[] = []
     for (const pair of snapshots) {
       const savedKeys = new Set<string>()
       for (const entry of pair.saved?.entries ?? []) if (entry.status === 'active') for (const part of await segments(projection(entry, pair.saved!))) {
@@ -160,7 +168,7 @@ export class MemorySearchService {
       }
     }
     let unsupported = 0, unsegmented = 0, unavailable = 0, unavailableRecords = 0
-    for (const ref of await this.memory.retrievalReferences(namespaceId, peer)) {
+    for (const ref of unitId === undefined ? await this.memory.retrievalReferences(namespaceId, peer) : []) {
       if (topicId !== undefined && ref.topicId !== topicId) continue
       signal.throwIfAborted()
       try {
@@ -176,14 +184,17 @@ export class MemorySearchService {
       } catch (error) { signal.throwIfAborted(); if ((error as { code?: string }).code === 'reference_format_unsupported') unsupported++; else unavailable++ }
     }
     const history = this.ctx.get?.('translationHistory') as HistoryService | undefined
-    const historyRows = async (pair: CurrentHistoryPair): Promise<Chunk[]> => {
+    const recordSegments = this.ctx.get?.('translationRecordIndex') as RecordSegments | undefined
+    const historyRows = async (pair: CurrentHistoryPair, parts?: readonly { readonly start: number; readonly end: number; readonly text: string }[]): Promise<Chunk[]> => {
       const points = { source: Array.from(pair.source), translation: Array.from(pair.translation) }, result: Chunk[] = []
-      const add = async (side: 'source' | 'translation' | 'bilingual', sourceRange: TranslationRecordSelection['sourceRange'], translationRange: TranslationRecordSelection['translationRange']): Promise<void> => {
+      const add = async (side: 'source' | 'translation' | 'bilingual', sourceRange: TranslationRecordSelection['sourceRange'], translationRange: TranslationRecordSelection['translationRange'], embeddingText?: string): Promise<void> => {
         const excerpt = await historyRecordExcerpt(pair, sourceRange, translationRange, points), range = sourceRange ?? translationRange!
-        result.push({ topicId: topicId ?? '', sourceId: historyIndexSourceId(pair.sessionId, pair.unitId, side), hash: excerpt.selection.sha256, start: range.start, end: range.end,
-          text: historyRecordText(excerpt), keywordText: [excerpt.source, excerpt.translation].filter(text => text !== null).join('\n'), saved: false, origin: 'current_final', ref: { kind: 'translation_record', selection: excerpt.selection, targetLanguage: pair.targetLanguage } })
+        result.push({ topicId: topicId ?? '', sourceId: historyIndexSourceId(pair.sessionId, pair.unitId, side), hash: embeddingText === undefined ? excerpt.selection.sha256 : await hash(JSON.stringify(['file-source-v1', pair.sourceVersion, excerpt.source, embeddingText])), start: range.start, end: range.end,
+          text: historyRecordText(excerpt), ...(embeddingText === undefined ? {} : { embeddingText }), keywordText: embeddingText ?? [excerpt.source, excerpt.translation].filter(text => text !== null).join('\n'), saved: false, origin: embeddingText === undefined ? 'current_final' : 'current_file_source', ref: { kind: 'translation_record', selection: excerpt.selection, targetLanguage: pair.targetLanguage } })
       }
-      if (points.source.length + points.translation.length <= 1000) {
+      if (parts !== undefined) {
+        for (const part of parts) if (part.text.trim()) await add('source', { start: part.start, end: part.end }, null, part.text)
+      } else if (points.source.length + points.translation.length <= 1000) {
         if (points.source.length + points.translation.length) await add('bilingual', points.source.length ? { start: 0, end: points.source.length } : null, points.translation.length ? { start: 0, end: points.translation.length } : null)
       } else for (const side of ['source', 'translation'] as const) for (const segment of await segments(pair[side])) {
         const range = { start: segment.start, end: segment.end }; await add(side, side === 'source' ? range : null, side === 'translation' ? range : null)
@@ -194,14 +205,24 @@ export class MemorySearchService {
       const savedRows: Chunk[] = []
       const load = async (bundle: typeof snapshot.current, countUnavailable: boolean): Promise<Chunk[]> => {
         const result: Chunk[] = []
-        for (const unit of bundle.history.units) if (!isDeletedUnit(unit)) {
+        for (const unit of bundle.history.units) if (!isDeletedUnit(unit) && (unitId === undefined || unit.id === unitId)) {
           signal.throwIfAborted()
           if (isTextUnit(unit) && !currentFinalRevision(unit) || isDocumentUnit(unit) && !currentDocumentFinal(unit)) continue
           if (isFileJobUnit(unit) && !bundle.fileJobs.some(record => record.summary.unitId === unit.id && record.summary.sourceVersion === unit.sourceVersion && record.final)) continue
           try {
+            const file = isFileHistoryUnit(bundle, unit.id)
+            if (unitId !== undefined && !file) continue
+            if (file && (!recordSegments || !/\.(?:txt|md)$/iu.test(historyFileName(bundle, unit.id) ?? '') || !await recordSegments.selected(snapshot.scope, unit.id, unit.sourceVersion, peer))) continue
             const pair = await currentHistoryPair(bundle, snapshot.scope, snapshot.token, unit.id, peer, this.ctx.get?.('translationSources') as TranslationSourcesService | undefined, signal)
             if (!pair) { if (countUnavailable) unavailableRecords++; continue }
-            for (const row of await historyRows(pair)) result.push({ ...row, topicId: snapshot.scope.topicId })
+            let parts: readonly { readonly start: number; readonly end: number; readonly text: string }[] | undefined
+            if (file) {
+              const plan = await recordSegments!.segments(snapshot.scope, unit.id, unit.sourceVersion, pair.source, peer, signal)
+              if (!plan.selected) continue
+              if (!plan.complete) { if (countUnavailable) unsegmented++; continue }
+              parts = plan.parts
+            }
+            for (const row of await historyRows(pair, parts)) result.push({ ...row, topicId: snapshot.scope.topicId })
           } catch { signal.throwIfAborted(); if (countUnavailable) unavailableRecords++ }
         }
         return result
@@ -237,7 +258,7 @@ export class MemorySearchService {
     await this.writer(async () => { check(); const db = await this.memory.databaseForArchives(); check(); db?.transaction(() => db.indexPrune(seat.namespaceId, space, collection.saved)) })
     const missing = collection.chunks.filter(row => !seat.vectors.has(identity(row)))
     for (let start = 0; start < missing.length; start += 32) {
-      check(); const batch = missing.slice(start, start + 32), result = await this.embedding.embed(batch.map(row => row.text), signal, config.revision); check()
+      check(); const batch = missing.slice(start, start + 32), result = await this.embedding.embed(batch.map(row => row.embeddingText ?? row.text), signal, config.revision); check()
       const vectors = result.vectors.map(normalized)
       const dimensions = seat.vectors.values().next().value?.length
       if (vectors.some(vector => !vector || dimensions !== undefined && vector.length !== dimensions)) throw failure('嵌入维度已变化或返回零向量，请重建记忆索引。')
@@ -251,6 +272,81 @@ export class MemorySearchService {
         batch.forEach((row, i) => { if (live.has(identity(row))) seat.vectors.set(identity(row), vectors[i]!) })
       })
       this.coverage(seat, latest)
+    }
+  }
+  /** File actions never wake the namespace-wide build or embed another object's content. */
+  async buildRecord(scope: HistoryScope, unitId: string, peer: string, signal: AbortSignal): Promise<void> {
+    const key = JSON.stringify([scope.namespaceId, scope.topicId, scope.sessionId, unitId])
+    const existing = this.recordJobs.get(key)
+    if (existing) return existing.promise
+    signal.throwIfAborted()
+    const controller = new AbortController(), abort = (): void => controller.abort()
+    signal.addEventListener('abort', abort, { once: true })
+    const job = this.tail.catch(() => {}).then(() => this.runRecord(scope, unitId, peer, controller.signal)).finally(() => {
+      signal.removeEventListener('abort', abort)
+      if (this.recordJobs.get(key)?.promise === job) this.recordJobs.delete(key)
+    })
+    this.recordJobs.set(key, { controller, promise: job }); this.tail = job.catch(() => {})
+    return job
+  }
+  private async runRecord(scope: HistoryScope, unitId: string, peer: string, signal: AbortSignal): Promise<void> {
+    const check = (): void => { this.check(scope.namespaceId, peer); signal.throwIfAborted() }
+    check()
+    const seat = await this.seat(scope.namespaceId, peer, false), config = await this.embedding.configuration()
+    check(); if (!config) throw failure('尚未配置嵌入 API。')
+    const space = configKey(config); await this.cache(seat, space)
+    const read = () => this.collect(scope.namespaceId, peer, signal, scope.topicId, [scope.sessionId], unitId)
+    let collection = await read(); check()
+    const wanted = new Set(collection.chunks.map(identity)), sourceIds = new Set(historyIndexSourceIds(scope.sessionId, unitId))
+    for (const id of seat.vectors.keys()) {
+      const [topicId, sourceId] = JSON.parse(id) as string[]
+      if (topicId === scope.topicId && sourceIds.has(sourceId!) && !wanted.has(id)) seat.vectors.delete(id)
+    }
+    await this.writer(async () => {
+      check(); const db = await this.memory.databaseForArchives(true); check()
+      db!.transaction(() => {
+        db!.indexEnable(scope.namespaceId)
+        for (const sourceId of sourceIds) db!.indexRemoveSource(scope.namespaceId, scope.topicId, sourceId)
+        const durable = new Set(collection.saved.map(identity))
+        for (const row of collection.chunks) {
+          const vector = seat.vectors.get(identity(row))
+          if (vector && durable.has(identity(row))) db!.indexPut(scope.namespaceId, space, { ...row, vector })
+        }
+      })
+      seat.enabled = true; seat.status = { ...seat.status, enabled: true }
+    })
+    const missing = collection.chunks.filter(row => !seat.vectors.has(identity(row)))
+    for (let start = 0; start < missing.length; start += 32) {
+      check()
+      const batch = missing.slice(start, start + 32), result = await this.embedding.embed(batch.map(row => row.embeddingText ?? row.text), signal, config.revision)
+      check()
+      const vectors = result.vectors.map(normalized), dimensions = seat.vectors.values().next().value?.length
+      if (vectors.some(vector => !vector || dimensions !== undefined && vector.length !== dimensions)) throw failure('嵌入维度已变化或返回零向量，请重建记忆索引。')
+      collection = await read(); check()
+      const live = new Set(collection.chunks.map(identity)), durable = new Set(collection.saved.map(identity)), latestConfig = await this.embedding.configuration()
+      check(); if (!latestConfig || latestConfig.revision !== config.revision || configKey(latestConfig) !== space) throw failure('嵌入配置已变化。')
+      await this.writer(async () => {
+        check(); const db = await this.memory.databaseForArchives(true); check()
+        db!.transaction(() => batch.forEach((row, i) => {
+          if (live.has(identity(row)) && durable.has(identity(row))) db!.indexPut(scope.namespaceId, space, { ...row, vector: vectors[i]! })
+        }))
+        batch.forEach((row, i) => { if (live.has(identity(row))) seat.vectors.set(identity(row), vectors[i]!) })
+      })
+    }
+  }
+  async recordCoverage(scope: HistoryScope, unitId: string, peer: string, signal: AbortSignal): Promise<{ readonly indexed: number; readonly total: number }> {
+    const seat = await this.seat(scope.namespaceId, peer, false), config = await this.embedding.configuration()
+    if (config) await this.cache(seat, configKey(config))
+    const collection = await this.collect(scope.namespaceId, peer, signal, scope.topicId, [scope.sessionId], unitId)
+    return { indexed: config && seat.config === configKey(config) ? collection.chunks.filter(row => seat.vectors.has(identity(row))).length : 0, total: collection.chunks.length }
+  }
+  invalidateRecord(scope: HistoryScope, unitId: string): void {
+    const key = JSON.stringify([scope.namespaceId, scope.topicId, scope.sessionId, unitId])
+    this.recordJobs.get(key)?.controller.abort()
+    const seat = this.seats.get(scope.namespaceId), sourceIds = new Set(historyIndexSourceIds(scope.sessionId, unitId))
+    if (seat) for (const id of seat.vectors.keys()) {
+      const [topicId, sourceId] = JSON.parse(id) as string[]
+      if (topicId === scope.topicId && sourceIds.has(sourceId!)) seat.vectors.delete(id)
     }
   }
   async search(namespaceId: string, topicId: string, query: string, peer: string, signal: AbortSignal, sessionIds: readonly string[] = [], targetLanguage?: string) {
@@ -314,6 +410,6 @@ export class MemorySearchService {
     const current = await this.collect(namespaceId, peer, signal, topicId, sessionIds)
     return matches.every(match => current.chunks.some(row => JSON.stringify(row.ref) === JSON.stringify(match.ref) && row.text === match.excerpt))
   }
-  hasActiveJobs(): boolean { return this.searches > 0 || [...this.seats.values()].some(seat => !!seat.job) }
-  async dispose(): Promise<void> { this.disposed = true; for (const seat of this.seats.values()) seat.controller?.abort(); await this.tail; this.seats.clear() }
+  hasActiveJobs(): boolean { return this.searches > 0 || this.recordJobs.size > 0 || [...this.seats.values()].some(seat => !!seat.job) }
+  async dispose(): Promise<void> { this.disposed = true; for (const seat of this.seats.values()) seat.controller?.abort(); for (const job of this.recordJobs.values()) job.controller.abort(); await this.tail; this.seats.clear() }
 }

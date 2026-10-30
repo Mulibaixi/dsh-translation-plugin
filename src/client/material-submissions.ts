@@ -546,8 +546,7 @@ export class MaterialSubmissionsClient {
       if (file.size > MAX_TRANSLATION_SOURCE_BYTES) return '文件超过 2 MiB 上限；所选文件保留。'
       return undefined
     }
-    if (!session.input.trim()) return this.getSentFiles(session.id).length
-      ? '文件已发送；可在主会话继续说明处理要求，或添加新的待译材料。' : '请输入待译材料。'
+    if (!session.input.trim()) return '请输入待译材料。'
     try { pastedTextSize(session.input) } catch (error) { return detail(error) }
     return undefined
   }
@@ -589,7 +588,7 @@ export class MaterialSubmissionsClient {
     if (unknown) blocked = '提交结果尚不确定，请先检查提交状态。'
     let message = latest?.reason ?? (session ? this.notices.get(session.id) : undefined)
     if (latest?.withdrawn) message = latest.reason ?? '文本已撤回；原文保留在会话记录中，可重新发送。'
-    else if (this.getSentFiles(sessionId).length && !session?.input.trim() && !this.files.has(sessionId)) message = '文件已发送并冻结；待处理文件见会话记录。'
+    else if (this.getSentFiles(sessionId).length && !session?.input.trim() && !this.files.has(sessionId)) message = undefined
     else if (latest?.sent && latest.draft?.carrier?.kind !== 'selected_file' && !session?.input.trim() && !this.files.has(sessionId))
       message = latest.consumed ? '翻译业务已受理；原提交文本已记录。' : '文本已发送并冻结；待处理文本见会话记录。'
     else if (latest?.consumed) message = session && latest.draft && this.draftVersion(session) !== latest.draft.draftVersion

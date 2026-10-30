@@ -21,6 +21,8 @@ import { assetPriority, TRANSLATION_PRIORITY } from '../memory/asset-priority.js
 import type { TermHandleRegistry } from './term-handles.js'
 import { registerSettingTools } from './setting-tools.js'
 import { registerReferenceSegmentationTools } from './reference-segmentation-tools.js'
+import { registerRecordSegmentationTools, type RecordIndexService } from './record-index.js'
+import { TRANSLATION_TASK_GUIDANCE } from '../shared/translation-task.js'
 import type { OtherMemoryFilesService } from './other-memory-files.js'
 import { TRANSLATION_SELF_REVIEW } from '../shared/translation-review.js'
 import { registerDirectProposalTool } from './direct-proposals.js'
@@ -29,8 +31,14 @@ import type { OtherMemoryService } from './other-memory.js'
 export interface ToolExecution { readonly agent?: MainAgent; readonly callId: string; readonly signal: AbortSignal }
 export interface MainAgent {
   readonly id: string
-  readonly session: { readonly id: string }
-  readonly ctx: { readonly tools: { register(definition: unknown): () => void } }
+  readonly session: { readonly id: string; snapshotEvents?(): readonly unknown[] }
+  readonly ctx: {
+    readonly tools: { register(definition: unknown): () => void }
+    readonly systemPrompt?: {
+      getSectionOrder(name: 'PLAN_POLICY'): number
+      section(section: { readonly name: string; readonly order: number; readonly text: string; readonly interpolate: false }): () => void
+    }
+  }
   readonly inbox?: { readonly nextTurn: readonly ToolNotice[]; readonly nextStep: readonly ToolNotice[] }
   whenIdle?(): Promise<void>
 }
@@ -220,6 +228,7 @@ export class TopicToolsService {
     this.activateGroups(agent, MATERIAL_TOOL_GROUPS[kind])
   }
   activateReferenceSegmentation(agent: Pick<MainAgent, 'id' | 'session'>): void { this.activateGroups(agent, ['reference_segment']) }
+  activateRecordSegmentation(agent: Pick<MainAgent, 'id' | 'session'>): void { this.activateGroups(agent, ['record_segment']) }
   /**
    * Keep the currently installed tools through the following turn. A user correction usually arrives as a new
    * turn with no translation notice, and a reclaimed tool would fail as "unknown tool" before any argument
@@ -239,6 +248,7 @@ export class TopicToolsService {
     if (message.source.kind === 'translation-document-unit') return ['direct', 'file_jobs']
     if (message.source.kind === 'translation-unit') return MATERIAL_TOOL_GROUPS.short
     if (message.source.kind === 'translation-reference-segmentation') return ['reference_segment']
+    if (message.source.kind === 'translation-record-segmentation') return ['record_segment']
     if (message.source.kind === 'dsh-composer-exchange') return (this.ctx.get?.('translationBatch') as DocumentExecutionService | undefined)?.hasActiveJobs(agent.id)
       ? ['document_execute', 'document_prepare', 'memory_read', 'reference_read'] : [...MATERIAL_TOOL_GROUPS.short, 'reference_read']
     if (message.source.kind === 'dsh-composer-task-phase') {
@@ -441,6 +451,8 @@ export class TopicToolsService {
     ]
     const disposers: (() => void)[] = []
     try {
+      const prompt = agent.ctx.systemPrompt
+      if (prompt) disposers.push(prompt.section({ name: 'translation:task-boundary', order: prompt.getSectionOrder('PLAN_POLICY'), text: TRANSLATION_TASK_GUIDANCE, interpolate: false }))
       for (const definition of definitions) disposers.push(register(define({ name: definition.name, description: definition.description, parameters: definition.parameters,
         output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
         execute: (args: Record<string, unknown>, exec: ToolExecution) => {
@@ -763,6 +775,8 @@ export class TopicToolsService {
       if (memory && connection.protocol >= 4) disposers.push(...registerSettingTools(memory, this, agent, options => define(options), register, this.ctx))
       const referenceFiles = this.ctx.get?.('translationOtherMemoryFiles') as OtherMemoryFilesService | undefined
       if (memory && referenceFiles && connection.protocol >= 4) disposers.push(...registerReferenceSegmentationTools(this.ctx, memory, referenceFiles, this, agent, options => define(options), register))
+      const recordIndex = this.ctx.get?.('translationRecordIndex') as RecordIndexService | undefined
+      if (recordIndex && connection.protocol >= 4) disposers.push(...registerRecordSegmentationTools(recordIndex, options => define(options), register))
       if (connection.protocol >= 4) disposers.push(registerDirectProposalTool(this, agent, options => define(options), register, this.ctx))
       this.toolDirectories.set(agent, { connection, directory })
       disposers.push(agent.ctx.tools.register(helpers.defineTool({ name: 'translation_load_tools', description: TRANSLATION_TOOL_LOADER_DESCRIPTION,

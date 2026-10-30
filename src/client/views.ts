@@ -7,6 +7,7 @@ import { h, react } from './react.js'
 import { EmbeddingSettingsView } from './embedding-settings-view.js'
 import type { EmbeddingClient } from './embedding-client.js'
 import type { MemoryIndexClient } from './memory-index-client.js'
+import { RecordIndexControl, RecordIndexStatus, supportsRecordIndex, type RecordIndexProps } from './record-index-view.js'
 import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
@@ -38,7 +39,7 @@ type TextEvent = { currentTarget: { value: string } }
 type CheckEvent = { currentTarget: { checked: boolean } }
 type FileEvent = { currentTarget: { files: FileList | null; value: string } }
 interface StoreProps { readonly store: SessionStore }
-interface TopicUiProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps {
+interface TopicUiProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps, RecordIndexProps {
   readonly memoryIndex?: MemoryIndexClient | undefined
   readonly archive?: import('./topic-archive-store.js').TopicArchiveStore | undefined
   readonly otherMemory?: import('./other-memory-client.js').OtherMemoryClient | undefined
@@ -138,7 +139,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, terms, archive, otherMemory, memoryIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, terms, archive, otherMemory, memoryIndex, recordIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [assetTopic, setAssetTopic] = react.useState<string | undefined>(undefined)
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
@@ -175,11 +176,11 @@ export function PanelRouter({ store, models, quick, normal, sessionId, topics, m
     },
   }
   if (assetTopic && terms && archive) return h('section', { className: 'dsh-tp dsh-tp-panel' }, button('返回翻译资料库', () => setAssetTopic(undefined)),
-    h(MemoryAssetsView, { store, terms, archive, otherMemory, memoryIndex, mainSessionId: sessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing,
+    h(MemoryAssetsView, { store, terms, archive, otherMemory, memoryIndex, recordIndex, materials, mainSessionId: sessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing,
       ownerId: sessionId ?? store.getNamespaceId(), topicId: assetTopic, onSelectTopic: setAssetTopic, onDeleteTerm: onDeleteTerm ?? (async () => false) }))
   const openAssets = onOpenAssets ?? (terms && archive ? (_entryId: string, topicId: string) => setAssetTopic(topicId) : undefined)
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    h(WorkspaceView, { store, models, quick, normal, editor, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets: openAssets, ownerId: sessionId?.trim() || store.getNamespaceId(), key: sessionId ?? store.getNamespaceId() }),
+    h(WorkspaceView, { store, models, quick, normal, editor, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, onDeleteTerm, onOpenAssets: openAssets, ownerId: sessionId?.trim() || store.getNamespaceId(), key: sessionId ?? store.getNamespaceId() }),
   )
 }
 
@@ -521,7 +522,7 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
   )
 }
 
-function TranslationUnit({ store, unit, quick, normal, materials, session, editor, topics, objects, objectAssets, viewFiles, executionOwner }: StoreProps & TopicUiProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly executionOwner?: string }): unknown {
+function TranslationUnit({ store, unit, quick, normal, materials, session, editor, topics, objects, objectAssets, viewFiles, executionOwner, recordIndex }: StoreProps & TopicUiProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly executionOwner?: string }): unknown {
   const [expanded, setExpanded] = react.useState(false)
   const [sourcesExpanded, setSourcesExpanded] = react.useState(false)
   const [exchangeExpanded, setExchangeExpanded] = react.useState(false)
@@ -577,13 +578,15 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : pointed ? pointed.sourceVersion !== unit.sourceVersion ? `原最终版本 ${pointed.order}已过时，待新原文定稿` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中` : '待定稿'
   const blocked = session.mode === 'normal' ? !executionOwner ? '请选择本次任务使用的主会话。' : normal?.retranslateBlockedReason(session.id, unit.id) ?? (normal ? undefined : '普通重译入口未就绪。') : quick.retranslateBlockedReason(session, unit.id)
   const file = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
+  const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
   return h('article', { className: 'dsh-tp-translation', 'aria-label': `${file ? '文件' : '文本'} ${unit.order}` },
     h('div', { className: 'dsh-tp-unit-header' },
-      h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`),
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
       h('div', { className: 'dsh-tp-actions' },
         collapsibleSource && !file ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文${sourceCollapsed ? '展开' : '收起'}`, 'aria-expanded': !sourceCollapsed,
           title: sourceCollapsed ? '展开原文' : '收起原文，只显示前三行', onClick: () => setSourceCollapsed(value => !value) }, sourceCollapsed ? '展开' : '收起') : null,
         h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
+        h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, disabled: !final || session.archivedAt !== null }),
         h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
         file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
     ),
@@ -636,7 +639,7 @@ function FileUnitView({ file, session, materials, viewFiles }: {
     notice ? h('p', { role: 'status', className: 'dsh-tp-muted' }, notice) : null)
 }
 
-function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
+function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   const [, refreshViewFiles] = react.useState(0)
@@ -719,10 +722,10 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       view: isFileJobUnit(unit) ? h('article', { className: 'dsh-tp-record-unit', 'aria-label': `单元 ${unit.order} · 文件` },
         h('span', { role: 'status' }, `单元 ${unit.order} · 文件 · ${unit.deletion ? '已删除' : '文件记录暂不可用'}`),
         unit.deletion?.calls ? h('p', { className: 'dsh-tp-muted' }, `保留 ${unit.deletion.calls} 次实际调用统计。`) : null)
-        : isTextUnit(unit) ? h(TranslationUnit, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, store, unit, quick, normal, materials, session: current, editor, objects, objectAssets, viewFiles, topics: current.mode === 'normal' ? topics : undefined })
-        : h(DocumentUnitView, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, unit, session: current, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, materials, topics: current.mode === 'normal' ? topics : undefined }) })),
+        : isTextUnit(unit) ? h(TranslationUnit, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, store, unit, quick, normal, materials, session: current, editor, objects, objectAssets, viewFiles, recordIndex, topics: current.mode === 'normal' ? topics : undefined })
+        : h(DocumentUnitView, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, unit, session: current, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, materials, recordIndex, topics: current.mode === 'normal' ? topics : undefined }) })),
     ...fileJobRecords.map(record => ({ createdAt: fileUnits.find(file => file.materialId === record.summary.materialId || file.unitId === record.summary.unitId)?.createdAt ?? record.summary.createdAt,
-      view: h(FileJobView, { key: record.summary.unitId, unitNumber: units.find(unit => unit.id === record.summary.unitId)?.order, jobs: fileJobs, record, viewFiles, materials, onOpenAssets, ownerId }) })),
+      view: h(FileJobView, { key: record.summary.unitId, unitNumber: units.find(unit => unit.id === record.summary.unitId)?.order, jobs: fileJobs, record, viewFiles, materials, recordIndex, onOpenAssets, ownerId }) })),
     ...fileUnits.filter(file => !fileJobs?.isUnitRemoved(current.id, file.unitId) && !fileJobRecords.some(record => record.summary.materialId === file.materialId || record.summary.unitId === file.unitId) && !units.some(unit => unit.id === file.unitId || unit.id === file.documentUnitId)).map(file => ({ createdAt: file.createdAt,
       view: h(FileUnitView, { key: file.unitId, file, session: current, materials, viewFiles }) })),
     ...transient.map(record => ({ createdAt: record.createdAt, view: h(TranslationRecord, { key: record.id, record, quick, canRestore: !current.input }) })),

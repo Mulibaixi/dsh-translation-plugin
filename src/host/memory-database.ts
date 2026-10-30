@@ -6,6 +6,7 @@ import type { TopicHostContext } from './topic-tools.js'
 import { decodeTopicArchiveSnapshot, type TopicArchiveSnapshot } from '../memory/topic-archive.js'
 import { decodeTopicTermSnapshot, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { splitHistoryBundle, joinHistoryBundle, type HistoryBundle, type HistoryPart } from '../shared/history-bundle.js'
+import { parseRecordIndexPlan, type RecordIndexPlan } from '../shared/record-index.js'
 
 interface Statement { all(...args: unknown[]): readonly Record<string, unknown>[]; get(...args: unknown[]): Record<string, unknown> | undefined; run(...args: unknown[]): unknown }
 interface SqliteConnection { exec(sql: string): void; prepare(sql: string): Statement; close(): void }
@@ -40,6 +41,9 @@ export interface MemoryDatabase {
   historyCleanups(): readonly HistoryCleanup[]
   historyCleanupSave(task: HistoryCleanup): void
   historyCleanupRemove(namespaceId: string, sessionId: string, unitId: string): void
+  recordIndexGet(namespaceId: string, sessionId: string, unitId: string): RecordIndexPlan | undefined
+  recordIndexSave(namespaceId: string, topicId: string, sessionId: string, unitId: string, plan: RecordIndexPlan): void
+  recordIndexRemove(namespaceId: string, topicId: string, sessionId?: string, unitId?: string): void
   close(): void
 }
 function unavailable(message: string): Error { return Object.assign(new Error(message), { code: 'other_memory_storage_unavailable' }) }
@@ -74,7 +78,8 @@ export async function loadMemoryDatabase(ctx: TopicHostContext, create: boolean)
     if (!exists || version === 1 || version === 2 || version === 3) db.exec('BEGIN IMMEDIATE; CREATE TABLE memory_index_enabled (namespace_id TEXT PRIMARY KEY); CREATE TABLE memory_vectors (namespace_id TEXT NOT NULL, config TEXT NOT NULL, topic_id TEXT NOT NULL, source_id TEXT NOT NULL, hash TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, vector TEXT NOT NULL, PRIMARY KEY(namespace_id, config, topic_id, source_id, hash, start, end)); PRAGMA user_version = 4; COMMIT;')
     if (!exists || version === 1 || version === 2 || version === 3 || version === 4) db.exec('BEGIN IMMEDIATE; CREATE TABLE history_sessions (namespace_id TEXT NOT NULL, session_id TEXT NOT NULL, topic_id TEXT NOT NULL, token TEXT NOT NULL, header TEXT, PRIMARY KEY(namespace_id, session_id)); CREATE INDEX history_topic ON history_sessions(namespace_id, topic_id); CREATE TABLE history_parts (namespace_id TEXT NOT NULL, session_id TEXT NOT NULL, kind TEXT NOT NULL, parent TEXT NOT NULL, id TEXT NOT NULL, position INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(namespace_id, session_id, kind, parent, id)); PRAGMA user_version = 5; COMMIT;')
     if (!exists || typeof version === 'number' && version >= 1 && version <= 5) db.exec('BEGIN IMMEDIATE; CREATE TABLE history_cleanup (namespace_id TEXT NOT NULL, session_id TEXT NOT NULL, unit_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(namespace_id, session_id, unit_id)); PRAGMA user_version = 6; COMMIT;')
-    else if (version !== 6) throw unavailable('其他记忆数据库格式不受当前版本支持，原副本已保留。')
+    if (!exists || typeof version === 'number' && version >= 1 && version <= 6) db.exec('BEGIN IMMEDIATE; CREATE TABLE record_index_plans (namespace_id TEXT NOT NULL, topic_id TEXT NOT NULL, session_id TEXT NOT NULL, unit_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(namespace_id, session_id, unit_id)); PRAGMA user_version = 7; COMMIT;')
+    else if (version !== 7) throw unavailable('其他记忆数据库格式不受当前版本支持，原副本已保留。')
   } catch (error) { try { db.close() } catch { /* Preserve the original failure. */ } throw error }
   return {
     all(namespaceId) { return (namespaceId === undefined ? db.prepare('SELECT * FROM other_memory').all() : db.prepare('SELECT * FROM other_memory WHERE namespace_id = ?').all(namespaceId)).map(row) },
@@ -83,7 +88,7 @@ export async function loadMemoryDatabase(ctx: TopicHostContext, create: boolean)
     transaction(action) { db.exec('BEGIN IMMEDIATE'); try { const result = action(); db.exec('COMMIT'); return result } catch (error) { db.exec('ROLLBACK'); throw error } },
     save(entry) { const saved = parseOtherMemoryEntry(entry); if (saved.persistence !== 'saved') throw new TypeError('Cannot persist a runtime memory row'); db.prepare('INSERT INTO other_memory (id, namespace_id, topic_id, kind, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET namespace_id = excluded.namespace_id, topic_id = excluded.topic_id, kind = excluded.kind, payload = excluded.payload').run(saved.id, saved.namespaceId, saved.topicId, saved.kind, JSON.stringify(saved)) },
     remove(id) { db.prepare('DELETE FROM other_memory WHERE id = ?').run(id) },
-    retire(namespaceId, topicId) { db.prepare('INSERT OR IGNORE INTO retired_topics VALUES (?, ?)').run(namespaceId, topicId) },
+    retire(namespaceId, topicId) { db.prepare('INSERT OR IGNORE INTO retired_topics VALUES (?, ?)').run(namespaceId, topicId); db.prepare('DELETE FROM record_index_plans WHERE namespace_id = ? AND topic_id = ?').run(namespaceId, topicId) },
     archiveState(namespaceId, topicId) {
       const head = db.prepare('SELECT owner_id, header FROM archive_topics WHERE namespace_id = ? AND topic_id = ?').get(namespaceId, topicId)
       if (!head) return undefined
@@ -152,6 +157,10 @@ export async function loadMemoryDatabase(ctx: TopicHostContext, create: boolean)
       catch { throw unavailable('会话历史数据库正文或所属关系无效，原副本已保留。') }
     },
     historySave(namespaceId, topicId, sessionId, token, bundle) {
+      const units = new Map(bundle?.history.units.filter(unit => !unit.deletion).map(unit => [unit.id, unit.sourceVersion]))
+      for (const plan of db.prepare('SELECT unit_id, payload FROM record_index_plans WHERE namespace_id = ? AND session_id = ?').all(namespaceId, sessionId))
+        if (units.get(String(plan.unit_id)) !== parseRecordIndexPlan(JSON.parse(String(plan.payload))).sourceVersion)
+          db.prepare('DELETE FROM record_index_plans WHERE namespace_id = ? AND session_id = ? AND unit_id = ?').run(namespaceId, sessionId, plan.unit_id)
       const split = bundle ? splitHistoryBundle(bundle) : { header: null, parts: [] }
       db.prepare('INSERT INTO history_sessions VALUES (?, ?, ?, ?, ?) ON CONFLICT(namespace_id, session_id) DO UPDATE SET topic_id = excluded.topic_id, token = excluded.token, header = excluded.header').run(namespaceId, sessionId, topicId, token, split.header)
       const id = (part: Pick<HistoryPart, 'kind' | 'parent' | 'id'>): string => JSON.stringify([part.kind, part.parent, part.id])
@@ -167,6 +176,14 @@ export async function loadMemoryDatabase(ctx: TopicHostContext, create: boolean)
     historyCleanups() { return db.prepare('SELECT payload FROM history_cleanup').all().map(row => JSON.parse(String(row.payload)) as HistoryCleanup) },
     historyCleanupSave(task) { db.prepare('INSERT OR REPLACE INTO history_cleanup VALUES (?, ?, ?, ?)').run(task.scope.namespaceId, task.scope.sessionId, task.unitId, JSON.stringify(task)) },
     historyCleanupRemove(namespaceId, sessionId, unitId) { db.prepare('DELETE FROM history_cleanup WHERE namespace_id = ? AND session_id = ? AND unit_id = ?').run(namespaceId, sessionId, unitId) },
+    recordIndexGet(namespaceId, sessionId, unitId) { const value = db.prepare('SELECT payload FROM record_index_plans WHERE namespace_id = ? AND session_id = ? AND unit_id = ?').get(namespaceId, sessionId, unitId); return value ? parseRecordIndexPlan(JSON.parse(String(value.payload))) : undefined },
+    recordIndexSave(namespaceId, topicId, sessionId, unitId, plan) { db.prepare('INSERT OR REPLACE INTO record_index_plans VALUES (?, ?, ?, ?, ?)').run(namespaceId, topicId, sessionId, unitId, JSON.stringify(parseRecordIndexPlan(plan))) },
+    recordIndexRemove(namespaceId, topicId, sessionId, unitId) {
+      const fields = ['namespace_id = ?', 'topic_id = ?'], args = [namespaceId, topicId]
+      if (sessionId !== undefined) { fields.push('session_id = ?'); args.push(sessionId) }
+      if (unitId !== undefined) { fields.push('unit_id = ?'); args.push(unitId) }
+      db.prepare(`DELETE FROM record_index_plans WHERE ${fields.join(' AND ')}`).run(...args)
+    },
     close() { db.close() },
   }
 }

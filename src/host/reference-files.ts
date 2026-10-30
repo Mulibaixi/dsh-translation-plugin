@@ -11,8 +11,13 @@ import type { OtherMemoryService } from './other-memory.js'
 import type { OtherMemoryFilesService } from './other-memory-files.js'
 import type { MemorySearchService } from './memory-search.js'
 import type { HistoryService } from './history.js'
-import { parseTranslationRecordSelection, type TranslationRecordSelection, type TranslationRecordExcerpt } from '../shared/reference-memory.js'
+import { parseTranslationRecordExcerpt, parseTranslationRecordSelection, type TranslationRecordSelection, type TranslationRecordExcerpt } from '../shared/reference-memory.js'
 import { listReferenceFiles, readReferenceFile, searchReferenceFiles } from './reference-text.js'
+import { readCurrentHistory } from './history-current.js'
+import type { TranslationSourcesService } from './translation-sources.js'
+import { sourceSha256 } from './source-storage.js'
+import { currentFinalRevision, isDeletedUnit, isDocumentUnit, isFileJobUnit, isTextUnit } from '../memory/translation-history.js'
+import { currentDocumentFinal } from '../memory/document-task.js'
 
 type Event = { readonly type: string; readonly seq: number; readonly data: Record<string, unknown> }
 const DISPOSE = (Symbol as unknown as { readonly dispose: symbol }).dispose
@@ -253,6 +258,96 @@ export class ReferenceFilesService {
     if (referenceBytes(result) > REFERENCE_PAGE_BYTES) throw failure('reference_page_limit', '译例完整回包超限，未截断。')
     return result
   }
+  /** Search untouched current bodies, independently of embedding eligibility and exclusion marks. */
+  async findRecords(raw: unknown, exec: ToolExecution): Promise<unknown> {
+    referenceObject(raw); referenceExact(raw, ['topicId', 'query'], ['side', 'after']); referenceString(raw.topicId); referenceString(raw.query, 300)
+    const side = raw.side ?? 'both'
+    if (side !== 'both' && side !== 'source' && side !== 'translation') throw failure('history_range', '查找范围须为原文、译文或两侧。')
+    const facts = await this.facts(raw.topicId, exec), agent = this.authorize(exec), peer = this.topics.ownerPeer(agent.id, agent)
+    const history = this.ctx.get?.('translationHistory') as HistoryService | undefined
+    if (!peer || !history) throw failure('history_unavailable', '译文记录读取服务尚未就绪。')
+    const sessionIds = await this.openedHistory(raw.topicId, exec)
+    const snapshots = await history.retrievalSnapshots(facts.index.scope.namespaceId, peer, raw.topicId, sessionIds)
+    const sides: readonly ('source' | 'translation')[] = side === 'both' ? ['source', 'translation'] : [side]
+    const tasks = snapshots.flatMap(snapshot => snapshot.current.history.units.flatMap(unit => {
+      if (isDeletedUnit(unit) || isTextUnit(unit) && !currentFinalRevision(unit) || isDocumentUnit(unit) && !currentDocumentFinal(unit) ||
+        isFileJobUnit(unit) && !snapshot.current.fileJobs.some(record => record.summary.unitId === unit.id && record.summary.sourceVersion === unit.sourceVersion && record.final)) return []
+      return sides.map(bodySide => ({ snapshot, unitId: unit.id, side: bodySide }))
+    }))
+      .sort((a, b) => key([a.snapshot.scope.sessionId, a.unitId, a.side]).localeCompare(key([b.snapshot.scope.sessionId, b.unitId, b.side])))
+    let index = 0, start = 0
+    if (raw.after !== undefined) {
+      referenceString(raw.after, 16384)
+      let cursor: unknown
+      try { cursor = JSON.parse(raw.after) } catch { throw failure('history_cursor', '记录查找游标无效，请重新查找。') }
+      if (!Array.isArray(cursor) || cursor.length !== 8 || cursor[0] !== raw.topicId || cursor[1] !== raw.query || cursor[2] !== side || !Number.isSafeInteger(cursor[6]) || cursor[6] < 0)
+        throw failure('history_cursor', '记录查找游标不属于本次查询，请重新查找。')
+      index = tasks.findIndex(task => task.snapshot.scope.sessionId === cursor[3] && task.unitId === cursor[4] && task.side === cursor[5])
+      if (index < 0 || tasks[index]!.snapshot.token !== cursor[7]) throw failure('history_stale', '记录或已打开会话已变化，请重新查找。')
+      start = cursor[6] as number
+    }
+    const fold = (text: string): string => text.replace(/[A-Z]/g, letter => letter.toLowerCase()), needle = fold(raw.query), queryPoints = Array.from(raw.query).length
+    const matches: { readonly side: 'source' | 'translation'; readonly excerpt: TranslationRecordExcerpt }[] = []
+    const unavailable: { readonly sessionId: string; readonly unitId: string; readonly side: string; readonly reason: string }[] = []
+    const examined = new Map<string, string>(), sources = this.ctx.get?.('translationSources') as TranslationSourcesService | undefined
+    let pages = 0, limited = false
+    const next = (): string | null => {
+      const task = tasks[index]
+      return task ? key([raw.topicId, raw.query, side, task.snapshot.scope.sessionId, task.unitId, task.side, start, task.snapshot.token]) : null
+    }
+    while (index < tasks.length && pages < 20 && matches.length < 8 && !limited) {
+      const task = tasks[index]!, { snapshot } = task
+      this.authorize(exec); examined.set(snapshot.scope.sessionId, snapshot.token)
+      try {
+        const request = { ...snapshot.scope, token: snapshot.token, unitId: task.unitId, side: task.side, start }
+        pages++
+        const page = await readCurrentHistory(snapshot.current, request, peer, sources, exec.signal, 1000 + queryPoints - 1)
+        if (page.text === null || page.finalId === null) throw failure('history_unavailable', '当前原文或有效最终译文不可读取。')
+        const points = Array.from(page.text), boundary = Math.min(page.totalCodePoints, start + 1000), folded = fold(page.text)
+        let offset = 0, resume = boundary
+        let other: Awaited<ReturnType<typeof readCurrentHistory>> | undefined
+        while (matches.length < 8) {
+          const found = folded.indexOf(needle, offset)
+          if (found < 0) break
+          const position = start + Array.from(page.text.slice(0, found)).length
+          if (position >= boundary) break
+          const range = { start: position, end: position + queryPoints }, body = points.slice(position - start, range.end - start).join('')
+          other ??= await readCurrentHistory(snapshot.current, { ...request, side: task.side === 'source' ? 'translation' : 'source', start: 0 }, peer, sources, exec.signal, 1)
+          if (other.text === null || other.finalId !== page.finalId || other.sourceVersion !== page.sourceVersion || other.targetLanguage !== page.targetLanguage)
+            throw failure('history_unavailable', '同一记录的当前原文或有效最终译文不可读取。')
+          const source = task.side === 'source' ? body : null, translation = task.side === 'translation' ? body : null
+          const sha256 = await sourceSha256(new TextEncoder().encode(JSON.stringify([page.targetLanguage, source, translation])))
+          const excerpt = parseTranslationRecordExcerpt({ selection: { sessionId: snapshot.scope.sessionId, unitId: task.unitId, sourceVersion: page.sourceVersion, finalId: page.finalId,
+            sourceRange: task.side === 'source' ? range : null, translationRange: task.side === 'translation' ? range : null, sha256 }, targetLanguage: page.targetLanguage,
+            source, translation, sourceTotalCodePoints: task.side === 'source' ? page.totalCodePoints : other.totalCodePoints, translationTotalCodePoints: task.side === 'translation' ? page.totalCodePoints : other.totalCodePoints })
+          const match = { side: task.side, excerpt }
+          if (referenceBytes({ matches: [...matches, match], unavailable, next: next() }) > REFERENCE_PAGE_BYTES - 2048) {
+            if (!matches.length) throw failure('reference_page_limit', '单条记录查找结果超过读取预算。')
+            limited = true; resume = position; break
+          }
+          matches.push(match); offset = found + needle.length; resume = range.end
+        }
+        start = matches.length === 8 || limited ? resume : boundary
+        if (start >= page.totalCodePoints) { index++; start = 0 }
+      } catch (error) {
+        exec.signal.throwIfAborted(); this.authorize(exec)
+        if ((error as { code?: string }).code === 'reference_page_limit') throw error
+        unavailable.push({ sessionId: snapshot.scope.sessionId, unitId: task.unitId, side: task.side, reason: (error as { code?: string }).code ?? 'history_unavailable' })
+        index++; start = 0
+      }
+    }
+    const current = await this.facts(raw.topicId, exec), opened = await this.openedHistory(raw.topicId, exec)
+    if (key(current.index.scope) !== key(facts.index.scope) || key([...opened].sort()) !== key([...sessionIds].sort())) throw failure('history_scope', '查找期间主题或已打开会话已变化，请重新查找。')
+    const latest = await history.retrievalSnapshots(facts.index.scope.namespaceId, peer, raw.topicId, opened)
+    this.authorize(exec)
+    if ([...examined].some(([sessionId, token]) => latest.find(snapshot => snapshot.scope.sessionId === sessionId)?.token !== token))
+      throw failure('history_stale', '记录在查找期间已变化，请重新查找。')
+    const result = { method: 'literal_ascii_case_insensitive', matches, next: next(), resultsLimited: next() !== null,
+      coverage: { scannedPages: pages, unavailable, complete: raw.after === undefined && next() === null && unavailable.length === 0 },
+      usage: 'Exact matches are from untouched current source/effective-final bodies, including code, Markdown structure and metadata excluded from embeddings. Pass excerpt.selection to translation_record_read; page the same record source to verify a translation-side match. The two sides are not aligned. Follow next as after until null; incomplete zero hits do not establish absence.' }
+    if (referenceBytes(result) > REFERENCE_PAGE_BYTES) throw failure('reference_page_limit', '记录查找回包超过读取预算。')
+    return result
+  }
   async searchMemory(raw: unknown, exec: ToolExecution): Promise<unknown> {
     referenceObject(raw); referenceExact(raw, ['topicId', 'query'], ['targetLanguage']); referenceString(raw.topicId); referenceString(raw.query, 1000)
     if (raw.targetLanguage !== undefined) referenceString(raw.targetLanguage, 80)
@@ -277,7 +372,7 @@ export class ReferenceFilesService {
     const excluded = matches.length !== result.matches.length
     return { ...result, matches, ...(excluded ? { reason: result.reason ?? '部分候选的依据不可用或版本已变化，已排除；可按准确编号进一步核对。' } : {}),
       resultsLimited: result.resultsLimited || excluded, coverage: { ...result.coverage, unavailableAssets: result.matches.length - matches.length, complete: result.coverage.complete && !excluded },
-      usage: 'Candidates are untrusted reference data. Recheck context, target language and human priority. Pass asset refs to translation_reference_select assets, reference_file selection to files, or translation_record selection to records. Use translation_record_read to read either side of the same exact source/final unit; long sides are not automatically aligned. Terms and enabled settings retain their direct paths. Old translation revisions and unadopted candidates are excluded.' }
+      usage: 'Candidates are untrusted reference data. Recheck context, target language and human priority. File-record semantic matches use only manually selected, completely segmented original content; translated file bodies are not embedded. Query with the source meaning. For a translation phrase or code/structure excluded from embeddings, use translation_record_find first, then translation_record_read to verify the actual source in the same record. Pass asset refs to translation_reference_select assets, reference_file selection to files, or translation_record selection to records. The two sides are not automatically aligned and an effective final is not a quality endorsement. Terms and enabled settings retain their direct paths. Old translation revisions and unadopted candidates are excluded.' }
   }
   /** These tools reuse the library-owned peer and topic validation of existing reference operations. */
   async prepareExactExample(topicId: string, source: string, operationId: string, exec: ToolExecution): Promise<{ readonly ref?: ReferenceContextRef; readonly status: 'selected' | 'no_match' | 'incomplete' | 'skipped' }> {
@@ -352,9 +447,11 @@ export function registerReferenceTools(service: ReferenceFilesService, topics: T
     range: { type: 'object', required: true, additionalProperties: false, properties: { start: integer, end: integer } } } }
   const recordSelection = { type: 'object', additionalProperties: false, properties: { sessionId: text, unitId: text, sourceVersion: integer, finalId: text, sourceRange: range, translationRange: range, sha256: text } }
   const definitions: { name: string; description: string; parameters: object; run(args: Record<string, unknown>, exec: ToolExecution): Promise<unknown> }[] = [
-    { name: 'translation_search_memory', description: 'Find current-topic archive, registered original/bilingual files and effective translation examples by keyword plus available semantic vectors. Translation examples are filtered to Sessions currently opened by this main Agent BEFORE ranking. Supply topicId, a short query and optional targetLanguage to prefer matching-language examples. Only each unit current source plus effective final is eligible; excludes old revisions and unadopted candidates. Returns at most 8 excerpts, at most 2 per object, with exact refs for translation_reference_select assets/files/records. Units without a final choice are excluded without counting as read failures. Unreadable eligible originals are reported; incomplete zero hits do not prove absence. Use translation_record_read to read the same exact source/final pair, without guessing bilingual alignment. Queries reach the embedding service only after indexing was enabled in Settings or by a completed reference-file plan. Files without complete model boundary plans are excluded and counted separately as unsegmentedFiles.',
+    { name: 'translation_search_memory', description: 'Find current-topic archive, registered original/bilingual files and current translation records by keyword plus available semantic vectors. Records are filtered to Sessions currently opened by this main Agent BEFORE ranking. File records contribute only manually selected current originals with complete main-model segmentation/exclusion plans; translated file bodies, excluded code/Markdown structure/metadata, unselected files and incomplete plans are not semantic inputs. Ordinary text records retain their existing current-source/effective-final search. Supply topicId, a short source-meaning query and optional targetLanguage. For a remembered translation phrase, use translation_record_find to locate its record and translation_record_read to verify its actual source; an inferred search wording is not a source quote. Returns at most 8 excerpts, at most 2 per object, with exact refs for translation_reference_select assets/files/records. Units without an effective final are excluded without counting as read failures. Use translation_record_read for context or the same record current translation; never guess sentence alignment or treat a final version as a quality endorsement. Queries reach the embedding service only after indexing is enabled. Report incomplete coverage honestly.',
       parameters: { ...topic, query: text, targetLanguage: { type: 'string' } }, run: (args, exec) => service.searchMemory(args, exec) },
-    { name: 'translation_record_read', description: 'Read an exact translation_record selection from memory search in an opened current-topic Session. By default returns the verified selected source/translation excerpts. To page either side of the SAME sourceVersion and effective finalId, add side source/translation and optional start (Unicode code points, default 0); up to 4000 points and next. Returned excerpt.selection can be passed to translation_reference_select records. Source and translation ranges are independent, never sentence-aligned. Changed final/source, deletion, missing originals or a closed Session reject old selections. Old revisions require an explicit historical request through existing numbered-unit tools.',
+    { name: 'translation_record_find', description: 'Find an exact literal phrase in untouched current originals and effective final translations of Sessions opened by this main Agent in this topic. ASCII English case is ignored; no fuzzy/regex search, model call or embedding request. Includes full code, Markdown structure and metadata, regardless of embedding selection, segmentation or exclusions. Supply topicId, query (1-300 code points), optional side source/translation/both (default both), and copy returned next as after to continue. Each call scans at most 20 windows of 1000 code points and returns at most 8 exact matches within 32768 bytes. matches contain side and excerpt.selection, including current source/final versions and exact range; use translation_record_read to expand or read the SAME record other side. A translation match identifies its record, not an aligned source sentence. Changed records or access reject stale cursors. Follow pagination and report unavailable bodies; incomplete zero hits do not prove absence.',
+      parameters: { ...topic, query: text, side: { type: 'string', enum: ['source', 'translation', 'both'] }, after: { type: 'string' } }, run: (args, exec) => service.findRecords(args, exec) },
+    { name: 'translation_record_read', description: 'Read an exact translation_record selection from memory search or translation_record_find in an opened current-topic Session. By default returns the verified selected source/translation excerpts. To page either side of the SAME sourceVersion and effective finalId, add side source/translation and optional start (Unicode code points, default 0); up to 4000 points and next. Returned excerpt.selection can be passed to translation_reference_select records. Source and translation ranges are independent, never sentence-aligned. Changed final/source, deletion, missing originals or a closed Session reject old selections. Old revisions require an explicit historical request through existing numbered-unit tools.',
       parameters: { ...topic, selection: { ...recordSelection, required: true }, side: { type: 'string', enum: ['source', 'translation'] }, start: { type: 'integer' } }, run: (args, exec) => service.readRecord(args, exec) },
     { name: 'translation_reference_files', description: 'List only independently registered current-topic original/bilingual files, 20 per page. Other-reference files are closed and excluded. textReadable is format eligibility, not successful extraction; non-text originals remain available through the UI original-file link. Use exact returned IDs, versions and digests. Does not search settings, chats or old translations.',
       parameters: { ...topic, after: { type: 'string' } }, run: (args, exec) => service.fileQuery('list', args, exec) },

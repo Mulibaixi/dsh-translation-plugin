@@ -70,7 +70,7 @@ export class LocalDataService {
   private authorize():void{if(!this.ctx.invocation?.peer.id)throw stopped('本地数据操作缺少宿主连接身份。')}
   /** Library-wide cleanup checks every service; topic cleanup uses its own scope. */
   private hasActiveJobs():boolean{
-    const services=['translationFileJobs','translationQuick','translationNormal','translationBatch','translationReview','translationMaterials','translationSources','translationReferences','translationOtherMemoryFiles','translationOtherMemory','translationArchive','translationTerms','translationEmbedding','translationMemorySearch','translationHistory']
+    const services=['translationFileJobs','translationQuick','translationNormal','translationBatch','translationReview','translationMaterials','translationSources','translationReferences','translationOtherMemoryFiles','translationOtherMemory','translationArchive','translationTerms','translationEmbedding','translationMemorySearch','translationRecordIndex','translationHistory']
     return services.some(name=>(this.ctx.get?.(name) as Service|undefined)?.hasActiveJobs?.())
   }
   private async hasActiveTopicJobs(scope:HistoryScope):Promise<boolean>{
@@ -273,7 +273,7 @@ export class LocalDataService {
     this.authorize();referenceObject(raw);referenceExact(raw,['operationId']);referenceString(raw.operationId)
     try {
     if(this.complete)return {operationId:raw.operationId,cleared:true}
-    const services=['translationHistory','translationMemorySearch','translationEmbedding','translationFileJobs','translationQuick','translationNormal','translationBatch','translationAnalysis','translationReview','translationCorrection','translationMaterials','translationObjects','translationSources','translationReferences','translationArchive','translationTerms','translationOtherMemoryFiles','translationOtherMemory','translationPreparation','translationPlanning','translationTopics']
+    const services=['translationRecordIndex','translationHistory','translationMemorySearch','translationEmbedding','translationFileJobs','translationQuick','translationNormal','translationBatch','translationAnalysis','translationReview','translationCorrection','translationMaterials','translationObjects','translationSources','translationReferences','translationArchive','translationTerms','translationOtherMemoryFiles','translationOtherMemory','translationPreparation','translationPlanning','translationTopics']
     if(!this.blocked&&services.some(name=>(this.ctx.get?.(name) as Service|undefined)?.hasActiveJobs?.()))throw Object.assign(new Error('仍有运行中、等待处理或结果未知的翻译任务，请先结束或确认任务。'), {code:'local_data_busy'})
     // Resolve the complete bounded file inventory before interrupting services or deleting bytes.
     const files=await this.files();await files.scan()

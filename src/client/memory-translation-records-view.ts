@@ -13,6 +13,8 @@ import type { RecordObjectReference } from '../shared/record-objects.js'
 import { RecordObjectEditor, RecordObjectText, type RecordObjectsProps } from './record-object-view.js'
 import { captureRecordSearchBodies, searchRecordBodies, type RecordSearchBody, type RecordSearchMatch, type RecordSearchResult } from './record-search.js'
 import { RecordSearchExcerpt, RecordSearchText } from './record-search-view.js'
+import { RecordIndexControl, RecordIndexStatus, supportsRecordIndex, type RecordIndexProps } from './record-index-view.js'
+import type { MaterialSubmissionsClient } from './material-submissions.js'
 
 interface EditDraft { readonly baseRevisionId: string; readonly original: string; readonly text: string }
 type RecordsScope = 'session' | 'topic'
@@ -28,12 +30,14 @@ function editable(revision: TextRevision): boolean {
 function projectExport(request: Omit<PendingRecordsExport, 'result'>, documents: DocumentViewProps['documents']): Promise<TopicTranslationExport> {
   return buildRecordObjectExportAsync(request, documents, true)
 }
-export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, ownerId, topicId, associatedSessionId, navigationRevision, visible = true, onOpenAssets }: RecordObjectsProps & DocumentViewProps & FileJobViewProps & {
+export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, materials, mainSessionId, ownerId, topicId, associatedSessionId, navigationRevision, visible = true, onOpenAssets }: RecordObjectsProps & DocumentViewProps & FileJobViewProps & RecordIndexProps & {
   readonly store: SessionStore; readonly quick: QuickTranslationClient; readonly ownerId: string; readonly topicId: string
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined; readonly visible?: boolean
+  readonly materials?: MaterialSubmissionsClient | undefined; readonly mainSessionId?: string | undefined
   readonly onOpenAssets?: ((ownerId: string, topicId: string, sessionId?: string, jobId?: string) => void) | undefined
 }): unknown {
   const [contentRevision, refresh] = react.useState(0)
+  react.useEffect(() => materials?.subscribe(() => refresh(value => value + 1)), [materials])
   const [searchSourceRevision, refreshSearchSources] = react.useState(0)
   const associated = associatedSessionId ? store.getSession(associatedSessionId) : undefined
   const validAssociated = associated?.topicId === topicId && !store.isSessionDeleted(associated.id) ? associated.id : undefined
@@ -203,13 +207,15 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
       ...groups.map(({ session, units, jobs }) => h('section', { key: session.id, className: 'dsh-tp-records-session', 'aria-label': `会话译文：${session.remark || session.name}`, 'data-session-id': session.id },
         h('h3', null, session.remark || session.name),
         session.archivedAt !== null ? h('p', { className: 'dsh-tp-muted' }, '会话已归档，请先在翻译工作区恢复后编辑。') : null,
-        ...jobs.map(record => h('div', { key: record.summary.unitId }, h(FileJobView, { jobs: fileJobs, record, viewFiles, onOpenAssets, ownerId }), ...excerpts(session.id, record.summary.unitId))),
+        ...jobs.map(record => h('div', { key: record.summary.unitId }, h(FileJobView, { jobs: fileJobs, record, viewFiles, recordIndex, visible, onOpenAssets, ownerId: mainSessionId ?? ownerId }), ...excerpts(session.id, record.summary.unitId))),
         ...units.map(unit => {
-          if (!isTextUnit(unit)) return h('div', { key: unit.id }, h(DocumentUnitView, { unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, visible, navigationRevision }), ...excerpts(session.id, unit.id))
+          if (!isTextUnit(unit)) return h('div', { key: unit.id }, h(DocumentUnitView, { unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, recordIndex, materials, executionOwner: mainSessionId, visible, navigationRevision }), ...excerpts(session.id, unit.id))
           const revisions = unit.revisions
           const key = JSON.stringify([session.id, unit.id]), draft = drafts.get(key), open = expanded.has(key)
           const pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
           const final = currentFinalRevision(unit)
+          const file = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
+          const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
           const latest = unit.revisions.at(-1)
           const candidate = latest?.accepted && latest.status === 'completed' && latest.text.trim() && latest.id !== final?.id ? latest : undefined
           const archived = session.archivedAt !== null
@@ -286,7 +292,10 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
             h('div', { className: 'dsh-tp-record-pair' },
               h('div', { className: 'dsh-tp-record-source', 'aria-label': '原文' },
                 h('div', { className: 'dsh-tp-record-column-heading' }, h('h4', null, '原文'),
-                  h('div', { className: 'dsh-tp-record-heading-actions' }, h(SourceOpenLink, { unit, session, objects, viewFiles, visible, navigationRevision }))),
+                  indexTarget && recordIndex ? h('small', { className: 'dsh-tp-muted' }, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, visible })) : null,
+                  h('div', { className: 'dsh-tp-record-heading-actions' },
+                    h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId, visible, disabled: !final || archived }),
+                    h(SourceOpenLink, { unit, session, objects, viewFiles, visible, navigationRevision }))),
                 h(RecordObjectText, { text: unit.source, target, objects, objectAssets, renderText: highlight(session.id, unit.id, 'source') }),
                 open && unit.sourceVersions.length > 1 ? h('div', null, ...unit.sourceVersions.slice(0, -1).map(source => h('section', { key: source.version },
                   h('small', { className: 'dsh-tp-muted' }, `历史原文版本 ${source.version}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null),

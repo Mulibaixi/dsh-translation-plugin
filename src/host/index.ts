@@ -7,6 +7,7 @@ import { TopicTermsService } from './topic-terms.js'
 import { EmbeddingService } from './embedding.js'
 import { MemorySearchService } from './memory-search.js'
 import { HistoryService } from './history.js'
+import { RecordIndexService } from './record-index.js'
 import { createTranslationFramework } from './framework.js'
 import { installQuickTranslation, type QuickHostContext } from './quick-translation.js'
 import { installTopicTools, type TopicHostContext } from './topic-tools.js'
@@ -35,6 +36,8 @@ export { TopicTermsService } from './topic-terms.js'
 export { EmbeddingService } from './embedding.js'
 export { MemorySearchService } from './memory-search.js'
 export { HistoryService } from './history.js'
+export { RecordIndexService } from './record-index.js'
+export type * from '../shared/record-index.js'
 export type * from '../shared/history-bundle.js'
 export type * from '../shared/history-remote.js'
 export type * from '../shared/embedding.js'
@@ -69,7 +72,7 @@ export type * from '../shared/translation-source-storage.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationOtherMemory', 'translationOtherMemoryFiles', 'translationArchive', 'translationTerms', 'translationEmbedding', 'translationMemorySearch', 'translationHistory', 'translationLocalData', 'translationFileJobs'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationOtherMemory', 'translationOtherMemoryFiles', 'translationArchive', 'translationTerms', 'translationEmbedding', 'translationMemorySearch', 'translationHistory', 'translationRecordIndex', 'translationLocalData', 'translationFileJobs'] as const
 
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
@@ -154,6 +157,9 @@ export function apply(ctx: QuickHostContext): void {
   const history = new HistoryService(ctx as TopicHostContext, otherMemory)
   ctx.provide('translationHistory', history)
   ctx.effect?.(() => () => history.dispose(), 'history lifetime')
+  const recordIndex = new RecordIndexService(ctx as TopicHostContext, otherMemory, history)
+  ctx.provide('translationRecordIndex', recordIndex)
+  ctx.effect?.(() => () => recordIndex.dispose(), 'record index lifetime')
   const terms = new TopicTermsService(ctx as TopicHostContext, otherMemory)
   ctx.provide('translationTerms', terms)
   ctx.effect?.(() => () => terms.dispose(), 'topic terms lifetime')

@@ -111,6 +111,16 @@ export class HistoryService {
     return { sessions, next: sessions.length < candidates.length ? sessions.at(-1)!.sessionId : null }
   }
   /** Filter scope and opened-session ids before loading any history body. Index builds omit the id filter. */
+  async recordSnapshot(scope: HistoryScope, peer: string): Promise<{ readonly bundle: HistoryBundle; readonly token: string; readonly isCurrent: () => boolean }> {
+    const guard: Guard = { scope, peer, generation: this.generation }
+    this.check(guard); await this.tail
+    const seat = await this.seat(guard); this.check(guard)
+    if (!seat?.current) throw failure('history_unavailable', '文件记录已删除或尚未保存。')
+    const bundle = seat.current
+    return { bundle, token: seat.token, isCurrent: () => {
+      try { this.check(guard); return this.seats.get(key(scope))?.current === bundle } catch { return false }
+    } }
+  }
   async retrievalSnapshots(namespaceId: string, peer: string, topicId?: string, sessionIds?: readonly string[]): Promise<readonly { readonly scope: HistoryScope; readonly token: string; readonly current: HistoryBundle; readonly saved: HistoryBundle | null }[]> {
     const guard: Guard = { scope: { namespaceId, topicId: topicId ?? '*', sessionId: '*' }, peer, generation: this.generation }
     this.check(guard); await this.tail
