@@ -40,8 +40,8 @@ When you reach the next chapter, keep established names and terminology within r
 
 ## Requirements
 
-- DSH `0.2.0-rc.2`, `0.2.1-rc.2`, or `0.2.1-rc.3`, with local plugin support and a configured model.
-- **Quick mode** needs no Composer extension. **Normal mode** requires a matching `dsh-composer-extension` and Composer submission host patch.
+- DSH `>=0.2.0-rc.2`, with local plugin support, the required interfaces, and a configured model. Compatibility does not enumerate individual DSH versions.
+- **Quick mode** needs no Composer extension. **Normal mode** requires a companion `dsh-composer-extension` and submissions protocol 1. When the host lacks this interface, the extension matches patches by target-module fingerprints; unrelated DSH updates do not require adaptation.
 - Source builds require Node.js 22 or newer, pnpm, and the Composer extension source directory alongside this repository. The DSH Host must load built-in `node:sqlite`.
 - Current TXT/Markdown text files must use UTF-8 and can be up to 2 MiB each. Support boundaries for other formats are described below.
 
@@ -49,19 +49,24 @@ When you reach the next chapter, keep established names and terminology within r
 
 ### Install
 
-1. Build the Composer extension according to its instructions, then run in this plugin directory:
+1. For Normal mode, first install a matching Composer extension distribution according to its instructions. For Quick mode, proceed to the next step.
+2. Obtain a `dsh-translation-plugin-<version>.tgz` distribution package. Enter its full local path or download URL in DSH's plugin manager, then install and enable it. Distribution packages include the build output and need no local build.
+3. Open **翻译 (Translation)** in the main chat's right sidebar and create a topic and session. Restart when requested by the plugin manager. If Composer reports a prepared patch, exit DSH completely and reopen it before using Normal mode.
+
+### Build from source
+
+Place the two repositories side by side. Build the Composer extension according to its instructions, then run in this plugin directory:
 
    ```powershell
    pnpm install --frozen-lockfile
    pnpm build
    ```
 
-2. In DSH's plugin manager, install and enable this directory as the local `dsh-translation-plugin`. Normal mode also needs the companion extension and host patch.
-3. Fully restart DSH, open **翻译 (Translation)** in the main chat's right sidebar, and create a topic and session.
+After building, install this directory in DSH's plugin manager or run `pnpm pack` to create a distribution package.
 
 ### Update
 
-Back up important material, update both source directories, build the Composer extension followed by the translation plugin, and fully restart DSH. When upgrading DSH, check that the extension and host patch match. See the [migration notes (简体中文)](docs/user-guide.zh-CN.md#已有资料的升级与迁移) for existing material and [CHANGELOG](CHANGELOG.md) for version changes.
+Back up important material, install the newer Composer extension and translation plugin distributions in that order through the plugin manager, and follow any restart or linked-component installation instructions. For source installations, update both repositories and rebuild them in the same order first. After upgrading DSH, check linked-component status. A new version number alone does not block loading; changes to required interfaces or patch target modules may need adaptation. See the [migration notes (简体中文)](docs/user-guide.zh-CN.md#已有资料的升级与迁移) for existing material and [CHANGELOG](CHANGELOG.md) for version changes.
 
 ## Usage
 
