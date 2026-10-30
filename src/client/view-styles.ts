@@ -1,5 +1,13 @@
 export const TOPIC_SUBMENU_WIDTH = 220
 
+export const materialAttachmentStyles = `
+.dsh-translation-material-marker { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; color: var(--dsw-alias-label-caption, #888); font: inherit; font-size: 12px; line-height: 20px; }
+.dsh-translation-material-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-translation-material-toggle { appearance: none; flex: none; border: 0; border-radius: 5px; background: transparent; box-shadow: none; padding: 1px 5px; color: inherit; font: inherit; line-height: inherit; white-space: nowrap; cursor: pointer; }
+.dsh-translation-material-toggle:hover { background: var(--dsw-alias-interactive-bg-hover, #8882); color: var(--dsw-alias-label-primary, inherit); }
+.dsh-translation-material-toggle:focus-visible { outline: 2px solid var(--dsw-focus-ring-color, #568bf0); outline-offset: 2px; }
+`
+
 export const styles = `
 .dsh-tp { box-sizing: border-box; color: var(--dsw-alias-label-primary, inherit); font: inherit; font-size: 14px; line-height: 1.6; }
 .dsh-tp * { box-sizing: border-box; }

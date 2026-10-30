@@ -4,6 +4,7 @@ import type { LocalDataRemotePort } from '../shared/local-data.js'
 import { ReferenceStore } from './reference-store.js'
 import { OtherMemoryClient, type OtherMemoryRemotePort, type OtherMemoryFilesRemotePort } from './other-memory-client.js'
 import { h, react } from './react.js'
+import { materialAttachmentStyles } from './view-styles.js'
 import { PanelRouter, SettingsView, MemoryAssetsView } from './views.js'
 import { createSessionStore } from './session-store.js'
 import { HistoryPersistenceClient } from './history-persistence.js'
@@ -453,8 +454,10 @@ export function apply(ctx: ClientPluginContext): void {
       const attachment = !frozen && ownerId ? materials.getAttachment(ownerId) : undefined
       if (!attachment || !ownerId) return null
       return h('span', { className: 'dsh-translation-material-marker', role: 'status' },
-        h('span', null, attachment.omitted ? '本次不附带待译稿' : attachment.label),
-        attachment.available ? h('button', { type: 'button', onClick: () => materials.setOmit(ownerId, !attachment.omitted) }, attachment.omitted ? '恢复附带' : '本次不附带') : null)
+        h('style', null, materialAttachmentStyles),
+        h('span', { className: 'dsh-translation-material-label', title: attachment.omitted ? '本次不附带待译稿' : attachment.label }, attachment.omitted ? '本次不附带待译稿' : attachment.label),
+        attachment.available ? h('button', { type: 'button', className: 'dsh-translation-material-toggle', 'aria-pressed': attachment.omitted,
+          onClick: () => materials.setOmit(ownerId, !attachment.omitted) }, attachment.omitted ? '恢复附带' : '本次不附带') : null)
     }
     ctx.effect(() => ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
       { name: 'conversation.input.left', id: `${CLIENT_ID}-material`, order: 40 }, MaterialAttachmentMarker,

@@ -114,10 +114,9 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const session = this.sessions.getSession(target.translationSessionId)
     const unit = this.sessions.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
     const revision = unit && isTextUnit(unit) ? unit.revisions.at(-1) : undefined
-    const file = this.materials?.getFileUnits(target.translationSessionId).find(file => file.materialId === (unit && isTextUnit(unit) ? unit.material?.materialId : undefined))
     if (ownerId !== target.mainSessionId || !session || !this.sessions.isSessionOpen(ownerId, session.id) || !unit || !isTextUnit(unit) || unit.deletion ||
-      unit.sourceVersion !== target.sourceVersion || !revision || revision.id !== request.revisionId || revision.status !== 'completed' || revision.sourceVersion !== unit.sourceVersion || !file)
-      throw Object.assign(new Error('文件原文或译文版本已变化，或不属于已打开会话，请重新读取后总结提案。'), { code: 'stale_proposals' })
+      unit.sourceVersion !== target.sourceVersion || !revision || revision.id !== request.revisionId || revision.status !== 'completed' || revision.sourceVersion !== unit.sourceVersion)
+      throw Object.assign(new Error('原文或译文版本已变化，或不属于已打开会话，请重新读取后总结提案。'), { code: 'stale_proposals' })
     const proposals: FileJobProposal[] = request.proposals.map(({ quotes, ...proposal }) => ({ ...proposal, origin: 'inferred', disposition: 'pending', evidence: quotes.map((quote, index) => {
       const offset = unit.source.indexOf(quote)
       if (offset < 0) throw new Error(`候选 ${proposal.candidateId} 的 quotes[${index}] 未出现在此单元原文中，请复制准确原文。`)
