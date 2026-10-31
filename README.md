@@ -1,8 +1,9 @@
-# DeepSeek Translation Plugin
+# DeepSeek Harness Translation Plugin
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/Mulibaixi/dsh-translation-plugin?label=release)](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest)
 
 **Keep long translations moving, and give every revision something to build on.**
 
@@ -49,8 +50,8 @@ When you reach the next chapter, keep established names and terminology within r
 
 ### Install
 
-1. For Normal mode, first install a matching Composer extension distribution according to its instructions. For Quick mode, proceed to the next step.
-2. Obtain a `dsh-translation-plugin-<version>.tgz` distribution package. Enter its full local path or download URL in DSH's plugin manager, then install and enable it. Distribution packages include the build output and need no local build.
+1. For Normal mode, install Composer **0.4.5** first from its [Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases/latest). Quick mode does not require Composer.
+2. Download `dsh-translation-plugin-<version>.tgz` from this plugin's [Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest). Enter its full local path or the asset's download URL in DSH's plugin manager, then install and enable it. Choose the `.tgz` asset; distribution packages include the build output and need no local build.
 3. Open **翻译 (Translation)** in the main chat's right sidebar and create a topic and session. Restart when requested by the plugin manager. If Composer reports a prepared patch, exit DSH completely and reopen it before using Normal mode.
 
 ### Build from source
@@ -78,6 +79,10 @@ The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics
 
 **Put sources in the translation input, and requirements or revision feedback in the main chat.** Use Quick mode for a direct translation, or Normal mode for main-chat coordination, discussion, and repeated refinement.
 
+Terminology and structured archives support adopting pending proposals and review items by category. Batch adoption keeps the list and edit drafts visible, restores entry actions when finished, and reports failures.
+
+After a topic reference file is uploaded, the main model delegates two independent full-file annotations and parallel cross-reviews to native subagents, resolves substantive issues, and saves one complete plan. Bilingual pairs and fine semantic boundaries are preserved. This requires a model that can hold the entire file and result, and two available subagent slots. Use **重试主模型分段 (Retry segmentation)** when unfinished; completed plans are preserved unless resegmentation is requested.
+
 Translation actions identify the current task and exact material. Interrupted history does not authorize automatic continuation. When the intended task or target remains genuinely conflicting or unclear, the main model is instructed to ask you before proceeding; it can still load tools and check relevant context. Material accompanying a chat message follows that message's stated purpose, including learning or discussion.
 
 For TXT and Markdown file history, choose **嵌入原文 (Embed source)** next to **重译 (Retranslate)** or on the source row in translation records. The main model marks semantic chunks and exclusions; only that original's retained prose is embedded. Code, Markdown structure and metadata remain available through exact record search. File translations are read on demand rather than embedded, and changing the final translation reuses the original's vectors. Existing file history must be selected explicitly; unselected files are not automatically indexed.
@@ -93,12 +98,12 @@ For TXT and Markdown file history, choose **嵌入原文 (Embed source)** next t
 
 ## Projects and documentation
 
-The GitHub links below use the planned publication URLs.
-
 | Entry | Link |
 | --- | --- |
 | Translation plugin | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin) |
 | Composer extension | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension) |
+| Distribution packages | [Translation releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer releases](https://github.com/Mulibaixi/dsh-composer-extension/releases) |
+| Bug reports | [Translation plugin issues](https://github.com/Mulibaixi/dsh-translation-plugin/issues) |
 | User guide (简体中文) | [Detailed operations and issue reports](docs/user-guide.zh-CN.md) |
 | Changes | [CHANGELOG](CHANGELOG.md) |
 | Contributions | [CONTRIBUTING](CONTRIBUTING.md) |

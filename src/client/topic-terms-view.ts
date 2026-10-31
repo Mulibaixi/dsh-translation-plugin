@@ -134,13 +134,14 @@ function mutationMessage(result: TermMutationResult): true | string {
   if (result.status === 'invalid') return '术语内容或来源无效，未修改此条目。'
   return result.status === 'updated' || result.status === 'unchanged' ? true : '操作未完成，请核对后重试。'
 }
-export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect, hideExport = false, targetLanguage, active = true, evidenceContextKey }: {
+export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, onDelete, onExport, bridgeReason, onReconnect, hideExport = false, targetLanguage, active = true, evidenceContextKey, adoptionPending = false }: {
   readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly ownerId: string; readonly topicId: string; readonly topicName: string
   readonly onDelete: (snapshot: TopicTermSnapshot, entry: TopicTerm) => Promise<boolean>; readonly onExport: (result: TopicTermsExport) => void
   readonly bridgeReason?: string | undefined; readonly onReconnect?: (() => void) | undefined
   readonly hideExport?: boolean | undefined
   readonly targetLanguage?: string | undefined
   readonly active?: boolean | undefined; readonly evidenceContextKey?: string | undefined
+  readonly adoptionPending?: boolean | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => terms.subscribe(() => refresh(value => value + 1)), [terms])
@@ -165,13 +166,13 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
   if (!readState.snapshot) return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题术语：${topicName}` },
     h('p', { role: readState.status === 'error' ? 'alert' : 'status', className: 'dsh-tp-message' }, readState.error ?? '正在读取主题术语…'),
     readState.status === 'error' ? h('button', { type: 'button', onClick: () => { void terms.reload(ownerId, topicId) } }, '重试读取术语') : null)
-  const snapshot = readState.snapshot, pending = actionPending || readState.status !== 'ready'
+  const snapshot = readState.snapshot, pending = actionPending || adoptionPending || readState.status !== 'ready'
   const scopedSession = sessions.getActiveSession(ownerId)
   const scopedLanguage = targetLanguage ?? (scopedSession?.topicId === topicId ? scopedSession.targetLanguage :
     sessions.getAvailableSessions(ownerId).find(session => session.topicId === topicId)?.targetLanguage) ?? sessions.getSettings().targetLanguage
   const note = [
     '同主题共用；快译不使用。',
-    `保存状态：${storageLabels[terms.getStatus(ownerId, topicId)]}`,
+    `保存状态：${readState.status === 'error' ? '读取失败' : adoptionPending ? '正在采用…' : readState.status === 'loading' ? '正在刷新' : storageLabels[terms.getStatus(ownerId, topicId)]}`,
   ].join(' ')
   const needle = query.trim().toLocaleLowerCase()
   const entries = snapshot.entries.filter(entry => (status === 'all' || status === entry.status) &&
@@ -228,12 +229,12 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
     if (alive.current) setRetry(result.status === 'save_failed' ? { kind, id: entry.id } : undefined)
     return mutationMessage(result)
   }
-  return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题术语：${topicName}` },
+  return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题术语：${topicName}`, 'aria-busy': adoptionPending || readState.status === 'loading' },
     h('div', { className: 'dsh-tp-asset-toolbar' },
       h('div', { className: 'dsh-tp-unit-header' },
         h('div', { className: 'dsh-tp-asset-heading' }, h('h3', null, '主题术语'), h('small', { className: 'dsh-tp-muted dsh-tp-asset-note', title: note }, note)),
         h('div', { className: 'dsh-tp-actions' },
-          h('button', { type: 'button', disabled: actionPending || readState.status === 'loading', onClick: () => { void terms.reload(ownerId, topicId).then(loaded => { if (!loaded && alive.current) setFailure('最新主题术语无法读取，编辑稿保留。') }) } }, '刷新术语'),
+          h('button', { type: 'button', disabled: actionPending || adoptionPending || readState.status === 'loading', onClick: () => { void terms.reload(ownerId, topicId).then(loaded => { if (!loaded && alive.current) setFailure('最新主题术语无法读取，编辑稿保留。') }) } }, '刷新术语'),
           h('button', { type: 'button', disabled: pending || Boolean(form), onClick: () => startEdit() }, '新增术语'),
           hideExport ? null : h('button', { type: 'button', onClick: () => exportTerms('json') }, '导出 JSON'), hideExport ? null : h('button', { type: 'button', onClick: () => exportTerms('markdown') }, '导出 Markdown'))),
       h('div', { className: 'dsh-tp-asset-filters' },
@@ -244,7 +245,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
       bridgeReason ? h('small', { role: 'status', className: 'dsh-tp-muted' }, bridgeReason) : null,
       bridgeReason && onReconnect ? h('button', { type: 'button', onClick: onReconnect }, '重新连接主会话') : null,
       terms.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, terms.getNotice()) : null,
-      readState.status !== 'ready' ? h('p', { role: readState.status === 'error' ? 'alert' : 'status', className: 'dsh-tp-muted' }, readState.error ?? '正在刷新主题术语，编辑稿保留。') : null,
+      readState.status === 'error' ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, readState.error ?? '最新术语读取失败，当前显示上次读取内容。') : null,
       failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, failure) : null,
       retry && snapshot.entries.some(entry => entry.id === retry.id) ? h('button', { type: 'button', disabled: pending, onClick: () => {
         const entry = snapshot.entries.find(entry => entry.id === retry.id)
@@ -285,8 +286,10 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
             return message
           }) } }, pending ? '正在保存…' : '保存并采用'), h('button', { type: 'button', disabled: pending, onClick: () => { drafts.current.delete(form.id); setForm(undefined); setOriginal(undefined) } }, '取消')),
         ) : entry ? h('div', { className: 'dsh-tp-term-details' },
-          h('h3', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`), h('div', { className: 'dsh-tp-muted' }, `${labels[entry.status]} · ${entry.sourceLanguage ?? '未指定源语言'} → ${entry.targetLanguage} · ${entry.acceptance ? entry.origin === 'inferred' ? '模型推断 · 用户已采纳' : `${origins[entry.origin]} · 用户已采纳` : origins[entry.origin]} · 条目版本 ${entry.version}`),
-          h('button', { type: 'button', disabled: pending, onClick: () => startEdit(entry) }, '编辑'),
+          h('div', { className: 'dsh-tp-asset-detail-header' },
+            h('h3', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`),
+            h('button', { type: 'button', disabled: pending, onClick: () => startEdit(entry) }, '编辑')),
+          h('div', { className: 'dsh-tp-muted' }, `${labels[entry.status]} · ${entry.sourceLanguage ?? '未指定源语言'} → ${entry.targetLanguage} · ${entry.acceptance ? entry.origin === 'inferred' ? '模型推断 · 用户已采纳' : `${origins[entry.origin]} · 用户已采纳` : origins[entry.origin]} · 条目版本 ${entry.version}`),
           entry.sense ? h('div', null, `说明：${entry.sense}`) : null, entry.aliases.length ? h('div', null, `别名：${entry.aliases.join('、')}`) : null,
           entry.forbidden.length ? h('div', null, `避免：${entry.forbidden.join('、')}`) : null,
           ...entry.evidence.map((reference, index) => h(TopicEvidenceView, { key: `${ownerId}:${topicId}:${entry.id}:${entry.version}:${index}`, sessions, terms, snapshot, reference, active, contextKey: evidenceContextKey })),

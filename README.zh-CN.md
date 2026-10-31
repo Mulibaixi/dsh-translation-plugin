@@ -1,8 +1,9 @@
-# DeepSeek 翻译插件
+# DeepSeek Harness 翻译插件
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 [![许可证：MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/Mulibaixi/dsh-translation-plugin?label=release)](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest)
 
 **让长篇翻译持续推进，让每一轮润色都有积累。**
 
@@ -49,8 +50,8 @@
 
 ### 安装
 
-1. 普通模式先按配套 Composer 扩展的说明安装匹配的分发包；快译可直接进入下一步。
-2. 取得 `dsh-translation-plugin-<版本>.tgz` 分发包，在 DSH 插件管理器的安装输入框中填写安装包的完整路径或下载链接，安装并启用。分发包包含构建产物，使用者无需本地构建。
+1. 普通模式先从 [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases/latest) 安装配套的 **Composer 0.4.5**；快译无需 Composer。
+2. 从本插件的 [Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest) 下载 `dsh-translation-plugin-<版本>.tgz`，在 DSH 插件管理器的安装输入框中填写安装包的完整路径或附件下载链接，安装并启用。选择 `.tgz` 附件；分发包包含构建产物，使用者无需本地构建。
 3. 在主聊天右侧栏打开“翻译”，建立主题和会话。按插件管理器提示重启；若 Composer 提示补丁已准备，则正常完全退出并重开 DSH 后再使用普通模式。
 
 ### 从源码构建
@@ -78,6 +79,10 @@ Composer 只有实际需要替换宿主补丁时，才必须正常完全退出�
 
 **翻译输入框放原稿，主聊天输入框放要求和修改意见。** 选择快译直接取得译文，或在普通模式中通过主聊天组织翻译、讨论和反复润色。
 
+术语与结构化档案支持按类别一键采用待确认、待复核条目；批量处理时保留列表和编辑稿，完成后恢复条目操作，失败时显示提示。
+
+主题参考文件上传后，由主模型安排两个原生子代理独立标注整份文件并并行交叉复核，核对必要分歧后统一保存分段。保留双语句对与细粒度语义边界；需要可承载全文及完整结果的模型和两个可用子代理名额。未完成时可点击“重试主模型分段”；已完成方案不会自动重做。
+
 翻译操作会明确本次任务及准确材料；已中断历史不代表允许自动续做。任务或对象确实存在矛盾、无法确定时，主模型应先询问，再继续处理，仍可主动加载工具核对必要上下文。随主聊天附带的材料遵从本条消息明确的学习、讨论等用途。
 
 TXT、Markdown 文件历史可在“重译”右侧或译文记录原文行选择**嵌入原文**。主模型标记语义分段与排除内容后，仅嵌入该原文文件的保留正文；代码、Markdown 结构和元信息仍可精确查找。文件译文按需读取，不参与嵌入；切换最终译文可复用原文向量。已有文件历史也需手动选择，未选择文件不会自动建立索引。
@@ -93,12 +98,12 @@ TXT、Markdown 文件历史可在“重译”右侧或译文记录原文行选�
 
 ## 项目与文档
 
-GitHub 仓库链接按计划发布地址预留。
-
 | 入口 | 链接 |
 | --- | --- |
 | 翻译插件 | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin) |
 | Composer 扩展 | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension) |
+| 分发包 | [翻译插件发行页](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer 发行页](https://github.com/Mulibaixi/dsh-composer-extension/releases) |
+| 问题反馈 | [翻译插件 Issues](https://github.com/Mulibaixi/dsh-translation-plugin/issues) |
 | 中文使用指南 | [详细操作与问题反馈](docs/user-guide.zh-CN.md) |
 | 更新记录 | [CHANGELOG](CHANGELOG.md) |
 | 贡献指南 | [CONTRIBUTING](CONTRIBUTING.md) |

@@ -1,6 +1,6 @@
 # 贡献指南
 
-开发需要 Node.js 22 或更高版本及 pnpm。运行 `pnpm install --frozen-lockfile` 安装依赖，之后执行 `pnpm hooks:install`；提交代码前运行 `pnpm test`。
+开发需要 Node.js 22 或更高版本及 pnpm。按 README 将配套 Composer 源码并排放置并先完成构建，再运行 `pnpm install --frozen-lockfile` 安装依赖，之后执行 `pnpm hooks:install`。公开源码的构建检查入口为 `pnpm build`，无需本地测试文件。
 
 实现应遵循 DSH 公开接口和仓库现有模块边界。不得提交凭据、用户数据、内部设计资料、依赖目录或构建产物。
 
@@ -8,7 +8,7 @@
 
 已有测试应通过 `git rm --cached` 停止跟踪并提交索引删除，保留本地文件；不删除本地测试，也不重写历史。`.gitignore` 只阻止未跟踪文件入库，不能代替已有测试的停止跟踪操作。
 
-`pnpm test` 构建后只运行 `tests/*.test.mjs`；需要外部 DSH 运行环境的检查使用 `*.integration.mjs`，由 `pnpm test:native` 运行。测试优先检查可观察的操作结果与实际回归，不锁定 CSS 文本、像素值或 JSON 字段顺序，也不复制第三方组件实现来验证其内部行为。组件桩只能验证插件与组件的交互，不能证明真实布局或桌面运行正确。
+`pnpm test` 和 `pnpm test:native` 是维护者准备好本地用例后的验证入口，测试文件不随公开仓库提供。涉及代码的提交前运行已具备的相关检查；本地完整用例就绪时运行 `pnpm test`。`pnpm test` 构建后只运行 `tests/*.test.mjs`；需要外部 DSH 运行环境的检查使用 `*.integration.mjs`，由 `pnpm test:native` 运行。测试优先检查可观察的操作结果与实际回归，不锁定 CSS 文本、像素值或 JSON 字段顺序，也不复制第三方组件实现来验证其内部行为。组件桩只能验证插件与组件的交互，不能证明真实布局或桌面运行正确。
 
 `test:native` 运行上述两个目录的全部集成用例，最多四个文件并发。普通翻译以当前 `direct` 流程为准，覆盖慢保存、中断恢复、上下文、原文纠错和资源生命周期，同时验证历史读取与未结算任务收束。已停用的执行流程及无引用夹具移出活动目录，备份只保留在本地忽略目录。
 

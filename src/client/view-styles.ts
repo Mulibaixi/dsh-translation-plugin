@@ -162,6 +162,9 @@ export const styles = `
 .dsh-tp-asset-list { border-right: 1px solid var(--dsw-alias-border-l2, #8883); }
 .dsh-tp-asset-choice { display: block; width: 100%; text-align: left; }
 .dsh-tp-asset-details h3 { margin: 10px 0 4px; }
+.dsh-tp-asset-detail-header { display: flex; align-items: baseline; gap: 8px; }
+.dsh-tp-asset-detail-header h3 { flex: 1; min-width: 0; }
+.dsh-tp-asset-detail-header > button { flex: none; white-space: nowrap; font-size: 14px; font-weight: 400; }
 .dsh-tp-term-form textarea { min-height: 48px; resize: vertical; }
 /* Continuous translation records: one scroll surface, paired rows in reading order. */
 .dsh-tp-records-scope { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }

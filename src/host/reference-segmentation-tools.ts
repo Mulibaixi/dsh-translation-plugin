@@ -1,5 +1,5 @@
 import { referenceExact, referenceInteger, referenceObject, referenceString } from '../shared/reference-memory.js'
-import { REFERENCE_SEGMENTATION_GUIDANCE } from '../shared/reference-segmentation.js'
+import { REFERENCE_SEGMENTATION_GUIDANCE, referenceSegmentationComplete } from '../shared/reference-segmentation.js'
 import { referenceAnchorPage, referenceBoundaryEnds, referencePlanSummary } from './reference-segments.js'
 import { diagnosticSpan } from './diagnostics.js'
 import type { OtherMemoryService } from './other-memory.js'
@@ -10,11 +10,11 @@ import type { MainAgent, TopicHostContext, TopicToolsService, ToolExecution } fr
 export function registerReferenceSegmentationTools(ctx: TopicHostContext, memory: OtherMemoryService, files: OtherMemoryFilesService, topics: TopicToolsService, agent: MainAgent,
   define: (options: Record<string, unknown>) => unknown, register: (definition: unknown) => () => void): readonly (() => void)[] {
   const text = { type: 'string', required: true }, integer = { type: 'integer', required: true }, identity = { topicId: text, id: text, version: integer }
-  return ['read', 'write'].map(action => register(define({
+  const definitions = ['read', 'write'].map(action => register(define({
     name: action === 'read' ? 'translation_reference_segmentation_read' : 'translation_reference_segment',
     description: (action === 'read' ? 'Read one page of original file text with stable line/sentence end anchors and the current segmentation progress. Omit after to start; follow next for full reading. Existing segmentEnd flags identify current boundaries. No model or embedding call. '
       : 'Mark boundaries in an existing original/bilingual file; never send rewritten text or numeric offsets. Submit endAnchors in increasing order, mode append to continue or replace to start a requested replacement. expectedPlanVersion comes from the latest read/write receipt. No automatic splitting or partial-file embedding. A complete valid plan automatically queues indexing when an embedding service is configured. ') + REFERENCE_SEGMENTATION_GUIDANCE,
-    parameters: action === 'read' ? { ...identity, after: { type: 'string' } } : { ...identity, expectedPlanVersion: { type: 'integer', required: true },
+    parameters: action === 'read' ? { ...identity, after: { type: 'string' }, proposalId: { type: 'string', description: 'Optional prepared proposal: mark candidate A/B boundaries on the same bounded original page.' } } : { ...identity, expectedPlanVersion: { type: 'integer', required: true },
       mode: { type: 'string', enum: ['append', 'replace'], required: true }, endAnchors: { type: 'array', items: { type: 'string' }, required: true } },
     output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
     execute: async (raw: unknown, exec: ToolExecution) => {
@@ -25,7 +25,7 @@ export function registerReferenceSegmentationTools(ctx: TopicHostContext, memory
         return peer
       }
       check(); referenceObject(raw)
-      referenceExact(raw, action === 'read' ? ['topicId', 'id', 'version'] : ['topicId', 'id', 'version', 'expectedPlanVersion', 'mode', 'endAnchors'], action === 'read' ? ['after'] : [])
+      referenceExact(raw, action === 'read' ? ['topicId', 'id', 'version'] : ['topicId', 'id', 'version', 'expectedPlanVersion', 'mode', 'endAnchors'], action === 'read' ? ['after', 'proposalId'] : [])
       referenceString(raw.topicId); referenceString(raw.id); referenceInteger(raw.version, 1)
       if (raw.after !== undefined) referenceString(raw.after, 64)
       const scope = await topics.requestOwned(agent.id, { kind: 'settings_scope', topicId: raw.topicId as string }, exec)
@@ -34,7 +34,15 @@ export function registerReferenceSegmentationTools(ctx: TopicHostContext, memory
       const original = await files.readText(request, check(), exec.signal)
       check()
       const identityResult = { id: original.entry.id, version: original.entry.version, name: original.entry.source.name, totalCodePoints: original.entry.source.totalCodePoints }
-      if (action === 'read') return { file: identityResult, ...referenceAnchorPage(original.text, original.entry.segmentation, raw.after as string | undefined) as object }
+      if (action === 'read') {
+        const page = referenceAnchorPage(original.text, original.entry.segmentation, raw.after as string | undefined) as { readonly rows: readonly { readonly anchor: string }[] }
+        if (raw.proposalId === undefined) return { file: identityResult, ...page }
+        referenceString(raw.proposalId)
+        const draft = files.segmentation.proposal(raw.proposalId, agent.id, check(), original.entry)
+        const a = new Set(draft.reviewed[0]!.endAnchors), b = new Set(draft.reviewed[1]!.endAnchors)
+        return { file: identityResult, ...page, proposalId: raw.proposalId,
+          rows: page.rows.map(row => ({ ...row, candidateAEnd: a.has(row.anchor), candidateBEnd: b.has(row.anchor) })) }
+      }
       referenceInteger(raw.expectedPlanVersion)
       if (!['append', 'replace'].includes(String(raw.mode)) || !Array.isArray(raw.endAnchors) || !raw.endAnchors.length || raw.endAnchors.length > 512) throw new Error('每批须提交 1～512 个递增分段定位点。')
       for (const anchor of raw.endAnchors) referenceString(anchor, 64)
@@ -60,4 +68,68 @@ export function registerReferenceSegmentationTools(ctx: TopicHostContext, memory
       } catch (error) { report(exec.signal.aborted ? 'cancelled' : 'failed', {}, error); throw error }
     },
   })))
+  for (const action of ['prepare', 'commit'] as const) definitions.push(register(define({
+    name: `translation_reference_segment_${action}`,
+    description: action === 'prepare'
+      ? 'Prepare two independent COMPLETE full-file semantic boundary plans using fresh native subagents, then cross-review both in parallel. No plan is saved. Returns a proposalId, candidate counts and substantive unresolved ranges. Retrying reuses completed work in this Host. Existing complete plans are preserved; resegment:true is only for user-requested resegmentation. Do not manually page through the full file first. ' + REFERENCE_SEGMENTATION_GUIDANCE
+      : 'Save one COMPLETE cross-reviewed candidate after the main model has resolved substantive issues against original context. Choose A or B; optional addEndAnchors/removeEndAnchors correct only identified errors, never mechanically combine both plans. Use the exact proposalId from prepare. The Host validates the entire plan and its captured file/plan version, then saves once and queues indexing. Candidate differences alone do not require correction. queued is not finished indexing.',
+    parameters: action === 'prepare' ? { ...identity, resegment: { type: 'boolean', description: 'Only true when the user explicitly asked to replace an already completed plan.' } }
+      : { ...identity, proposalId: text, candidate: { type: 'string', enum: ['A', 'B'], required: true },
+        addEndAnchors: { type: 'array', items: { type: 'string' } }, removeEndAnchors: { type: 'array', items: { type: 'string' } } },
+    output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+    execute: async (raw: unknown, exec: ToolExecution) => {
+      const check = (): string => {
+        exec.signal.throwIfAborted()
+        const peer = topics.ownerPeer(agent.id, agent)
+        if (exec.agent !== agent || !peer) throw new Error('参考文件分段不属于此主会话连接。')
+        return peer
+      }
+      check(); referenceObject(raw)
+      referenceExact(raw, action === 'prepare' ? ['topicId', 'id', 'version'] : ['topicId', 'id', 'version', 'proposalId', 'candidate'],
+        action === 'prepare' ? ['resegment'] : ['addEndAnchors', 'removeEndAnchors'])
+      referenceString(raw.topicId); referenceString(raw.id); referenceInteger(raw.version, 1)
+      const scope = await topics.requestOwned(agent.id, { kind: 'settings_scope', topicId: raw.topicId }, exec)
+      if (scope.kind !== 'settings_scope' || scope.scope.topicId !== raw.topicId || scope.scope.namespaceId !== topics.namespaceForAgent(agent.id)) throw new Error('参考文件分段范围回执无效。')
+      const request = { ...scope.scope, topicId: raw.topicId, id: raw.id, version: raw.version }, original = await files.readText(request, check(), exec.signal)
+      const file = { id: original.entry.id, version: original.entry.version, name: original.entry.source.name, totalCodePoints: original.entry.source.totalCodePoints }
+      if (action === 'prepare') {
+        if (raw.resegment !== undefined && typeof raw.resegment !== 'boolean') throw new Error('重新分段参数无效。')
+        if (referenceSegmentationComplete(original.entry) && raw.resegment !== true) return { file, alreadyComplete: true, ...referencePlanSummary(original.text, original.entry.segmentation),
+          nextStep: 'The saved plan is already complete. Do not start another annotation unless the user requested resegmentation. Index completion is a separate status.' }
+        const verify = async (): Promise<void> => {
+          const latest = await memory.getReference(request, check())
+          check()
+          if (!latest || latest.source.sha256 !== original.entry.source.sha256 || (latest.segmentation?.version ?? 0) !== (original.entry.segmentation?.version ?? 0)) throw new Error('参考文件或分段方案已变化，未采用旧候选。')
+        }
+        const proposal = await files.segmentation.prepare(original.entry, original.text, agent.id, check(), verify, exec.signal)
+        check()
+        return { file, ...proposal as object }
+      }
+      referenceString(raw.proposalId)
+      if (raw.candidate !== 'A' && raw.candidate !== 'B') throw new Error('分段候选选择无效。')
+      const amendments = (value: unknown): string[] => {
+        if (value === undefined) return []
+        if (!Array.isArray(value) || value.length > 20000) throw new Error('分段修正清单无效。')
+        for (const anchor of value) referenceString(anchor, 64)
+        return value as string[]
+      }
+      const endAnchors = files.segmentation.boundaries(raw.proposalId, agent.id, check(), original.entry, raw.candidate,
+        amendments(raw.addEndAnchors), amendments(raw.removeEndAnchors))
+      const report = diagnosticSpan(ctx, 'memory.segmentation.commit', { segments: endAnchors.length }, exec.callId)
+      try {
+        const saved = await memory.putReferenceSegmentation({ ...request, expectedPlanVersion: original.entry.segmentation?.version ?? 0,
+          mode: 'replace', ends: referenceBoundaryEnds(original.text, endAnchors) }, check(), () => { check() })
+        files.segmentation.forget(raw.proposalId)
+        let indexing = 'queued', reason: string | undefined
+        try {
+          const search = ctx.get?.('translationMemorySearch') as MemorySearchService | undefined
+          if (!search) throw new Error('语义索引服务尚未就绪。')
+          await search.buildForPeer({ namespaceId: request.namespaceId, rebuild: false }, check())
+        } catch (error) { indexing = 'unavailable'; reason = (error as Error).message }
+        report('completed', { saved: true, persistence: saved.persistence, indexing, planVersion: saved.segmentation!.version })
+        return { file, ...referencePlanSummary(original.text, saved.segmentation), persistence: saved.persistence, indexing, ...(reason ? { reason } : {}) }
+      } catch (error) { report(exec.signal.aborted ? 'cancelled' : 'failed', {}, error); throw error }
+    },
+  })))
+  return [...definitions, () => files.segmentation.releaseAgent(agent.id)]
 }

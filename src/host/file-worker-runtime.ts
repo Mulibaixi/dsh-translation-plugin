@@ -8,10 +8,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import { diagnosticSpan } from './diagnostics.js'
 
 /** Public 0.2.0-rc.2 runs and 0.2.1-rc.2 Activations share the same collected result. */
 interface NativeAgentOptions { readonly provider?: string; readonly model?: string; readonly reasoningEffort?: string; readonly maxTokens?: number }
-interface NativeEvent { readonly type: string; readonly data: { readonly header?: { readonly config: NativeAgentOptions }; readonly message?: { readonly source?: { readonly provider?: string; readonly model?: string } }; readonly usage?: { readonly inputTokens: number; readonly outputTokens: number }; readonly reason?: { readonly kind: string } } }
+interface NativeEvent { readonly type: string; readonly data: { readonly header?: { readonly config: NativeAgentOptions }; readonly message?: { readonly source?: { readonly provider?: string; readonly model?: string } }; readonly usage?: { readonly inputTokens: number; readonly outputTokens: number; readonly cacheReadTokens?: number; readonly cacheWriteTokens?: number; readonly reasoningTokens?: number }; readonly reason?: { readonly kind: string } } }
 interface NativeAgent {
   readonly id: string
   readonly options: NativeAgentOptions
@@ -70,7 +71,7 @@ export class FileWorkerRuntimeError extends Error {
   }
 }
 
-interface Schema { readonly type?: string; readonly properties?: Readonly<Record<string, Schema>>; readonly required?: readonly string[]; readonly additionalProperties?: false; readonly items?: Schema; readonly oneOf?: readonly Schema[]; readonly enum?: readonly string[]; readonly const?: string }
+export interface Schema { readonly type?: string; readonly properties?: Readonly<Record<string, Schema>>; readonly required?: readonly string[]; readonly additionalProperties?: false; readonly items?: Schema; readonly oneOf?: readonly Schema[]; readonly enum?: readonly string[]; readonly const?: string }
 const string: Schema = { type: 'string' }
 const array = (items: Schema): Schema => ({ type: 'array', items })
 const object = (properties: Record<string, Schema>): Schema => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false })
@@ -344,6 +345,46 @@ export class FileWorkerRuntime {
   private async sdk(): Promise<FileWorkerSdk> {
     try { return await (this.loading ??= this.loadSdk()) }
     catch (error) { this.loading = undefined; throw error }
+  }
+  /** One complete structured task on a fresh native child, using the same routing and teardown as file workers. */
+  structuredTask(jobId: string, mainSessionId: string, task: { readonly label: string; readonly persona: string; readonly prompt: string; readonly schema: Schema }, signal: AbortSignal): Promise<unknown> {
+    const key = `structured:${jobId}`
+    if (this.active.has(key)) return Promise.reject(new FileWorkerRuntimeError('native_subagent_already_running', 'worker_start', '同一子任务已在运行。'))
+    const controller = new AbortController(), abort = (): void => controller.abort(signal.reason)
+    signal.addEventListener('abort', abort, { once: true }); if (signal.aborted) abort()
+    const result = (async () => {
+      const report = diagnosticSpan(this.ctx, 'memory.segmentation.worker', { phase: task.label, promptBytes: new TextEncoder().encode(task.prompt).byteLength }, jobId)
+      let run: NativeRun | undefined, error: unknown, value: unknown
+      let facts = { modelCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }
+      try {
+        controller.signal.throwIfAborted()
+        const capability = await this.capabilities(mainSessionId)
+        if (!capability.available) throw new FileWorkerRuntimeError('native_subagent_unavailable', 'worker_capability', capability.reason!)
+        const parent = this.parent(mainSessionId), sdk = await this.sdk()
+        if (!parent || parent.id !== parent.session.id) throw new Error('实际主 Agent 已不可用。')
+        controller.signal.throwIfAborted()
+        run = await this.startWorker({ parent, label: task.label, prompt: [{ type: 'text', text: task.prompt }], signal: controller.signal,
+          outputSchema: task.schema, persona: task.persona, toolFilter: { allow: [] }, maxDepth: sdk.delegationDepthOf(parent) + 1,
+          agentOptions: sdk.parentAgentOptionsForDelegation(parent) })
+        const outcome = await run.result
+        controller.signal.throwIfAborted()
+        if (outcome.stopReason !== 'completed' || outcome.structured === undefined) throw new FileWorkerRuntimeError(
+          'native_subagent_invalid_output', 'worker_output', '原生分段子任务未提交完整结构化结果。')
+        const calls = run.localAgent?.session.snapshotEvents().filter(event => event.type === 'assistant/message') ?? []
+        facts = { modelCalls: calls.length, inputTokens: calls.reduce((n, event) => n + (event.data.usage?.inputTokens ?? 0), 0),
+          outputTokens: calls.reduce((n, event) => n + (event.data.usage?.outputTokens ?? 0), 0),
+          cacheReadTokens: calls.reduce((n, event) => n + (event.data.usage?.cacheReadTokens ?? 0), 0),
+          cacheWriteTokens: calls.reduce((n, event) => n + (event.data.usage?.cacheWriteTokens ?? 0), 0),
+          reasoningTokens: calls.reduce((n, event) => n + (event.data.usage?.reasoningTokens ?? 0), 0) }
+        value = outcome.structured
+      } catch (cause) { error = cause; report(controller.signal.aborted ? 'cancelled' : 'failed', {}, cause); throw cause }
+      finally {
+        try { await run?.dispose() }
+        catch (cause) { if (error instanceof Error) Object.assign(error, { cleanupError: cause }); else if (!error) { report('failed', { stage: 'cleanup' }, cause); throw cause } }
+      }
+      report('completed', facts); return value
+    })().finally(() => { signal.removeEventListener('abort', abort); this.active.delete(key) })
+    this.active.set(key, { jobId, controller, result }); return result
   }
   async capabilities(mainSessionId?: string): Promise<FileWorkerCapability> {
     const unavailable = (reason: string): FileWorkerCapability => ({ available: false, provider: this.providerName, reason })

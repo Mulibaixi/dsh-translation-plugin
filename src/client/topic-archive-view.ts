@@ -47,10 +47,11 @@ function mutationMessage(result: ArchiveMutationResult): true | string {
   return result.status === 'updated' || result.status === 'unchanged' ? true : '操作未完成，请核对后重试。'
 }
 /** One mounted view per topic and type keeps drafts when the user changes entries or categories. */
-export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, kind, active = true, evidenceContextKey }: {
+export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, kind, active = true, evidenceContextKey, adoptionPending = false }: {
   readonly sessions: SessionStore; readonly terms: TopicTermsViewPort; readonly archive: TopicArchiveStore
   readonly ownerId: string; readonly topicId: string; readonly kind: TopicArchiveKind
   readonly active?: boolean | undefined; readonly evidenceContextKey?: string | undefined
+  readonly adoptionPending?: boolean | undefined
 }): unknown {
   const [, refresh] = react.useState(0)
   react.useEffect(() => archive.subscribe(() => refresh(value => value + 1)), [archive])
@@ -73,10 +74,10 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
     h('p', { role: readState.status === 'error' ? 'alert' : 'status', className: 'dsh-tp-message' }, readState.error ?? '正在读取主题档案…'),
     readState.status === 'error' ? h('button', { type: 'button', onClick: () => { void archive.reloadAsync(ownerId, topicId).catch(() => {}) } }, '重试读取档案') : null)
   const snapshot = readState.snapshot, all = snapshot.entries.filter(entry => entry.kind === kind)
-  const pending = actionPending || readState.status !== 'ready'
+  const pending = actionPending || adoptionPending || readState.status !== 'ready'
   const note = [
     '同主题共用；快译不使用。关联实体须为生效条目。',
-    `保存状态：${readState.status === 'loading' ? '正在刷新' : storageLabels[archive.getStatus(ownerId, topicId)]}`,
+    `保存状态：${readState.status === 'error' ? '读取失败' : adoptionPending ? '正在采用…' : readState.status === 'loading' ? '正在刷新' : storageLabels[archive.getStatus(ownerId, topicId)]}`,
   ].join(' ')
   const entities = snapshot.entries.filter(entry => entry.kind === 'entity'), needle = query.trim().toLocaleLowerCase()
   const entries = all.filter(entry => (status === 'all' || status === entry.status) &&
@@ -163,7 +164,7 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
       return message
     })
   }
-  return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题${kinds[kind]}`, 'aria-busy': readState.status === 'loading' },
+  return h('section', { className: 'dsh-tp-terms', 'aria-label': `主题${kinds[kind]}`, 'aria-busy': adoptionPending || readState.status === 'loading' },
     h('div', { className: 'dsh-tp-asset-toolbar' },
       h('div', { className: 'dsh-tp-unit-header' },
         h('div', { className: 'dsh-tp-asset-heading' }, h('h3', null, `主题${kinds[kind]}`), h('small', { className: 'dsh-tp-muted dsh-tp-asset-note', title: note }, note)),
@@ -175,7 +176,7 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
       snapshot.version > 0 ? h('small', { className: 'dsh-tp-muted' }, h('time', { dateTime: snapshot.updatedAt }, `档案更新于 ${new Date(snapshot.updatedAt).toLocaleString()}`)) : null,
       archive.getNotice() ? h('p', { role: 'alert', className: 'dsh-tp-message' }, archive.getNotice()) : null,
       readState.status === 'error' ? h('p', { role: 'alert', className: 'dsh-tp-message' }, readState.error ?? '最新档案读取失败，当前显示上次读取内容。',
-        h('button', { type: 'button', disabled: actionPending, onClick: () => { void archive.reloadAsync(ownerId, topicId).catch(() => {}) } }, '重试读取档案')) : null,
+        h('button', { type: 'button', disabled: actionPending || adoptionPending, onClick: () => { void archive.reloadAsync(ownerId, topicId).catch(() => {}) } }, '重试读取档案')) : null,
       failure ? h('p', { role: 'alert', className: 'dsh-tp-message' }, failure) : null,
       retry && snapshot.entries.some(entry => entry.id === retry.id) ? h('button', { type: 'button', disabled: pending, onClick: () => {
         const entry = snapshot.entries.find(entry => entry.id === retry.id)!
@@ -221,9 +222,11 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
           h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending || deletedForm || !dirty || !valid, onClick: save }, pending ? '正在保存…' : '保存并采用'),
             deletedForm ? h('button', { type: 'button', disabled: pending, onClick: copyDraft }, '复制编辑稿') : null,
             h('button', { type: 'button', disabled: pending, onClick: () => { drafts.current.delete(form.id); setForm(undefined); setOriginal(undefined) } }, '取消')),
-        ) : entry ? h('div', { className: 'dsh-tp-term-details' }, h('h3', null, title(snapshot, entry)),
+        ) : entry ? h('div', { className: 'dsh-tp-term-details' },
+          h('div', { className: 'dsh-tp-asset-detail-header' },
+            h('h3', null, title(snapshot, entry)),
+            h('button', { type: 'button', disabled: pending, onClick: () => edit(entry) }, '编辑')),
           h('div', { className: 'dsh-tp-muted' }, `${statuses[entry.status]} · ${entry.acceptance ? entry.origin === 'inferred' ? '模型推断 · 用户已采纳' : `${origins[entry.origin]} · 用户已采纳` : origins[entry.origin]} · 条目版本 ${entry.version}`),
-          h('button', { type: 'button', disabled: pending, onClick: () => edit(entry) }, '编辑'),
           entry.kind === 'entity' ? [h('div', null, `别名：${entry.aliases.join('、') || '无'}`), h('div', { className: 'dsh-tp-translation-text' }, entry.description)] :
             entry.kind === 'fact' ? [h('div', { className: 'dsh-tp-translation-text' }, entry.body), h('div', null, `关联实体：${entry.entityIds.map(id => entityLabel(snapshot, id)).join('、') || '无'}`)] :
               [h('div', null, `源实体：${entityLabel(snapshot, entry.sourceEntityId)}`), h('div', null, `关系：${entry.relation}`), h('div', null, `目标实体：${entityLabel(snapshot, entry.targetEntityId)}`), h('div', { className: 'dsh-tp-translation-text' }, entry.description)],

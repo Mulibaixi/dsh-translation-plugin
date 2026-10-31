@@ -98,12 +98,13 @@ export function MemoryAssetsView({ store, terms, archive, otherMemory, memoryInd
   )
 }
 
-function AssetAdoptionControl({ terms, archive, ownerId, topicId, kind, active, memoryIndex }: {
+function AssetAdoptionControl({ terms, archive, ownerId, topicId, kind, active, memoryIndex, adopting, onAdoptingChange }: {
   readonly terms: TopicTermsViewPort; readonly archive: TopicArchiveStore; readonly ownerId: string; readonly topicId: string
   readonly kind: TopicAssetKind; readonly active: boolean; readonly memoryIndex?: MemoryIndexClient | undefined
+  readonly adopting: boolean; readonly onAdoptingChange: (adopting: boolean) => void
 }): unknown {
   const assets = kind === 'terms' ? terms : archive
-  const [, refresh] = react.useState(0), [adopting, setAdopting] = react.useState(false), [notice, setNotice] = react.useState<string | undefined>(undefined)
+  const [, refresh] = react.useState(0), [notice, setNotice] = react.useState<string | undefined>(undefined)
   const busy = react.useRef(false), alive = react.useRef(true)
   react.useEffect(() => assets.subscribe(() => refresh(value => value + 1)), [assets])
   react.useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
@@ -111,7 +112,7 @@ function AssetAdoptionControl({ terms, archive, ownerId, topicId, kind, active, 
   const count = ready ? state.snapshot!.entries.filter(e => ['proposal', 'review_required'].includes(e.status) && (kind === 'terms' || ('kind' in e && e.kind === kind))).length : 0
   async function adopt(): Promise<void> {
     if (busy.current || !active || !ready || !count) return
-    busy.current = true; setAdopting(true); setNotice(undefined)
+    busy.current = true; onAdoptingChange(true); setNotice(undefined)
     // A page switch may release its view, but must not evict a batch still being saved.
     const release = assets.retain(ownerId, topicId)
     try {
@@ -119,7 +120,7 @@ function AssetAdoptionControl({ terms, archive, ownerId, topicId, kind, active, 
       if (alive.current) setNotice(`已采用 ${result.adopted} 条${result.remaining ? `，${result.remaining} 条仍待处理${kind === 'fact' || kind === 'relation' ? '，请核对条目及关联实体状态' : ''}` : ''}。`)
       void memoryIndex?.refresh(topicId)
     } catch (error) { if (alive.current) setNotice((error as Error).message) }
-    finally { release(); busy.current = false; if (alive.current) setAdopting(false) }
+    finally { release(); busy.current = false; if (alive.current) onAdoptingChange(false) }
   }
   if (!active) return null
   return h('div', { className: 'dsh-tp-actions' },
@@ -141,6 +142,8 @@ function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex
   react.useEffect(() => fileJobs?.subscribe(() => refreshJobs(value => value + 1)), [fileJobs])
   react.useEffect(() => { if (jobId) setCategory('terms') }, [jobId, navigationRevision])
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
+  const [adopting, setAdopting] = react.useState<Partial<Record<TopicAssetKind, boolean>>>({})
+  const archiveAdopting = !!(adopting.entity || adopting.fact || adopting.relation)
   react.useEffect(() => {
     if (!active) return
     // The four pages share this topic window's lifetime, rather than evicting each other on tab changes.
@@ -197,7 +200,8 @@ function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex
                 h('div', { className: 'dsh-tp-segmented', role: 'radiogroup', 'aria-label': '档案类型' },
                   ...archiveKinds.map(option => h('button', { key: option.value, type: 'button', role: 'radio', 'aria-label': option.label,
                     'aria-checked': kind === option.value, onClick: () => setKind(option.value) }, option.label))),
-                h('div', { className: 'dsh-tp-actions' }, ...archiveKinds.map(option => h(AssetAdoptionControl, { key: option.value, terms, archive, ownerId, topicId, kind: option.value, active: active && category === 'terms' && kind === option.value, memoryIndex })),
+                h('div', { className: 'dsh-tp-actions' }, ...archiveKinds.map(option => h(AssetAdoptionControl, { key: option.value, terms, archive, ownerId, topicId, kind: option.value, active: active && category === 'terms' && kind === option.value, memoryIndex,
+                  adopting: !!adopting[option.value], onAdoptingChange: (value: boolean) => setAdopting(current => ({ ...current, [option.value]: value })) })),
                   memoryIndex ? h('button', { type: 'button', 'aria-expanded': indexOpen, onClick: () => setIndexOpen(value => !value) }, '语义索引') : null,
                   h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('json') }, '导出 JSON'),
                   h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('markdown') }, '导出 Markdown'), memoryClear.menu)),
@@ -206,13 +210,13 @@ function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex
               memoryClear.feedback, memoryClear.dialog),
             h('div', { className: 'dsh-tp-assets-module', hidden: kind !== 'terms' },
               h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName, hideExport: true,
-                active: active && category === 'terms' && kind === 'terms', evidenceContextKey,
+                active: active && category === 'terms' && kind === 'terms', evidenceContextKey, adoptionPending: !!adopting.terms,
                 targetLanguage: associatedSessionId && store.getSession(associatedSessionId)?.topicId === topicId ? store.getSession(associatedSessionId)?.targetLanguage : undefined,
                 onDelete: onDeleteTerm, onExport: () => {}, bridgeReason: topics?.getStatus(ownerId).reason,
                 onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined })),
             ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
               h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type,
-                active: active && category === 'terms' && kind === type, evidenceContextKey }))))),
+                active: active && category === 'terms' && kind === type, evidenceContextKey, adoptionPending: archiveAdopting }))))),
         otherVisited ? h('div', { className: 'dsh-tp-assets-module dsh-tp-other-memory-module', hidden: category !== 'other' },
           otherMemory ? h(OtherMemoryView, { client: otherMemory, store, topicId, mainSessionId, active: active && category === 'other' }) : h('p', { className: 'dsh-tp-message', role: 'status' }, '其他记忆服务暂不可用。')) : null,
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },

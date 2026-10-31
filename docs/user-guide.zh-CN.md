@@ -100,7 +100,9 @@ Markdown 翻译和审阅要求保留标题、列表、表格、代码及公式�
 
 ### 主题参考文件
 
-**主题参考文件**只登记原文／双语对照文件，每份最多 2 MiB。列表显示文件名、分段进度和原件入口，不预览正文。上传后通知当前主模型标记分段边界，支持分批提交、中断后请求继续；程序按边界取原文，不重写原件，也不自动对齐或补造双语。
+**主题参考文件**只登记原文／双语对照文件，每份最多 2 MiB。列表显示文件名、分段进度和原件入口，不预览正文。上传后通知当前主模型，安排两个原生子代理各自完整标注同一份文件，再并行交叉复核。主模型核对未解决的实质问题、选择一份自洽方案后统一保存；不同但合理的边界无需强行合并。程序按边界取原文，不重写原件，也不自动对齐或补造双语。
+
+每段仍以语义为准，通常 200～600 字符，最长 2,000 字符；完整双语句对保持在同一段。整份处理需要模型容纳完整原文、定位点与结果，以及两个可用原生子代理名额。未完成时点击**重试主模型分段**，同一次宿主运行中可复用已完成的候选；重载后需重新准备未保存的候选。正式分段方案在最终提交前保留，已完成方案仅在明确要求重新分段时替换。主模型忙碌时，上传通知进入后续轮次等待处理。
 
 全文分段完整后，已配置的嵌入服务会排队建立索引；未完成时仍可打开、读取和字面查找。支持读取 UTF-8 TXT、Markdown、CSV、TSV、JSON、JSONL、LOG 和 RST；其他格式提供原件入口，学习内容可在主聊天提炼为资产或设定。
 
@@ -158,6 +160,17 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 ## 发行包与源码更新
 
 ### 发行包更新
+
+安装包入口：[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)。选择 `.tgz` 附件，按对应发行说明核对配套版本；当前翻译工作流配套 Composer `0.4.5`。
+
+使用 DSH CLI 时，以下命令固定安装已发布的翻译插件 `0.26.6` 与 Composer `0.4.5`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；新功能随对应版本的发行包提供。
+
+```powershell
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.5/dsh-composer-extension-0.4.5.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.26.6/dsh-translation-plugin-0.26.6.tgz
+```
+
+上述命令使用桌面 `desktop` profile；Web 环境使用自身实际 profile，联动组件支持范围仍以 Composer 说明为准。使用桌面插件管理器安装时无需另装 CLI。
 
 1. 等待正在执行的任务结束，确认历史与记忆已经保存；需要保留完整回退点时，按下节备份。
 2. 下载带版本号的新 `.tgz`，在 DSH 插件管理器的安装输入框填写其完整路径或版本下载链接，安装并启用。**不需要先卸载旧版**；使用新的文件名或链接，不要只覆盖原路径中的同名包。
