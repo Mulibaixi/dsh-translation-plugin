@@ -2,7 +2,7 @@ import { parseLibraryConnection, type LibraryConnectionIdentity } from '../share
 import { registerReferenceTools, type ReferenceFilesService } from './reference-files.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
-import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection } from '../shared/normal-translation.js'
+import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt } from '../shared/normal-translation.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TerminologyAnalysisService } from './terminology-analysis.js'
 import type { TranslationPreparationService } from './translation-preparation.js'
@@ -66,6 +66,7 @@ const unitTargetParameter = { type: 'object', additionalProperties: false, prope
   translationSessionId: sessionParameter, unitId: { type: 'string', required: true }, sourceVersion: { type: 'integer', required: true },
 } }
 const topicParameter = { type: 'string', required: true, description: 'Exact topic id from translation_list_topics or translation_list_sessions.' }
+const WRITE_RECEIPT_GUIDANCE = ' Returns a compact write receipt. Use version as the next expectedVersion for this same collection, and entry.id/version to edit that entry. State, priority and term languages are actual results; archive affected lists changed dependents. Do not re-list after each write; query only to inspect content or other versions. Errors do not authorize automatic retries.'
 /** Translation-facing term projection: the model copies `ref` verbatim into termReferences instead of rebuilding `{id, entryVersion}` out of a full management snapshot. */
 function projectTermQuery(value: TopicBridgeValue, mintHandle?: (entry: { readonly id: string; readonly version: number }) => string): unknown {
   if (value.kind !== 'terms_query') return value
@@ -167,8 +168,8 @@ class ManagementConnection {
     if (reply.ok) {
       const expected = { direct_proposals: 'direct_proposals', settings_scope: 'settings_scope', list_units: 'unit_directory', read_units: 'unit_contents', reference_assets: 'reference_assets', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         file_history: 'file_history', document_review_page: 'document_review_page', document_review_read: 'document_review_text', document_review_begin: 'document_review_receipt', document_review_submit: 'document_review_receipt', document_review_manual: 'document_review_receipt', document_review_observe: 'document_review_observed', document_task_terms: 'document_task_terms',
-        set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'terms',
-        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_commit: 'normal_committed', normal_export: 'normal_exported', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
+        set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'term_write',
+        list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive_write', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_commit: 'normal_committed', normal_export: 'normal_exported', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
         preparation_review_correction: 'preparation_receipt', preparation_prepare: 'preparation_receipt', preparation_set: 'preparation_receipt', preparation_status: 'preparation_receipt', preparation_read: 'preparation_page', preparation_capture: 'preparation_captured',
         document_correct_observe: 'document_correct_observed', document_capture: 'document_captured', document_correct: 'document_corrected', document_accept_unit: 'document_accepted', document_accept: 'document_accepted', document_register: 'document_registered', document_event: 'document_updated', document_finish: 'document_updated', document_observe: 'document_observed', document_release: 'document_updated', document_control: 'document_updated', document_restore: 'document_restored' }[pending.frame.command.kind]
       if (reply.value.kind !== expected && !(pending.frame.command.kind === 'read_unit' && reply.value.kind === 'file_unit')) throw bridgeError('invalid_reply', '主题管理回执类型不一致。')
@@ -441,13 +442,13 @@ export class TopicToolsService {
       { name: 'translation_query_terms', kind: 'query_terms', parameters: { translationSessionId: sessionParameter, sourceLanguage: termFields.sourceLanguage, targetLanguage: termFields.targetLanguage, forms: { type: 'array', items: { type: 'string' }, required: true } }, description: 'Select active topic terms for translation by exact source language (null means any source language), target language and explicit forms or aliases. Invalid or outdated basis is excluded. Each hit returns ref {id, entryVersion} together with sourceForms, aliases, preferred, sense, forbidden and priority; copy ref verbatim into translation_translate termReferences. Each hit also carries termRef, a short run-scoped handle for the same version, which translation_translate accepts as {termRef} when copying a long id is inconvenient. An empty result is a normal answer, not a reason to dump the whole management list.' },
       { name: 'translation_upsert_term', kind: 'upsert_term', parameters: { translationSessionId: sessionParameter, expectedVersion: { type: 'integer', required: true }, entry: { type: 'object', additionalProperties: false, required: true,
         properties: { ...termFields, id: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true,
-          description: 'Existing term id when updating, or null to create. The program assigns every new id; never invent one or copy a display name.' } } } }, description: 'Propose or source-check one topic term against observed topic/entry versions using exact evidence from an opened translation Session. Pass id=null with expectedEntryVersion=null for a new entry; for an existing entry pass its queried id and expected version, never a new id. The main model may edit any existing entry, including adopted or user-edited entries, with the exact observed ID/version. Changed content becomes pending review and does not inherit adoption; unchanged content retains its current state. Update the actual term rather than creating a setting to bypass its old wording. Cannot fabricate user confirmation.' },
+          description: 'Existing term id when updating, or null to create. The program assigns every new id; never invent one or copy a display name.' } } } }, description: 'Propose or source-check one topic term against observed topic/entry versions using exact evidence from an opened translation Session. Pass id=null with expectedEntryVersion=null for a new entry; for an existing entry pass its queried id and expected version, never a new id. The main model may edit any existing entry, including adopted or user-edited entries, with the exact observed ID/version. Changed content becomes pending review and does not inherit adoption; unchanged content retains its current state. Update the actual term rather than creating a setting to bypass its old wording. Cannot fabricate user confirmation.' + WRITE_RECEIPT_GUIDANCE },
       { name: 'translation_list_topic_archive', kind: 'list_topic_archive', parameters: { topicId: topicParameter }, description: 'Read entity, fact and relation entries, statuses, versions and evidence references for one local topic, including a retained topic without translation Sessions. Does not include source bodies or drafts.' },
       { name: 'translation_query_archive', kind: 'query_archive', parameters: { translationSessionId: sessionParameter,
         kinds: { type: 'array', items: { type: 'string', enum: archiveKinds }, required: true }, forms: { type: 'array', items: { type: 'string' }, required: true } },
         description: 'Select active topic archive entries by explicit exact names, aliases, titles or relation forms. The translation Session fixes owner, topic and actual mode; Quick returns no entries. Outdated basis and unavailable entity references are excluded.' },
       { name: 'translation_upsert_archive', kind: 'upsert_archive', parameters: { topicId: topicParameter, expectedVersion: { type: 'integer', required: true }, entry: archiveEntryParameter },
-        description: 'Propose or source-check one entity, fact or relation in a local topic against observed topic and entry versions. History evidence must belong to an opened translation Session; inferred entries stay proposals. The main model may edit any existing entity/fact/relation with the exact observed ID/version. Changed content becomes pending review without inherited adoption; unchanged content retains its state. Cannot fabricate user confirmation, edit translation text or invoke translation. Retained topics without Sessions also accept proposals.' },
+        description: 'Propose or source-check one entity, fact or relation in a local topic against observed topic and entry versions. History evidence must belong to an opened translation Session; inferred entries stay proposals. The main model may edit any existing entity/fact/relation with the exact observed ID/version. Changed content becomes pending review without inherited adoption; unchanged content retains its state. Cannot fabricate user confirmation, edit translation text or invoke translation. Retained topics without Sessions also accept proposals.' + WRITE_RECEIPT_GUIDANCE },
     ]
     const disposers: (() => void)[] = []
     try {
@@ -676,7 +677,7 @@ export class TopicToolsService {
           },
         })))
       }
-      const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown>; correctSource(args: unknown, exec: ToolExecution): Promise<unknown>;
+      const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown>; correctSource(args: unknown, exec: ToolExecution): Promise<NormalTranslationCorrectionReceipt>;
         translate(args: unknown, exec: ToolExecution): Promise<unknown>; readResult(args: unknown, exec: ToolExecution): unknown;
         extractAssets(args: unknown, exec: ToolExecution): Promise<unknown>; saveArtifact(args: unknown, exec: ToolExecution): Promise<unknown>;
         openArtifact(args: unknown, exec: ToolExecution): Promise<unknown> } | undefined
@@ -764,9 +765,10 @@ export class TopicToolsService {
         parameters: { target: { ...unitTargetParameter, required: true }, operationId: { type: 'string', required: true },
           sourceText: { type: 'string', required: true }, reason: { type: 'string', required: true, description: 'Brief correction reason; may be empty.' } },
         output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
-        execute: (args: unknown, exec: ToolExecution) => {
+        execute: async (args: unknown, exec: ToolExecution) => {
           if (exec.agent !== agent) throw bridgeError('scope_mismatch', '纠错工具不属于此 Agent。')
-          return normal.correctSource(parseNormalTranslationSourceCorrection(args), exec)
+          const { persistence: _persistence, ...correction } = await normal.correctSource(parseNormalTranslationSourceCorrection(args), exec)
+          return correction
         },
       })))
       const references = this.ctx.get?.('translationReferences') as ReferenceFilesService | undefined

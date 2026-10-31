@@ -4,8 +4,9 @@ import {
   MAX_TOPIC_BRIDGE_REPLY_BYTES, parseLibraryConnection, parseTopicBridgeCapability, parseTopicBridgeV2Capability, parseTopicBridgeDown, parseTopicBridgeReply,
   type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact, type TopicSessionSummary,
 } from '../shared/topic-bridge.js'
-import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceRef, TopicTermQuery } from '../memory/topic-terms.js'
-import type { TopicArchiveSnapshot, TopicArchivePut, ArchiveMutationResult, TopicArchiveQuery } from '../memory/topic-archive.js'
+import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceRef, TopicTermQuery, TopicTerm } from '../memory/topic-terms.js'
+import { referencedEntityIds, type TopicArchiveSnapshot, type TopicArchivePut, type ArchiveMutationResult, type TopicArchiveQuery, type TopicArchiveEntry } from '../memory/topic-archive.js'
+import { assetPriority } from '../memory/asset-priority.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { NormalTranslationAcceptance, NormalTranslationUpdate, DirectTranslationCommit, NormalTranslationTarget } from '../shared/normal-translation.js'
@@ -51,6 +52,7 @@ export interface TopicBridgeTermsPort {
 }
 export interface TopicBridgeArchivePort {
   getSnapshot(ownerId: string, topicId: string): TopicArchiveSnapshot
+  ensureLoaded(ownerId: string, topicId: string): Promise<TopicArchiveSnapshot>
   reconcileAsync?(ownerId: string, topicId: string): Promise<TopicArchiveSnapshot>
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot
   queryAsync?(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot>
@@ -99,6 +101,9 @@ interface Connection {
   requests: Set<string>
 }
 function error(requestId: string, code: string, message: string): TopicBridgeReply { return { requestId, ok: false, error: { code, message } } }
+function writeEntry(entry: TopicTerm | TopicArchiveEntry) {
+  return { id: entry.id, version: entry.version, status: entry.status, origin: entry.origin, priority: assetPriority(entry) }
+}
 
 /** Browser facts remain authoritative for material, history and terminology. */
 export class TopicBridgeClient {
@@ -514,10 +519,18 @@ export class TopicBridgeClient {
       if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
       if (command.kind === 'list_topic_archive') return success({ kind: 'archive', snapshot: await (this.archive.reconcileAsync?.(ownerId, command.topicId) ?? this.archive.getSnapshot(ownerId, command.topicId)) })
       if (!command.entry.evidence.every(ref => this.accessibleEvidence(ownerId, command.topicId, ref))) return error(request.requestId, 'reference_not_published', '档案依据不在用户明确提供的历史范围中。')
+      const before = await this.archive.ensureLoaded(ownerId, command.topicId)
       const result = await this.archive.apply(ownerId, command.topicId, command.expectedVersion, { kind: 'put', input: command.entry })
       if (result.status === 'save_failed') return error(request.requestId, result.status, '当前档案内容可能已更新但未保存，请先查询当前版本后明确重试。')
       if (result.status !== 'updated' && result.status !== 'unchanged') return error(request.requestId, result.status, '档案提交未完成，请核对当前版本及依据。')
-      return success({ kind: 'archive', snapshot: result.snapshot })
+      if (!result.entry) return error(request.requestId, 'invalid_reply', '档案写入缺少准确条目回执，请查询当前记录。')
+      const entry = result.entry, previous = new Map(before.entries.map(item => [item.id, item]))
+      const affected = result.status === 'updated' && entry.kind === 'entity' ? result.snapshot.entries
+        .filter(item => item.id !== entry.id && item.status === 'review_required' && referencedEntityIds(item).includes(entry.id)
+          && previous.get(item.id)?.status !== 'review_required' && previous.get(item.id)?.version !== item.version)
+        .map(item => ({ id: item.id, version: item.version, status: 'review_required' as const })) : []
+      return success({ kind: 'archive_write', status: result.status, topicId: result.snapshot.topicId, version: result.snapshot.version,
+        entry: { ...writeEntry(entry), kind: entry.kind }, ...(affected.length ? { affected } : {}) })
     }
     if (command.kind === 'create_session') {
       const result = await this.sessions.createManagedSessionAsync(ownerId, command.start)
@@ -563,8 +576,11 @@ export class TopicBridgeClient {
       case 'upsert_term': {
         if (!command.entry.evidence.every(ref => this.accessibleEvidence(ownerId, session.topicId, ref))) return error(request.requestId, 'reference_not_published', '术语依据不在用户明确提供的历史范围中。')
         const result = await this.terms.apply(ownerId, session.topicId, command.expectedVersion, { kind: 'put', input: command.entry })
+        if (result.status === 'save_failed') return error(request.requestId, result.status, '当前术语内容可能已更新但未保存，请先查询当前版本后明确重试。')
         if (result.status !== 'updated' && result.status !== 'unchanged') return error(request.requestId, result.status, '术语提交未完成，请核对当前版本及依据。')
-        return success({ kind: 'terms', snapshot: result.snapshot })
+        if (!result.entry) return error(request.requestId, 'invalid_reply', '术语写入缺少准确条目回执，请查询当前记录。')
+        return success({ kind: 'term_write', status: result.status, topicId: result.snapshot.topicId, version: result.snapshot.version,
+          entry: { ...writeEntry(result.entry), sourceLanguage: result.entry.sourceLanguage, targetLanguage: result.entry.targetLanguage } })
       }
     }
   }

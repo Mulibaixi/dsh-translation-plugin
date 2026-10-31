@@ -79,7 +79,11 @@ The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics
 
 **Put sources in the translation input, and requirements or revision feedback in the main chat.** Use Quick mode for a direct translation, or Normal mode for main-chat coordination, discussion, and repeated refinement.
 
+Session history saves automatically in the background while the main model reviews and delivers the translation. If history saving fails, the workspace keeps the current content and offers **重试保存 (Retry saving)** without calling the translation model again.
+
 Terminology and structured archives support adopting pending proposals and review items by category. Batch adoption keeps the list and edit drafts visible, restores entry actions when finished, and reports failures.
+
+After writing terminology or structured archive entries, the main model receives only the write result, exact versions and entry state, reducing repeated full-collection context. Complete content remains available in the interface, exports and on-demand queries.
 
 After a topic reference file is uploaded, the main model delegates two independent full-file annotations and parallel cross-reviews to native subagents, resolves substantive issues, and saves one complete plan. Bilingual pairs and fine semantic boundaries are preserved. This requires a model that can hold the entire file and result, and two available subagent slots. Use **重试主模型分段 (Retry segmentation)** when unfinished; completed plans are preserved unless resegmentation is requested.
 

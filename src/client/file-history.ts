@@ -124,7 +124,7 @@ export class FileHistoryClient {
       if (request.request.ownerId !== ownerId) fail('scope_mismatch', '文件记录所属主会话不符。')
       const record = this.jobs.get(request.request.jobId)
       if (!record) fail('not_found', request.request.jobId.startsWith('unit:')
-        ? '这是单元 ID，不是旧文件任务 jobId。直译结果请用 translation_translate 返回的 unit target 和新 operationId 修订，再用 translation_save_result 保存；runtime_only 不表示没有单元历史。'
+        ? '这是单元 ID，不是旧文件任务 jobId。直译结果请用 translation_translate 返回的 unit target 和新 operationId 修订，在原会话中审阅和交付；仅在用户要求单独导出时调用 translation_save_result。'
         : '此任务尚无已保存文件记录。请先核对准确 jobId；普通直译结果使用 unit target 调用 translation_translate 修订。')
       const current = this.unit({ kind: 'unit', mainSessionId: ownerId, translationSessionId: record.summary.translationSessionId, unitId: record.summary.unitId, sourceVersion: record.summary.sourceVersion })
       if (request.action === 'revise' && (current.jobId !== request.request.jobId || current.unsettled)) fail('stale_job', '此单元已有较新的任务，请读取最新任务后修订。')

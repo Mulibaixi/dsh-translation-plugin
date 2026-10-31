@@ -102,7 +102,7 @@ export interface DirectTranslationView {
   readonly revisionId: string
   readonly sourceVersion: number
   readonly status: 'completed' | 'failed' | 'cancelled' | 'unknown'
-  /** Whether the Client confirmed the revision write. A model body alone is not a saved result. */
+  /** Whether the Client confirmed the revision in its Session history; not a disk-save acknowledgement. */
   readonly recorded: boolean
   readonly text?: string
   readonly textPreview?: string
@@ -114,7 +114,6 @@ export interface DirectTranslationView {
   readonly timing: { readonly prepareMs: number; readonly firstTextMs: number | null; readonly streamMs: number; readonly recordMs: number; readonly totalMs: number }
   readonly message?: string
   readonly resultRef?: { readonly operationId: string; readonly totalCodePoints: number; readonly tool: 'translation_read_result' }
-  readonly persistence: 'saved' | 'runtime_only' | 'unconfirmed'
   readonly contextUsage?: { readonly terms: number; readonly nearbyUnits: number; readonly revisionBaseId: string | null; readonly referenceStatus: string; readonly referenceFiles: number }
 }
 function ok<T>(value: T): NormalTranslationResult<T> { return { ok: true, value: structuredClone(value) } }
@@ -690,7 +689,7 @@ export class NormalTranslationService {
       topicId: material.topicId, unitId: receipt?.unitId ?? material.unitReference?.unitId ?? fallbackUnitId,
       revisionId: receipt?.revisionId ?? callId, sourceVersion: material.sourceVersion, status, recorded: receipt !== undefined,
       totalCodePoints, metadata: translationCallFacts(metadata), timing, ...(checks.length ? { checks } : {}),
-      ...(message ? { message } : {}), persistence: receipt?.persistence ?? 'unconfirmed' as const }
+      ...(message ? { message } : {}) }
     const assetReview = material.sourceText === undefined && status === 'completed' && receipt ? { assetReview: {
       tool: 'translation_submit_proposals' as const, target: { kind: 'unit' as const, mainSessionId: request.target.mainSessionId,
         translationSessionId: material.translationSessionId, unitId: receipt.unitId, sourceVersion: receipt.sourceVersion }, revisionId: receipt.revisionId,

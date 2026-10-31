@@ -1614,6 +1614,7 @@ export class SessionStore {
         seat.savedSession = receipt.saved?.session; seat.savedTranslationHistory = receipt.saved?.history ?? emptyTranslationHistory()
         seat.stored = this.historyBackend.snapshot(id)
         seat.status = currentVersion(seat) === captured && receipt.state.persistence === 'saved' ? 'saved' : 'memory'
+        if (this.notice === seat.storageError) this.notice = undefined
         delete seat.storageError
         return receipt.state.persistence === 'saved'
       }

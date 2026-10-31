@@ -90,6 +90,8 @@ Markdown 翻译和审阅要求保留标题、列表、表格、代码及公式�
 
 四类档案中的条目可查看依据、新增、编辑、采用、停用或删除。主模型可修改已有条目；内容改变后回到待审阅，相同内容保留状态。冲突或依据变化时需复核。同主题会话共享资产，不同主题独立管理。
 
+主模型写入术语或档案后，收到本次写入结果、准确版本和条目状态；实体修改涉及的关联待复核条目会一并说明。写入回执不重复整份资料，完整内容仍可在界面、查询和导出中查看。
+
 候选直接保存在相应类别中。**一键采用**处理当前主题、当前类别的全部待审及待复核条目，不受页内筛选影响；事实和关系的关联实体须先采用。暂不能采用的条目保留并显示未完成数量，候选不阻碍译文交付。
 
 翻译采用优先级为：**用户指令 = 用户编辑确定的条目 > 用户审阅通过的条目 > 待审条目 = 模型理解**。用户指令与用户编辑条目冲突时请求指示；候选不会自动覆盖已生效资产，模型整理的说明也不会变成用户指令。
@@ -145,6 +147,8 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 
 启动先读取会话目录，打开、查阅或导出时按需加载正文；保存传输变化记录，失败时保留当前编辑并可重试或重新读取。删除最初创建资料的主聊天，不会删除已保存的翻译资料。
 
+普通翻译记录结果后，主模型继续审阅和交付，程序在后台保存历史。若当前会话历史保存失败，工作区显示错误，可点击**重试保存**写入已有内容；此操作不重新翻译或新增版本。保存冲突仍需读取最新副本或明确选择覆盖。正常翻译不需要为确认保存重复调用工具，也无需另存一个文件。
+
 | 清理层级 | 作用 |
 | --- | --- |
 | 旧版本 | 删除可清理的旧原稿或译文正文及其独占资源，保留版本号与调用事实。最终／最新结果、保留修订的基础及未结算任务受保护。 |
@@ -163,11 +167,11 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 
 安装包入口：[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)。选择 `.tgz` 附件，按对应发行说明核对配套版本；当前翻译工作流配套 Composer `0.4.5`。
 
-使用 DSH CLI 时，以下命令固定安装已发布的翻译插件 `0.26.6` 与 Composer `0.4.5`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；新功能随对应版本的发行包提供。
+使用 DSH CLI 时，以下命令固定安装翻译插件 `0.26.8` 与 Composer `0.4.5`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；新功能随对应版本的发行包提供。
 
 ```powershell
 dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.5/dsh-composer-extension-0.4.5.tgz
-dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.26.6/dsh-translation-plugin-0.26.6.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.26.8/dsh-translation-plugin-0.26.8.tgz
 ```
 
 上述命令使用桌面 `desktop` profile；Web 环境使用自身实际 profile，联动组件支持范围仍以 Composer 说明为准。使用桌面插件管理器安装时无需另装 CLI。

@@ -3,7 +3,7 @@ import { parseDirectHistoryContext, type DirectHistoryContext } from './direct-h
 import { parseOtherMemoryScope, type OtherMemoryScope } from './other-memory.js'
 import { parseDirectProposalSubmission, type DirectProposalSubmission, type DirectProposalReceipt } from './direct-proposals.js'
 import { parseReferenceFacts, parseReferenceIndex, type ReferenceFacts, type ReferenceIndex } from './reference-memory.js'
-import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot } from '../memory/topic-terms.js'
+import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot, type TopicTerm } from '../memory/topic-terms.js'
 import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
 import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, parseNormalTranslationUpdate, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseNormalTranslationCorrectionReceipt, parseDirectTranslationCommit, parseDirectTranslationReceipt, parseDirectTranslationExport, type NormalTranslationAcceptance, type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationUnitTarget, type NormalTranslationTarget, type NormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt, type DirectTranslationCommit, type DirectTranslationReceipt, type NormalTranslationExport } from './normal-translation.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
@@ -138,7 +138,23 @@ export type TopicBridgeCommand =
   | { readonly kind: 'list_topic_archive'; readonly topicId: string }
   | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
+export interface TopicWriteEntry {
+  readonly id: string
+  readonly version: number
+  readonly status: TopicTerm['status']
+  readonly origin: TopicTerm['origin']
+  readonly priority: 0 | 1 | 2
+}
+export type TopicWriteReceipt = {
+  readonly status: 'updated' | 'unchanged'
+  readonly topicId: string
+  /** Latest version of this terms or archive collection, for the next expectedVersion. */
+  readonly version: number
+} & ({ readonly kind: 'term_write'; readonly entry: TopicWriteEntry & Pick<TopicTerm, 'sourceLanguage' | 'targetLanguage'> }
+  | { readonly kind: 'archive_write'; readonly entry: TopicWriteEntry & { readonly kind: TopicArchiveKind }
+      readonly affected?: readonly { readonly id: string; readonly version: number; readonly status: 'review_required' }[] })
 export type TopicBridgeValue =
+  | TopicWriteReceipt
   | { readonly kind: 'direct_proposals'; readonly receipt: DirectProposalReceipt }
   | { readonly kind: 'settings_scope'; readonly scope: OtherMemoryScope }
   | { readonly kind: 'unit_directory'; readonly directory: UnitDirectory }
@@ -432,6 +448,34 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
   object(value)
   if (protocol === 1 && (String(value.kind).startsWith('document_review_') || ['normal_v2_updated', 'normal_committed', 'normal_exported', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string))) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
+    case 'term_write': case 'archive_write': {
+      if (protocol < 4) throw new TypeError('Memory write receipts require topic bridge v4')
+      exact(value, ['kind', 'status', 'topicId', 'version', 'entry', ...(Object.hasOwn(value, 'affected') ? ['affected'] : [])])
+      if (!['updated', 'unchanged'].includes(value.status as string)) throw new TypeError('Invalid memory write result')
+      text(value.topicId); integer(value.version, 1); object(value.entry)
+      const entry = value.entry
+      exact(entry, ['id', 'version', 'status', 'origin', 'priority', ...(value.kind === 'term_write' ? ['sourceLanguage', 'targetLanguage'] : ['kind'])])
+      text(entry.id); integer(entry.version, 1)
+      if (entry.version > value.version || !['proposal', 'active', 'review_required', 'disabled', ...(value.kind === 'term_write' ? ['conflict'] : [])].includes(entry.status as string)
+        || !['inferred', 'source_checked', 'user_explicit'].includes(entry.origin as string) || ![0, 1, 2].includes(entry.priority as number)) throw new TypeError('Invalid memory write entry')
+      if (value.kind === 'term_write') {
+        if (Object.hasOwn(value, 'affected')) throw new TypeError('Unexpected term write effects')
+        if (entry.sourceLanguage !== null) text(entry.sourceLanguage)
+        text(entry.targetLanguage)
+      } else {
+        if (!['entity', 'fact', 'relation'].includes(entry.kind as string)) throw new TypeError('Invalid archive write kind')
+        if (Object.hasOwn(value, 'affected')) {
+          if (entry.kind !== 'entity' || value.status !== 'updated' || !Array.isArray(value.affected) || !value.affected.length) throw new TypeError('Invalid archive write effects')
+          const ids = new Set<string>([entry.id])
+          for (const affected of value.affected) {
+            object(affected); exact(affected, ['id', 'version', 'status']); text(affected.id); integer(affected.version, 1)
+            if (affected.status !== 'review_required' || affected.version > value.version || ids.has(affected.id)) throw new TypeError('Invalid affected archive entry')
+            ids.add(affected.id)
+          }
+        }
+      }
+      return structuredClone(value) as unknown as TopicWriteReceipt
+    }
     case 'settings_scope':
       if (protocol < 4) throw new TypeError('Settings maintenance requires topic bridge v4')
       exact(value, ['kind', 'scope'])

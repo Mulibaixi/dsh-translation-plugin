@@ -30,7 +30,8 @@ export function registerDirectProposalTool(topics: TopicToolsService, agent: Mai
       try {
         const value = await topics.requestOwned(agent.id, { kind: 'direct_proposals', request }, exec)
         if (value.kind !== 'direct_proposals') throw new Error('提案保存回执类型不一致。')
-        report('completed', { count: value.receipt.count, persistence: value.receipt.persistence }); return value.receipt
+        report('completed', { count: value.receipt.count, persistence: value.receipt.persistence })
+        return { count: value.receipt.count, skipped: value.receipt.skipped }
       } catch (error) { report(exec.signal.aborted ? 'cancelled' : 'failed', {}, error); throw error }
     },
   }))

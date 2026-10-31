@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.26.7",
+  "version": "0.26.8",
   "private": true,
   "license": "MIT",
   "description": "Translation and refinement workspace for DeepSeek Harness, with topic memory, revision history, and main-model collaboration.",
