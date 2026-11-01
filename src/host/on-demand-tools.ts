@@ -106,23 +106,19 @@ export class OnDemandTranslationTools {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new Error('Tool loading requires an object.')
     const input = raw as Record<string, unknown>
     if (Object.keys(input).some(key => key !== 'groups' && key !== 'mode') || input.mode !== undefined && input.mode !== 'add' && input.mode !== 'select') throw new Error('Unknown tool-loading option.')
-    let learningGuide = false
     if (input.groups !== undefined) {
       if (!Array.isArray(input.groups) || input.groups.some(group => typeof group !== 'string' || group !== 'file' && !Object.hasOwn(groups, group))) throw new Error('Unknown translation tool group. Call translation_load_tools with {} for the directory; new files and direct-result corrections use direct; only actual legacy jobs use file_jobs.')
       const requested = [...new Set(input.groups.flatMap(group => group === 'file' ? [...MATERIAL_TOOL_GROUPS.file] : [group]))] as TranslationToolGroup[]
       for (const group of requested) if (!groups[group].tools.some(name => this.entries.has(name))) throw new Error(`Translation tool group unavailable on this connection: ${group}`)
       this.activate(requested)
-      learningGuide = requested.includes('memory_write') || requested.includes('learning_sources')
       // A loader may share a batch with another tool; never remove that tool before it executes.
       if (input.mode === 'select') this.selectionAfterTurn = requested
+      return { loadedGroups: [...this.expand(requested)],
+        ...(requested.includes('memory_write') || requested.includes('learning_sources') ? { memoryGuide: MEMORY_LEARNING_GUIDE } : {}),
+        ...(this.selectionAfterTurn === undefined ? {} : { selectionAfterTurn: this.selectionAfterTurn }) }
     }
     return { groups: Object.entries(groups).filter(([, group]) => group.tools.some(name => this.entries.has(name))).map(([name, group]) => ({ name, purpose: group.description,
-      active: this.selected.has(name as TranslationToolGroup) })),
-      activeTools: [...this.entries.values()].filter(entry => !!entry.dispose).map(entry => entry.name),
-      taskGuidance: TRANSLATION_TASK_GUIDANCE,
-      ...(learningGuide ? { memoryGuide: MEMORY_LEARNING_GUIDE } : {}),
-      ...(this.selectionAfterTurn === undefined ? {} : { selectionAfterTurn: this.selectionAfterTurn }),
-      lifetime: 'Groups are reclaimed after the settled main turn; queued material and background tasks retain their required groups. select replaces the selection only at that safe boundary. Loading exposes schemas on the next model request; it does not authorize business operations.' }
+      active: this.selected.has(name as TranslationToolGroup) })) }
   }
 
   dispose(): void {
@@ -133,4 +129,4 @@ export class OnDemandTranslationTools {
   }
 }
 
-export const TRANSLATION_TOOL_LOADER_DESCRIPTION = TRANSLATION_TASK_GUIDANCE + '\n' + MEMORY_LEARNING_TRIGGER + ' Call this before any translation, retranslation, terminology or memory-write action, including a user request to change a translation delivered earlier: groups loaded in an earlier turn are reclaimed, so a tool you remember may not exist now. {} lists the compact directory without loading anything. translation_list_units, translation_read_units and translation_read_unit are always available for stable numbered content in opened sidebar Sessions, and returning a text unit exposes the direct group on the next model request. For text retranslation load direct, then translation_translate with the returned exact unit target and a new operationId; no per-unit reference grant or old material requestId is needed. For a direct file/text result, discover its exact unit target with translation_list_units / translation_read_units even after reload. translation_file_list instead discovers legacy FileJobs/document records and exposes file_jobs schemas on the next request. For a direct result, use direct with its exact unit target to append a corrected revision in that record; export separately only when explicitly requested. Use file_jobs only to inspect/correct actual saved legacy jobIds or settle already-running tasks. New execution of legacy file/document records is retired; resend the original through the current file input. The file alias loads direct and reference_read. New file material goes through direct: read the cached original yourself, optionally extract assets with the native subagent, call translation_translate (whole text, one exact range, or an organized body for non-text originals), review and deliver through the existing Session file entry; translation_save_result/translation_open_file are only for an explicitly requested separate export. Never replay old material targets or ask the user for internal JSON. Other groups: direct (new material or an existing direct text/file unit, waits for the actual result); sessions; memory_read/memory_write; reference_read/learning_sources; reference_segment (mark original/bilingual file boundaries); source. Legacy document groups only inspect or explicitly recover original legacy tasks. Pass groups to add schemas before the next model request. select defers removal until the settled turn boundary.'
+export const TRANSLATION_TOOL_LOADER_DESCRIPTION = TRANSLATION_TASK_GUIDANCE + '\n' + MEMORY_LEARNING_TRIGGER + ' Call this only when a required tool is absent from the CURRENT tool schemas. If translation_translate is already declared, use it directly without reloading direct. Groups may be retained for queued work or a follow-up turn; current schemas, not remembered availability, decide whether loading is needed. {} lists available groups without loading. With groups, only the requested groups and dependencies are acknowledged; memory_write/learning_sources also return the learning guide. translation_list_units, translation_read_units and translation_read_unit are always available for exact numbered targets in opened sidebar Sessions; reading a direct text/file unit exposes direct on the next request. Use translation_translate with that exact unit target and a new operationId for corrections; never reuse an old material requestId or legacy FileJobs jobId. New material and direct results use direct. file_jobs only inspects actual legacy jobs or settles already-running tasks; new legacy execution is retired. The file alias loads direct and reference_read. File results normally belong in the Session; translation_save_result/translation_open_file require an explicit separate export request. Loading only exposes tools; it does not authorize a different task. select changes the retained selection after the current turn settles, never during a tool batch.'

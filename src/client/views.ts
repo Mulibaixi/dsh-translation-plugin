@@ -730,28 +730,35 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       view: h(FileUnitView, { key: file.unitId, file, session: current, materials, viewFiles }) })),
     ...transient.map(record => ({ createdAt: record.createdAt, view: h(TranslationRecord, { key: record.id, record, quick, canRestore: !current.input }) })),
     ...sentTexts.map(material => ({ createdAt: material.createdAt, view: h('article', { key: material.materialId, className: 'dsh-tp-record-unit', 'aria-label': '已发送文本' },
-      h('p', { role: 'status' }, material.status),
+      h('div', { className: 'dsh-tp-unit-header' },
+        h('span', { role: 'status', className: 'dsh-tp-muted' }, material.status),
+        h('div', { className: 'dsh-tp-actions dsh-tp-record-heading-actions' },
+          button('撤回', () => { void materials?.recoverText(current.id, material.materialId, 'withdraw') }, material.busy || material.withdrawn),
+          button('重新发送', () => { void materials?.recoverText(current.id, material.materialId, 'retry') }, material.busy || material.unknown),
+          material.unknown ? button('检查提交状态', () => { void materials?.query(current.id, material.materialId) }, material.busy) : null)),
       h('div', { style: { whiteSpace: 'pre-wrap' } }, material.text),
       material.message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, material.message) : null,
-      material.withdrawn ? h('small', { className: 'dsh-tp-muted' }, '原材料引用已撤回，主会话中已有的通知仍保留。') : null,
-      h('div', { className: 'dsh-tp-actions' },
-        button('撤回', () => { void materials?.recoverText(current.id, material.materialId, 'withdraw') }, material.busy || material.withdrawn),
-        button('重新发送', () => { void materials?.recoverText(current.id, material.materialId, 'retry') }, material.busy || material.unknown),
-        material.unknown ? button('检查提交状态', () => { void materials?.query(current.id, material.materialId) }, material.busy) : null)) })),
+      material.withdrawn ? h('small', { className: 'dsh-tp-muted' }, '原材料引用已撤回，主会话中已有的通知仍保留。') : null) })),
   ].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)) : []
-  // 进入或切换会话后定位到最新的单元；只在该会话首批内容出现时滚动一次，此后不再改变用户自己的滚动位置。
+  const resultCount = units.reduce((count, unit) => count + (unit.deletion || fileJobRecords.some(record => record.summary.unitId === unit.id) ? 0
+    : isTextUnit(unit) ? unit.revisions.filter(revision => !revision.deletion && revision.text).length
+      : isDocumentUnit(unit) ? unit.revisions.filter(revision => !revision.deletion).length : 0), 0)
+    + fileJobRecords.reduce((count, record) => count + record.results.filter(result => !result.deletion && result.text).length, 0)
+    + transient.filter(record => record.text).length
+  // 新材料、译文首次出现时定位到底部，包括结果替换占位记录而总数不变的情况。
   const transcript = react.useRef<{ scrollTop: number; scrollHeight: number } | null>(null)
-  const transcriptEntry = react.useRef({ sessionId: undefined as string | undefined, pending: false })
+  const transcriptEntry = react.useRef({ sessionId: undefined as string | undefined, length: 0, results: 0, pending: false })
   react.useEffect(() => {
     const entry = transcriptEntry.current
-    if (entry.sessionId !== current?.id) { entry.sessionId = current?.id; entry.pending = true }
+    if (entry.sessionId !== current?.id || timeline.length > entry.length || resultCount > entry.results) entry.pending = true
+    entry.sessionId = current?.id; entry.length = timeline.length; entry.results = resultCount
     if (!entry.pending) return
     const element = transcript.current
     if (!element) return
     element.scrollTop = element.scrollHeight
     // 容器尚未参与布局（scrollHeight 为 0）时保留定位意图，等下一次内容变化再试。
     if (timeline.length > 0 && element.scrollHeight > 0) entry.pending = false
-  }, [current?.id, timeline.length])
+  }, [current?.id, timeline.length, resultCount])
   const materialStatus = current?.mode === 'normal' ? materials?.getStatus(current.id, ownerId) : undefined
   const blocked = current?.mode === 'normal' ? materialStatus?.blocked ?? (materials ? undefined : '普通模式暂不可用：当前 DSH 缺少同步发送材料接口。') : current ? quick.blockedReason(current) : undefined
   const busy = current?.mode === 'normal' ? materialStatus?.busy ?? false : current ? quick.isBusy(current.id) : false

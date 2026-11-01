@@ -36,7 +36,7 @@ import type { NormalTranslationResolution } from '../shared/normal-translation-v
 import type { FileJobConflict, FileJobMechanicalIssue, FileJobProposal, FileJobTerm, FileJobWorker } from '../shared/file-jobs.js'
 import { FileWorkerRuntime } from './file-worker-runtime.js'
 import { artifactExtension, parseArtifactOpen, parseArtifactSave, type TranslationArtifactCheck, type TranslationArtifactSaved } from '../shared/translation-artifact.js'
-import { TRANSLATION_SELF_REVIEW, DIRECT_REVISION_GUIDANCE, FILE_MEMORY_REVIEW_GUIDANCE, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
+import { DIRECT_REVIEW_NEXT_STEP, FILE_MEMORY_REVIEW_GUIDANCE, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
 import { resolveMarkdownImages } from './markdown-files.js'
 import { loadArtifactStorage, type ArtifactStorage } from './translation-delivery.js'
 import { assetPriority } from '../memory/asset-priority.js'
@@ -696,7 +696,7 @@ export class NormalTranslationService {
       nextStep: 'Review this result, then submit reusable entity/term/fact/relation proposals consistent with it using exact unique source quotes. draftTerms were only translation input, not saved proposals. Submit [] if no new assets. The translation Session already owns this recorded file result; point the user to its file entry. Do not create a separate delivery copy unless the user explicitly asks for an export.' } } : {}
     const handoff = receipt ? { target: { kind: 'unit' as const, mainSessionId: request.target.mainSessionId,
       translationSessionId: receipt.translationSessionId, unitId: receipt.unitId, sourceVersion: receipt.sourceVersion },
-      nextStep: TRANSLATION_SELF_REVIEW + ' ' + DIRECT_REVISION_GUIDANCE } : {}
+      nextStep: DIRECT_REVIEW_NEXT_STEP } : {}
     const withText = { ...base, ...assetReview, ...handoff, text, truncated: false }
     if (new TextEncoder().encode(JSON.stringify(withText)).byteLength <= 60_000) return withText
     return { ...base, ...assetReview, ...handoff, textPreview: Array.from(text).slice(0, 4000).join(''), truncated: true,
@@ -920,9 +920,8 @@ export class NormalTranslationService {
         request.fileName ? `Original file: ${request.fileName}. After review, submit reusable candidates with translation_submit_proposals using the returned target/revisionId (or [] if none). Keep delivery in this file unit and its version entry; briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation. Save a file only when the user explicitly requests a separate export.',
         STYLE_SETTINGS_GUIDANCE,
         ...(request.fileName ? [FILE_MEMORY_REVIEW_GUIDANCE] : []),
-        TRANSLATION_SELF_REVIEW,
+        DIRECT_REVIEW_NEXT_STEP,
         ...(request.fileName && /\.md$/iu.test(request.fileName) ? [MARKDOWN_REVIEW_GUIDANCE] : []),
-        DIRECT_REVISION_GUIDANCE,
         JSON.stringify({ target: request.target, operationId: request.operationId, userRequirements: '', organizedNotes: '', termReferences: [] }),
         ...(directive ? [directive] : []),
       ].join('\n') }], source: { kind: 'translation-unit', form: 'notice', summary: '重译单元', plugin: 'dsh-translation-plugin', mainSessionId: request.target.mainSessionId,
