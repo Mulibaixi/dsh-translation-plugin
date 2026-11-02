@@ -121,7 +121,7 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 润色已有译文时，在主聊天指出单元或版本并说明要求，例如“把单元 5 改得更自然，保留人物克制的语气和已约定的术语”。审阅新版本后，可继续给出具体意见。单次措辞修改不会自动变成长久规则；需要用于后续材料时，可要求更新对应记忆。
 
 - **重译**追加版本，保留原稿和旧译文；短文本**编辑**追加人工版本。文件修改通过主聊天提出，外部编辑文件不会自动写回插件。
-- 完整翻译自动建立最终选择，后续修订跟随更新；**设为最终**固定人工选择，新版本不会自动替换它。不完整或取消的输出不自动定稿。
+- 完整翻译自动建立最终选择，后续机器修订及人工保存会立即推进已有的“自动最终”；**设为最终**或**保存并定稿**固定人工选择，新版本不会自动替换它。不完整或取消的输出不自动定稿。
 - 同一文件的查找、导出及语义检索后按需读取译文共用有效定稿；文件只对选中的原文正文建立语义向量，切换最终译文不重新嵌入原文。不同原稿的译文不会混用，旧版本默认不进入检索。
 - 右键会话选择**导出译文 TXT**或**导出对照 JSON**，再选择当前会话或主题；记录页也提供导出。缺少定稿时会提示，可明确选择部分导出。主题档案另有 JSON／Markdown 导出。
 
@@ -167,11 +167,11 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 
 安装包入口：[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)。选择 `.tgz` 附件，按对应发行说明核对配套版本；当前翻译工作流配套 Composer `0.4.5`。
 
-使用 DSH CLI 时，以下命令固定安装翻译插件 `0.26.9` 与 Composer `0.4.5`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；新功能随对应版本的发行包提供。
+使用 DSH CLI 时，以下命令固定安装翻译插件 `0.26.10` 与 Composer `0.4.5`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；新功能随对应版本的发行包提供。
 
 ```powershell
 dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.5/dsh-composer-extension-0.4.5.tgz
-dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.26.9/dsh-translation-plugin-0.26.9.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.26.10/dsh-translation-plugin-0.26.10.tgz
 ```
 
 上述命令使用桌面 `desktop` profile；Web 环境使用自身实际 profile，联动组件支持范围仍以 Composer 说明为准。使用桌面插件管理器安装时无需另装 CLI。

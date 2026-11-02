@@ -728,14 +728,15 @@ export function finalizeCompletedUnit(history: TranslationHistory, unitId: strin
 }
 export function finalizeExportedUnit(history: TranslationHistory, unitId: string, at: string): TranslationHistory { return finalizeCompletedUnit(history, unitId, at, 'export') }
 
-/** Editing saves a new complete local fact and leaves the existing final pointer alone. */
+/** Editing appends a complete revision and advances an existing automatic final; user-fixed choices remain explicit. */
 export function appendManualRevision(history: TranslationHistory, unitId: string, data: { readonly id: string; readonly baseRevisionId: string; readonly text: string; readonly at: string }): TranslationHistory {
   const unit = findUnit(history, unitId), base = unit.revisions.find(revision => revision.id === data.baseRevisionId)
   if (unit.deletion || !base || !canEditTextRevision(base) || !text(data.text, 2_000_000, true) || !time(data.at)) throw new Error('Manual revision requires nonempty ended source and body')
   const revision = newRevision(history, { id: data.id, operationId: `manual:${data.id}`, kind: 'manual', model: null, draftVersion: null,
     baseRevisionId: base.id, callRecord: null, sourceVersion: base.sourceVersion, createdAt: data.at, updatedAt: data.at, accepted: true, status: 'completed', text: data.text, message: null }, unit.revisions.length + 1, unit.id)
   const updated: TextUnit = { ...unit, revisions: [...unit.revisions, revision] }
-  return event(replaceUnit(history, updated), updated, revision, 'revision.manual_saved', data.at)
+  const next = event(replaceUnit(history, updated), updated, revision, 'revision.manual_saved', data.at)
+  return advanceSettledAutomaticFinal(next, unitId, revision.id, data.at)
 }
 
 /** Append an admitted new unit and finalize its predecessor in the same conversion. */

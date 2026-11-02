@@ -1,4 +1,5 @@
 import { referenceSegmentationComplete } from '../shared/reference-segmentation.js'
+import { DIRECT_REVIEW_NEXT_STEP, DIRECT_REVISION_GUIDANCE, TRANSLATION_SELF_REVIEW } from '../shared/translation-review.js'
 import { diagnosticSpan } from './diagnostics.js'
 import type { OtherMemoryService } from './other-memory.js'
 import type { MainAgent, TopicHostContext, TopicToolsService } from './topic-tools.js'
@@ -49,6 +50,12 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
   const plans = new Map<string, Promise<number | undefined>>()
   const replacements: { event: HistoryEvent; message: ToolMessage; text: string; previous: string }[] = []
   const nodes = new Set(session.surface.nodes)
+  // A continuing learning task still needs one complete guide, even when its tools stay loaded.
+  let latestLearningCallId: string | undefined
+  for (const [id, call] of calls) {
+    const result = originals.get(id)
+    if (call.data.name === 'translation_load_tools' && result && !result.isError && typeof json(content(result))?.memoryGuide === 'string') latestLearningCallId = id
+  }
   for (const event of events) {
     if (event.type !== 'tool/result' || !nodes.has(event.seq) || !ended.has(event.data.turn as number)) continue
     const message = session.deriveEventMessage(event)
@@ -58,7 +65,23 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
     if (previous === undefined || !original || original.isError || !call || !args) continue
     const value = json(content(original)), snapshot = object(value?.snapshot)
     let summary: Data | undefined
-    if ((call.data.name === 'translation_upsert_term' && value?.kind === 'terms' || call.data.name === 'translation_upsert_archive' && value?.kind === 'archive')
+    if (call.data.name === 'translation_load_tools' && value) {
+      const loadedGroups = Array.isArray(value.loadedGroups) ? value.loadedGroups
+        : Array.isArray(value.groups) ? value.groups.flatMap(group => { const item = object(group); return item?.active === true && typeof item.name === 'string' ? [item.name] : [] }) : undefined
+      summary = { kind: 'tool_loading_history',
+        ...(Array.isArray(args.groups) ? { requestedGroups: args.groups } : {}),
+        ...(loadedGroups ? { loadedGroups } : {}),
+        ...(value.selectionAfterTurn === undefined ? {} : { selectionAfterTurn: value.selectionAfterTurn }),
+        ...(message.toolCallId === latestLearningCallId ? { memoryGuide: value.memoryGuide } : {}),
+        note: 'Historical loading receipt. Current schemas determine availability; load only missing tools.' }
+    } else if (call.data.name === 'translation_translate' && value?.status === 'completed' && value.recorded === true) {
+      const visible = json(previous)
+      // Replace only the known static block; keep the current body, refs, usage and any task-specific suffix.
+      if (typeof visible?.nextStep === 'string') {
+        const nextStep = visible.nextStep.replace(TRANSLATION_SELF_REVIEW + ' ' + DIRECT_REVISION_GUIDANCE, DIRECT_REVIEW_NEXT_STEP)
+        if (nextStep !== visible.nextStep) summary = { ...visible, nextStep }
+      }
+    } else if ((call.data.name === 'translation_upsert_term' && value?.kind === 'terms' || call.data.name === 'translation_upsert_archive' && value?.kind === 'archive')
       && snapshot && typeof snapshot.topicId === 'string' && Number.isSafeInteger(snapshot.version) && Array.isArray(snapshot.entries)) {
       summary = { kind: call.data.name === 'translation_upsert_term' ? 'terms_history' : 'archive_history', topicId: snapshot.topicId,
         version: snapshot.version, entryCount: snapshot.entries.length,

@@ -36,7 +36,7 @@ When you reach the next chapter, keep established names and terminology within r
 1. **Prepare material and context.** Create a topic and session, add sources, and describe the audience, style, and background.
 2. **Produce a first translation.** Use Quick mode for independent short text, or Normal mode when context and memory matter.
 3. **Discuss and refine.** Identify a unit or version in the main chat and adjust meaning, phrasing, voice, or terminology.
-4. **Review and finalize.** Compare the source and translation versions, revise further, choose a final, and open or export it.
+4. **Review and finalize.** Compare the source and translation versions, revise further, choose a final, and open or export it. Manual edits advance an existing automatic final; an explicitly fixed final keeps your selection.
 5. **Reuse knowledge.** Review and adopt useful memory for later passages and sessions.
 
 ## Requirements
