@@ -3,6 +3,10 @@ import { DIRECT_REVIEW_NEXT_STEP, DIRECT_REVISION_GUIDANCE, TRANSLATION_SELF_REV
 import { diagnosticSpan } from './diagnostics.js'
 import type { OtherMemoryService } from './other-memory.js'
 import type { MainAgent, TopicHostContext, TopicToolsService } from './topic-tools.js'
+import type { HistoryService } from './history.js'
+import type { HistoryBundle } from '../shared/history-bundle.js'
+import { parseHistoryTextRead, type HistoryTextRead } from '../shared/history-text.js'
+import { isTextUnit } from '../memory/translation-history.js'
 
 type Data = Record<string, unknown>
 interface ToolMessage extends Data {
@@ -27,6 +31,20 @@ function json(text: unknown): Data | undefined { try { return typeof text === 's
 function content(message: ToolMessage): string | undefined {
   return message.content.every(block => block.type === 'text' && typeof block.text === 'string') ? message.content.map(block => block.text).join('\n') : undefined
 }
+type SavedSnapshot = NonNullable<Awaited<ReturnType<HistoryService['compactionSnapshot']>>>
+function recordedText(bundle: HistoryBundle, request: HistoryTextRead, operationId: unknown): { readonly source: string; readonly text: string } | undefined {
+  const unit = bundle.history.units.find(unit => unit.id === request.unitId)
+  if (!unit || !isTextUnit(unit) || unit.deletion) return undefined
+  const source = unit.sourceVersions.find(source => source.version === request.sourceVersion)
+  const revision = unit.revisions.find(revision => revision.id === request.revisionId)
+  return source && revision?.status === 'completed' && !revision.deletion && revision.sourceVersion === request.sourceVersion && revision.operationId === operationId
+    ? { source: source.text, text: revision.text } : undefined
+}
+function bodyMatches(value: Data, text: string): boolean {
+  const points = Array.from(text)
+  return value.totalCodePoints === points.length && (typeof value.text === 'string' ? value.text === text
+    : typeof value.textPreview === 'string' && !!value.textPreview && value.textPreview === points.slice(0, Array.from(value.textPreview).length).join(''))
+}
 
 /** Native, logged surface replacement: original events remain intact and replay needs no plugin interpreter. */
 export async function compactTranslationHistory(ctx: TopicHostContext, topics: TopicToolsService, agent: MainAgent, turn: number, signal: AbortSignal) {
@@ -48,8 +66,22 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
   }
   const memory = ctx.get?.('translationOtherMemory') as OtherMemoryService | undefined
   const plans = new Map<string, Promise<number | undefined>>()
-  const replacements: { event: HistoryEvent; message: ToolMessage; text: string; previous: string }[] = []
+  const replacements: { event: HistoryEvent; message: ToolMessage; text: string; previous: string; readable?: () => boolean; sessionId?: string; topicId?: string }[] = []
   const nodes = new Set(session.surface.nodes)
+  const history = ctx.get?.('translationHistory') as HistoryService | undefined
+  const snapshots = new Map<string, Promise<SavedSnapshot | undefined>>()
+  const openedSessions = async (): Promise<Map<string, string>> => {
+    const value = await topics.requestOwned(agent.id, { kind: 'list_sessions' }, { agent, callId: 'history-compaction', signal })
+    if (value.kind !== 'sessions') throw new Error('历史收缩未取得已打开会话。')
+    return new Map(value.sessions.map(item => [item.id, item.topicId]))
+  }
+  let opened: Promise<Map<string, string>> | undefined, latestTranslationTurn = -1
+  for (const event of events) if (event.type === 'tool/result' && ended.has(event.data.turn as number)) {
+    const message = event.data.message as ToolMessage | undefined
+    if (!message || message.isError || calls.get(message.toolCallId)?.data.name !== 'translation_translate') continue
+    const value = json(content(message))
+    if (value?.status === 'completed' && value.recorded === true) latestTranslationTurn = Math.max(latestTranslationTurn, event.data.turn as number)
+  }
   // A continuing learning task still needs one complete guide, even when its tools stay loaded.
   let latestLearningCallId: string | undefined
   for (const [id, call] of calls) {
@@ -65,6 +97,7 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
     if (previous === undefined || !original || original.isError || !call || !args) continue
     const value = json(content(original)), snapshot = object(value?.snapshot)
     let summary: Data | undefined
+    let readable: (() => boolean) | undefined, bodyScope: { sessionId: string; topicId: string } | undefined
     if (call.data.name === 'translation_load_tools' && value) {
       const loadedGroups = Array.isArray(value.loadedGroups) ? value.loadedGroups
         : Array.isArray(value.groups) ? value.groups.flatMap(group => { const item = object(group); return item?.active === true && typeof item.name === 'string' ? [item.name] : [] }) : undefined
@@ -76,10 +109,39 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
         note: 'Historical loading receipt. Current schemas determine availability; load only missing tools.' }
     } else if (call.data.name === 'translation_translate' && value?.status === 'completed' && value.recorded === true) {
       const visible = json(previous)
-      // Replace only the known static block; keep the current body, refs, usage and any task-specific suffix.
+      // Keep the visible body unless an exact saved version can replace it with a shorter reference.
       if (typeof visible?.nextStep === 'string') {
         const nextStep = visible.nextStep.replace(TRANSLATION_SELF_REVIEW + ' ' + DIRECT_REVISION_GUIDANCE, DIRECT_REVIEW_NEXT_STEP)
         if (nextStep !== visible.nextStep) summary = { ...visible, nextStep }
+      }
+      if (visible && visible.kind !== 'translation_result_history' && event.data.turn !== latestTranslationTurn && history?.compactionSnapshot &&
+        visible.mainSessionId === agent.id && typeof visible.topicId === 'string' && (typeof visible.text === 'string' || typeof visible.textPreview === 'string')) {
+        let request: HistoryTextRead | undefined
+        try { request = parseHistoryTextRead({ translationSessionId: visible.translationSessionId, unitId: visible.unitId, sourceVersion: visible.sourceVersion,
+          side: 'translation', revisionId: visible.revisionId, start: 0 }) } catch { /* Unknown historical result shapes retain their visible body. */ }
+        if (request) {
+          const { text: _text, textPreview: _preview, resultRef: _runtimeRef, truncated: _truncated, ...facts } = summary ?? visible
+          const candidate = { ...facts, kind: 'translation_result_history', read: { tool: 'translation_read_history', arguments: request },
+            note: 'Historical recorded result, not the current final or a new task. Read this exact version when needed; discover the current unit before editing.' }
+          // Short translations do not pay for extra Client/storage checks just to grow their receipt.
+          if (JSON.stringify(candidate).length < JSON.stringify(summary ?? visible).length) {
+            const allowed = await (opened ??= openedSessions())
+            if (!current()) return stats
+            const sessionId = request.translationSessionId, topicId = visible.topicId
+            if (allowed.get(sessionId) === topicId) {
+              let snapshot = snapshots.get(sessionId)
+              if (!snapshot) { snapshot = history.compactionSnapshot({ namespaceId, topicId, sessionId }, peer); snapshots.set(sessionId, snapshot) }
+              const saved = await snapshot
+              if (!current()) return stats
+              if (saved?.isCurrent()) {
+                const result = recordedText(saved.saved, request, visible.operationId), live = recordedText(saved.current, request, visible.operationId)
+                if (result && live?.text === result.text && live.source === result.source && bodyMatches(visible, result.text)) {
+                  summary = candidate; readable = saved.isCurrent; bodyScope = { sessionId, topicId }
+                }
+              }
+            }
+          }
+        }
       }
     } else if ((call.data.name === 'translation_upsert_term' && value?.kind === 'terms' || call.data.name === 'translation_upsert_archive' && value?.kind === 'archive')
       && snapshot && typeof snapshot.topicId === 'string' && Number.isSafeInteger(snapshot.version) && Array.isArray(snapshot.entries)) {
@@ -107,14 +169,17 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
     }
     if (!summary) continue
     const text = JSON.stringify(summary)
-    if (text.length < previous.length) replacements.push({ event, message, text, previous })
+    if (text.length < previous.length) replacements.push({ event, message, text, previous, ...(readable ? { readable, ...bodyScope } : {}) })
   }
   if (!replacements.length || !current()) return stats
+  const stillOpened = replacements.some(item => item.readable) ? await openedSessions() : undefined
+  if (!current()) return stats
   const report = diagnosticSpan(ctx, 'model.history.compact')
   try {
     const active = new Set(session.surface.nodes)
-    for (const { event, message, text, previous } of replacements) {
+    for (const { event, message, text, previous, readable, sessionId, topicId } of replacements) {
       if (!active.has(event.seq)) continue
+      if (readable && (!readable() || stillOpened?.get(sessionId!) !== topicId)) continue
       const shadowedTokenCount = meter.estimateMessage(message)
       if (!Number.isFinite(shadowedTokenCount) || shadowedTokenCount < 0) throw new Error('上下文替换缺少有效的宿主 token 估算。')
       session.append('compaction/prune', { shadowedRange: { start: event.seq, end: event.seq }, shadowedSeqs: [event.seq], shadowedTokenCount })

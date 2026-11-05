@@ -1,5 +1,6 @@
 import { parseReferenceAssetSelection, parseReferenceContextAsset, type ReferenceAssetSelection, type ReferenceContextAsset } from './reference-memory.js'
 import { parseDirectHistoryContext, type DirectHistoryContext } from './direct-history-context.js'
+import { parseDirectTranslationBasis, type DirectTranslationBasis } from './direct-context-basis.js'
 import { parseOtherMemoryScope, type OtherMemoryScope } from './other-memory.js'
 import { parseDirectProposalSubmission, type DirectProposalSubmission, type DirectProposalReceipt } from './direct-proposals.js'
 import { parseReferenceFacts, parseReferenceIndex, type ReferenceFacts, type ReferenceIndex } from './reference-memory.js'
@@ -32,6 +33,7 @@ import { parseDocumentReviewPageRequest, parseDocumentReviewPage, parseDocumentR
 
 import { parseFileHistoryRequest, parseFileHistoryValue, parseFileHistoryUnit, type FileHistoryRequest, type FileHistoryValue, type FileHistoryUnit } from './file-history.js'
 import { parseUnitRequest, parseUnitDirectory, parseUnitContent, type UnitDirectoryRequest, type UnitReadRequest, type UnitDirectory, type UnitContent } from './numbered-units.js'
+import { parseHistoryTextRead, parseHistoryTextPage, type HistoryTextRead, type HistoryTextPage } from './history-text.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
@@ -82,6 +84,7 @@ export interface TopicUnitFact {
 export type TopicBridgeCommand =
   | ({ readonly kind: 'list_units' } & UnitDirectoryRequest)
   | ({ readonly kind: 'read_units' } & UnitReadRequest)
+  | ({ readonly kind: 'read_history' } & HistoryTextRead)
   | { readonly kind: 'file_history'; readonly request: FileHistoryRequest }
   | { readonly kind: 'reference_assets'; readonly topicId: string; readonly selections: readonly ReferenceAssetSelection[] }
   | { readonly kind: 'reference_bind'; readonly operationId: string; readonly start: TopicSessionStart }
@@ -159,6 +162,7 @@ export type TopicBridgeValue =
   | { readonly kind: 'settings_scope'; readonly scope: OtherMemoryScope }
   | { readonly kind: 'unit_directory'; readonly directory: UnitDirectory }
   | { readonly kind: 'unit_contents'; readonly contents: readonly UnitContent[] }
+  | { readonly kind: 'history_text'; readonly page: HistoryTextPage }
   | { readonly kind: 'file_history'; readonly value: FileHistoryValue }
   | { readonly kind: 'file_unit'; readonly unit: FileHistoryUnit }
   | { readonly kind: 'reference_assets'; readonly assets: readonly ReferenceContextAsset[] }
@@ -181,7 +185,7 @@ export type TopicBridgeValue =
   | { readonly kind: 'normal_resolved'; readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }> }
   | { readonly kind: 'normal_source_corrected'; readonly correction: NormalTranslationCorrectionReceipt }
   | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
-  | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot; readonly historyContext?: DirectHistoryContext }
+  | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot; readonly historyContext?: DirectHistoryContext; readonly basis?: DirectTranslationBasis }
   | { readonly kind: 'normal_committed'; readonly receipt: DirectTranslationReceipt }
   | { readonly kind: 'normal_exported'; readonly export: NormalTranslationExport }
   | { readonly kind: 'normal_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
@@ -251,6 +255,7 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
       return { kind: 'settings_scope', topicId: value.topicId as string | null }
     case 'list_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, false) } }
     case 'read_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, true) } }
+    case 'read_history': { const { kind, ...request } = value; return { kind, ...parseHistoryTextRead(request) } }
       case 'reference_assets': {
         exact(value, ['kind','topicId','selections']); text(value.topicId)
         if (!Array.isArray(value.selections) || value.selections.length > 100) throw new TypeError('Invalid asset selections')
@@ -310,9 +315,8 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
         return { kind: 'normal_correct_source', ...parseNormalTranslationSourceCorrection(correction) }
       }
       case 'normal_accept': case 'normal_prepare': {
-        exact(value, ['kind', 'envelope', 'operationId', 'organizedRequirements', 'termReferences', ...(Object.hasOwn(value,'referenceContextRef') ? ['referenceContextRef'] : [])])
-        return { kind: value.kind, ...parseNormalTranslationAcceptance({ envelope: value.envelope, operationId: value.operationId,
-          organizedRequirements: value.organizedRequirements, termReferences: value.termReferences, ...(value.referenceContextRef === undefined ? {} : {referenceContextRef:value.referenceContextRef}) }) }
+        const { kind, ...request } = value
+        return { kind, ...parseNormalTranslationAcceptance(request) }
       }
       case 'normal_commit': {
         const { kind, ...commit } = value
@@ -490,6 +494,7 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
       return { kind: 'direct_proposals', receipt: value.receipt as unknown as DirectProposalReceipt }
     }
     case 'unit_directory': exact(value, ['kind', 'directory']); return { kind: 'unit_directory', directory: parseUnitDirectory(value.directory) }
+    case 'history_text': exact(value, ['kind', 'page']); return { kind: 'history_text', page: parseHistoryTextPage(value.page) }
     case 'unit_contents':
       exact(value, ['kind', 'contents'])
       if (!Array.isArray(value.contents) || !value.contents.length || value.contents.length > 8) throw new TypeError('Invalid unit content list')
@@ -517,10 +522,11 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
     case 'normal_source_corrected': exact(value, ['kind', 'correction']); return { kind: 'normal_source_corrected', correction: parseNormalTranslationCorrectionReceipt(value.correction) }
     case 'normal_observed': exact(value, ['kind', 'operation']); return { kind: 'normal_observed', operation: value.operation === null ? null : parseNormalTranslationOperation(value.operation) }
     case 'normal_prepared': {
-      exact(value, ['kind', 'termSnapshot', ...(Object.hasOwn(value, 'historyContext') ? ['historyContext'] : [])])
+      exact(value, ['kind', 'termSnapshot', ...(Object.hasOwn(value, 'historyContext') ? ['historyContext'] : []), ...(Object.hasOwn(value, 'basis') ? ['basis'] : [])])
       const termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)
       if (!termSnapshot || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation preparation')
-      return { kind: 'normal_prepared', termSnapshot, ...(value.historyContext === undefined ? {} : { historyContext: parseDirectHistoryContext(value.historyContext) }) }
+      return { kind: 'normal_prepared', termSnapshot, ...(value.historyContext === undefined ? {} : { historyContext: parseDirectHistoryContext(value.historyContext) }),
+        ...(value.basis === undefined ? {} : { basis: parseDirectTranslationBasis(value.basis) }) }
     }
     case 'normal_committed': {
       exact(value, ['kind', 'receipt'])

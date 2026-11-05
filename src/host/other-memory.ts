@@ -4,12 +4,14 @@ import { OTHER_MEMORY_RESPONSE_BYTES, parseOtherMemoryEntry, parseOtherMemoryReq
 import { referenceBytes, referenceString } from '../shared/reference-memory.js'
 import type { SourceIdentity } from '../shared/translation-sources.js'
 import { parseReferenceSegmentation } from '../shared/reference-segmentation.js'
+import { remapReferenceSegmentation, type ReferenceFilePlan } from './reference-segmentation-reuse.js'
 import { loadMemoryDatabase, type MemoryDatabase } from './memory-database.js'
 import type { LocalDataService } from './local-data.js'
 import type { TopicHostContext, TopicToolsService } from './topic-tools.js'
 
 export interface OtherMemoryReferenceFilesHooks {
   persistSource(entry: OtherMemoryReference): Promise<void>
+  readSource(source: SourceIdentity): Promise<string>
   release(entry: OtherMemoryReference): void
 }
 interface Guard { readonly scope: OtherMemoryScope; readonly peerId: string; readonly generation: number; readonly epoch: number }
@@ -129,15 +131,45 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
     referenceString(request.topicId, 3000)
     if (request.category !== 'full_text') throw new TypeError('其他参考资料已关闭，仅支持原文／双语对照文件。')
     const guard = this.authorize(request, peerId)
-    const entry = parseOtherMemoryEntry({ id: `memory-${crypto.randomUUID()}`, namespaceId: request.namespaceId, topicId: request.topicId, version: 1, kind: 'reference',
-      category: request.category, source: request.source, persistence: 'saved' }) as OtherMemoryReference
     return this.serial(guard, async () => {
       await this.database(); this.check(guard)
       if (!this.hooks) throw failure('other_memory_original_unavailable', '参考原件保存服务尚未就绪。')
+      const sameName = this.entries(request.namespaceId).filter((entry): entry is OtherMemoryReference => entry.kind === 'reference' && entry.category === 'full_text' && entry.source.name === request.source.name)
+      const local = sameName.filter(entry => entry.topicId === request.topicId)
+      if (local.length > 1) throw failure('reference_filename_conflict', '当前主题存在多份同名参考文件，请保留要沿用的一份后重试；未重新分段。')
+      const old = local[0]
+      let baseline = this.db?.referencePlan(request.namespaceId, request.source.name)
+      if (!baseline) {
+        const candidates = (old?.segmentation ? [old] : sameName.filter(entry => entry.segmentation !== undefined))
+        for (const candidate of candidates) {
+          const value: ReferenceFilePlan = { source: candidate.source, segmentation: candidate.segmentation! }
+          if (!baseline) { baseline = value; continue }
+          const first = await this.hooks.readSource(baseline.source), other = await this.hooks.readSource(value.source)
+          this.check(guard)
+          if (first !== other || JSON.stringify(baseline.segmentation.ends) !== JSON.stringify(value.segmentation.ends))
+            throw failure('reference_filename_conflict', '同名历史参考文件存在不同分段，请先在要沿用的原主题更新该文件以确定基准；未重新分段。')
+        }
+      }
+      let segmentation: OtherMemoryReference['segmentation']
+      if (baseline) {
+        const before = await this.hooks.readSource(baseline.source), after = await this.hooks.readSource(request.source)
+        this.check(guard)
+        const mapped = remapReferenceSegmentation(before, after, baseline.segmentation)
+        segmentation = { version: old?.segmentation && JSON.stringify(old.segmentation.ends) === JSON.stringify(mapped.ends)
+          ? old.segmentation.version : (old?.segmentation?.version ?? 0) + 1, ends: mapped.ends }
+      }
+      const entry = parseOtherMemoryEntry({ id: old?.id ?? `memory-${crypto.randomUUID()}`, namespaceId: request.namespaceId, topicId: request.topicId,
+        version: (old?.version ?? 0) + 1, kind: 'reference', category: request.category, source: request.source, persistence: 'saved',
+        ...(segmentation ? { segmentation } : {}) }) as OtherMemoryReference
       await this.hooks.persistSource(entry); this.check(guard)
       return this.writer(async () => {
         const db = await this.database(true); this.check(guard)
-        db!.save(entry);
+        db!.transaction(() => {
+          db!.save(entry)
+          if (entry.segmentation) db!.referencePlanSave(entry.namespaceId, { source: entry.source, segmentation: entry.segmentation })
+          if (old) db!.indexRemoveSource(entry.namespaceId, entry.topicId, `reference:${entry.id}`)
+        })
+        if (old) this.hooks!.release(old)
         return structuredClone(entry)
       })
     })
@@ -160,7 +192,12 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
       const entry = parseOtherMemoryEntry({ ...old, segmentation, persistence: 'saved' }) as OtherMemoryReference
       return this.writer(async () => {
         const db = await this.database(true); this.check(guard); validate()
-        db!.save(entry)
+        db!.transaction(() => {
+          db!.save(entry)
+          // A late task on another topic's older snapshot must not roll back the latest filename baseline.
+          const baseline = db!.referencePlan(entry.namespaceId, entry.source.name)
+          if (!baseline || baseline.source.sourceId === entry.source.sourceId) db!.referencePlanSave(entry.namespaceId, { source: entry.source, segmentation })
+        })
         ;(this.ctx.get?.('translationMemorySearch') as { contentChanged(): void } | undefined)?.contentChanged()
         return structuredClone(entry)
       })
@@ -184,6 +221,11 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
   removeEntry(raw: OtherMemoryRemove): Promise<{ readonly removed: true }> {
     return this.removeForPeer(raw, this.ctx.invocation?.peer.id)
   }
+  private retainReferencePlan(db: MemoryDatabase, entry: OtherMemoryEntry): void {
+    if (entry.kind !== 'reference' || !entry.segmentation || db.referencePlan(entry.namespaceId, entry.source.name)) return
+    const candidates = this.entries(entry.namespaceId).filter(item => item.kind === 'reference' && item.source.name === entry.source.name && item.segmentation !== undefined)
+    if (candidates.length === 1) db.referencePlanSave(entry.namespaceId, { source: entry.source, segmentation: entry.segmentation })
+  }
   removeSettingForAgent(raw: OtherMemoryRemove, peerId: string): Promise<{ readonly removed: true }> { return this.removeForPeer(raw, peerId, true) }
   private removeForPeer(raw: OtherMemoryRemove, peerId: string | undefined, settingsOnly = false): Promise<{ readonly removed: true }> {
     const request = parseOtherMemoryRequest('removeEntry', raw) as OtherMemoryRemove, guard = this.authorize(request, peerId)
@@ -191,7 +233,7 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
       const db = await this.database(); this.check(guard)
       const entry = this.current(request.id, request.namespaceId)
       if (!entry || entry.topicId !== request.topicId || entry.version !== request.expectedVersion || settingsOnly && entry.kind !== 'setting') throw failure('other_memory_stale', '此条目已变化、已删除或不是指定范围的设定，请重新读取后重试。')
-      db?.transaction(() => { db.remove(entry.id); if (entry.kind === 'reference') db.indexRemoveSource(entry.namespaceId, entry.topicId, `reference:${entry.id}`) })
+      db?.transaction(() => { this.retainReferencePlan(db, entry); db.remove(entry.id); if (entry.kind === 'reference') db.indexRemoveSource(entry.namespaceId, entry.topicId, `reference:${entry.id}`) })
       if (entry.kind === 'reference') this.hooks?.release(entry)
       return { removed: true as const }
     }))
@@ -199,6 +241,7 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
   private removeTopic(namespaceId: string, topicId: string): void {
     const durable = this.db?.all(namespaceId).filter(entry => entry.topicId === topicId) ?? []
     this.db?.transaction(() => {
+      for (const entry of durable) this.retainReferencePlan(this.db!, entry)
       for (const entry of durable) this.db!.remove(entry.id)
       for (const entry of durable) if (entry.kind === 'reference') this.db!.indexRemoveSource(namespaceId, topicId, `reference:${entry.id}`)
     })
@@ -226,19 +269,20 @@ export class OtherMemoryService implements OtherMemoryRemotePort {
     const db = await this.database(true)
     const durable = db!.all(namespaceId).filter(entry => entry.topicId === topicId)
     db!.transaction(() => {
+      for (const entry of durable) this.retainReferencePlan(db!, entry)
       for (const entry of durable) db!.remove(entry.id)
       db!.retire(namespaceId, topicId)
     })
     for (const entry of durable) if (entry.kind === 'reference') this.hooks?.release(entry)
   }
-  /** Provenance alone never holds bytes; only saved registrations retain originals. */
+  /** Topic deletion releases its registrations; filename baselines retain their own originals. */
   async topicSourcesLocked(namespaceId: string, topicId: string): Promise<readonly SourceIdentity[]> {
     await this.database()
     return [...(this.db?.all(namespaceId) ?? [])].filter((entry): entry is OtherMemoryReference => entry.namespaceId === namespaceId && entry.topicId === topicId && entry.kind === 'reference').map(entry => entry.source)
   }
   async heldSourceDigests(): Promise<ReadonlySet<string>> {
     await this.database()
-    return new Set([...(this.db?.all() ?? [])].filter((entry): entry is OtherMemoryReference => entry.kind === 'reference').map(entry => entry.source.sha256))
+    return new Set([...this.db?.referencePlanSources() ?? [], ...(this.db?.all() ?? []).filter((entry): entry is OtherMemoryReference => entry.kind === 'reference').map(entry => entry.source)].map(source => source.sha256))
   }
   async dispose(): Promise<void> {
     this.disposed = true; this.generation++

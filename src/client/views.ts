@@ -32,6 +32,7 @@ import type { NormalTranslationClient } from './normal-translation.js'
 import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
 import type { TopicMemoryStore, TopicTermVersion } from './topic-memory-store.js'
 import { createSessionReorder, type SessionDrop, type SessionPointerEvent } from './session-reorder.js'
+import { TranscriptPosition } from './transcript-position.js'
 import type { TopicDeletionClient, TopicDeletionPreview } from './topic-deletion.js'
 export { MemoryAssetsView } from './memory-assets-view.js'
 
@@ -344,7 +345,7 @@ function SessionPicker({ store, ownerId, current, open, onOpenChange: setOpen, c
 
 function TranslationRecord({ record, quick, canRestore }: { readonly record: QuickRecord; readonly quick: QuickTranslationClient; readonly canRestore: boolean }): unknown {
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知' }[record.status]
-  return h('article', { className: 'dsh-tp-translation', 'aria-label': `翻译记录：${status}` },
+  return h('article', { className: 'dsh-tp-translation', 'data-operation-id': record.id, 'aria-label': `翻译记录：${status}` },
     h('div', { className: 'dsh-tp-muted' }, '原文'),
     h('div', { className: 'dsh-tp-translation-text' }, record.source),
     h('div', { className: 'dsh-tp-muted', role: 'status' }, record.status === 'completed' ? `${status} · ${record.targetLanguage}` : status),
@@ -562,12 +563,12 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
     )) : null
   const edit = [...editor.drafts.values()].find(edit => edit.sessionId === session.id && edit.unitId === unit.id)
   react.useEffect(() => { if (edit && edit.baseRevisionId !== latest?.id) setExpanded(true) }, [edit?.baseRevisionId, latest?.id])
-  if (unit.deletion) return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
+  if (unit.deletion) return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-unit-header' },
       h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · 文本 · 已删除`),
       h('time', { dateTime: unit.deletion.at, className: 'dsh-tp-muted' }, new Date(unit.deletion.at).toLocaleString())),
     h('p', { className: 'dsh-tp-muted' }, '正文已清除；编号保留，不再参与导出或记忆依据。'))
-  if (!latest) return h('article', { className: 'dsh-tp-translation', 'aria-label': `文本 ${unit.order}` },
+  if (!latest) return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-unit-header' },
       h('span', { className: 'dsh-tp-muted' }, '原文'),
       h('div', { className: 'dsh-tp-actions' }, h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
@@ -579,7 +580,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const blocked = session.mode === 'normal' ? !executionOwner ? '请选择本次任务使用的主会话。' : normal?.retranslateBlockedReason(session.id, unit.id) ?? (normal ? undefined : '普通重译入口未就绪。') : quick.retranslateBlockedReason(session, unit.id)
   const file = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
   const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
-  return h('article', { className: 'dsh-tp-translation', 'aria-label': `${file ? '文件' : '文本'} ${unit.order}` },
+  return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `${file ? '文件' : '文本'} ${unit.order}` },
     h('div', { className: 'dsh-tp-unit-header' },
       h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
       h('div', { className: 'dsh-tp-actions' },
@@ -717,19 +718,35 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const fileUnits = current ? materials?.getFileUnits(current.id) ?? [] : []
   const fileJobRecords = current ? fileJobs?.units(current.id) ?? [] : []
   const sentTexts = current ? materials?.getSentTexts(current.id) ?? [] : []
+  const unitPositions = new Map(units.map(unit => {
+    const revisions = isTextUnit(unit) ? unit.revisions.filter(revision => revision.kind === 'machine' && !revision.deletion) : []
+    const intent = current ? normal?.getRetranslationStatus(current.id, unit.id) : undefined
+    const operation = current ? normal?.getUnitStatus(current.id, unit.id) : undefined
+    const calls = records.filter(record => record.unitId === unit.id)
+    return [unit.id, { id: unit.deletion ? '' : `u:${unit.id}`, events: [
+      ...revisions.flatMap(revision => [`call:${revision.id}`, ...(revision.text ? [`result:${revision.id}`] : [])]),
+      ...calls.map(record => `call:${record.id}`),
+      ...(intent ? [`intent:${intent.operationId}`] : []), ...(operation ? [`operation:${operation.operationId}`] : []),
+      ...(isDocumentUnit(unit) ? [...unit.tasks.map(task => `task:${task.taskId}`), ...unit.revisions.filter(revision => !revision.deletion).map(revision => `result:${revision.id}`)] : []),
+    ], active: !!intent?.active || !!operation && ['accepted', 'running', 'unknown'].includes(operation.status)
+      || calls.some(record => ['submitting', 'running', 'unknown'].includes(record.status))
+      || revisions.some(revision => ['submitting', 'running', 'unknown'].includes(revision.status))
+      || isDocumentUnit(unit) && unit.tasks.some(task => ['running', 'unknown'].includes(task.status)) }]
+  }))
   const timeline = current ? [
-    ...units.filter(unit => !fileJobRecords.some(record => record.summary.unitId === unit.id)).map(unit => ({ createdAt: fileUnits.find(file => file.unitId === unit.id || file.documentUnitId === unit.id)?.createdAt ?? unit.createdAt,
-      view: isFileJobUnit(unit) ? h('article', { className: 'dsh-tp-record-unit', 'aria-label': `单元 ${unit.order} · 文件` },
+    ...units.filter(unit => !fileJobRecords.some(record => record.summary.unitId === unit.id)).map(unit => ({ ...unitPositions.get(unit.id)!, createdAt: fileUnits.find(file => file.unitId === unit.id || file.documentUnitId === unit.id)?.createdAt ?? unit.createdAt,
+      view: isFileJobUnit(unit) ? h('article', { className: 'dsh-tp-record-unit', 'data-unit-id': unit.id, 'aria-label': `单元 ${unit.order} · 文件` },
         h('span', { role: 'status' }, `单元 ${unit.order} · 文件 · ${unit.deletion ? '已删除' : '文件记录暂不可用'}`),
         unit.deletion?.calls ? h('p', { className: 'dsh-tp-muted' }, `保留 ${unit.deletion.calls} 次实际调用统计。`) : null)
         : isTextUnit(unit) ? h(TranslationUnit, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, store, unit, quick, normal, materials, session: current, editor, objects, objectAssets, viewFiles, recordIndex, topics: current.mode === 'normal' ? topics : undefined })
         : h(DocumentUnitView, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, unit, session: current, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, materials, recordIndex, topics: current.mode === 'normal' ? topics : undefined }) })),
-    ...fileJobRecords.map(record => ({ createdAt: fileUnits.find(file => file.materialId === record.summary.materialId || file.unitId === record.summary.unitId)?.createdAt ?? record.summary.createdAt,
+    ...fileJobRecords.map(record => ({ id: `u:${record.summary.unitId}`, events: [`operation:${record.summary.operationId}`, ...record.results.filter(result => !result.deletion && result.text).map(result => `result:${result.version}`)],
+      active: !['completed', 'failed', 'cancelled'].includes(record.summary.phase), createdAt: fileUnits.find(file => file.materialId === record.summary.materialId || file.unitId === record.summary.unitId)?.createdAt ?? record.summary.createdAt,
       view: h(FileJobView, { key: record.summary.unitId, unitNumber: units.find(unit => unit.id === record.summary.unitId)?.order, jobs: fileJobs, record, viewFiles, materials, recordIndex, onOpenAssets, ownerId }) })),
-    ...fileUnits.filter(file => !fileJobs?.isUnitRemoved(current.id, file.unitId) && !fileJobRecords.some(record => record.summary.materialId === file.materialId || record.summary.unitId === file.unitId) && !units.some(unit => unit.id === file.unitId || unit.id === file.documentUnitId)).map(file => ({ createdAt: file.createdAt,
+    ...fileUnits.filter(file => !fileJobs?.isUnitRemoved(current.id, file.unitId) && !fileJobRecords.some(record => record.summary.materialId === file.materialId || record.summary.unitId === file.unitId) && !units.some(unit => unit.id === file.unitId || unit.id === file.documentUnitId)).map(file => ({ id: `u:${file.unitId}`, events: [], active: false, createdAt: file.createdAt,
       view: h(FileUnitView, { key: file.unitId, file, session: current, materials, viewFiles }) })),
-    ...transient.map(record => ({ createdAt: record.createdAt, view: h(TranslationRecord, { key: record.id, record, quick, canRestore: !current.input }) })),
-    ...sentTexts.map(material => ({ createdAt: material.createdAt, view: h('article', { key: material.materialId, className: 'dsh-tp-translation', 'aria-label': '已发送文本' },
+    ...transient.map(record => ({ id: `o:${record.id}`, events: record.text ? ['result'] : [], active: ['submitting', 'running', 'unknown'].includes(record.status), createdAt: record.createdAt, view: h(TranslationRecord, { key: record.id, record, quick, canRestore: !current.input }) })),
+    ...sentTexts.map(material => ({ id: `m:${material.materialId}`, events: [], active: false, createdAt: material.createdAt, view: h('article', { key: material.materialId, className: 'dsh-tp-translation', 'data-material-id': material.materialId, 'aria-label': '已发送文本' },
       h('div', { className: 'dsh-tp-unit-header' },
         h('span', { role: 'status', className: 'dsh-tp-muted' }, material.status),
         h('div', { className: 'dsh-tp-actions dsh-tp-record-heading-actions' },
@@ -740,25 +757,9 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       material.message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, material.message) : null,
       material.withdrawn ? h('small', { className: 'dsh-tp-muted' }, '原材料引用已撤回，主会话中已有的通知仍保留。') : null) })),
   ].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)) : []
-  const resultCount = units.reduce((count, unit) => count + (unit.deletion || fileJobRecords.some(record => record.summary.unitId === unit.id) ? 0
-    : isTextUnit(unit) ? unit.revisions.filter(revision => !revision.deletion && revision.text).length
-      : isDocumentUnit(unit) ? unit.revisions.filter(revision => !revision.deletion).length : 0), 0)
-    + fileJobRecords.reduce((count, record) => count + record.results.filter(result => !result.deletion && result.text).length, 0)
-    + transient.filter(record => record.text).length
-  // 新材料、译文首次出现时定位到底部，包括结果替换占位记录而总数不变的情况。
-  const transcript = react.useRef<{ scrollTop: number; scrollHeight: number } | null>(null)
-  const transcriptEntry = react.useRef({ sessionId: undefined as string | undefined, length: 0, results: 0, pending: false })
-  react.useEffect(() => {
-    const entry = transcriptEntry.current
-    if (entry.sessionId !== current?.id || timeline.length > entry.length || resultCount > entry.results) entry.pending = true
-    entry.sessionId = current?.id; entry.length = timeline.length; entry.results = resultCount
-    if (!entry.pending) return
-    const element = transcript.current
-    if (!element) return
-    element.scrollTop = element.scrollHeight
-    // 容器尚未参与布局（scrollHeight 为 0）时保留定位意图，等下一次内容变化再试。
-    if (timeline.length > 0 && element.scrollHeight > 0) entry.pending = false
-  }, [current?.id, timeline.length, resultCount])
+  const transcript = react.useRef<HTMLElement | null>(null)
+  const transcriptPosition = react.useRef(new TranscriptPosition())
+  react.useEffect(() => { transcriptPosition.current.update(current?.id, timeline.filter(entry => entry.id), transcript.current) }, [current?.id, timeline])
   const materialStatus = current?.mode === 'normal' ? materials?.getStatus(current.id, ownerId) : undefined
   const blocked = current?.mode === 'normal' ? materialStatus?.blocked ?? (materials ? undefined : '普通模式暂不可用：当前 DSH 缺少同步发送材料接口。') : current ? quick.blockedReason(current) : undefined
   const busy = current?.mode === 'normal' ? materialStatus?.busy ?? false : current ? quick.isBusy(current.id) : false

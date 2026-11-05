@@ -3,7 +3,7 @@ import type { FrozenReferenceContext } from '../shared/reference-memory.js'
 import type { ModelSelection } from '../shared/contracts.js'
 import type { TextCapabilityEvidence, TextExecutionAdapter, TextExecutionEvent, TextExecutionPacket } from '../shared/domain-contracts.js'
 import type { DirectHistoryContext } from '../shared/direct-history-context.js'
-import { NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION, NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION,
+import { NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION, NORMAL_TRANSLATION_DIRECT_CONTEXT_PROMPT_VERSION, NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION, NORMAL_TRANSLATION_PROMPT_VERSION, TRANSLATION_PROMPT_VERSION, isNormalExchangePromptVersion,
   reconstructTranslationContext, reconstructNormalExchangeTranslationContext, reconstructDirectTranslationContext, reconstructNormalTranslationContext,
   type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
 import { parseRequestContextInput, type RequestContextInput } from '../shared/request-context.js'
@@ -18,8 +18,6 @@ export interface DshPreparedCall {
   readonly config: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string; readonly maxTokens?: number }
   readonly adapterDefaults: Record<string, true>
   readonly context?: { readonly contextWindow: number }
-  /** Public rc.2 exact-route evidence that the adapter handles tool declarations. */
-  readonly toolUpdate?: 'in-history' | 'addition-only'
   stream(options: Record<string, unknown>): AsyncIterable<Record<string, unknown>>
 }
 export interface DshDetachedSession {
@@ -56,7 +54,7 @@ export interface NormalExecutionPacket {
   readonly targetLanguage: string
   readonly instruction: string
   readonly context: NormalTranslationContext
-  /** One real call returns the body to the main model; no control tool and no resume protocol. */
+  /** One real call returns a complete body or a completed question; no provider resume protocol. */
   readonly mode?: 'direct'
   readonly referenceContext?: FrozenReferenceContext
   readonly referenceContextCurrent?: () => boolean
@@ -142,7 +140,7 @@ function failure(error: unknown, stage: string): SafeExecutionFailure {
   return { code: code(error), stage, message: stage === 'prepare' ? '无法准备所选模型，请检查模型配置或更换模型。' : stage === 'protocol' ? '模型返回了不完整或不支持的响应。' : '模型调用失败，请检查模型配置后重试。' }
 }
 
-/** Calls the registered DSH adapter once, with a detached native Session and no tools. */
+/** Calls the registered DSH adapter once, with a detached native Session and scoped tools. */
 export class DshTextExecutionAdapter implements TextExecutionAdapter {
   private readonly generation = `dsh-quick:${crypto.randomUUID()}`
   private readonly prepared = new Map<string, PreparedNormalCall>()
@@ -244,8 +242,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
   }
   /** Document calls keep their actual prompt version and reference-only context metadata. */
   preflightDocument(packet: DocumentExecutionPacket): DocumentCallRecord {
-    const bound = this.prepared.get(packet.operationId)
-    const requestContext = packet.requestContextAvailable === true && bound?.call.toolUpdate !== undefined
+    const requestContext = packet.requestContextAvailable === true
     const context = this.documentContext(packet, requestContext)
     // Reuse the actual declaration passed to stream(), including its complete serialized input budget.
     const toolBytes = requestContext ? new TextEncoder().encode(JSON.stringify([requestContextTool])).byteLength : 0
@@ -266,7 +263,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     const systemPrompt = reconstructDocumentSystemPrompt(requestContext)
     return { systemPrompt, userMessage: JSON.stringify(body) }
   }
-  documentRequestContextAvailable(operationId: string): boolean { return this.prepared.get(operationId)?.call.toolUpdate !== undefined }
+  documentRequestContextAvailable(operationId: string): boolean { return this.prepared.has(operationId) }
   async *executeDocument(packet: DocumentExecutionPacket, signal: AbortSignal, onDispatch?: () => void): AsyncGenerator<NormalExecutionEvent> {
     const bound = this.prepared.get(packet.operationId)
     this.prepared.delete(packet.operationId)
@@ -298,20 +295,21 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       if (!bound || key(bound.route) !== key(packet.model)) throw Object.assign(new Error('Normal preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
       if(packet.context.referenceContextRef && (!packet.referenceContext || JSON.stringify(packet.context.referenceContextRef)!==JSON.stringify(packet.referenceContext.manifestRef)) || packet.referenceContextCurrent?.()===false)throw Object.assign(new Error('Reference context unavailable or changed'),{code:'REFERENCE_CONTEXT_CHANGED'})
       const direct = packet.mode === 'direct'
-      const requestContext = !direct && requestContextAvailable && bound.call.toolUpdate !== undefined
+      // toolUpdate describes changes to declarations across requests. Its absence
+      // means a complete tool list per request, not that tools are unsupported.
+      const requestContext = requestContextAvailable
       const material = { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }
-      const context = requestContext
-        ? reconstructNormalExchangeTranslationContext(material, packet.context, bound.exchangeResume, packet.referenceContext)
-        : direct ? reconstructDirectTranslationContext(material, packet.context, packet.referenceContext, packet.historyContext)
+      const context = direct ? reconstructDirectTranslationContext(material, packet.context, packet.referenceContext, packet.historyContext, requestContext)
+        : requestContext ? reconstructNormalExchangeTranslationContext(material, packet.context, bound.exchangeResume, packet.referenceContext)
         : reconstructNormalTranslationContext(material, packet.context, packet.referenceContext)
       // Model capacity is decided by the bound adapter, not by treating bytes as tokens.
       const normalContext = frozen(structuredClone(packet.context))
       this.prepared.set(packet.operationId, { ...bound, normalContext, requestContext, direct })
-      return { promptVersion: requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : direct ? NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION,
+      return { promptVersion: direct ? requestContext ? NORMAL_TRANSLATION_DIRECT_CONTEXT_PROMPT_VERSION : NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION : requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION,
         model: { provider: bound.call.config.provider, model: bound.call.config.model,
         reasoningEffort: bound.call.config.reasoningEffort ?? null }, configVersion: null, maxOutputTokens: bound.call.config.maxTokens ?? null,
         usage: { inputTokens: null, outputTokens: null }, context: normalContext,
-        ...(requestContext ? { exchangeContext: bound.exchangeResume
+        ...(requestContext && !direct ? { exchangeContext: bound.exchangeResume
           ? { contextVersion: packet.exchangeContextVersion ?? 1, resolutionRefs: [{ resolutionId: bound.exchangeResume.resolutionId }] }
           : { contextVersion: 1, resolutionRefs: [] } } : {}) }
     } catch (error) { this.failures.set(packet.operationId, failure(error, 'prepare')); throw error }
@@ -320,7 +318,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     if (!packet.exchangeResume) throw new Error('Resume resolution is missing')
     await this.prepareOperation(packet.operationId, packet.model, signal)
     const bound = this.prepared.get(packet.operationId)
-    if (!bound?.call.toolUpdate) throw Object.assign(new Error('Resume route no longer supports tools'), { code: 'INVALID_PREPARED_CALL' })
+    if (!bound) throw Object.assign(new Error('Resume preparation unavailable'), { code: 'INVALID_PREPARED_CALL' })
     this.prepared.set(packet.operationId, { ...bound, normalContext: frozen(structuredClone(packet.context)), requestContext: true,
       exchangeResume: frozen(structuredClone(packet.exchangeResume)) })
     return this.preflightNormal(packet, true)
@@ -355,10 +353,10 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     if(packet.referenceContextCurrent?.()===false)throw Object.assign(new Error('Reference context changed before dispatch'),{code:'REFERENCE_CONTEXT_CHANGED'})
     if (!bound || key(bound.route) !== key(packet.model) || !bound.normalContext || JSON.stringify(bound.normalContext) !== JSON.stringify(packet.context)) throw new Error('Normal execution preparation does not match')
     const material = { source: packet.sourceText, targetLanguage: packet.targetLanguage, instruction: packet.instruction }
-    const promptVersion = bound.requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : bound.direct ? NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION
+    const promptVersion = bound.direct ? bound.requestContext ? NORMAL_TRANSLATION_DIRECT_CONTEXT_PROMPT_VERSION : NORMAL_TRANSLATION_DIRECT_PROMPT_VERSION : bound.requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION
     yield* this.executePrepared(packet.operationId, packet.callId, bound.call, 'normal',
-      bound.requestContext ? reconstructNormalExchangeTranslationContext(material, bound.normalContext, bound.exchangeResume, packet.referenceContext)
-        : bound.direct ? reconstructDirectTranslationContext(material, bound.normalContext, packet.referenceContext, packet.historyContext)
+      bound.direct ? reconstructDirectTranslationContext(material, bound.normalContext, packet.referenceContext, packet.historyContext, bound.requestContext)
+        : bound.requestContext ? reconstructNormalExchangeTranslationContext(material, bound.normalContext, bound.exchangeResume, packet.referenceContext)
         : reconstructNormalTranslationContext(material, bound.normalContext, packet.referenceContext),
       signal, bound.normalContext, onDispatch, bound.requestContext, Array.from(packet.sourceText).length, bound.exchangeResume, packet.exchangeContextVersion, promptVersion)
   }
@@ -403,7 +401,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
         ?? (mode === 'normal' ? requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION),
         model: Object.freeze({ provider: call.config.provider, model: call.config.model, reasoningEffort: call.config.reasoningEffort ?? null }),
         configVersion: null, maxOutputTokens: call.config.maxTokens ?? null, ...(normalContext ? { context: normalContext } : {}),
-        ...(requestContext ? { exchangeContext: exchangeResume
+        ...(requestContext && isNormalExchangePromptVersion(promptVersion ?? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION) ? { exchangeContext: exchangeResume
           ? { contextVersion: exchangeContextVersion, resolutionRefs: [{ resolutionId: exchangeResume.resolutionId }] }
           : { contextVersion: 1, resolutionRefs: [] } } : {}) }))
       onDispatch?.()

@@ -1,6 +1,14 @@
 import type { NormalTranslationQuery } from './normal-translation.js'
 export interface TranslationLogRead extends NormalTranslationQuery { readonly callId: string; readonly start: number }
 export interface TranslationLogPage { readonly text: string; readonly next: number | null; readonly total: number }
+export type DirectTranslationLogRead = Pick<TranslationLogRead, 'operationId' | 'callId' | 'start'>
+export function parseDirectTranslationLogRead(raw: unknown): DirectTranslationLogRead {
+  const value = raw as DirectTranslationLogRead
+  if (!value || typeof value !== 'object' || Object.keys(value).length !== 3 ||
+    !['operationId', 'callId'].every(key => typeof value[key as keyof DirectTranslationLogRead] === 'string' && String(value[key as keyof DirectTranslationLogRead]).length > 0 && String(value[key as keyof DirectTranslationLogRead]).length <= 3000) ||
+    !Number.isSafeInteger(value.start) || value.start < 0) throw new TypeError('Invalid direct translation log cursor')
+  return { operationId: value.operationId, callId: value.callId, start: value.start }
+}
 export function parseTranslationLogRead(raw: unknown): TranslationLogRead {
   const value = raw as TranslationLogRead
   if (!value || Object.keys(value).length !== 6 || !['mainSessionId', 'translationSessionId', 'operationId', 'callId'].every(key => typeof value[key as keyof TranslationLogRead] === 'string' && String(value[key as keyof TranslationLogRead]).length > 0 && String(value[key as keyof TranslationLogRead]).length <= 3000) || !Number.isSafeInteger(value.start) || value.start < 0 || !Number.isSafeInteger(value.afterSequence) || value.afterSequence < 0) throw new TypeError('Invalid translation log cursor')

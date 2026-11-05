@@ -121,6 +121,19 @@ export class HistoryService {
       try { this.check(guard); return this.seats.get(key(scope))?.current === bundle } catch { return false }
     } }
   }
+  /** Exact saved-history evidence for compaction; never wait for an in-flight history write. */
+  async compactionSnapshot(scope: HistoryScope, peer: string): Promise<{ readonly current: HistoryBundle; readonly saved: HistoryBundle; readonly isCurrent: () => boolean } | undefined> {
+    const guard: Guard = { scope, peer, generation: this.generation }
+    this.check(guard)
+    if (this.pending) return undefined
+    const seat = await this.seat(guard); this.check(guard)
+    if (this.pending || !seat?.current || !seat.saved) return undefined
+    const current = seat.current, saved = seat.saved
+    return { current, saved, isCurrent: () => {
+      try { this.check(guard); return !this.pending && this.seats.get(key(scope)) === seat && seat.current === current && seat.saved === saved }
+      catch { return false }
+    } }
+  }
   async retrievalSnapshots(namespaceId: string, peer: string, topicId?: string, sessionIds?: readonly string[]): Promise<readonly { readonly scope: HistoryScope; readonly token: string; readonly current: HistoryBundle; readonly saved: HistoryBundle | null }[]> {
     const guard: Guard = { scope: { namespaceId, topicId: topicId ?? '*', sessionId: '*' }, peer, generation: this.generation }
     this.check(guard); await this.tail

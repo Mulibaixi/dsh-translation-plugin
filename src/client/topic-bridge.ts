@@ -23,6 +23,7 @@ import type { DocumentTasksClient } from './document-tasks.js'
 import type { DocumentReviewClient } from './document-review-client.js'
 import { planDocumentTermSedimentation } from './document-term-sedimentation.js'
 import { NumberedUnits } from './numbered-units.js'
+import { HISTORY_TEXT_REPLY_BYTES } from '../shared/history-text.js'
 
 async function sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
@@ -280,6 +281,14 @@ export class TopicBridgeClient {
     if (!this.sessions.isHistoryReady()) return error(request.requestId, 'operation_failed', this.sessions.getNotice() ?? '正在读取宿主会话历史，请稍候。')
     const command = request.command
     const success = (value: TopicBridgeValue): TopicBridgeReply => ({ requestId: request.requestId, ok: true, value })
+    if (command.kind === 'read_history') {
+      const { kind, ...payload } = command
+      try {
+        const reply = success({ kind: 'history_text', page: this.numbered.readHistory(ownerId, payload) })
+        if (new TextEncoder().encode(JSON.stringify(reply)).byteLength > HISTORY_TEXT_REPLY_BYTES) return error(request.requestId, 'history_page_too_large', '完整历史正文回执超过 32768 字节，未截断。')
+        return reply
+      } catch (cause) { return error(request.requestId, String((cause as { code?: string }).code ?? 'history_read_failed'), (cause as Error).message) }
+    }
     if (command.kind === 'list_units' || command.kind === 'read_units') {
       const { kind, ...payload } = command
       try { return kind === 'list_units' ? success({ kind: 'unit_directory', directory: this.numbered.list(ownerId, payload) }) : success({ kind: 'unit_contents', contents: await this.numbered.read(ownerId, payload) }) }

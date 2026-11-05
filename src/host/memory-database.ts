@@ -7,6 +7,8 @@ import { decodeTopicArchiveSnapshot, type TopicArchiveSnapshot } from '../memory
 import { decodeTopicTermSnapshot, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { splitHistoryBundle, joinHistoryBundle, type HistoryBundle, type HistoryPart } from '../shared/history-bundle.js'
 import { parseRecordIndexPlan, type RecordIndexPlan } from '../shared/record-index.js'
+import { parseReferenceFilePlan, type ReferenceFilePlan } from './reference-segmentation-reuse.js'
+import type { SourceIdentity } from '../shared/translation-sources.js'
 
 interface Statement { all(...args: unknown[]): readonly Record<string, unknown>[]; get(...args: unknown[]): Record<string, unknown> | undefined; run(...args: unknown[]): unknown }
 interface SqliteConnection { exec(sql: string): void; prepare(sql: string): Statement; close(): void }
@@ -17,6 +19,9 @@ export interface MemoryDatabase {
   retired(namespaceId: string, topicId: string): boolean
   transaction<T>(action: () => T): T
   save(entry: OtherMemoryEntry): void
+  referencePlan(namespaceId: string, name: string): ReferenceFilePlan | undefined
+  referencePlanSave(namespaceId: string, plan: ReferenceFilePlan): void
+  referencePlanSources(): readonly SourceIdentity[]
   remove(id: string): void
   retire(namespaceId: string, topicId: string): void
   archiveState(namespaceId: string, topicId: string): { readonly ownerId: string; readonly snapshot: TopicArchiveSnapshot | null } | undefined
@@ -79,11 +84,24 @@ export async function loadMemoryDatabase(ctx: TopicHostContext, create: boolean)
     if (!exists || version === 1 || version === 2 || version === 3 || version === 4) db.exec('BEGIN IMMEDIATE; CREATE TABLE history_sessions (namespace_id TEXT NOT NULL, session_id TEXT NOT NULL, topic_id TEXT NOT NULL, token TEXT NOT NULL, header TEXT, PRIMARY KEY(namespace_id, session_id)); CREATE INDEX history_topic ON history_sessions(namespace_id, topic_id); CREATE TABLE history_parts (namespace_id TEXT NOT NULL, session_id TEXT NOT NULL, kind TEXT NOT NULL, parent TEXT NOT NULL, id TEXT NOT NULL, position INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(namespace_id, session_id, kind, parent, id)); PRAGMA user_version = 5; COMMIT;')
     if (!exists || typeof version === 'number' && version >= 1 && version <= 5) db.exec('BEGIN IMMEDIATE; CREATE TABLE history_cleanup (namespace_id TEXT NOT NULL, session_id TEXT NOT NULL, unit_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(namespace_id, session_id, unit_id)); PRAGMA user_version = 6; COMMIT;')
     if (!exists || typeof version === 'number' && version >= 1 && version <= 6) db.exec('BEGIN IMMEDIATE; CREATE TABLE record_index_plans (namespace_id TEXT NOT NULL, topic_id TEXT NOT NULL, session_id TEXT NOT NULL, unit_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(namespace_id, session_id, unit_id)); PRAGMA user_version = 7; COMMIT;')
-    else if (version !== 7) throw unavailable('其他记忆数据库格式不受当前版本支持，原副本已保留。')
+    if (!exists || typeof version === 'number' && version >= 1 && version <= 7) db.exec('BEGIN IMMEDIATE; CREATE TABLE reference_file_plans (namespace_id TEXT NOT NULL, file_name TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(namespace_id, file_name)); PRAGMA user_version = 8; COMMIT;')
+    else if (version !== 8) throw unavailable('其他记忆数据库格式不受当前版本支持，原副本已保留。')
   } catch (error) { try { db.close() } catch { /* Preserve the original failure. */ } throw error }
   return {
     all(namespaceId) { return (namespaceId === undefined ? db.prepare('SELECT * FROM other_memory').all() : db.prepare('SELECT * FROM other_memory WHERE namespace_id = ?').all(namespaceId)).map(row) },
     entry(id) { const value = db.prepare('SELECT * FROM other_memory WHERE id = ?').get(id); return value ? row(value) : undefined },
+    referencePlan(namespaceId, name) {
+      const value = db.prepare('SELECT payload FROM reference_file_plans WHERE namespace_id = ? AND file_name = ?').get(namespaceId, name)
+      if (!value) return undefined
+      const plan = parseReferenceFilePlan(JSON.parse(String(value.payload)))
+      if (plan.source.name !== name) throw unavailable('参考文件分段基准身份无效。')
+      return plan
+    },
+    referencePlanSave(namespaceId, value) {
+      const plan = parseReferenceFilePlan(value)
+      db.prepare('INSERT INTO reference_file_plans VALUES (?, ?, ?) ON CONFLICT(namespace_id, file_name) DO UPDATE SET payload = excluded.payload').run(namespaceId, plan.source.name, JSON.stringify(plan))
+    },
+    referencePlanSources() { return db.prepare('SELECT payload FROM reference_file_plans').all().map(value => parseReferenceFilePlan(JSON.parse(String(value.payload))).source) },
     retired(namespaceId, topicId) { return !!db.prepare('SELECT 1 FROM retired_topics WHERE namespace_id = ? AND topic_id = ?').get(namespaceId, topicId) },
     transaction(action) { db.exec('BEGIN IMMEDIATE'); try { const result = action(); db.exec('COMMIT'); return result } catch (error) { db.exec('ROLLBACK'); throw error } },
     save(entry) { const saved = parseOtherMemoryEntry(entry); if (saved.persistence !== 'saved') throw new TypeError('Cannot persist a runtime memory row'); db.prepare('INSERT INTO other_memory (id, namespace_id, topic_id, kind, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET namespace_id = excluded.namespace_id, topic_id = excluded.topic_id, kind = excluded.kind, payload = excluded.payload').run(saved.id, saved.namespaceId, saved.topicId, saved.kind, JSON.stringify(saved)) },

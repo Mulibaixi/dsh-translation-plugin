@@ -2,7 +2,8 @@ import { MAX_TRANSLATION_SOURCE_BYTES, parseSourceIdentity, type SourceIdentity 
 import { sourceCodePointLength } from '../shared/translation-source-read.js'
 import { parseOtherMemoryFilesRequest, type OtherMemoryFileImport, type OtherMemoryFileOpen, type OtherMemoryFilesCapability,
   type OtherMemoryFilesError, type OtherMemoryFilesResult, type OtherMemorySegmentationRequest } from '../shared/other-memory-files.js'
-import { REFERENCE_SEGMENTATION_GUIDANCE } from '../shared/reference-segmentation.js'
+import { REFERENCE_SEGMENTATION_GUIDANCE, referenceSegmentationComplete } from '../shared/reference-segmentation.js'
+import type { MemorySearchService } from './memory-search.js'
 import { diagnosticSpan } from './diagnostics.js'
 import { hostLlmLoader } from './dsh-text-adapter.js'
 import { ParallelReferenceSegmentation } from './reference-segmentation-parallel.js'
@@ -41,7 +42,7 @@ export class OtherMemoryFilesService {
     this.segmentation = new ParallelReferenceSegmentation(ctx)
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationOtherMemoryFiles', property: 'ctx' } })
     this.typertRemote = Object.freeze({ service: this, serviceKey: 'translationOtherMemoryFiles', namespace: 'translationOtherMemoryFiles' })
-    memory.setReferenceFilesHooks({ persistSource: entry => this.persistSource(entry), release: entry => this.release(entry) })
+    memory.setReferenceFilesHooks({ persistSource: entry => this.persistSource(entry), readSource: source => this.readSource(source), release: entry => this.release(entry) })
   }
   private owns(namespaceId: string, peerId: string | undefined): boolean {
     const topics = this.ctx.get?.('translationTopics') as { ownsLibrary(namespaceId: string, peerId: string): boolean } | undefined
@@ -81,9 +82,9 @@ export class OtherMemoryFilesService {
       const signature = JSON.stringify([request.namespaceId, request.topicId, request.mainSessionId, request.receiptId, request.category])
       const prior = this.receipts.get(signature)
       if (prior) {
-        const entry = await this.memory.getReference({ namespaceId: prior.namespaceId, topicId: prior.topicId, id: prior.id, version: prior.version }, peer!)
+        const entry = (await this.memory.referencesForTopic({ namespaceId: prior.namespaceId, topicId: prior.topicId }, peer!)).find(entry => entry.id === prior.id)
         if (entry) return ok(entry)
-        this.receipts.delete(signature)
+        return bad('receipt_not_found', '此上传对应的参考文件已移除，请重新选择文件；旧收据不会重新登记或覆盖文件。')
       }
       const file = uploads.resolve(agent, request.receiptId)
       if (!file) return bad('receipt_not_found', '上传收据已失效或不属于所选主会话，请重新选择文件。')
@@ -97,12 +98,22 @@ export class OtherMemoryFilesService {
         source: staged.source }, peer!)
       // The metadata commit is the completion boundary; a late cancellation must not report it as absent.
       this.receipts.set(signature, entry)
-      try { await this.notifySegmentation(entry, agent, peer!) }
-      catch (error) { diagnosticSpan(this.ctx, 'memory.segmentation', { action: 'notify' }, entry.id)('failed', { saved: true }, error) }
+      if (!entry.segmentation) {
+        try { await this.notifySegmentation(entry, agent, peer!) }
+        catch (error) { diagnosticSpan(this.ctx, 'memory.segmentation', { action: 'notify' }, entry.id)('failed', { saved: true }, error) }
+      } else {
+        const report = diagnosticSpan(this.ctx, 'memory.segmentation', { action: 'reuse' }, entry.id), complete = referenceSegmentationComplete(entry)
+        try {
+          if (complete) await (this.ctx.get?.('translationMemorySearch') as MemorySearchService | undefined)?.buildForPeer({ namespaceId: entry.namespaceId, rebuild: false }, peer!)
+          report('completed', { segments: entry.segmentation.ends.length, complete })
+        } catch (error) { report('failed', { saved: true }, error) }
+      }
       return ok(entry)
     } catch (error) {
       signal.throwIfAborted()
       const known = error as { code?: string }
+      if (['reference_alignment_failed', 'reference_filename_conflict', 'reference_format_unsupported', 'reference_integrity_failed'].includes(known.code ?? ''))
+        return bad('invalid_input', (error as Error).message)
       return bad(known.code === 'scope_mismatch' || !this.current(request.namespaceId, peer, generation) ? 'scope_mismatch' : 'storage_failed', '参考文件登记未完成，请刷新后重试。')
     } finally { if (staged) this.stagedFiles.delete(staged.source.sourceId); this.active-- }
   }
@@ -189,7 +200,18 @@ export class OtherMemoryFilesService {
   private release(entry: OtherMemoryReference): void {
     this.segmentation.releaseReference(entry.namespaceId, entry.id)
     this.stagedFiles.delete(entry.source.sourceId)
-    for (const [key, value] of this.receipts) if (value.id === entry.id) this.receipts.delete(key)
+  }
+  private async readSource(source: SourceIdentity): Promise<string> {
+    if (source.encoding !== 'utf-8') throw Object.assign(new Error('原件不是 UTF-8 文本，未采用本次文件更新。'), { code: 'reference_format_unsupported' })
+    const bytes = this.stagedFiles.get(source.sourceId)?.bytes ?? await (await this.disk()).readContent(source)
+    if (!bytes || bytes.byteLength !== source.bytes || await sourceSha256(bytes) !== source.sha256)
+      throw Object.assign(new Error('参考原件缺失或完整性校验失败。'), { code: 'reference_integrity_failed' })
+    let value: string
+    try { value = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }
+    catch { throw Object.assign(new Error('参考原件不是有效的 UTF-8 文本。'), { code: 'reference_format_unsupported' }) }
+    if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f]/u.test(value)) throw Object.assign(new Error('原件包含二进制控制字符，不能作为完整文本读取。'), { code: 'reference_format_unsupported' })
+    if (sourceCodePointLength(value) !== source.totalCodePoints) throw Object.assign(new Error('参考原件正文长度与登记不一致。'), { code: 'reference_integrity_failed' })
+    return value
   }
   /** Read-only extraction from the held original. No duplicate text file or persistent cache is created. */
   async readText(request: OtherMemoryFileOpen, peer: string, signal: AbortSignal): Promise<{ readonly entry: OtherMemoryReference; readonly text: string }> {
@@ -204,15 +226,7 @@ export class OtherMemoryFilesService {
       if (entry.category !== 'full_text') throw Object.assign(new Error('其他参考资料已关闭，不再提供正文读取或检索。'), { code: 'reference_format_unsupported' })
       if (entry.source.encoding !== 'utf-8' || !/\.(?:txt|text|md|markdown|csv|tsv|json|jsonl|log|rst)$/iu.test(entry.source.name))
         throw Object.assign(new Error('此格式尚不支持全文提取；仍可打开原始文件。'), { code: 'reference_format_unsupported' })
-      const bytes = await (await this.disk()).readContent(entry.source)
-      signal.throwIfAborted()
-      if (!bytes || bytes.byteLength !== entry.source.bytes || await sourceSha256(bytes) !== entry.source.sha256)
-        throw Object.assign(new Error('参考原件缺失或完整性校验失败。'), { code: 'reference_integrity_failed' })
-      let text: string
-      try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }
-      catch { throw Object.assign(new Error('参考原件不是有效的 UTF-8 文本。'), { code: 'reference_format_unsupported' }) }
-      if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f]/u.test(text)) throw Object.assign(new Error('原件包含二进制控制字符，不能作为完整文本读取。'), { code: 'reference_format_unsupported' })
-      if (sourceCodePointLength(text) !== entry.source.totalCodePoints) throw Object.assign(new Error('参考原件正文长度与登记不一致。'), { code: 'reference_integrity_failed' })
+      const text = await this.readSource(entry.source)
       signal.throwIfAborted()
       if (!this.current(request.namespaceId, peer, generation) || !await this.memory.getReference(request, peer)) throw unavailable('参考文件在读取期间已删除或连接已变化。')
       signal.throwIfAborted()

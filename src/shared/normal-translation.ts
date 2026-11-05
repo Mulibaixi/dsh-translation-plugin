@@ -3,6 +3,7 @@ import { parseOriginalFilePath } from './translation-sources.js'
 import { parseReferenceContextRef, type ReferenceContextRef } from './reference-memory.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type NormalTranslationTerm, type TranslationCallMetadata } from './translation-call.js'
+import { parseDirectContextResponse, parseDirectContextSupplement, type DirectContextResponse, type DirectContextSupplement } from './direct-context.js'
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
 export interface NormalTranslationMaterialTarget {
   readonly kind: 'material'
@@ -59,6 +60,9 @@ export interface NormalTranslationAcceptance {
   readonly organizedRequirements: string
   readonly termReferences: readonly NormalTranslationTermReference[]
   readonly referenceContextRef?: ReferenceContextRef
+  readonly range?: DirectTranslationRange
+  readonly body?: boolean
+  readonly contextSupplement?: DirectContextSupplement
 }
 export interface DirectTranslationDraftTerm {
   readonly sourceForms: readonly string[]
@@ -92,6 +96,7 @@ export interface DirectTranslationRequest {
   readonly body?: string
   /** Main-model integrated candidates for this call; authority 0, never formal memory. */
   readonly draftTerms?: readonly DirectTranslationDraftTerm[]
+  readonly contextResponse?: DirectContextResponse
 }
 export interface DirectTranslationRange { readonly start: number; readonly end: number }
 /** The Client writes the admitted unit and its completed body in one transaction. */
@@ -114,6 +119,7 @@ export interface DirectTranslationCommit {
   /** The body was extracted and organized by the main model, not read from the frozen original. */
   readonly body?: boolean
   readonly draftTerms?: readonly DirectTranslationDraftTerm[]
+  readonly contextSupplement?: DirectContextSupplement
 }
 export interface DirectTranslationReceipt {
   readonly operationId: string
@@ -273,7 +279,7 @@ function parseDraftTerms(value: unknown): readonly DirectTranslationDraftTerm[] 
 export function parseDirectTranslationRequest(value: unknown): RawDirectTranslationRequest {
   object(value)
   // Omitted optional inputs mean "none"; a model never has to serialize an empty string or array.
-  const optional = ['organizedNotes', 'auxiliaryContext', 'userRequirements', 'termReferences', 'range', 'body', 'draftTerms'].filter(field => Object.hasOwn(value, field))
+  const optional = ['organizedNotes', 'auxiliaryContext', 'userRequirements', 'termReferences', 'range', 'body', 'draftTerms', 'contextResponse'].filter(field => Object.hasOwn(value, field))
   exact(value, ['target', 'operationId', ...optional,
     ...(Object.hasOwn(value, 'referenceContextRef') ? ['referenceContextRef'] : [])])
   const target = parseNormalTranslationTarget(value.target)
@@ -285,11 +291,14 @@ export function parseDirectTranslationRequest(value: unknown): RawDirectTranslat
   const range = value.range === undefined ? undefined : parseDirectRange(value.range)
   if (value.body !== undefined) text(value.body, 2_000_000)
   const draftTerms = parseDraftTerms(value.draftTerms)
+  const contextResponse = value.contextResponse === undefined ? undefined : parseDirectContextResponse(value.contextResponse)
+  if (contextResponse?.operationId === value.operationId) throw new TypeError('A context response requires a new operation id')
   if (range && value.body !== undefined) throw new TypeError('A direct call takes either a frozen range or an organized body, not both')
   if (target.kind === 'unit' && (range || value.body !== undefined)) throw new TypeError('Unit calls have no range or replacement body')
   return { target, operationId: value.operationId, userRequirements, organizedNotes, auxiliaryContext,
     termReferences: structuredClone(termReferences), ...(range ? { range } : {}), ...(value.body === undefined ? {} : { body: value.body as string }),
     ...(draftTerms === undefined ? {} : { draftTerms }),
+    ...(contextResponse === undefined ? {} : { contextResponse }),
     ...(value.referenceContextRef === undefined ? {} : { referenceContextRef: parseReferenceContextRef(value.referenceContextRef) }) }
 }
 function parseDirectRange(value: unknown): DirectTranslationRange {
@@ -302,7 +311,7 @@ function parseDirectRange(value: unknown): DirectTranslationRange {
 }
 export function parseDirectTranslationCommit(value: unknown): DirectTranslationCommit {
   object(value)
-  const optional = ['organizedNotes', 'auxiliaryContext', 'range', 'sourceText', 'body', 'draftTerms'].filter(field => Object.hasOwn(value, field))
+  const optional = ['organizedNotes', 'auxiliaryContext', 'range', 'sourceText', 'body', 'draftTerms', 'contextSupplement'].filter(field => Object.hasOwn(value, field))
   exact(value, ['envelope', 'operationId', 'userRequirements', 'termReferences', 'revisionId', 'status', 'text', 'message', 'callRecord', ...optional,
     ...(Object.hasOwn(value, 'referenceContextRef') ? ['referenceContextRef'] : [])])
   const envelope = parseTranslationMaterialEnvelope(value.envelope)
@@ -334,6 +343,8 @@ export function parseDirectTranslationCommit(value: unknown): DirectTranslationC
     termReferences: structuredClone(value.termReferences), revisionId: value.revisionId,
     status: value.status as DirectTranslationCommit['status'], text: value.text, message: value.message,
     callRecord: parseTranslationCallMetadata(value.callRecord), ...(range ? { range } : {}), ...(body ? { body: true } : {}),
+    ...(value.contextSupplement === undefined ? {} : { contextSupplement: parseDirectContextSupplement(value.contextSupplement,
+      Array.from(value.sourceText as string ?? envelope.material.sourceText ?? '').length) }),
     ...(draftTerms === undefined ? {} : { draftTerms }),
     ...(value.sourceText === undefined ? {} : { sourceText: value.sourceText as string }),
     ...(value.referenceContextRef === undefined ? {} : { referenceContextRef: parseReferenceContextRef(value.referenceContextRef) }) }
@@ -402,11 +413,18 @@ export function parseNormalTranslationResultRead(value: unknown): NormalTranslat
   return { operationId: value.operationId, range: { start: start as number, end: end as number } }
 }
 export function parseNormalTranslationAcceptance(value: unknown): NormalTranslationAcceptance {
-  object(value); exact(value, ['envelope', 'operationId', 'organizedRequirements', 'termReferences', ...(Object.hasOwn(value,'referenceContextRef') ? ['referenceContextRef'] : [])])
+  object(value); exact(value, ['envelope', 'operationId', 'organizedRequirements', 'termReferences', ...['referenceContextRef', 'range', 'body', 'contextSupplement'].filter(field => Object.hasOwn(value, field))])
   const envelope = parseTranslationMaterialEnvelope(value.envelope)
   if (envelope.kind !== 'material') throw new TypeError('Normal translation requires material')
   text(value.operationId); text(value.organizedRequirements, 4000, true); references(value.termReferences)
-  return { envelope, operationId: value.operationId, organizedRequirements: value.organizedRequirements, termReferences: structuredClone(value.termReferences), ...(value.referenceContextRef === undefined ? {} : {referenceContextRef: parseReferenceContextRef(value.referenceContextRef)}) }
+  const range = value.range === undefined ? undefined : parseDirectRange(value.range)
+  if (value.body !== undefined && typeof value.body !== 'boolean' || range && value.body) throw new TypeError('Invalid direct preparation source')
+  if ((range || value.body) && !envelope.material.sourceRef) throw new TypeError('Direct preparation range or body requires a file')
+  if (range && range.end > envelope.material.sourceRef!.totalCodePoints) throw new TypeError('Direct preparation range exceeds the frozen file')
+  return { envelope, operationId: value.operationId, organizedRequirements: value.organizedRequirements, termReferences: structuredClone(value.termReferences),
+    ...(range ? { range } : {}), ...(value.body === undefined ? {} : { body: value.body }),
+    ...(value.contextSupplement === undefined ? {} : { contextSupplement: parseDirectContextSupplement(value.contextSupplement) }),
+    ...(value.referenceContextRef === undefined ? {} : {referenceContextRef: parseReferenceContextRef(value.referenceContextRef)}) }
 }
 export function parseNormalTranslationOperation(value: unknown): NormalTranslationOperation {
   object(value); exact(value, ['operationId', 'mainSessionId', 'topicId', 'translationSessionId', 'materialId', 'unitId', 'sourceVersion', 'draftVersion', 'status', 'persistence'])
