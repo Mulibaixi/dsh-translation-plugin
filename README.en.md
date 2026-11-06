@@ -5,39 +5,41 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/Mulibaixi/dsh-translation-plugin?label=release)](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest)
 
-**Keep long translations moving, and give every revision something to build on.**
+**Discuss wording and style with the main model, then apply your feedback to the translation.**
 
-Bring first drafts, discussion, refinement, and final selection into one workspace for novels, game scripts, and academic material that need consistent context and expression over time.
+State your requirements and feedback directly in the main chat. Discuss wording, tone, and style with the main model, then have it turn that discussion into instructions for the translation model to translate or refine the text.
 
-When you reach the next chapter, keep established names and terminology within reach. When a sentence needs more work, discuss it with the source and earlier translations available. When you switch main chats or restart DSH, return to the work you have saved.
+For example, say “this sentence is too literal” or “make this character's voice more restrained.” Discuss the source and existing translation, request a new version in the agreed direction, then compare, revise, and finalize. Keep the whole process in one workspace for novels, game scripts, and academic material that benefit from careful revision, and learn through the discussion.
 
 [Why choose it](#why-choose-it) · [Installation and updates](#installation-and-updates) · [User guide (简体中文)](docs/user-guide.zh-CN.md) · [Projects and documentation](#projects-and-documentation)
 
 ## Why choose it
 
-- **Keep translating long projects with less repeated explanation.** Collect confirmed terminology, character details, style requirements, and references within a topic for later chapters and sessions, giving consistent wording and context a foundation.
-- **Keep refining until the translation fits your intent.** Discuss accuracy, tone, rhythm, and character voice around a specific translation. Turn “this sounds unnatural” into actionable feedback and work toward the result you want.
-- **Let the models do more organizing and checking, with less copying and relaying for you.** Describe your goal in the main chat; let the main model organize context, coordinate translation, and review revisions. The companion integration submits source material with instructions, reducing repeated copying between inputs.
-- **Try different expressions and keep control of the final choice.** Sources and translation versions stay in the same session, ready to revisit, compare, and refine before you choose the version you prefer.
-- **Turn the DSH you already know into a lasting translation workspace.** Reuse your model configuration and choose a translation model and reasoning effort for the task. History and memory save locally, so material organized today remains available for your next session.
+- **Discuss wording and style directly.** Talk through accuracy, tone, rhythm, and character voice with the main model around a specific source or translation. Compare alternatives and ask about the reasons for a rendering.
+- **Put the discussion into the next version.** The main model organizes your background, requirements, and feedback for the translation model to apply. Give feedback on a specific unit and request further revisions toward the expression you want, without manually copying source text or relaying instructions between models.
+- **Try different expressions and keep control of the final choice.** Sources and translation versions stay in the same unit, ready to revisit, compare, and revise before you choose the version you prefer.
+- **Reuse confirmed wording and requirements.** Organize terminology, character details, style requirements, and references within a topic for later chapters and sessions, reducing repeated explanation.
+- **Continue refining saved work across main chats.** History and topic material save locally for reuse after switching chats or restarting DSH. Keep your DSH model configuration and choose a translation model and reasoning effort for the task.
 
 ## Main capabilities
 
 | Capability | Purpose |
 | --- | --- |
+| Discussion and refinement | In Normal mode, state requirements and discuss wording and style with the main model, then use that feedback for a first translation or further revision. |
+| Version comparison and final selection | Retain the source and translation versions, compare and revise them, select a final, and save history automatically for continued discussion. |
 | Quick translation | Translate independent plain text directly for short passages and occasional lookups. |
-| Translation and refinement | Use Normal mode for main-model coordination and repeated discussion, revision, and review with requirements and context. |
 | File delivery | Work primarily with TXT/Markdown sources, process ranges when needed, and open results through the session or save a translation version to a chosen location with **操作 → 另存为…… (Actions → Save as…)**. |
 | Topic memory | Share terms, entities, facts, relations, settings, and references across topic sessions, with optional semantic retrieval. |
-| Versions and local saving | Retain sources and translation versions, select finals, and save history and memory automatically for reuse across chats and app restarts. |
 
 ## A translation and refinement workflow
 
-1. **Prepare material and context.** Create a topic and session, add sources, and describe the audience, style, and background.
-2. **Produce a first translation.** Use Quick mode for independent short text, or Normal mode when context and memory matter.
-3. **Discuss and refine.** Identify a unit or version in the main chat and adjust meaning, phrasing, voice, or terminology.
-4. **Review and finalize.** Compare the source and translation versions, revise further, choose a final, and open or export it. Manual edits advance an existing automatic final; an explicitly fixed final keeps your selection.
-5. **Reuse knowledge.** Review and adopt useful memory for later passages and sessions.
+1. **State your requirements.** Create a topic and session, add the source, and describe the audience, style, background, and translation goal in the main chat.
+2. **Produce a first translation.** In Normal mode, the main model organizes requirements and starts translation. Quick mode is also available for independent short text.
+3. **Discuss alternatives.** Identify a sentence, unit, or version and compare wording, tone, and style with the main model to decide what to change.
+4. **Apply the feedback.** Ask for refinement based on the discussion. The main model passes the consolidated requirements to the translation model to produce a new version of the same unit. Continue discussing and revising as needed.
+5. **Compare and finalize.** Compare the source and translation versions, choose the one you prefer, then open it or save it as a file.
+
+Confirmed terminology, settings, and style requirements can also become topic memory for later translation and discussion.
 
 ## Requirements
 
@@ -79,27 +81,17 @@ See the user guide for [backup and restoration](docs/user-guide.zh-CN.md#资料�
 
 ## Usage
 
-The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics and sessions, material submission, Markdown delivery, memory management, refinement and finals, storage cleanup, and issue reports.
+The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics and sessions, material submission, refinement and finals, file delivery, memory management, storage cleanup, and issue reports.
 
-**Put sources in the translation input, and requirements or revision feedback in the main chat.** Use Quick mode for a direct translation, or Normal mode for main-chat coordination, discussion, and repeated refinement.
+**Put sources in the translation input, and requirements or revision feedback in the main chat.** Use Normal mode to hand the source and current requirements to the main model for coordination.
 
-Session history saves automatically in the background while the main model reviews and delivers the translation. If history saving fails, the workspace keeps the current content and offers **重试保存 (Retry saving)** without calling the translation model again.
+**Discuss first, then decide what to change.** For example, ask “what other renderings would fit this word? Let's discuss first, without translating yet.” Once you choose a direction, say “use the second option and refine this unit in the tone we agreed on.” The main model passes the explicit feedback to the translation model, with the existing translation as the revision basis.
 
-Older saved translations can be replaced with exact version references in the main model's context when this reduces its size. The current and most recent successful translation turns keep their existing bodies or previews; earlier versions remain available on demand from opened translation sessions, including after source corrections or final-version changes.
+Before discussing an older translation, open its translation session in the current main chat so the main model can read the source and existing translation by exact unit and version.
 
-Older saved translations can be replaced with exact version references in the main model's context when this reduces its size. The current and most recent successful translation turns keep their existing bodies or previews; earlier versions remain available on demand from opened translation sessions, including after source corrections or final-version changes.
+Session history saves automatically in the background. If saving fails, the workspace keeps the current content and offers **重试保存 (Retry saving)** without calling the translation model again.
 
-Terminology and structured archives support adopting pending proposals and review items by category. Batch adoption keeps the list and edit drafts visible, restores entry actions when finished, and reports failures.
-
-After writing terminology or structured archive entries, the main model receives only the write result, exact versions and entry state, reducing repeated full-collection context. Complete content remains available in the interface, exports and on-demand queries.
-
-When a topic reference file has no existing segmentation, the main model delegates two independent full-file annotations and parallel cross-reviews to native subagents, resolves substantive issues, and saves one complete plan. Bilingual pairs and fine semantic boundaries are preserved. This requires a model that can hold the entire file and result, and two available subagent slots. Use **重试主模型分段 (Retry segmentation)** when unfinished; completed plans are preserved unless resegmentation is requested.
-
-Reference files use unique complete filenames within a library. Uploading the same name updates that topic's existing registration and reuses its logical segmentation, moving boundaries through text edits without another automatic model annotation. If alignment is ambiguous or a segment exceeds its limit, the previous original and plan remain available with a location-specific error. Filename baselines survive restarts and removal of topic registrations; clearing plugin local data removes them too.
-
-Translation actions identify the current task and exact material. Interrupted history does not authorize automatic continuation. When the intended task or target remains genuinely conflicting or unclear, the main model is instructed to ask you before proceeding; it can still load tools and check relevant context. Material accompanying a chat message follows that message's stated purpose, including learning or discussion.
-
-For TXT and Markdown file history, choose **嵌入原文 (Embed source)** next to **重译 (Retranslate)** or on the source row in translation records. The main model marks semantic chunks and exclusions; only that original's retained prose is embedded. Code, Markdown structure and metadata remain available through exact record search. File translations are read on demand rather than embedded, and changing the final translation reuses the original's vectors. Existing file history must be selected explicitly; unselected files are not automatically indexed.
+Organize terminology, style requirements, and references as [memory assets (简体中文)](docs/user-guide.zh-CN.md#记忆资产) to support later discussion and translation. See the guide for entry adoption, reference-file segmentation, source indexing, and saving rules.
 
 ## Current limitations and data
 
