@@ -1,6 +1,7 @@
 import { OBJECT_ASSET_REMOTE, parseObjectAssetRequest, parseObjectAssetVersion, type ObjectAssetCapability, type ObjectAssetErrorCode,
   type ObjectAssetOpen, type ObjectAssetRegister, type ObjectAssetRegistration, type ObjectAssetResult, type ObjectAssetVersion } from '../shared/object-assets.js'
 import type { QuickHostContext } from './quick-translation.js'
+import { uploadedFile, type NativeUpload } from './native-upload.js'
 
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
 interface Agent { readonly id: string; readonly session: { readonly id: string }; readonly ctx: unknown }
@@ -104,14 +105,14 @@ export class ObjectAssetsService {
     try { request = parseObjectAssetRequest('register', input) as ObjectAssetRegister } catch { return bad('invalid_input', '原件关联参数无效。') }
     if (!this.owns(request.namespaceId)) return bad('scope_mismatch', '原件关联不属于此主会话连接。')
     const attachments = this.ctx.get?.('attachments') as Attachments | undefined
-    const uploads = this.ctx.get?.('fileUploads') as { resolve(agent: Agent, receiptId: string): FileRef | undefined } | undefined
+    const uploads = this.ctx.get?.('fileUploads') as { resolve(agent: Agent, receiptId: string): NativeUpload | undefined } | undefined
     const controller = this.ctx.get?.('sessionController') as Controller | undefined
     if (!attachments || typeof uploads?.resolve !== 'function' || !controller) return bad('unavailable', '宿主受管原件服务尚未就绪。')
     signal.throwIfAborted()
     let agent = (this.ctx.get?.('agents') as { get(id: string): Agent | undefined } | undefined)?.get(request.mainSessionId)
     try { agent ??= await controller.resolveAgent(request.mainSessionId) } catch { return bad('unavailable', '无法恢复所属主会话的上传服务。') }
     if (!this.owns(request.namespaceId) || agent.id !== request.mainSessionId || agent.session.id !== request.mainSessionId) return bad('scope_mismatch', '上传主会话身份不一致。')
-    const file = uploads.resolve(agent, request.receiptId)
+    const file = uploadedFile(uploads.resolve(agent, request.receiptId))
     if (!file) return bad('receipt_not_found', '原件上传收据已失效或属于其他主会话，请重新选择原件。')
     const receiptKey = JSON.stringify([request.mainSessionId, request.topicId, request.receiptId, request.kind, request.existingObjectId ?? null])
     let record = this.receipts.get(receiptKey), original: StoredObjectAsset | undefined

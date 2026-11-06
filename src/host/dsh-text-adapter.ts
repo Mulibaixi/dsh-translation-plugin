@@ -13,7 +13,7 @@ import { DOCUMENT_TRANSLATION_PROMPT_VERSION, DOCUMENT_TRANSLATION_CONTEXT_PROMP
 import type { DocumentCallRecord } from '../shared/translation-batch.js'
 export { QUICK_SYSTEM_PROMPT } from '../shared/translation-call.js'
 
-/** Narrow views of the 0.2.0-rc.2 public runtime, checked against the installed packages. */
+/** Narrow views of the public runtime, checked against the supported installed packages. */
 export interface DshPreparedCall {
   readonly config: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string; readonly maxTokens?: number }
   readonly adapterDefaults: Record<string, true>
@@ -37,6 +37,7 @@ export interface DshExecutionContext extends DiagnosticContext {
   readonly loader?: { readonly internal?: { import(specifier: string, parentUrl: string, attributes: Record<string, never>): Promise<unknown> } }
 }
 export interface DshLlmHelpers {
+  readonly Session: { create(id: string): DshDetachedSession }
   createSystemMessage(text: string): unknown
   createUserMessage(input: unknown): unknown
   createAssistantMessage(input: unknown): unknown
@@ -108,12 +109,16 @@ export function hostLlmLoader(ctx: DshExecutionContext): LlmModuleLoader {
   return async () => {
     if (!ctx.baseUrl) throw new Error('Host composition anchor unavailable')
     const loader = ctx.get ? ctx.get('loader') as DshExecutionContext['loader'] : ctx.loader
-    if (loader?.internal) return await loader.internal.import(llmModule, ctx.baseUrl, {}) as DshLlmHelpers
+    const combine = ([llm, sessions]: [Omit<DshLlmHelpers, 'Session'>, Pick<DshLlmHelpers, 'Session'>]): DshLlmHelpers => ({ ...llm, Session: sessions.Session })
+    if (loader?.internal) return combine(await Promise.all([
+      loader.internal.import(llmModule, ctx.baseUrl, {}), loader.internal.import('@deepseek-ai/dsh-session', ctx.baseUrl, {}),
+    ]) as [Omit<DshLlmHelpers, 'Session'>, Pick<DshLlmHelpers, 'Session'>])
     const moduleName = 'node:module'
     const urlName = 'node:url'
     const { createRequire } = await import(moduleName) as { createRequire(anchor: string): { resolve(name: string): string } }
     const { pathToFileURL } = await import(urlName) as { pathToFileURL(path: string): { href: string } }
-    return await import(pathToFileURL(createRequire(ctx.baseUrl).resolve(llmModule)).href) as DshLlmHelpers
+    const require = createRequire(ctx.baseUrl)
+    return combine(await Promise.all([llmModule, '@deepseek-ai/dsh-session'].map(name => import(pathToFileURL(require.resolve(name)).href))) as [Omit<DshLlmHelpers, 'Session'>, Pick<DshLlmHelpers, 'Session'>])
   }
 }
 
@@ -160,7 +165,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     try {
       this.helpers ??= await (this.loading ??= this.loadModule())
       return typeof this.helpers.createSystemMessage === 'function' && typeof this.helpers.createUserMessage === 'function' &&
-        typeof this.helpers.createAssistantMessage === 'function' && typeof this.helpers.AssistantStreamAccumulator === 'function' && typeof this.helpers.BlockAssembler === 'function'
+        typeof this.helpers.createAssistantMessage === 'function' && typeof this.helpers.AssistantStreamAccumulator === 'function' && typeof this.helpers.BlockAssembler === 'function' && typeof this.helpers.Session?.create === 'function'
     } catch { this.loading = undefined; return false }
   }
 
@@ -367,25 +372,14 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     promptVersion?: TranslationCallMetadata['promptVersion']): AsyncGenerator<NormalExecutionEvent> {
     const report = diagnosticSpan(this.ctx, 'model.stream', { mode, promptVersion, provider: call.config.provider, model: call.config.model, inputChars: context.systemPrompt.length + context.userMessage.length, terms: normalContext?.terms.length }, operationId)
     const helpers = this.helpers!
-    const session = this.sessions!.prepare(`translation-${mode}:${attemptId}`)
+    // Internal call logs use an independent Session; preparing a store-owned Session makes it read-only until publication.
+    const session = helpers.Session.create(`translation-${mode}:${attemptId}`)
     this.callOperations.set(attemptId, operationId)
     const events: unknown[] = []
     const append = (type: string, data: unknown, surface = false): void => {
       events.push(session.append(type, data, ...(surface ? [{ surfaceOp: 'append' as const }] : [])))
       this.logs.set(operationId, Object.freeze([...events]))
     }
-    append('system/message', { message: helpers.createSystemMessage(context.systemPrompt) }, true)
-    append('user/message', helpers.createUserMessage({
-      content: [{ type: 'text', text: context.userMessage }], source: { kind: 'user' },
-    }), true)
-    append('request/header', {
-      header: {
-        config: call.config,
-        ...(Object.keys(call.adapterDefaults).length ? { adapterDefaults: call.adapterDefaults } : {}),
-      }, reason: 'initial', startsSeries: true,
-    })
-    const options = Object.freeze({ ...call.config, messages: frozen([...session.deriveMessages()]), signal,
-      ...(mode !== 'quick' ? { tools: requestContext ? Object.freeze([requestContextTool]) : Object.freeze([]) } : {}) })
     const stream = new helpers.AssistantStreamAccumulator()
     const assembler = new helpers.BlockAssembler()
     const blocks = new Map<number, { type: 'text' | 'reasoning' | 'tool-call'; declared: boolean; text: string }>()
@@ -396,6 +390,16 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
     let emittedText = ''
     let settlementDone = false
     try {
+      append('system/message', { message: helpers.createSystemMessage(context.systemPrompt) }, true)
+      append('user/message', helpers.createUserMessage({
+        content: [{ type: 'text', text: context.userMessage }], source: { kind: 'user' },
+      }), true)
+      append('request/header', {
+        header: { config: call.config, ...(Object.keys(call.adapterDefaults).length ? { adapterDefaults: call.adapterDefaults } : {}) },
+        reason: 'initial', startsSeries: true,
+      })
+      const options = Object.freeze({ ...call.config, messages: frozen([...session.deriveMessages()]), signal,
+        ...(mode !== 'quick' ? { tools: requestContext ? Object.freeze([requestContextTool]) : Object.freeze([]) } : {}) })
       signal.throwIfAborted()
       if (mode !== 'analysis' && mode !== 'document') this.calls.set(operationId, Object.freeze({ promptVersion: promptVersion
         ?? (mode === 'normal' ? requestContext ? NORMAL_TRANSLATION_EXCHANGE_PROMPT_VERSION : NORMAL_TRANSLATION_PROMPT_VERSION : TRANSLATION_PROMPT_VERSION),
@@ -515,7 +519,7 @@ export class DshTextExecutionAdapter implements TextExecutionAdapter {
       this.failures.set(operationId, diagnostic)
       throw error
     } finally {
-      if (!settlementDone) append('assistant/attempt', { turn: 0, step: 0, stream: stream.snapshot() })
+      if (!settlementDone && events.length) append('assistant/attempt', { turn: 0, step: 0, stream: stream.snapshot() })
     }
   }
 }

@@ -22,7 +22,8 @@ import { type HistoryVersion, type SessionStore, type TextRevisionDeletionPlan, 
 import { DEFAULT_SESSION_SETTINGS, sessionName, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
 import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconChevronRightOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
 import { type TopicTermsViewPort } from './topic-terms-view.js'
-import { downloadExport } from './browser-download.js'
+import { downloadExport, saveExport } from './browser-download.js'
+import { buildRevisionExport } from './revision-export.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
 import { StorageUsageView } from './storage-usage-view.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
@@ -358,14 +359,16 @@ function TranslationRecord({ record, quick, canRestore }: { readonly record: Qui
   )
 }
 
-function TextRevisionDeletionControl({ store, session, unit, revision, quick, normal, materials, topics, editor, objects }: StoreProps & TopicUiProps & {
-  readonly session: LocalSession; readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor
+function TextRevisionActions({ store, session, unit, revision, quick, normal, materials, topics, editor, objects, file }: StoreProps & TopicUiProps & {
+  readonly session: LocalSession; readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly file?: DirectFile | undefined
 }): unknown {
   const [open, setOpen] = react.useState(false)
+  const [exportBusy, setExportBusy] = react.useState(false)
+  const [exportError, setExportError] = react.useState<string | undefined>(undefined)
   const [plan, setPlan] = react.useState<TextRevisionDeletionPlan | undefined>(undefined)
   const [pending, setPending] = react.useState(false)
   const [message, setMessage] = react.useState<string | undefined>(undefined)
-  const lifetime = react.useRef({ mounted: true, busy: false })
+  const lifetime = react.useRef({ mounted: true, busy: false, exporting: false })
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false } }, [])
   const operationId = store.getPendingTextRevisionDeletion(session.id, unit.id, revision.id)
   const externalBlocked = (): string | undefined => {
@@ -375,6 +378,30 @@ function TextRevisionDeletionControl({ store, session, unit, revision, quick, no
     return objects?.revisionDeletionBlockedReason({ ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id })
   }
   const blocked = store.getTextRevisionDeletionBlockedReason(session.id, unit.id, revision.id) ?? externalBlocked()
+  const label = `${file ? '文件' : '文本'} ${unit.order} 版本 ${revision.order}`
+  const eligible = revision.sourceVersion === unit.sourceVersion && revision.accepted && revision.status === 'completed' && !!revision.text.trim()
+  const fixed = unit.final?.revisionId === revision.id && unit.final.selection === 'user_fixed'
+  async function exportFile(): Promise<void> {
+    if (lifetime.current.exporting) return
+    lifetime.current.exporting = true; setExportBusy(true); setMessage(undefined); setExportError(undefined); setOpen(false)
+    try {
+      const result = buildRevisionExport(unit, revision, file?.name)
+      const outcome = await saveExport(result)
+      if (lifetime.current.mounted && outcome !== 'cancelled') setMessage(outcome === 'saved' ? '文件已保存。' : `已发起下载：${result.fileName}`)
+    } catch (error) { if (lifetime.current.mounted) setExportError(error instanceof Error ? error.message : '文件导出失败，请重试。') }
+    finally { lifetime.current.exporting = false; if (lifetime.current.mounted) setExportBusy(false) }
+  }
+  async function exportLog(): Promise<void> {
+    if (lifetime.current.exporting || !normal) return
+    lifetime.current.exporting = true; setExportBusy(true); setMessage(undefined); setExportError(undefined); setOpen(false)
+    try {
+      const content = await normal.exportCallLog(session.id, revision.operationId, revision.id)
+      if (!lifetime.current.mounted) return
+      downloadExport({ content, fileName: `translation-call-${revision.id.replace(/[^a-zA-Z0-9-]/gu, '-')}.json`, mimeType: 'application/json' })
+      setMessage('已发起调用日志下载。')
+    } catch (error) { if (lifetime.current.mounted) setExportError(error instanceof Error ? error.message : '调用日志导出失败，请重试。') }
+    finally { lifetime.current.exporting = false; if (lifetime.current.mounted) setExportBusy(false) }
+  }
   async function execute(query = false): Promise<void> {
     if (lifetime.current.busy) return
     lifetime.current.busy = true; setPending(true)
@@ -389,12 +416,16 @@ function TextRevisionDeletionControl({ store, session, unit, revision, quick, no
   }
   if (revision.status === 'deleted') return null
   return h('div', null,
-    unit.revisions.at(-1)?.id !== revision.id ? h(Menu, {
+    h(Menu, {
       open, onClose: () => setOpen(false), portal: true, align: 'end', compact: true, listClassName: 'dsh-tp-popup',
-      anchor: h('button', { type: 'button', 'aria-label': `文本 ${unit.order} 版本 ${revision.order}操作`, 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => setOpen(value => !value) }, '操作'),
-    }, h(MenuItemButton, { danger: true, disabled: pending || !!blocked, title: blocked, onSelect: () => {
+      anchor: h('button', { type: 'button', 'aria-label': `${label}操作`, 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => setOpen(value => !value) }, '操作'),
+    },
+    h(MenuItemButton, { disabled: !eligible || fixed, onSelect: () => { setOpen(false); quick.selectFinal(session.id, unit.id, revision.id) } }, fixed ? '已固定' : '设为最终'),
+    session.mode === 'normal' && normal && revision.kind === 'machine' && !revision.deletion ? h(MenuItemButton, { disabled: exportBusy || ['running', 'submitting'].includes(revision.status), onSelect: () => { void exportLog() } }, h('span', { title: '包含本次调用的原文、提示词和模型输出；仅在原宿主运行期间可导出。' }, '导出调用日志')) : null,
+    unit.revisions.at(-1)?.id !== revision.id ? h(MenuItemButton, { danger: true, disabled: pending || !!blocked, title: blocked, onSelect: () => {
       setOpen(false); setMessage(undefined); setPlan(store.captureTextRevisionDeletion(session.id, unit.id, revision.id))
-    } }, '删除旧版本')) : null,
+    } }, '删除旧版本') : null,
+    h(MenuItemButton, { disabled: exportBusy || revision.status !== 'completed' || !revision.text.trim(), onSelect: () => { void exportFile() } }, exportBusy ? '正在导出…' : '另存为……')),
     plan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除短文本旧版本确认', 'aria-busy': pending },
       h('p', null, `删除文本 ${unit.order} 的版本 ${revision.order}正文？`),
       h('p', null, '引用此版本的记忆依据可能需要复核。已下载文件和主模型已经收到的消息无法撤回。'),
@@ -403,6 +434,7 @@ function TextRevisionDeletionControl({ store, session, unit, revision, quick, no
           : h('button', { type: 'button', disabled: pending, onClick: () => { void execute() } }, pending ? '正在删除…' : '确认删除正文'),
         h('button', { type: 'button', disabled: pending || !!operationId, onClick: () => setPlan(undefined) }, '取消')),
     ) : operationId ? h('button', { type: 'button', disabled: pending, onClick: () => { void execute(true) } }, '查询本次删除结果') : null,
+    exportError ? h('p', { className: 'dsh-tp-muted', role: 'alert' }, exportError) : null,
     message ? h('p', { className: 'dsh-tp-muted', role: 'status' }, message) : null)
 }
 
@@ -457,12 +489,9 @@ function TextUnitDeletionControl({ store, session, unit, quick, normal, material
 function TranslationRevision({ store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, resultOpen, versionsToggle, executionOwner, file, viewFiles }: StoreProps & TopicUiProps & { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly resultOpen?: unknown; readonly versionsToggle?: unknown; readonly file?: DirectFile | undefined }): unknown {
   const [details, setDetails] = react.useState(false)
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
-  const [logBusy, setLogBusy] = react.useState(false), [logError, setLogError] = react.useState<string | undefined>(undefined)
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断', context_requested: '等待补充背景', deleted: '已删除' }[revision.status]
   const record = quick.getRecords(session.id).find(record => record.id === revision.operationId)
   const currentSource = revision.sourceVersion === unit.sourceVersion
-  const eligible = revision.sourceVersion === unit.sourceVersion && revision.accepted && revision.status === 'completed' && !!revision.text.trim()
-  const fixed = unit.final?.revisionId === revision.id && unit.final.selection === 'user_fixed'
   const label = `${file ? '文件' : '文本'} ${unit.order} 版本 ${revision.order}`
   const key = editKey(session.id, unit.id, revision.id)
   const draft = editor.drafts.get(key)
@@ -483,16 +512,10 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
         revision.status === 'deleted' ? null : h('button', { type: 'button', 'aria-label': `复制${label}`, disabled: !revision.text, onClick: () => { void copy() } }, copyState === 'copied' ? '已复制' : '复制'),
         revision.status === 'deleted' ? null : h('button', { type: 'button', 'aria-label': `编辑${label}`, disabled: !!editBlocked || !canEdit || !!draft || otherEdit, title: editBlocked ?? (otherEdit ? '请先保存或取消此段的当前编辑。' : undefined), onClick: () => editor.start(session.id, unit.id, revision.id, revision.text) }, draft ? '编辑中' : '编辑'),
-        revision.status === 'deleted' ? null : h('button', { type: 'button', 'aria-label': `${label}设为最终`, disabled: !eligible || fixed, onClick: () => { quick.selectFinal(session.id, unit.id, revision.id) } }, fixed ? '已固定' : '设为最终'),
         h('button', { type: 'button', 'aria-label': `${label}详情`, 'aria-expanded': details, onClick: () => setDetails(value => !value) }, '详情'),
-        session.mode === 'normal' && normal && revision.kind === 'machine' && !revision.deletion ? h('button', { type: 'button', disabled: logBusy || ['running', 'submitting'].includes(revision.status), 'aria-label': `导出${label}调用日志`, title: '包含本次调用的原文、提示词和模型输出；仅在原宿主运行期间可导出。', onClick: () => {
-          setLogBusy(true); setLogError(undefined)
-          void normal.exportCallLog(session.id, revision.operationId, revision.id).then(content => downloadExport({ content, fileName: `translation-call-${revision.id.replace(/[^a-zA-Z0-9-]/gu, '-')}.json`, mimeType: 'application/json' })).catch(error => setLogError((error as Error).message)).finally(() => setLogBusy(false))
-        } }, logBusy ? '正在导出日志…' : '导出调用日志') : null,
-        logError ? h('span', { role: 'alert', className: 'dsh-tp-muted' }, logError) : null,
         versionsToggle ?? null,
+        h(TextRevisionActions, { store, session, unit, revision, quick, normal, materials, topics, editor, objects, file }),
         resultOpen ?? null,
-        h(TextRevisionDeletionControl, { store, session, unit, revision, quick, normal, materials, topics, editor, objects }),
       ),
     ),
     details ? h('div', { className: 'dsh-tp-muted dsh-tp-version-details' },

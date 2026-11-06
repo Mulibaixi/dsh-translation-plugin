@@ -1,6 +1,6 @@
 # 翻译插件使用指南
 
-[项目概览与安装](../README.zh-CN.md) · [English overview](../README.md)
+[项目概览与安装](../README.md) · [English overview](../README.en.md)
 
 本指南介绍翻译、润色、审阅与定稿的具体操作，以及主题记忆、文件交付、本地保存和问题反馈。首次使用可依次阅读主题与会话、快译或普通模式、修订定稿与导出，再按需要配置记忆和检索。
 
@@ -20,11 +20,11 @@
 
 ## 环境与依赖
 
-- DSH `>=0.2.0-rc.2`，支持本地插件、具备所需接口，并已配置可用模型；不逐项列举兼容版本。
+- DSH `>=0.2.0-rc.2 <0.2.3-0`，支持本地插件、具备所需接口，并已配置可用模型；范围内按接口能力判断兼容性。支持 `0.2.2-rc.1`，该宿主的普通模式需配套 Composer `0.4.7` 及其新版补丁。
 - **快译**不要求 Composer 扩展；**普通模式**需要配套的 `dsh-composer-extension` 及 submissions protocol 1。宿主已有该接口时直接使用；缺少时，Windows 桌面版按目标模块指纹匹配随包补丁，正常完全退出后安装，重开生效。
 - 配套源码使用内容协议 3 和任务阶段协议 2。升级 DSH 后查看扩展的联动组件维护状态；相关模块不变可复用补丁，无需仅为版本号变化更新插件。所需接口或补丁目标改变时才需要适配。
 - 文件候选资产提取使用 DSH 原生子代理，适配受支持版本的 run／Activation 接口；能力缺失会提示原因，主模型仍可直接读取文本原稿并翻译。
-- 宿主需能加载内置 `node:sqlite`；从源码构建需要 Node.js 22 或更高版本、pnpm，以及并排放置的 Composer 扩展源码目录。
+- 宿主需能加载内置 `node:sqlite`；从源码构建插件需要 Node.js 22 或更高版本、pnpm，以及并排放置的 Composer 扩展源码目录。构建 DSH `0.2.2-rc.1` 及其宿主补丁需要 Node.js 24.9 或更高版本。
 
 当前文件翻译主要支持 UTF-8 编码的 TXT／Markdown，每份最多 2 MiB，可按原格式交付。其他格式仍依赖主模型使用自身工具读取或识读，插件尚未提供 PDF、图片、DOCX 等格式的完整解析、OCR 与原格式还原流程。JSON／HTML 结果可按约定形式保存；参考全文的可读格式见下文。
 
@@ -64,7 +64,7 @@
 
 ### Markdown 与本地图片
 
-Markdown 翻译和审阅要求保留标题、列表、表格、代码及公式结构，目录和文内锚点由主模型复查；仍需人工核对实际显示与跳转。桌面上传会保留原 MD 的本机位置，打开／导出时把标准 Markdown 相对引用的本地图片复制到 MD 副本旁，并使用相对链接，记录正文仍保留原引用。生成副本时原图片须可读取；移动或分享译件时须连同旁边的图片一起保留。Web 上传没有来源位置时保留原引用。本阶段不处理图片内文字、HTML 图片引用或整个资源目录打包。
+Markdown 翻译和审阅要求保留标题、列表、表格、代码及公式结构，目录和文内锚点由主模型复查；仍需人工核对实际显示与跳转。桌面上传会保留原 MD 的本机位置，打开或由主模型导出时把标准 Markdown 相对引用的本地图片复制到 MD 副本旁，并使用相对链接，记录正文仍保留原引用。生成副本时原图片须可读取；移动或分享译件时须连同旁边的图片一起保留。Web 上传没有来源位置时保留原引用。译文版本的“另存为……”保存正文及其原有引用，不额外复制图片。本阶段不处理图片内文字、HTML 图片引用或整个资源目录打包。
 
 ### 上下文与任务恢复
 
@@ -129,7 +129,8 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 润色已有译文时，在主聊天指出单元或版本并说明要求，例如“把单元 5 改得更自然，保留人物克制的语气和已约定的术语”。审阅新版本后，可继续给出具体意见。单次措辞修改不会自动变成长久规则；需要用于后续材料时，可要求更新对应记忆。
 
 - **重译**追加版本，保留原稿和旧译文；短文本**编辑**追加人工版本。文件修改通过主聊天提出，外部编辑文件不会自动写回插件。
-- 完整翻译自动建立最终选择，后续机器修订及人工保存会立即推进已有的“自动最终”；**设为最终**或**保存并定稿**固定人工选择，新版本不会自动替换它。不完整或取消的输出不自动定稿。
+- 完整翻译自动建立最终选择，后续机器修订及人工保存会立即推进已有的“自动最终”；译文行的**操作 → 设为最终**或编辑时的**保存并定稿**固定人工选择，新版本不会自动替换它。不完整或取消的输出不自动定稿。
+- 译文行的**操作 → 另存为……**打开系统保存窗口，可选择目录和文件名，保存该行对应的完整译文版本；旧版本也可单独保存，不改变最终选择。Markdown 文件使用 `.md`，其他正文使用 `.txt`。取消窗口不保存；环境不支持另存为窗口时使用普通下载，保存位置由下载设置决定。
 - 同一文件的查找、导出及语义检索后按需读取译文共用有效定稿；文件只对选中的原文正文建立语义向量，切换最终译文不重新嵌入原文。不同原稿的译文不会混用，旧版本默认不进入检索。
 - 右键会话选择**导出译文 TXT**或**导出对照 JSON**，再选择当前会话或主题；记录页也提供导出。缺少定稿时会提示，可明确选择部分导出。主题档案另有 JSON／Markdown 导出。
 
@@ -175,13 +176,13 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 
 ### 发行包更新
 
-安装包入口：[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)。选择 `.tgz` 附件，按对应发行说明核对配套版本；当前翻译工作流配套 Composer `0.4.6`。
+安装包入口：[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)。选择 `.tgz` 附件，按对应发行说明核对配套版本；当前版本配套 Composer `0.4.7`，也可使用本地构建的包。
 
-使用 DSH CLI 时，以下命令固定安装翻译插件 `0.26.11` 与 Composer `0.4.6`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；新功能随对应版本的发行包提供。
+使用 DSH CLI 时，以下命令固定安装翻译插件 `0.26.12` 与 Composer `0.4.7`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；也可使用下载后的包的完整路径。
 
 ```powershell
-dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.6/dsh-composer-extension-0.4.6.tgz
-dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.26.11/dsh-translation-plugin-0.26.11.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.7/dsh-composer-extension-0.4.7.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.26.12/dsh-translation-plugin-0.26.12.tgz
 ```
 
 上述命令使用桌面 `desktop` profile；Web 环境使用自身实际 profile，联动组件支持范围仍以 Composer 说明为准。使用桌面插件管理器安装时无需另装 CLI。
@@ -245,7 +246,7 @@ dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-pl
 
 ## 运行诊断与问题反馈
 
-普通文本机器版本提供**导出调用日志**，记录该版本的提示、输入、输出与执行事件。日志含翻译正文，按会话和版本校验，仅在原宿主运行期间可用；需要保留时先导出，分享前检查敏感内容。
+普通模式的文本／文件机器版本在译文行的**操作 → 导出调用日志**中记录该版本的提示、输入、输出与执行事件。日志含翻译正文，按会话和版本校验，仅在原宿主运行期间可用；需要保留时先导出，分享前检查敏感内容。
 
 在 DSH 宿主日志搜索 `[dsh-translation]`，按 `traceId` 关联操作；客户端保存或依据检查失败也会在浏览器控制台输出摘要。
 
@@ -260,4 +261,4 @@ dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-pl
 
 反馈时提供 DSH／插件版本、复现时间、操作、预期与实际现象，以及关联摘要。质量问题还需指出具体段落和判断依据。
 
-[返回项目概览](../README.zh-CN.md)
+[返回项目概览](../README.md)

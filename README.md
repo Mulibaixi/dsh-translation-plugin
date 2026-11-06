@@ -1,127 +1,127 @@
-# DeepSeek Harness Translation Plugin
+# DeepSeek Harness 翻译插件
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[简体中文](README.md) | [English](README.en.md)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![许可证：MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/Mulibaixi/dsh-translation-plugin?label=release)](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest)
 
-**Keep long translations moving, and give every revision something to build on.**
+**让长篇翻译持续推进，让每一轮润色都有积累。**
 
-Bring first drafts, discussion, refinement, and final selection into one workspace for novels, game scripts, and academic material that need consistent context and expression over time.
+把初译、讨论、润色和定稿放进同一个工作区，适合小说、游戏剧本和学术材料等需要长期维护语境与表达的翻译项目。
 
-When you reach the next chapter, keep established names and terminology within reach. When a sentence needs more work, discuss it with the source and earlier translations available. When you switch main chats or restart DSH, return to the work you have saved.
+翻译到下一章，人物称谓和术语有资料可循；想再打磨一句话，可以带着原稿和旧译文继续讨论；换个主聊天或重启 DSH，已保存的工作仍可接着用。
 
-[Why choose it](#why-choose-it) · [Installation and updates](#installation-and-updates) · [User guide (简体中文)](docs/user-guide.zh-CN.md) · [Projects and documentation](#projects-and-documentation)
+[为什么选择它](#为什么选择它) · [安装与更新](#安装与更新) · [中文使用指南](docs/user-guide.zh-CN.md) · [项目与文档](#项目与文档)
 
-## Why choose it
+## 为什么选择它
 
-- **Keep translating long projects with less repeated explanation.** Collect confirmed terminology, character details, style requirements, and references within a topic for later chapters and sessions, giving consistent wording and context a foundation.
-- **Keep refining until the translation fits your intent.** Discuss accuracy, tone, rhythm, and character voice around a specific translation. Turn “this sounds unnatural” into actionable feedback and work toward the result you want.
-- **Let the models do more organizing and checking, with less copying and relaying for you.** Describe your goal in the main chat; let the main model organize context, coordinate translation, and review revisions. The companion integration submits source material with instructions, reducing repeated copying between inputs.
-- **Try different expressions and keep control of the final choice.** Sources and translation versions stay in the same session, ready to revisit, compare, and refine before you choose the version you prefer.
-- **Turn the DSH you already know into a lasting translation workspace.** Reuse your model configuration and choose a translation model and reasoning effort for the task. History and memory save locally, so material organized today remains available for your next session.
+- **长篇连续翻译，避免重复交代背景。** 将确认过的术语、人物设定、文风要求和参考资料积累在同一主题，供后续章节与会话继续使用，为用词和语境的一致性提供依据。
+- **初译到满意，润色逐轮深入。** 围绕具体译文讨论准确性、语气、节奏和角色口吻，把“这里不够自然”变成可继续处理的修改意见，让译文逐步贴近你的目标。
+- **模型完成整理与复核，减少人工搬运和传话。** 在主聊天说明目标，由主模型组织背景、安排翻译并审阅修订；配套联动将原稿和要求一起交给任务，减少来回复制材料的操作。
+- **多试几种表达，定稿由你掌握。** 原稿和历次译文保留在同一会话，可以回看、比较和继续修改，再选定满意的版本，让每一轮尝试有据可查。
+- **把熟悉的 DSH 用成长期翻译工作台。** 沿用已有模型配置，按任务选择翻译模型与推理等级；历史和记忆在本机自动保存，今天整理的资料，下次仍能继续使用。
 
-## Main capabilities
+## 主要能力
 
-| Capability | Purpose |
+| 能力 | 用途 |
 | --- | --- |
-| Quick translation | Translate independent plain text directly for short passages and occasional lookups. |
-| Translation and refinement | Use Normal mode for main-model coordination and repeated discussion, revision, and review with requirements and context. |
-| File delivery | Work primarily with TXT/Markdown sources, process ranges when needed, and open results through the session or export them. |
-| Topic memory | Share terms, entities, facts, relations, settings, and references across topic sessions, with optional semantic retrieval. |
-| Versions and local saving | Retain sources and translation versions, select finals, and save history and memory automatically for reuse across chats and app restarts. |
+| 快译 | 直接翻译独立纯文本，适合短句和临时查译。 |
+| 翻译与润色 | 普通模式由主模型组织翻译，结合要求和背景反复讨论、修订与审阅。 |
+| 文件交付 | 以 TXT／Markdown 原稿为主，按需分段处理，通过会话打开译件，或在译文版本的“操作 → 另存为……”中选择位置保存。 |
+| 主题记忆 | 在同主题会话间共享术语、实体、事实、关系、设定和参考资料；按需配置语义检索。 |
+| 版本与本地保存 | 保留原稿和译文版本，选择定稿，自动保存历史与记忆，跨主聊天和应用重启后继续使用已保存资料。 |
 
-## A translation and refinement workflow
+## 翻译与润色工作流
 
-1. **Prepare material and context.** Create a topic and session, add sources, and describe the audience, style, and background.
-2. **Produce a first translation.** Use Quick mode for independent short text, or Normal mode when context and memory matter.
-3. **Discuss and refine.** Identify a unit or version in the main chat and adjust meaning, phrasing, voice, or terminology.
-4. **Review and finalize.** Compare the source and translation versions, revise further, choose a final, and open or export it. Manual edits advance an existing automatic final; an explicitly fixed final keeps your selection.
-5. **Reuse knowledge.** Review and adopt useful memory for later passages and sessions.
+1. **准备材料与背景**：建立主题和会话，放入原稿，说明文风、背景和翻译需求。
+2. **形成初译**：独立短文用快译；需要背景与记忆时使用普通模式。
+3. **讨论与润色**：在主聊天指出单元或版本，调整含义、表达、语气和术语。
+4. **审阅与定稿**：比较原稿和各版译文，继续修订、选择定稿，再打开或导出。人工编辑会推进已有的自动最终，明确固定的最终选择继续保留。
+5. **复用知识**：审阅并采用有用的记忆，用于后续段落与会话。
 
-## Requirements
+## 环境与依赖
 
-- DSH `>=0.2.0-rc.2`, with local plugin support, the required interfaces, and a configured model. Compatibility does not enumerate individual DSH versions.
-- **Quick mode** needs no Composer extension. **Normal mode** requires a companion `dsh-composer-extension` and submissions protocol 1. When the host lacks this interface, the extension matches patches by target-module fingerprints; unrelated DSH updates do not require adaptation.
-- Source builds require Node.js 22 or newer, pnpm, and the Composer extension source directory alongside this repository. The DSH Host must load built-in `node:sqlite`.
-- Current TXT/Markdown text files must use UTF-8 and can be up to 2 MiB each. Support boundaries for other formats are described below.
+- DSH `>=0.2.0-rc.2 <0.2.3-0`，支持本地插件、具备所需接口并已配置模型；范围内按接口能力判断兼容性。
+- **快译**无需 Composer 扩展；**普通模式**需要配套的 `dsh-composer-extension` 和 submissions protocol 1。宿主缺少该接口时，由扩展按目标模块指纹匹配补丁；无关的 DSH 更新不要求重新适配。
+- 从源码构建需要 Node.js 22 或更高版本、pnpm，以及并排放置的 Composer 扩展源码目录；DSH 宿主需能加载内置 `node:sqlite`。
+- 当前 TXT／Markdown 文本文件每份最多 2 MiB，需使用 UTF-8 编码；其他格式的支持边界见下文。
 
-## Installation and updates
+支持 DSH `0.2.2-rc.1`；该宿主的普通模式需要 Composer `0.4.7` 及其匹配补丁。构建该版 DSH 及其宿主补丁需要 Node.js 24.9 或更高版本。
 
-### Install
+## 安装与更新
 
-1. For Normal mode, install Composer **0.4.6** first from its [Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases/latest). Quick mode does not require Composer.
-2. Download `dsh-translation-plugin-<version>.tgz` from this plugin's [Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest). Enter its full local path or the asset's download URL in DSH's plugin manager, then install and enable it. Choose the `.tgz` asset; distribution packages include the build output and need no local build.
-3. Open **翻译 (Translation)** in the main chat's right sidebar and create a topic and session. Restart when requested by the plugin manager. If Composer reports a prepared patch, exit DSH completely and reopen it before using Normal mode.
+### 安装
 
-### Build from source
+1. 普通模式先从 [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases/latest) 安装配套的 **Composer 0.4.7**；快译无需 Composer。
+2. 从本插件的 [Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest) 下载 `dsh-translation-plugin-<版本>.tgz`，在 DSH 插件管理器的安装输入框中填写安装包的完整路径或附件下载链接，安装并启用。选择 `.tgz` 附件；分发包包含构建产物，使用者无需本地构建。
+3. 在主聊天右侧栏打开“翻译”，建立主题和会话。按插件管理器提示重启；若 Composer 提示补丁已准备，则正常完全退出并重开 DSH 后再使用普通模式。
 
-Place the two repositories side by side. Build the Composer extension according to its instructions, then run in this plugin directory:
+### 从源码构建
+
+将两个仓库并排放置，先按 Composer 扩展的说明完成其构建，再在本插件目录执行：
 
    ```powershell
    pnpm install --frozen-lockfile
    pnpm build
    ```
 
-After building, install this directory in DSH's plugin manager or run `pnpm pack` to create a distribution package.
+构建完成后，可在 DSH 插件管理器中安装本目录，或执行 `pnpm pack` 生成分发包。
 
-### Update
+### 更新
 
-Wait for current tasks to finish and confirm that material is saved. Enter the new version's full `.tgz` path or versioned download URL in the plugin manager; **no prior uninstall is required**. Use a new versioned filename or URL. Usually only the changed plugin needs updating. If the release notes require companion updates, install Composer first, then the translation plugin. Hot loading is available when supported by the host; otherwise follow the manager's refresh, reload, or restart instructions.
+等待当前任务结束并确认资料已保存，再在插件管理器的安装输入框填写新版本 `.tgz` 的完整路径或版本下载链接，**无需预先卸载**。使用带版本号的新文件名或链接。通常只更新有变更的插件；发行说明要求配套更新时，先 Composer、后翻译插件。翻译插件可在宿主支持时热加载，否则按管理器提示刷新、重载或重启。
 
-Composer requires a normal full exit and reopen when a host patch actually needs replacement. Updating its extension package does not necessarily reinstall that patch. For source installations, update the original directories, rebuild in the order above, and refresh or reload.
+Composer 只有实际需要替换宿主补丁时，才必须正常完全退出并重开 DSH；更新扩展包不一定需要重新安装补丁。源码安装则更新原目录并按上方顺序重新构建，再刷新或重载。
 
-The local database upgrades to format v8 to retain filename segmentation baselines. Older plugins cannot read this format; downgrading requires restoring a complete backup from the matching version.
+本地数据库升级为 v8 格式，用于保留文件名分段基准。旧版插件无法读取该格式，回退时需恢复对应版本的完整数据备份。
 
-The local database upgrades to format v8 to retain filename segmentation baselines. Older plugins cannot read this format; downgrading requires restoring a complete backup from the matching version.
+资料库[备份与恢复](docs/user-guide.zh-CN.md#资料库备份与恢复)、[已有资料迁移](docs/user-guide.zh-CN.md#已有资料的升级与迁移)和[详细更新步骤](docs/user-guide.zh-CN.md#发行包与源码更新)见使用指南。版本变化见 [CHANGELOG](CHANGELOG.md)。
 
-See the user guide for [backup and restoration](docs/user-guide.zh-CN.md#资料库备份与恢复), [data migration](docs/user-guide.zh-CN.md#已有资料的升级与迁移), and [detailed update steps](docs/user-guide.zh-CN.md#发行包与源码更新) (简体中文). See [CHANGELOG](CHANGELOG.md) for version changes.
+## 使用说明
 
-## Usage
+详细操作见[中文使用指南](docs/user-guide.zh-CN.md)，涵盖主题与会话、材料提交、Markdown 交付、记忆管理、润色定稿、存储清理及问题反馈。
 
-The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics and sessions, material submission, Markdown delivery, memory management, refinement and finals, storage cleanup, and issue reports.
+**翻译输入框放原稿，主聊天输入框放要求和修改意见。** 选择快译直接取得译文，或在普通模式中通过主聊天组织翻译、讨论和反复润色。
 
-**Put sources in the translation input, and requirements or revision feedback in the main chat.** Use Quick mode for a direct translation, or Normal mode for main-chat coordination, discussion, and repeated refinement.
+会话历史由程序在后台自动保存，主模型继续审阅和交付译文。历史保存失败时，工作区保留当前内容并提供**重试保存**，无需重新调用翻译模型。
 
-Session history saves automatically in the background while the main model reviews and delivers the translation. If history saving fails, the workspace keeps the current content and offers **重试保存 (Retry saving)** without calling the translation model again.
+较早且已保存的译文在确实能缩短上下文时，可在主模型上下文中改为准确版本引用。当前及最近一次成功翻译回合保留已有正文或预览；更早版本可从已打开的翻译会话按需读回，原文纠错或改选定稿后仍按原版本读取。
 
-Older saved translations can be replaced with exact version references in the main model's context when this reduces its size. The current and most recent successful translation turns keep their existing bodies or previews; earlier versions remain available on demand from opened translation sessions, including after source corrections or final-version changes.
+较早且已保存的译文在确实能缩短上下文时，可在主模型上下文中改为准确版本引用。当前及最近一次成功翻译回合保留已有正文或预览；更早版本可从已打开的翻译会话按需读回，原文纠错或改选定稿后仍按原版本读取。
 
-Older saved translations can be replaced with exact version references in the main model's context when this reduces its size. The current and most recent successful translation turns keep their existing bodies or previews; earlier versions remain available on demand from opened translation sessions, including after source corrections or final-version changes.
+术语与结构化档案支持按类别一键采用待确认、待复核条目；批量处理时保留列表和编辑稿，完成后恢复条目操作，失败时显示提示。
 
-Terminology and structured archives support adopting pending proposals and review items by category. Batch adoption keeps the list and edit drafts visible, restores entry actions when finished, and reports failures.
+主模型写入术语与结构化档案后，仅接收本次写入结果、准确版本及条目状态，减少重复携带整份资料。完整内容仍可在界面查看、导出或按需查询。
 
-After writing terminology or structured archive entries, the main model receives only the write result, exact versions and entry state, reducing repeated full-collection context. Complete content remains available in the interface, exports and on-demand queries.
+主题参考文件没有可沿用分段时，由主模型安排两个原生子代理独立标注整份文件并并行交叉复核，核对必要分歧后统一保存分段。保留双语句对与细粒度语义边界；需要可承载全文及完整结果的模型和两个可用子代理名额。未完成时可点击“重试主模型分段”；已完成方案不会自动重做。
 
-When a topic reference file has no existing segmentation, the main model delegates two independent full-file annotations and parallel cross-reviews to native subagents, resolves substantive issues, and saves one complete plan. Bilingual pairs and fine semantic boundaries are preserved. This requires a model that can hold the entire file and result, and two available subagent slots. Use **重试主模型分段 (Retry segmentation)** when unfinished; completed plans are preserved unless resegmentation is requested.
+参考文件在资料库内使用唯一完整文件名。同名上传更新当前主题的已有登记，复用逻辑分段，随文字变更迁移边界，不再次自动调用模型标注。对应不明确或某段超限时，保留原件与原方案并指出具体位置。文件名基准在重启及移除主题登记后继续保留，清除插件本地数据时一并删除。
 
-Reference files use unique complete filenames within a library. Uploading the same name updates that topic's existing registration and reuses its logical segmentation, moving boundaries through text edits without another automatic model annotation. If alignment is ambiguous or a segment exceeds its limit, the previous original and plan remain available with a location-specific error. Filename baselines survive restarts and removal of topic registrations; clearing plugin local data removes them too.
+翻译操作会明确本次任务及准确材料；已中断历史不代表允许自动续做。任务或对象确实存在矛盾、无法确定时，主模型应先询问，再继续处理，仍可主动加载工具核对必要上下文。随主聊天附带的材料遵从本条消息明确的学习、讨论等用途。
 
-Translation actions identify the current task and exact material. Interrupted history does not authorize automatic continuation. When the intended task or target remains genuinely conflicting or unclear, the main model is instructed to ask you before proceeding; it can still load tools and check relevant context. Material accompanying a chat message follows that message's stated purpose, including learning or discussion.
+TXT、Markdown 文件历史可在“重译”右侧或译文记录原文行选择**嵌入原文**。主模型标记语义分段与排除内容后，仅嵌入该原文文件的保留正文；代码、Markdown 结构和元信息仍可精确查找。文件译文按需读取，不参与嵌入；切换最终译文可复用原文向量。已有文件历史也需手动选择，未选择文件不会自动建立索引。
 
-For TXT and Markdown file history, choose **嵌入原文 (Embed source)** next to **重译 (Retranslate)** or on the source row in translation records. The main model marks semantic chunks and exclusions; only that original's retained prose is embedded. Code, Markdown structure and metadata remain available through exact record search. File translations are read on demand rather than embedded, and changing the final translation reuses the original's vectors. Existing file history must be selected explicitly; unselected files are not automatically indexed.
+## 当前限制与数据
 
-## Current limitations and data
+- **补充信息**：支持工具调用的翻译模型可在普通翻译中提出关键问题，由主模型结合已有语境回答，或向用户询问后重新调用翻译。每次调用分别计量；问题引用仅在当前宿主运行期有效。所选提供商和模型须支持工具调用；工具声明被拒绝时报告错误，不静默重试为普通翻译。
+- **文件支持有限**：当前主要支持 UTF-8 编码的 TXT 和 Markdown。PDF、图片、DOCX 等格式尚未提供完整的解析、识读和原格式交付支持。
+- **翻译效率**：翻译效率经过一定优化，但最终完成时间受模型与材料影响。
+- **语义索引**：启用后会将相关正文发送给配置的嵌入服务。
+- 重启不自动续跑模型任务；结果未知时先查询原任务。导出不能替代完整备份，目前不支持导入恢复。
+- 禁用或卸载插件不会自动删除本地资料，可按需清理版本、单元、会话、主题或插件数据。
 
-- **Context questions**: Translation models with tool support can ask focused questions during Normal translation. The main model answers from available context or asks you, then starts a new translation call. Each call has its own usage; question references remain valid only during the current host run. The selected provider and model must support tool calls; a rejected tool declaration is reported without silently retrying as a translation.
-- **Limited file support**: the current focus is UTF-8 TXT and Markdown. Complete parsing, recognition, and delivery in the original format are not yet supported for PDF, images, DOCX, and similar formats.
-- **Translation efficiency**: some optimizations have been made, but final completion time is affected by the models and material.
-- **Semantic indexing**: enabling it sends relevant text to the configured embedding service.
-- Restart does not automatically resume model tasks; check the original task when its outcome is unknown. Exports do not replace a complete backup and cannot currently be imported for restoration.
-- Disabling or uninstalling the plugin does not automatically delete local material. Clean up versions, units, sessions, topics, or plugin data as needed.
+## 项目与文档
 
-## Projects and documentation
-
-| Entry | Link |
+| 入口 | 链接 |
 | --- | --- |
-| Translation plugin | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin) |
-| Composer extension | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension) |
-| Distribution packages | [Translation releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer releases](https://github.com/Mulibaixi/dsh-composer-extension/releases) |
-| Bug reports | [Translation plugin issues](https://github.com/Mulibaixi/dsh-translation-plugin/issues) |
-| User guide (简体中文) | [Detailed operations and issue reports](docs/user-guide.zh-CN.md) |
-| Changes | [CHANGELOG](CHANGELOG.md) |
-| Contributions | [CONTRIBUTING](CONTRIBUTING.md) |
+| 翻译插件 | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin) |
+| Composer 扩展 | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension) |
+| 分发包 | [翻译插件发行页](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer 发行页](https://github.com/Mulibaixi/dsh-composer-extension/releases) |
+| 问题反馈 | [翻译插件 Issues](https://github.com/Mulibaixi/dsh-translation-plugin/issues) |
+| 中文使用指南 | [详细操作与问题反馈](docs/user-guide.zh-CN.md) |
+| 更新记录 | [CHANGELOG](CHANGELOG.md) |
+| 贡献指南 | [CONTRIBUTING](CONTRIBUTING.md) |
 
-## Contributing and license
+## 贡献与许可证
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution instructions and [AGENTS.md](AGENTS.md) for project rules. Licensed under [MIT](LICENSE).
+贡献方式见 [CONTRIBUTING.md](CONTRIBUTING.md)，项目规范见 [AGENTS.md](AGENTS.md)。采用 [MIT 许可证](LICENSE)。

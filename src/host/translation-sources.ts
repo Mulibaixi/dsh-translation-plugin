@@ -7,6 +7,7 @@ import { MAX_TRANSLATION_SOURCE_BYTES, TRANSLATION_SOURCES_REMOTE, parseTranslat
   type TranslationSourceScope } from '../shared/translation-sources.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength, type TranslationSourceRange } from '../shared/translation-source-read.js'
 import type { QuickHostContext } from './quick-translation.js'
+import { uploadedFile, type NativeUpload } from './native-upload.js'
 import { TRANSLATION_SOURCE_STORAGE_REMOTE, parseTranslationSourceStorageRequest, type TranslationSourceConfirmReference,
   type TranslationSourcePrepareSave, type TranslationSourceQueryReference, type TranslationSourceReference, type TranslationSourceReleaseReference,
   type TranslationSourceRestored, type TranslationSourceStorageCapability, type TranslationSourceStorageErrorCode,
@@ -19,7 +20,7 @@ import { TRANSLATION_SOURCE_INTEGRITY_REMOTE, parseTranslationSourceRangeHash,
 interface Agent { readonly id: string; readonly session: { readonly id: string }; readonly ctx: unknown }
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
 interface Attachments { readFileStream(ref: FileRef, signal?: AbortSignal): AsyncIterable<Uint8Array> }
-interface Uploads { resolve(agent: Agent, receiptId: string): FileRef | undefined }
+interface Uploads { resolve(agent: Agent, receiptId: string): NativeUpload | undefined }
 interface Controller {
   resolveAgent(id: string): Promise<{ readonly agent: Agent } | { readonly error: unknown }>
   canOpenWorkspacePath(): boolean
@@ -173,7 +174,7 @@ export class TranslationSourcesService {
     let pending = this.pending.get(signature)
     if (pending && (pending.peerId !== peerId || pending.agent !== agent)) return bad('scope_mismatch', '此导入正在另一连接或 Agent 中准备。', 'resolve_upload')
     if (!pending) {
-      const file = uploads.resolve(agent, request.receiptId)
+      const file = uploadedFile(uploads.resolve(agent, request.receiptId))
       if (!file) return bad('receipt_not_found', '上传收据已失效或不属于此主会话。', 'resolve_upload')
       const promise = this.decode(request.scope, peerId!, agent, file, attachments, signal, signature, request.originalFilePath)
       pending = { peerId: peerId!, agent, promise }; this.pending.set(signature, pending)

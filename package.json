@@ -1,6 +1,6 @@
 {
   "name": "dsh-translation-plugin",
-  "version": "0.26.11",
+  "version": "0.26.12",
   "private": true,
   "license": "MIT",
   "description": "Translation and refinement workspace for DeepSeek Harness, with topic memory, revision history, and main-model collaboration.",
@@ -30,7 +30,7 @@
     "dist",
     "cordis.patch.yml",
     "README.md",
-    "README.zh-CN.md",
+    "README.en.md",
     "docs/user-guide.zh-CN.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
@@ -46,7 +46,7 @@
   },
   "engines": {
     "node": ">=22",
-    "dsh": ">=0.2.0-rc.2"
+    "dsh": ">=0.2.0-rc.2 <0.2.3-0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-client.mjs",

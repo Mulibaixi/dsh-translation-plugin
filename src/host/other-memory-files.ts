@@ -13,10 +13,12 @@ import type { OtherMemoryService } from './other-memory.js'
 import type { QuickHostContext } from './quick-translation.js'
 import { loadTranslationSourceStorage, sourceSha256, type TranslationSourceHostOptions, type TranslationSourceStorage } from './source-storage.js'
 
+import { uploadedFile, type NativeUpload } from './native-upload.js'
+
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
 interface Agent { readonly id: string; readonly session: { readonly id: string }; followup?(message: unknown): void }
 interface Attachments { readFileStream(file: FileRef, signal?: AbortSignal): AsyncIterable<Uint8Array> }
-interface Uploads { resolve(agent: Agent, receiptId: string): FileRef | undefined }
+interface Uploads { resolve(agent: Agent, receiptId: string): NativeUpload | undefined }
 interface Controller {
   resolveAgent(id: string): Promise<{ readonly agent: Agent } | { readonly error: unknown }>
   canOpenWorkspacePath(): boolean
@@ -86,7 +88,7 @@ export class OtherMemoryFilesService {
         if (entry) return ok(entry)
         return bad('receipt_not_found', '此上传对应的参考文件已移除，请重新选择文件；旧收据不会重新登记或覆盖文件。')
       }
-      const file = uploads.resolve(agent, request.receiptId)
+      const file = uploadedFile(uploads.resolve(agent, request.receiptId))
       if (!file) return bad('receipt_not_found', '上传收据已失效或不属于所选主会话，请重新选择文件。')
       const decoded = await this.readUpload(file, attachments, signal)
       if (!decoded.ok) return decoded

@@ -12,8 +12,8 @@
 
 `test:native` 运行上述两个目录的全部集成用例，最多四个文件并发。普通翻译以当前 `direct` 流程为准，覆盖慢保存、中断恢复、上下文、原文纠错和资源生命周期，同时验证历史读取与未结算任务收束。已停用的执行流程及无引用夹具移出活动目录，备份只保留在本地忽略目录。
 
-`README.md` 使用英文，`README.zh-CN.md` 使用中文，两者保持同步；CHANGELOG 和提交说明使用中文。提交采用 Conventional Commits，描述简洁，正文说明主要变化与验证结果；不要绕过仓库 Git hooks。
+`README.md` 使用中文，`README.en.md` 使用英文，两者保持同步并互相链接；CHANGELOG 和提交说明使用中文。提交采用 Conventional Commits，描述简洁，正文说明主要变化与验证结果；不要绕过仓库 Git hooks。
 
 开发中的变更可先记入 CHANGELOG 的 `Unreleased`；每次本地版本提交时，更新版本号并将对应变化整理到带版本号与日期的章节。本地提交及版本记录不代表 npm 或远程发行页发布；远程发布仍需用户明确授权。
 
-本地 Native 验证运行 `pnpm test:native`，需先准备相应的本地测试脚本，并将 `DSH_RUNTIME_ROOT` 指向含 `dsh/node_modules` 的目标 DSH 组件目录。最低宿主声明为 `>=0.2.0-rc.2`；按变更范围核对最低基线和目标新版（包括 `0.2.1-rc.5`）的实际接口契约，不用逐项版本白名单代替兼容性判断。Composer 联动需要 submissions protocol 1，以及任务阶段协议 2 的配套扩展构建；宿主缺少提交接口时，补丁仍须匹配目标模块指纹。测试用临时会话与合成 provider，不能据此宣称真实提供商或桌面操作已验证。
+本地 Native 验证运行 `pnpm test:native`，需先准备相应的本地测试脚本，并将 `DSH_RUNTIME_ROOT` 指向含 `dsh/node_modules` 的目标 DSH 组件目录。当前宿主声明为 `>=0.2.0-rc.2 <0.2.3-0`；按变更范围核对最低基线和目标版本（包括 `0.2.1-rc.5`、`0.2.2-rc.1`）的实际接口契约，不用逐项版本白名单代替兼容性判断。新版适配覆盖独立 Session、上传收据及 Composer 提交联动；构建 DSH `0.2.2-rc.1` 及其宿主补丁需要 Node.js 24.9 或更高版本。Composer 联动需要 submissions protocol 1，以及任务阶段协议 2 的配套扩展构建；宿主缺少提交接口时，补丁仍须匹配目标模块指纹。测试用临时会话与合成 provider，不能据此宣称真实提供商或桌面操作已验证。
