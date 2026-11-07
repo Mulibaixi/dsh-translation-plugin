@@ -99,6 +99,10 @@ export const styles = `
 .dsh-tp-translation-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 12px; }
 .dsh-tp-source-collapsed { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .dsh-tp-unit-header, .dsh-tp-version-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
+.dsh-tp-source { display: flow-root; }
+/* 抵消会话滚动区域的 12px 顶部内边距，各标题只在自己的正文块内吸顶。 */
+.dsh-tp-transcript .dsh-tp-source > .dsh-tp-unit-header,
+.dsh-tp-transcript .dsh-tp-version > .dsh-tp-version-header { position: sticky; top: -12px; z-index: 2; background: var(--dsw-alias-bg-base, Canvas); }
 .dsh-tp-version { padding: 6px 0; }
 /* 单元内各行功能（原文行、译文行、编辑器与执行行）使用同一按钮规格：12px、间距 4px。 */
 .dsh-tp-unit-header .dsh-tp-actions, .dsh-tp-version-actions { gap: 4px; font-size: 12px; }

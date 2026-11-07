@@ -91,6 +91,10 @@ Before discussing an older translation, open its translation session in the curr
 
 Session history saves automatically in the background. If saving fails, the workspace keeps the current content and offers **重试保存 (Retry saving)** without calling the translation model again.
 
+For withdrawn text, choose **清除 (Clear)** at the top right of its entry to remove the placeholder.
+
+When reading long text, the current source or translation heading and its controls stay at the top of the translation pane and follow the block being read. Collapsing the source positions the current translation heading at the top only when the source heading is already pinned there.
+
 Organize terminology, style requirements, and references as [memory assets (简体中文)](docs/user-guide.zh-CN.md#记忆资产) to support later discussion and translation. See the guide for entry adoption, reference-file segmentation, source indexing, and saving rules.
 
 ## Current limitations and data

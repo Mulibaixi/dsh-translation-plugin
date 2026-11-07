@@ -552,7 +552,26 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const [exchangeExpanded, setExchangeExpanded] = react.useState(false)
   // 大段原文可收起为三行，避免挤占译文；只在明显超出（约六行以上）时提供入口。
   const [sourceCollapsed, setSourceCollapsed] = react.useState(false)
+  const sourceHeading = react.useRef<HTMLElement | null>(null)
+  const locateTranslation = react.useRef(false)
   react.useEffect(() => { setSourceCollapsed(false) }, [unit.source])
+  react.useEffect(() => {
+    if (!sourceCollapsed || !locateTranslation.current) return
+    locateTranslation.current = false
+    const source = sourceHeading.current?.parentElement, version = source?.nextElementSibling
+    const viewport = source?.closest<HTMLElement>('.dsh-tp-transcript')
+    if (!viewport || !version?.matches('.dsh-tp-version')) return
+    // The version block keeps its natural position even when its heading is already sticky.
+    const inset = parseFloat(window.getComputedStyle(version).paddingTop) || 0
+    const offset = viewport.scrollTop + version.getBoundingClientRect().top + inset - viewport.getBoundingClientRect().top - viewport.clientTop
+    viewport.scrollTop = Math.max(0, Math.min(offset, viewport.scrollHeight - viewport.clientHeight))
+  }, [sourceCollapsed])
+  function toggleSource(): void {
+    const heading = sourceHeading.current, viewport = heading?.closest<HTMLElement>('.dsh-tp-transcript')
+    locateTranslation.current = !sourceCollapsed && !!heading && !!viewport &&
+      Math.abs(heading.getBoundingClientRect().top - viewport.getBoundingClientRect().top - viewport.clientTop) <= 1
+    setSourceCollapsed(value => !value)
+  }
   const collapsibleSource = Array.from(unit.source).length > 280 || unit.source.split('\n').length > 5
   const latest = unit.revisions.at(-1)
   const retranslation = normal?.getRetranslationStatus(session.id, unit.id)
@@ -591,7 +610,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
       h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · 文本 · 已删除`),
       h('time', { dateTime: unit.deletion.at, className: 'dsh-tp-muted' }, new Date(unit.deletion.at).toLocaleString())),
     h('p', { className: 'dsh-tp-muted' }, '正文已清除；编号保留，不再参与导出或记忆依据。'))
-  if (!latest) return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `文本 ${unit.order}` },
+  if (!latest) return h('article', { className: 'dsh-tp-translation dsh-tp-source', 'data-unit-id': unit.id, 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-unit-header' },
       h('span', { className: 'dsh-tp-muted' }, '原文'),
       h('div', { className: 'dsh-tp-actions' }, h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
@@ -604,20 +623,22 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const file = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
   const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
   return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `${file ? '文件' : '文本'} ${unit.order}` },
-    h('div', { className: 'dsh-tp-unit-header' },
-      h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
-      h('div', { className: 'dsh-tp-actions' },
-        collapsibleSource && !file ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文${sourceCollapsed ? '展开' : '收起'}`, 'aria-expanded': !sourceCollapsed,
-          title: sourceCollapsed ? '展开原文' : '收起原文，只显示前三行', onClick: () => setSourceCollapsed(value => !value) }, sourceCollapsed ? '展开' : '收起') : null,
-        h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
-        h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, disabled: !final || session.archivedAt !== null }),
-        h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
-        file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
+    h('div', { className: 'dsh-tp-source' },
+      h('div', { className: 'dsh-tp-unit-header', ref: sourceHeading },
+        h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
+        h('div', { className: 'dsh-tp-actions' },
+          collapsibleSource && !file ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文${sourceCollapsed ? '展开' : '收起'}`, 'aria-expanded': !sourceCollapsed,
+            title: sourceCollapsed ? '展开原文' : '收起原文，只显示前三行', onClick: toggleSource }, sourceCollapsed ? '展开' : '收起') : null,
+          h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
+          h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, disabled: !final || session.archivedAt !== null }),
+          h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
+          file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
+      ),
+      file ? h(DirectFileLink, { file, unit, session, materials, viewFiles }) : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
+      sourceHistory,
+      retranslation ? h('p', { className: 'dsh-tp-muted', role: 'status' }, retranslation.message) : null,
+      execution,
     ),
-    file ? h(DirectFileLink, { file, unit, session, materials, viewFiles }) : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
-    sourceHistory,
-    retranslation ? h('p', { className: 'dsh-tp-muted', role: 'status' }, retranslation.message) : null,
-    execution,
     h(TranslationRevision, { executionOwner, key: latest.id, store, unit, revision: latest, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles,
       resultOpen: file ? null : h(ResultOpenLink, { unit, session, objects, viewFiles }),
       versionsToggle: unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, title: expanded ? '收起旧版本' : '展开旧版本', onClick: () => setExpanded(value => !value) }, `旧版本（${unit.revisions.length - 1}）`) : null }),
@@ -648,7 +669,7 @@ function FileUnitView({ file, session, materials, viewFiles }: {
     } catch { if (lifetime.current.mounted) setNotice('原稿打开未完成，可重试。') }
     finally { lifetime.current.opening = false; lifetime.current.controller = null; if (lifetime.current.mounted) setOpening(false) }
   }
-  return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit', 'data-unit-id': file.unitId, 'data-material-id': file.materialId, 'aria-label': `文件：${file.name}` },
+  return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit dsh-tp-source', 'data-unit-id': file.unitId, 'data-material-id': file.materialId, 'aria-label': `文件：${file.name}` },
     h('div', { className: 'dsh-tp-unit-header' }, h('span', { role: file.status === 'failed' || file.unknown ? 'alert' : 'status', className: 'dsh-tp-muted' }, `原文 · ${status}`),
       h('div', { className: 'dsh-tp-actions' },
         ['failed', 'frozen'].includes(file.status) ? button('重新发送', () => { void materials.recoverFile(session.id, file.unitId, 'retry') }, file.busy || file.unknown) : null,
@@ -769,11 +790,13 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     ...fileUnits.filter(file => !fileJobs?.isUnitRemoved(current.id, file.unitId) && !fileJobRecords.some(record => record.summary.materialId === file.materialId || record.summary.unitId === file.unitId) && !units.some(unit => unit.id === file.unitId || unit.id === file.documentUnitId)).map(file => ({ id: `u:${file.unitId}`, events: [], active: false, createdAt: file.createdAt,
       view: h(FileUnitView, { key: file.unitId, file, session: current, materials, viewFiles }) })),
     ...transient.map(record => ({ id: `o:${record.id}`, events: record.text ? ['result'] : [], active: ['submitting', 'running', 'unknown'].includes(record.status), createdAt: record.createdAt, view: h(TranslationRecord, { key: record.id, record, quick, canRestore: !current.input }) })),
-    ...sentTexts.map(material => ({ id: `m:${material.materialId}`, events: [], active: false, createdAt: material.createdAt, view: h('article', { key: material.materialId, className: 'dsh-tp-translation', 'data-material-id': material.materialId, 'aria-label': '已发送文本' },
+    ...sentTexts.map(material => ({ id: `m:${material.materialId}`, events: [], active: false, createdAt: material.createdAt, view: h('article', { key: material.materialId, className: 'dsh-tp-translation dsh-tp-source', 'data-material-id': material.materialId, 'aria-label': '已发送文本' },
       h('div', { className: 'dsh-tp-unit-header' },
         h('span', { role: 'status', className: 'dsh-tp-muted' }, material.status),
         h('div', { className: 'dsh-tp-actions dsh-tp-record-heading-actions' },
-          button('撤回', () => { void materials?.recoverText(current.id, material.materialId, 'withdraw') }, material.busy || material.withdrawn),
+          material.withdrawn
+            ? button('清除', () => { materials?.clearWithdrawnText(current.id, material.materialId) }, material.busy)
+            : button('撤回', () => { void materials?.recoverText(current.id, material.materialId, 'withdraw') }, material.busy),
           button('重新发送', () => { void materials?.recoverText(current.id, material.materialId, 'retry') }, material.busy || material.unknown),
           material.unknown ? button('检查提交状态', () => { void materials?.query(current.id, material.materialId) }, material.busy) : null)),
       h('div', { style: { whiteSpace: 'pre-wrap' } }, material.text),

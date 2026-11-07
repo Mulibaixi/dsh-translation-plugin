@@ -283,6 +283,17 @@ export class MaterialSubmissionsClient {
         busy: !!item.textAction || item.settling || ['frozen', 'preparing', 'prepared'].includes(item.stage),
         withdrawn: !!item.withdrawn, unknown: item.stage === 'unknown', message: item.reason }] : [])
   }
+  /** Forget a withdrawn text placeholder after its authority has already been revoked. */
+  clearWithdrawnText(sessionId: string, materialId: string): boolean {
+    if (this.disposed) return false
+    const entry = [...this.submissions].find(([, item]) => item.sessionId === sessionId && item.draft?.materialId === materialId)
+    if (!entry) return false
+    const [key, item] = entry
+    if (!item.withdrawn || item.stage !== 'released' || item.textAction || item.settling || item.consumed || item.replacementId || fileCarrier(item.draft?.carrier)) return false
+    this.clearHandoff(item); clearTimeout(item.stallTimer)
+    this.submissions.delete(key)
+    this.reconcile(); this.emit(); return true
+  }
   /** Revoke the old authority before retrying; a delayed main-agent tool call must not admit it. */
   async recoverText(sessionId: string, materialId: string, action: 'withdraw' | 'retry'): Promise<void> {
     const item = [...this.submissions.values()].find(value => value.sessionId === sessionId && value.draft?.materialId === materialId)
