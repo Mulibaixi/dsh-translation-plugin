@@ -4,6 +4,8 @@
 
 [![许可证：MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/Mulibaixi/dsh-translation-plugin?label=release)](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest)
+[![Awesome DSH Plugin：已收录](https://img.shields.io/badge/awesome--dsh--plugin-listed-2ea44f)](https://awesome-dsh-plugin.com/?q=Mulibaixi%2Fdsh-translation-plugin)
+[![dsh-plugin.org：已收录](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/mulibaixi/dsh-translation-plugin)
 
 **和主模型讨论翻译，把要求和意见落实到译文中。**
 
@@ -113,6 +115,7 @@ Composer 只有实际需要替换宿主补丁时，才必须正常完全退出�
 | 翻译插件 | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin) |
 | Composer 扩展 | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension) |
 | 分发包 | [翻译插件发行页](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer 发行页](https://github.com/Mulibaixi/dsh-composer-extension/releases) |
+| 插件市场 | [Awesome DSH Plugin](https://awesome-dsh-plugin.com/?q=Mulibaixi%2Fdsh-translation-plugin) · [dsh-plugin.org](https://dsh-plugin.org/plugins/mulibaixi/dsh-translation-plugin) |
 | 问题反馈 | [翻译插件 Issues](https://github.com/Mulibaixi/dsh-translation-plugin/issues) |
 | 中文使用指南 | [详细操作与问题反馈](docs/user-guide.zh-CN.md) |
 | 更新记录 | [CHANGELOG](CHANGELOG.md) |
