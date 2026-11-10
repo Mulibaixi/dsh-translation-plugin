@@ -4,8 +4,10 @@ import {
   MAX_TOPIC_BRIDGE_REPLY_BYTES, parseLibraryConnection, parseTopicBridgeCapability, parseTopicBridgeV2Capability, parseTopicBridgeDown, parseTopicBridgeReply,
   type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact, type TopicSessionSummary,
 } from '../shared/topic-bridge.js'
-import type { TopicTermSnapshot, TopicTermPut, TermMutationResult, TermEvidenceRef, TopicTermQuery, TopicTerm } from '../memory/topic-terms.js'
-import { referencedEntityIds, type TopicArchiveSnapshot, type TopicArchivePut, type ArchiveMutationResult, type TopicArchiveQuery, type TopicArchiveEntry } from '../memory/topic-archive.js'
+import type { TopicTermSnapshot, TermMutationResult, TermEvidenceRef, TopicTermQuery, TopicTerm } from '../memory/topic-terms.js'
+import { referencedEntityIds, type TopicArchiveSnapshot, type ArchiveMutationResult, type TopicArchiveQuery, type TopicArchiveEntry } from '../memory/topic-archive.js'
+import type { TopicTermCommand } from './topic-memory-store.js'
+import type { TopicArchiveCommand } from './topic-archive-store.js'
 import { assetPriority } from '../memory/asset-priority.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
@@ -46,10 +48,11 @@ export interface TopicBridgeRemotePort {
 }
 export interface TopicBridgeTermsPort {
   getSnapshot(ownerId: string, topicId: string): TopicTermSnapshot
+  ensureLoaded(ownerId: string, topicId: string): Promise<TopicTermSnapshot>
   reconcileAsync?(ownerId: string, topicId: string): Promise<TopicTermSnapshot>
   query(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): TopicTermSnapshot
   queryAsync?(ownerId: string, topicId: string, query: Omit<TopicTermQuery, 'ownerId' | 'topicId'>): Promise<TopicTermSnapshot>
-  apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicTermPut }): Promise<TermMutationResult>
+  apply(ownerId: string, topicId: string, expectedVersion: number, command: Extract<TopicTermCommand, { kind: 'put' | 'delete' }>): Promise<TermMutationResult>
 }
 export interface TopicBridgeArchivePort {
   getSnapshot(ownerId: string, topicId: string): TopicArchiveSnapshot
@@ -57,7 +60,7 @@ export interface TopicBridgeArchivePort {
   reconcileAsync?(ownerId: string, topicId: string): Promise<TopicArchiveSnapshot>
   query(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): TopicArchiveSnapshot
   queryAsync?(ownerId: string, topicId: string, query: Omit<TopicArchiveQuery, 'ownerId' | 'topicId'>): Promise<TopicArchiveSnapshot>
-  apply(ownerId: string, topicId: string, expectedVersion: number, command: { readonly kind: 'put'; readonly input: TopicArchivePut }): Promise<ArchiveMutationResult>
+  apply(ownerId: string, topicId: string, expectedVersion: number, command: Extract<TopicArchiveCommand, { kind: 'put' | 'delete' }>): Promise<ArchiveMutationResult>
 }
 /** Read-only view of the terms a document task actually adopted; it never exposes source bodies. */
 export interface DocumentTaskTermSummary {
@@ -523,6 +526,21 @@ export class TopicBridgeClient {
     if (command.kind === 'list_topic_terms') {
       if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
       return success({ kind: 'terms', snapshot: await (this.terms.reconcileAsync?.(ownerId, command.topicId) ?? this.terms.getSnapshot(ownerId, command.topicId)) })
+    }
+    if (command.kind === 'remove_memory_asset') {
+      const { topicId, collection, id, expectedVersion, expectedEntryVersion } = command
+      if (!this.sessions.getTopics(ownerId).some(topic => topic.id === topicId)) return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
+      const store = collection === 'terms' ? this.terms : this.archive
+      const snapshot = await store.ensureLoaded(ownerId, topicId)
+      const entry = snapshot.entries.find(item => item.id === id)
+      if (snapshot.version !== expectedVersion || entry?.version !== expectedEntryVersion)
+        return error(request.requestId, 'stale', '条目不存在或档案版本已变化，请核对当前条目。')
+      if (entry.status !== 'proposal' && entry.status !== 'disabled')
+        return error(request.requestId, 'requires_user_action', '主模型只可删除待确认或已停用的条目。')
+      const result = await store.apply(ownerId, topicId, expectedVersion, { kind: 'delete', id, expectedEntryVersion })
+      if (result.status === 'save_failed') return error(request.requestId, result.status, '删除未能保存，请核对当前条目和保存状态。')
+      if (result.status !== 'updated') return error(request.requestId, result.status, '删除未完成，请核对当前条目。')
+      return success({ kind: 'memory_asset_removed', topicId, id, version: result.snapshot.version })
     }
     if (command.kind === 'list_topic_archive' || command.kind === 'upsert_archive') {
       if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')

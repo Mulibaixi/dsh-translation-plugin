@@ -7,6 +7,7 @@ import { isDocumentEvidenceUnloaded } from './document-evidence.js'
 import { buildTopicTermsJsonExport, buildTopicTermsMarkdownExport, type TopicTermsExport, type TopicTermsExportSnapshot } from './topic-terms-export.js'
 import type { EvidenceReadResult } from '../shared/translation-evidence.js'
 import type { TopicTermReadState } from './topic-memory-store.js'
+import { assetStatus, assetStatusLabels, assetStatusText } from './topic-asset-status.js'
 
 /** User editing and adoption record real browser actions, separate from model commands. */
 export interface TopicTermsViewPort {
@@ -24,7 +25,6 @@ export interface TopicTermsViewPort {
   apply(ownerId: string, topicId: string, expectedVersion: number,
     command: { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }): Promise<TermMutationResult>
 }
-const labels = { proposal: '待确认', active: '生效', conflict: '有冲突', review_required: '待复核', disabled: '已停用' } as const
 const origins = { inferred: '模型提案', source_checked: '原文依据', user_explicit: '用户采用' } as const
 const storageLabels = { memory: '仅本次运行', saved: '已保存', conflict: '存在存储冲突', error: '保存失败' } as const
 function evidenceBody(terms: TopicTermsViewPort, snapshot: TopicTermSnapshot, ref: TermEvidenceRef): string | undefined {
@@ -95,7 +95,8 @@ function TermRow({ entry, selected, pending, onAction, onDelete, onDetails }: {
   readonly onAction: (kind: 'adopt' | 'disable', entry: TopicTerm) => void
   readonly onDelete: (entry: TopicTerm) => void; readonly onDetails: () => void
 }): unknown {
-  return h('article', { className: 'dsh-tp-term', 'aria-label': `术语 ${entry.sourceForms.join('、')}`, 'aria-current': selected,
+  const title = `${entry.sourceForms.join('、')} → ${entry.preferred}`, status = assetStatus(entry), statusText = assetStatusText(entry, status)
+  return h('article', { className: 'dsh-tp-term', 'data-asset-status': status, title: statusText, 'aria-label': `术语 ${title}，${statusText}`, 'aria-current': selected,
     // 条目本身即详情入口：点击或回车展开右侧详情，条目内的操作按钮不触发。
     role: 'button', tabIndex: 0, 'aria-expanded': selected,
     onClick: onDetails,
@@ -105,12 +106,12 @@ function TermRow({ entry, selected, pending, onAction, onDelete, onDetails }: {
       if (event.target !== undefined && event.target !== event.currentTarget) return
       event.preventDefault(); onDetails()
     } },
-    h('div', { className: 'dsh-tp-unit-header' }, h('span', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`), h('span', { className: 'dsh-tp-muted', role: 'status' }, labels[entry.status])),
+    h('div', null, title),
     h('div', { className: 'dsh-tp-actions dsh-tp-version-actions', onClick: (event: { readonly target?: unknown; readonly currentTarget?: unknown; stopPropagation(): void }) => {
       // 只拦下操作按钮自身的事件；操作行的空白区域仍属于条目本身。
       if (event.target !== event.currentTarget) event.stopPropagation()
     } },
-      entry.status !== 'active' ? h('button', { type: 'button', disabled: pending, onClick: () => onAction('adopt', entry) }, entry.status === 'disabled' ? '重新采用' : '采用') : null,
+      status !== 'adopted' ? h('button', { type: 'button', disabled: pending, onClick: () => onAction('adopt', entry) }, entry.status === 'disabled' ? '重新采用' : '采用') : null,
       entry.status === 'active' ? h('button', { type: 'button', disabled: pending, onClick: () => onAction('disable', entry) }, '停用') : null,
       h('button', { type: 'button', disabled: pending, onClick: () => onDelete(entry) }, '删除'),
     ),
@@ -175,7 +176,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
     `保存状态：${readState.status === 'error' ? '读取失败' : adoptionPending ? '正在采用…' : readState.status === 'loading' ? '正在刷新' : storageLabels[terms.getStatus(ownerId, topicId)]}`,
   ].join(' ')
   const needle = query.trim().toLocaleLowerCase()
-  const entries = snapshot.entries.filter(entry => (status === 'all' || status === entry.status) &&
+  const entries = snapshot.entries.filter(entry => (status === 'all' || status === assetStatus(entry)) &&
     [entry.preferred, entry.sense, ...entry.sourceForms, ...entry.aliases, ...entry.forbidden].some(value => value.toLocaleLowerCase().includes(needle)))
   const entry = snapshot.entries.find(entry => entry.id === selected)
   const deletedForm = Boolean(form?.id && !snapshot.entries.some(entry => entry.id === form.id))
@@ -240,7 +241,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
       h('div', { className: 'dsh-tp-asset-filters' },
         h('input', { type: 'search', 'aria-label': '搜索术语', placeholder: '搜索术语', value: query, onChange: (event: { currentTarget: { value: string } }) => setQuery(event.currentTarget.value) }),
         h('select', { 'aria-label': '术语状态', value: status, onChange: (event: { currentTarget: { value: string } }) => setStatus(event.currentTarget.value) },
-          h('option', { value: 'all' }, '全部状态'), ...Object.entries(labels).map(([value, label]) => h('option', { key: value, value }, label)))),
+          h('option', { value: 'all' }, '全部状态'), ...Object.entries(assetStatusLabels).map(([value, label]) => h('option', { key: value, value }, label)))),
       snapshot.version > 0 ? h('div', { className: 'dsh-tp-muted' }, h('time', { dateTime: snapshot.updatedAt }, `档案更新于 ${new Date(snapshot.updatedAt).toLocaleString()}`)) : null,
       bridgeReason ? h('small', { role: 'status', className: 'dsh-tp-muted' }, bridgeReason) : null,
       bridgeReason && onReconnect ? h('button', { type: 'button', onClick: onReconnect }, '重新连接主会话') : null,
@@ -289,7 +290,7 @@ export function TopicTermsView({ sessions, terms, ownerId, topicId, topicName, o
           h('div', { className: 'dsh-tp-asset-detail-header' },
             h('h3', null, `${entry.sourceForms.join('、')} → ${entry.preferred}`),
             h('button', { type: 'button', disabled: pending, onClick: () => startEdit(entry) }, '编辑')),
-          h('div', { className: 'dsh-tp-muted' }, `${labels[entry.status]} · ${entry.sourceLanguage ?? '未指定源语言'} → ${entry.targetLanguage} · ${entry.acceptance ? entry.origin === 'inferred' ? '模型推断 · 用户已采纳' : `${origins[entry.origin]} · 用户已采纳` : origins[entry.origin]} · 条目版本 ${entry.version}`),
+          h('div', { className: 'dsh-tp-muted' }, `${assetStatusText(entry)} · ${entry.sourceLanguage ?? '未指定源语言'} → ${entry.targetLanguage} · ${entry.acceptance && entry.origin === 'inferred' ? '模型推断' : origins[entry.origin]} · 条目版本 ${entry.version}`),
           entry.sense ? h('div', null, `说明：${entry.sense}`) : null, entry.aliases.length ? h('div', null, `别名：${entry.aliases.join('、')}`) : null,
           entry.forbidden.length ? h('div', null, `避免：${entry.forbidden.join('、')}`) : null,
           ...entry.evidence.map((reference, index) => h(TopicEvidenceView, { key: `${ownerId}:${topicId}:${entry.id}:${entry.version}:${index}`, sessions, terms, snapshot, reference, active, contextKey: evidenceContextKey })),

@@ -17,6 +17,7 @@ export interface TopicArchiveVersion {
   readonly version: number; readonly currentCount: number; readonly storedCount: number
 }
 export type TopicArchiveCommand = { readonly kind: 'put'; readonly input: TopicArchivePut }
+  | { readonly kind: 'delete'; readonly id: string; readonly expectedEntryVersion: number }
   | { readonly kind: 'accept_file_proposal' | 'revise_file_proposal'; readonly input: TopicArchivePut; readonly acceptance: FileProposalAcceptance }
   | { readonly kind: 'user_put'; readonly input: TopicArchiveUserPut }
   | { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }

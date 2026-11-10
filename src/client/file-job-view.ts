@@ -47,7 +47,7 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
   const openSource = (): void => { if (viewFiles) void jobs.open(job.jobId, 'source', sourceVersion, viewFiles) }
   const openResult = (): void => { if (viewFiles && resultVersion !== undefined) void jobs.open(job.jobId, 'result', resultVersion, viewFiles) }
   const detailsControl = h('button', { type: 'button', 'aria-expanded': expanded, onClick: () => setExpanded(!expanded) }, expanded ? '收起详情' : '详情')
-  const versionsControl = current.results.length > 1 || current.sources.length > 1 ? h('button', { type: 'button', 'aria-expanded': versionsExpanded, onClick: () => setVersionsExpanded(!versionsExpanded) }, `旧版本（${Math.max(0, current.results.length - 1)}）`) : null
+  const versionsControl = current.results.length > 1 || current.sources.length > 1 ? h('button', { type: 'button', 'aria-expanded': versionsExpanded, onClick: () => setVersionsExpanded(!versionsExpanded) }, `旧版(${Math.max(0, current.results.length - 1)})`) : null
   const assetsControl = onOpenAssets ? h('button', { type: 'button',
     onClick: () => onOpenAssets(ownerId ?? jobs.getNamespaceId(), job.topicId, job.translationSessionId) }, '记忆资产') : null
   return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit dsh-tp-file-job', 'data-unit-id': job.unitId, 'data-file-job-id': job.jobId, 'data-file-job-phase': job.phase },

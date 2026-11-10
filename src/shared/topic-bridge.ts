@@ -141,6 +141,7 @@ export type TopicBridgeCommand =
   | { readonly kind: 'list_topic_archive'; readonly topicId: string }
   | { readonly kind: 'query_archive'; readonly translationSessionId: string; readonly kinds: readonly TopicArchiveKind[]; readonly forms: readonly string[] }
   | { readonly kind: 'upsert_archive'; readonly topicId: string; readonly expectedVersion: number; readonly entry: TopicArchivePut }
+  | { readonly kind: 'remove_memory_asset'; readonly topicId: string; readonly collection: 'terms' | 'archive'; readonly id: string; readonly expectedVersion: number; readonly expectedEntryVersion: number }
 export interface TopicWriteEntry {
   readonly id: string
   readonly version: number
@@ -158,6 +159,7 @@ export type TopicWriteReceipt = {
       readonly affected?: readonly { readonly id: string; readonly version: number; readonly status: 'review_required' }[] })
 export type TopicBridgeValue =
   | TopicWriteReceipt
+  | { readonly kind: 'memory_asset_removed'; readonly topicId: string; readonly id: string; readonly version: number }
   | { readonly kind: 'direct_proposals'; readonly receipt: DirectProposalReceipt }
   | { readonly kind: 'settings_scope'; readonly scope: OtherMemoryScope }
   | { readonly kind: 'unit_directory'; readonly directory: UnitDirectory }
@@ -253,6 +255,12 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
       if (protocol < 4) throw new TypeError('Settings maintenance requires topic bridge v4')
       exact(value, ['kind', 'topicId']); if (value.topicId !== null) text(value.topicId)
       return { kind: 'settings_scope', topicId: value.topicId as string | null }
+    case 'remove_memory_asset':
+      if (protocol < 4) throw new TypeError('Memory asset removal requires topic bridge v4')
+      exact(value, ['kind', 'topicId', 'collection', 'id', 'expectedVersion', 'expectedEntryVersion'])
+      if (value.collection !== 'terms' && value.collection !== 'archive') throw new TypeError('Invalid memory asset collection')
+      text(value.topicId); text(value.id); integer(value.expectedVersion, 1); integer(value.expectedEntryVersion, 1)
+      break
     case 'list_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, false) } }
     case 'read_units': { const { kind, ...request } = value; return { kind, ...parseUnitRequest(request, true) } }
     case 'read_history': { const { kind, ...request } = value; return { kind, ...parseHistoryTextRead(request) } }
@@ -452,6 +460,10 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
   object(value)
   if (protocol === 1 && (String(value.kind).startsWith('document_review_') || ['normal_v2_updated', 'normal_committed', 'normal_exported', 'normal_exchange_resolved', 'preparation_receipt', 'preparation_page', 'preparation_captured', 'document_accepted', 'document_registered', 'document_updated', 'document_observed', 'document_restored', 'document_captured', 'document_corrected', 'document_correct_observed'].includes(value.kind as string))) throw new TypeError('Reply requires topic bridge v2')
   switch (value.kind) {
+    case 'memory_asset_removed':
+      if (protocol < 4) throw new TypeError('Memory asset removal requires topic bridge v4')
+      exact(value, ['kind', 'topicId', 'id', 'version']); text(value.topicId); text(value.id); integer(value.version, 1)
+      break
     case 'term_write': case 'archive_write': {
       if (protocol < 4) throw new TypeError('Memory write receipts require topic bridge v4')
       exact(value, ['kind', 'status', 'topicId', 'version', 'entry', ...(Object.hasOwn(value, 'affected') ? ['affected'] : [])])

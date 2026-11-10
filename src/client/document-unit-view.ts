@@ -376,7 +376,7 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
   }
   const detailsControl = h('button', { type: 'button', 'aria-expanded': details || Boolean(draft), 'aria-label': `文件 ${unit.order}详情`, onClick: () => setDetails(value => !value) }, details ? '收起详情' : '详情')
   const oldVersionCount = manifests.length - (currentCandidate ? 1 : 0)
-  const versionsControl = oldVersionCount > 0 ? h('button', { type: 'button', 'aria-expanded': versionsExpanded, 'aria-label': `文件 ${unit.order}旧版本`, onClick: () => setVersionsExpanded(value => !value) }, `旧版本（${oldVersionCount}）`) : null
+  const versionsControl = oldVersionCount > 0 ? h('button', { type: 'button', 'aria-expanded': versionsExpanded, 'aria-label': `文件 ${unit.order}旧版本`, onClick: () => setVersionsExpanded(value => !value) }, `旧版(${oldVersionCount})`) : null
   let targetOffset: number | null = 0
   return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit', 'data-session-id': session.id, 'data-unit-id': unit.id, 'data-source-version': unit.sourceVersion, 'data-manifest-id': manifest?.id, 'aria-label': `文件 ${unit.order}：${name}` },
     h('div', { className: 'dsh-tp-unit-header' },

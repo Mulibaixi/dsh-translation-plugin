@@ -641,7 +641,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
     ),
     h(TranslationRevision, { executionOwner, key: latest.id, store, unit, revision: latest, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles,
       resultOpen: file ? null : h(ResultOpenLink, { unit, session, objects, viewFiles }),
-      versionsToggle: unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, title: expanded ? '收起旧版本' : '展开旧版本', onClick: () => setExpanded(value => !value) }, `旧版本（${unit.revisions.length - 1}）`) : null }),
+      versionsToggle: unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, title: expanded ? '收起旧版本' : '展开旧版本', onClick: () => setExpanded(value => !value) }, `旧版(${unit.revisions.length - 1})`) : null }),
     expanded ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
       ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles })),
     ) : null,

@@ -32,8 +32,10 @@ export function RecordIndexControl({ client, target, mainSessionId, disabled = f
   const action = phase === 'failed' ? 'retry' : phase === 'indexed' || phase === 'empty' ? 'resegment' : 'start'
   const blocked = disabled || state.busy || working || !mainSessionId
   const message = state.error ?? (phase === 'failed' ? state.status?.message : undefined)
+  const title = !mainSessionId ? '请选择本次任务使用的主会话。'
+    : phase === 'unselected' ? '调用主模型对当前文件原文进行语义分段，再建立索引。' : undefined
   return h('span', { className: 'dsh-tp-actions dsh-tp-record-index-actions' },
-    h('button', { type: 'button', disabled: blocked, title: !mainSessionId ? '请选择本次任务使用的主会话。' : undefined,
+    h('button', { type: 'button', disabled: blocked, title,
       onClick: () => { if (mainSessionId) void client.request(target, mainSessionId, action) } }, label),
     ['partial', 'failed', 'indexed', 'empty'].includes(phase) ? h('button', { type: 'button', disabled: blocked,
       onClick: () => { if (mainSessionId) void client.request(target, mainSessionId, 'remove') } }, '移出索引') : null,

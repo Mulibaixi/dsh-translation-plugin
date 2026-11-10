@@ -99,6 +99,10 @@ When reading long text, the current source or translation heading and its contro
 
 Organize terminology, style requirements, and references as [memory assets (简体中文)](docs/user-guide.zh-CN.md#记忆资产) to support later discussion and translation. See the guide for entry adoption, reference-file segmentation, source indexing, and saving rules.
 
+You can explicitly ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
+
+Names of people, places, and organizations go into entities with their renderings. Established renderings of specialized concepts go into terminology. Each referent belongs in one category.
+
 ## Current limitations and data
 
 - **Context questions**: Translation models with tool support can ask focused questions during Normal translation. The main model answers from available context or asks you, then starts a new translation call. Each call has its own usage; question references remain valid only during the current host run. The selected provider and model must support tool calls; a rejected tool declaration is reported without silently retrying as a translation.

@@ -236,7 +236,12 @@ export const styles = `
   .dsh-tp-record-pair { grid-template-columns: minmax(0, 1fr); }
   .dsh-tp-record-source { border-right: 0; border-bottom: 1px solid var(--dsw-alias-border-l2, #8883); }
 }
-.dsh-tp-term { padding: 8px 0; border-bottom: 1px solid var(--dsw-alias-border-l2, #8882); overflow-wrap: anywhere; }
+.dsh-tp-term { padding: 8px 0 8px 8px; border-bottom: 1px solid var(--dsw-alias-border-l2, #8882); overflow-wrap: anywhere;
+  border-inline-start: 2px solid var(--dsh-tp-asset-status-color, transparent); }
+.dsh-tp-term[data-asset-status=adopted] { --dsh-tp-asset-status-color: var(--dsw-alias-state-success-primary, #30955a); }
+.dsh-tp-term[data-asset-status=proposal], .dsh-tp-term[data-asset-status=review_required] { --dsh-tp-asset-status-color: var(--dsw-alias-state-warning-primary, #bd8b0d); }
+.dsh-tp-term[data-asset-status=disabled] { --dsh-tp-asset-status-color: #888; }
+.dsh-tp-term[data-asset-status=conflict] { --dsh-tp-asset-status-color: var(--dsw-alias-state-error-primary, #d54941); }
 .dsh-tp-term:last-of-type { border-bottom: 0; }
 .dsh-tp-term-details { padding-top: 4px; font-size: 12px; }
 .dsh-tp-term-evidence { padding-top: 4px; }

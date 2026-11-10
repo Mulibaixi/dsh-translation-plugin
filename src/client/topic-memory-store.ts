@@ -22,6 +22,7 @@ export interface TopicTermClearVersion extends TopicTermVersion {
   readonly version: number; readonly currentCount: number; readonly storedCount: number
 }
 export type TopicTermCommand = { readonly kind: 'put'; readonly input: TopicTermPut }
+  | { readonly kind: 'delete'; readonly id: string; readonly expectedEntryVersion: number }
   | { readonly kind: 'accept_file_proposal' | 'revise_file_proposal'; readonly input: TopicTermPut; readonly acceptance: FileProposalAcceptance }
   | { readonly kind: 'user_put'; readonly input: TopicTermUserPut }
   | { readonly kind: 'adopt' | 'disable'; readonly id: string; readonly expectedEntryVersion: number }

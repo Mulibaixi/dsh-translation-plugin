@@ -4,6 +4,7 @@ import type { TopicArchiveStore } from './topic-archive-store.js'
 import type { FileJobProposal } from '../shared/file-jobs.js'
 import type { TopicTerm, TermEvidenceRef } from '../memory/topic-terms.js'
 import type { TopicArchiveEntry, TopicArchivePut } from '../memory/topic-archive.js'
+import { namesEntity } from '../shared/asset-classification.js'
 
 const label = (s: string): string => s.normalize('NFC').trim().replace(/\s+/gu, ' ')
 const overlap = (a: readonly string[], b: readonly string[]): boolean => a.some(x => b.some(y => label(x) === label(y)))
@@ -23,6 +24,11 @@ export async function putAssetProposals(terms: TopicMemoryStore, archive: TopicA
     const evidence: TermEvidenceRef[] = p.evidence.map(e => ({ kind: 'source', sessionId: scope.sessionId, unitId: scope.unitId,
       sourceVersion: scope.sourceVersion, revisionId: null, selectionEventId: null, role: 'basis', range: e.range }))
     if (p.kind === 'term') {
+      const entitiesInTopic = archive.getSnapshot(scope.ownerId, scope.topicId).entries.filter(entry => entry.kind === 'entity')
+      if (namesEntity(p.sourceForms, p.preferred, entitiesInTopic)) {
+        skipped.push(`${title}：匹配实体名称或别名，请在实体档案中审阅`)
+        continue
+      }
       const snapshot = terms.getSnapshot(scope.ownerId, scope.topicId), matches = snapshot.entries.filter(e => e.targetLanguage === scope.targetLanguage && overlap([...e.sourceForms, ...e.aliases], p.sourceForms))
       if (matches.length > 1) { skipped.push(`${title}：匹配多个既有条目`); continue }
       const old = matches[0]
