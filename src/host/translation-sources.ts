@@ -18,8 +18,13 @@ import { TRANSLATION_SOURCE_INTEGRITY_REMOTE, parseTranslationSourceRangeHash,
   type TranslationSourceRangeHash } from '../shared/translation-source-integrity.js'
 
 interface Agent { readonly id: string; readonly session: { readonly id: string }; readonly ctx: unknown }
+import { imageFileFormat, matchesImageOriginal, MAX_IMAGE_ORIGINAL_BYTES } from '../shared/image-translation.js'
+
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
-interface Attachments { readFileStream(ref: FileRef, signal?: AbortSignal): AsyncIterable<Uint8Array> }
+interface Attachments {
+  readonly imageLimits?: { readonly maxImageBytes: number; readonly maxMessageImageBytes?: number }
+  readFileStream(ref: FileRef, signal?: AbortSignal): AsyncIterable<Uint8Array>
+}
 interface Uploads { resolve(agent: Agent, receiptId: string): NativeUpload | undefined }
 interface Controller {
   resolveAgent(id: string): Promise<{ readonly agent: Agent } | { readonly error: unknown }>
@@ -188,19 +193,21 @@ export class TranslationSourcesService {
   }
   private async decode(scope: TranslationSourceScope, peerId: string, agent: Agent, file: FileRef, attachments: Attachments,
     signal: AbortSignal, signature: string, originalFilePath?: string): Promise<TranslationSourceResult<TranslationSourceAsset>> {
-    // Format is not decided from the extension. Valid UTF-8 becomes readable text; every other
-    // file keeps its exact bytes and is never decoded, guessed or converted into TXT.
     if (typeof file.name !== 'string' || !file.name.trim() || file.name === '.' || file.name === '..' ||
       sourceCodePointLength(file.name) > 255 || /[\\/<>:"|?*\u0000-\u001f\u007f]/u.test(file.name)) return bad('invalid_input', '宿主返回的原件名称无效。', 'resolve_upload')
     if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) return bad('integrity_failed', '上传原件字节元信息无效。', 'read_original')
-    if (file.bytes > MAX_TRANSLATION_SOURCE_BYTES) return bad('source_too_large', '原件超过 2 MiB 上限，未导入。', 'read_original')
+    const format = imageFileFormat(file.name)
+    const maxBytes = format ? Math.min(MAX_IMAGE_ORIGINAL_BYTES, attachments.imageLimits?.maxImageBytes ?? Infinity,
+      attachments.imageLimits?.maxMessageImageBytes ?? Infinity) : MAX_TRANSLATION_SOURCE_BYTES
+    const sizeError = format ? '原图超过宿主支持的图片字节上限，未导入。' : '原件超过 2 MiB 上限，未导入。'
+    if (file.bytes > maxBytes) return bad('source_too_large', sizeError, 'read_original')
     const chunks: Uint8Array[] = []
     let count = 0
     try {
       for await (const chunk of attachments.readFileStream(file, signal)) {
         signal.throwIfAborted()
         count += chunk.byteLength
-        if (count > MAX_TRANSLATION_SOURCE_BYTES) return bad('source_too_large', '原件流超过 2 MiB 上限，未导入。', 'read_original')
+        if (count > maxBytes) return bad('source_too_large', sizeError, 'read_original')
         if (count > file.bytes) return bad('integrity_failed', '上传原件实际字节与元信息不一致。', 'read_original')
         chunks.push(new Uint8Array(chunk))
       }
@@ -210,8 +217,9 @@ export class TranslationSourcesService {
     const bytes = new Uint8Array(count)
     let offset = 0
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
-    let text = '', binary = false
-    try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { binary = true }
+    if (format && !matchesImageOriginal(format, bytes)) return bad('invalid_input', '原图内容与文件格式不一致，或使用了动态 WebP。', 'read_original')
+    let text = '', binary = !!format
+    if (!format) try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { binary = true }
     if (!binary && !text) return bad('empty_source', '原件没有可读取的正文。', 'decode_text')
     const totalCodePoints = binary ? 0 : sourceCodePointLength(text)
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes.buffer))
@@ -269,7 +277,7 @@ export class TranslationSourcesService {
    * The Client waits for this cache write before preparing file material, so a notice normally has it.
    */
   cachedOriginalPath(source: TranslationSourceAsset): string | undefined {
-    try { return this.storageInstance?.originalPath(source) } catch { return undefined }
+    try { return this.storageInstance?.originalPath(toSourceIdentity(source)) } catch { return undefined }
   }
   private storageOwns(scope: TranslationSourceScope, peerId: string | undefined, agent?: Agent, namespaceId?: string): boolean {
     if (!namespaceId) return this.owns(scope, peerId, agent)
@@ -387,10 +395,13 @@ export class TranslationSourcesService {
     if (bytes.byteLength !== request.source.bytes) return storageBad('source_corrupt', '已保存原稿字节大小不一致。', 'verify_saved_source')
     const digest = await sourceSha256(bytes)
     if (!current()) return storageBad('scope_mismatch', '校验已保存原稿时所属连接或 Agent 已失效。', 'verify_saved_source')
-    let text: string
-    try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { return storageBad('source_corrupt', '已保存原稿不是有效 UTF-8。', 'verify_saved_source') }
-    if (digest !== request.source.sha256 || (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) !== request.source.bom ||
-      sourceCodePointLength(text) !== request.source.totalCodePoints) return storageBad('source_corrupt', '已保存原稿内容与固定身份不一致。', 'verify_saved_source')
+    if (digest !== request.source.sha256) return storageBad('source_corrupt', '已保存原稿内容与固定身份不一致。', 'verify_saved_source')
+    let text = ''
+    if (request.source.encoding === 'utf-8') {
+      try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { return storageBad('source_corrupt', '已保存原稿不是有效 UTF-8。', 'verify_saved_source') }
+      if ((bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) !== request.source.bom ||
+        sourceCodePointLength(text) !== request.source.totalCodePoints) return storageBad('source_corrupt', '已保存原稿内容与固定身份不一致。', 'verify_saved_source')
+    }
     if (history && !await history.sourceReferenceAvailable(request)) return storageBad('reference_released', '原稿所属历史已删除。', 'verify_saved_source')
     return { ok: true, value: { bytes, text } }
   }
@@ -422,6 +433,13 @@ export class TranslationSourcesService {
         if (!controller?.canOpenWorkspacePath?.()) return storageBad('unavailable', '宿主不支持在系统应用中打开原稿。', 'read_library_source')
         await controller.openWorkspacePath({ path: storage.originalPath(request.stored.source) }, signal ?? new AbortController().signal)
         return current() ? ok({ kind: 'opened' }) : storageBad('scope_mismatch', '共享原稿连接已失效。', 'read_library_source')
+      }
+      if (request.action === 'image') {
+        const bytes = content.value.bytes, parts: string[] = [], pageBytes = 12 * 1024
+        for (let start = 0; start < bytes.length; start += pageBytes) {
+          parts.push(btoa(String.fromCharCode(...bytes.subarray(start, start + pageBytes))))
+        }
+        return ok({ kind: 'image', base64: parts.join('') })
       }
       const offsets = indexText(content.value.text), range = request.range!
       const text = content.value.text.slice(offsets[range.start]!, offsets[range.end]!)

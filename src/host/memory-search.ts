@@ -212,12 +212,12 @@ export class MemorySearchService {
           try {
             const file = isFileHistoryUnit(bundle, unit.id)
             if (unitId !== undefined && !file) continue
-            if (file && (!recordSegments || !/\.(?:txt|md)$/iu.test(historyFileName(bundle, unit.id) ?? '') || !await recordSegments.selected(snapshot.scope, unit.id, unit.sourceVersion, peer))) continue
+            if (file && (!recordSegments || !/\.(?:txt|md)$/iu.test(historyFileName(bundle, unit.id) ?? '') || !await recordSegments.selected(snapshot.scope, unit.id, unit.sourceVersion!, peer))) continue
             const pair = await currentHistoryPair(bundle, snapshot.scope, snapshot.token, unit.id, peer, this.ctx.get?.('translationSources') as TranslationSourcesService | undefined, signal)
             if (!pair) { if (countUnavailable) unavailableRecords++; continue }
             let parts: readonly { readonly start: number; readonly end: number; readonly text: string }[] | undefined
             if (file) {
-              const plan = await recordSegments!.segments(snapshot.scope, unit.id, unit.sourceVersion, pair.source, peer, signal)
+              const plan = await recordSegments!.segments(snapshot.scope, unit.id, unit.sourceVersion!, pair.source, peer, signal)
               if (!plan.selected) continue
               if (!plan.complete) { if (countUnavailable) unsegmented++; continue }
               parts = plan.parts

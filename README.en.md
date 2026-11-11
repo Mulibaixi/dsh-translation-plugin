@@ -28,9 +28,10 @@ For example, say “this sentence is too literal” or “make this character's 
 | Capability | Purpose |
 | --- | --- |
 | Discussion and refinement | In Normal mode, state requirements and discuss wording and style with the main model, then use that feedback for a first translation or further revision. |
-| Version comparison and final selection | Retain the source and translation versions, compare and revise them, select a final, and save history automatically for continued discussion. |
+| Source editing and final selection | Edit the current source in a Normal translation unit, retranslate it, or select a final. Existing translation revisions remain available after source edits. |
 | Quick translation | Translate independent plain text directly for short passages and occasional lookups. |
 | File delivery | Work primarily with TXT/Markdown sources, process ranges when needed, and open results through the session or save a translation version to a chosen location with **操作 → 另存为…… (Actions → Save as…)**. |
+| Single-image translation | The main model reads one PNG, JPEG, or static WebP. Edit the extracted source text and export a text PNG, a lettering prompt, or a ZIP with the original and the prompt. When available, the prompt includes the original pixel dimensions. The generated image may differ in size. |
 | Topic memory | Share terms, entities, facts, relations, settings, and references across topic sessions, with optional semantic retrieval. |
 
 ## A translation and refinement workflow
@@ -77,7 +78,7 @@ Wait for current tasks to finish and confirm that material is saved. Enter the n
 
 Composer requires a normal full exit and reopen when a host patch actually needs replacement. Updating its extension package does not necessarily reinstall that patch. For source installations, update the original directories, rebuild in the order above, and refresh or reload.
 
-The local database upgrades to format v8 to retain filename segmentation baselines. Older plugins cannot read this format; downgrading requires restoring a complete backup from the matching version.
+Image units and Normal translation units with editable sources use a new session history format. Older plugin versions cannot read sessions saved in this format. To downgrade, restore a full library backup from before the upgrade.
 
 See the user guide for [backup and restoration](docs/user-guide.zh-CN.md#资料库备份与恢复), [data migration](docs/user-guide.zh-CN.md#已有资料的升级与迁移), and [detailed update steps](docs/user-guide.zh-CN.md#发行包与源码更新) (简体中文). See [CHANGELOG](CHANGELOG.md) for version changes.
 

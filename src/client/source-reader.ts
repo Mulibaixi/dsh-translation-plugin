@@ -1,4 +1,4 @@
-import { isFileJobUnit } from './translation-history.js'
+import { isEditableTextUnit, isFileJobUnit } from './translation-history.js'
 import type { LibrarySourceRequest, LibrarySourcesPort } from '../shared/library-sources.js'
 import type { TermEvidenceRef } from '../memory/topic-terms.js'
 import { isDocumentManifestReuse } from '../memory/document-correction.js'
@@ -290,7 +290,7 @@ export class TranslationSourceReader implements TranslationEvidenceReader, Trans
     }
     const final = isDocumentUnit(unit) ? currentDocumentFinalRevision(unit) : currentFinalRevision(unit)
     const event = [...history!.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
-    if (!final || final.id !== request.revisionId || event?.revisionId !== final.id || event.id !== request.selectionEventId || final.sourceVersion !== request.sourceVersion) return unavailable(request, 'missing', 'stale_final')
+    if (!final || final.id !== request.revisionId || event?.revisionId !== final.id || event.id !== request.selectionEventId || (!isEditableTextUnit(unit) && final.sourceVersion !== request.sourceVersion)) return unavailable(request, 'missing', 'stale_final')
     if ('text' in final) {
       const totalCodePoints = sourceCodePointLength(final.text)
       if (request.range && request.range.end > totalCodePoints) return unavailable(request, 'missing', 'range_out_of_bounds', totalCodePoints)

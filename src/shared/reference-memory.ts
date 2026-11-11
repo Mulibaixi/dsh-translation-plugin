@@ -27,7 +27,7 @@ export interface FrozenReferenceContext {
   readonly records?: readonly TranslationRecordExcerpt[]
 }
 export interface TranslationRecordSelection {
-  readonly sessionId: string; readonly unitId: string; readonly sourceVersion: number; readonly finalId: string
+  readonly sessionId: string; readonly unitId: string; readonly sourceVersion?: number; readonly finalId: string
   readonly sourceRange: { readonly start: number; readonly end: number } | null
   readonly translationRange: { readonly start: number; readonly end: number } | null
   readonly sha256: string
@@ -38,8 +38,8 @@ export interface TranslationRecordExcerpt {
   readonly sourceTotalCodePoints: number; readonly translationTotalCodePoints: number
 }
 export function parseTranslationRecordSelection(value: unknown): TranslationRecordSelection {
-  referenceObject(value); referenceExact(value, ['sessionId', 'unitId', 'sourceVersion', 'finalId', 'sourceRange', 'translationRange', 'sha256'])
-  referenceString(value.sessionId, 3000); referenceString(value.unitId); referenceString(value.finalId); referenceInteger(value.sourceVersion, 1)
+  referenceObject(value); referenceExact(value, ['sessionId', 'unitId', 'finalId', 'sourceRange', 'translationRange', 'sha256'], ['sourceVersion'])
+  referenceString(value.sessionId, 3000); referenceString(value.unitId); referenceString(value.finalId); if (Object.hasOwn(value, 'sourceVersion')) referenceInteger(value.sourceVersion, 1)
   if (typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.sha256)) throw new TypeError('Invalid translation record digest')
   let size = 0
   for (const range of [value.sourceRange, value.translationRange]) if (range !== null) {

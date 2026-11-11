@@ -30,7 +30,7 @@ export interface NormalTranslationRemotePort {
   readLog?(request: TranslationLogRead): Promise<unknown>
   status(request: NormalTranslationQuery): Promise<unknown>
   cancel(request: NormalTranslationQuery): Promise<unknown>
-  requestUnit?(request: NormalTranslationUnitRequest): Promise<unknown>
+  requestUnit?(request: DirectUnitRequest): Promise<unknown>
 }
 export interface NormalTranslationV2RemotePort {
   status(request: NormalTranslationQuery): Promise<unknown>
@@ -78,6 +78,7 @@ export class NormalTranslationClient {
     throw new Error('日志读取已关闭。')
   }
   private readonly operations = new Map<string, AcceptedOperation>()
+  private readonly imageInputs = new Map<string, string>()
   private readonly unitSnapshots = new Map<string, Extract<TranslationMaterialEnvelope, { kind: 'material' }>>()
   private readonly preparedHistory = new Map<string, { readonly historyContext: DirectHistoryContext; readonly basis: DirectTranslationBasis; readonly contextSupplement?: DirectContextSupplement }>()
   private readonly unitRequests = new Map<string, { operationId: string; pending: boolean; outcome: 'pending' | 'submitted' | 'failed' | 'unknown'; message: string; release: (() => void) | undefined }>()
@@ -112,28 +113,98 @@ export class NormalTranslationClient {
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private key(ownerId: string, operationId: string): string { return JSON.stringify([ownerId, operationId]) }
 
-  resolve(ownerId: string, input: { readonly target: NormalTranslationUnitTarget; readonly operationId: string }): NormalTranslationReply {
-    const target = parseNormalTranslationTarget(input.target)
-    if (target.kind !== 'unit') return failure('invalid_input', '需要明确的历史单元引用。')
+  resolve(ownerId: string, input: { readonly target: DirectUnitTarget; readonly operationId: string }): NormalTranslationReply {
+    const target = parseDirectTranslationTarget(input.target)
+    if (target.kind === 'material') return failure('invalid_input', '需要明确的历史单元引用。')
     const session = this.store.getSession(target.translationSessionId), unit = this.store.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
     if (this.disposed || target.mainSessionId !== ownerId || !session || !this.store.isSessionOpen(ownerId, session.id) || this.store.isSessionDeleted(session.id) || !unit ||
       !this.store.canAccessUnit(ownerId, session.id, unit.id)) return failure('reference_not_published', '请先打开此翻译会话，并核对单元是否存在。')
     if (!isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
     if (session.mode !== 'normal' || session.archivedAt !== null) return failure('invalid_state', '请先恢复普通会话再处理历史单元。')
-    if (unit.sourceVersion !== target.sourceVersion || this.store.getStatus(session.id) === 'conflict') return failure('stale_version', '原文版本已变化，请读取当前单元。')
+    const image = isImageUnit(unit) ? unit : undefined
+    if ((target.kind === 'image_unit') !== !!image || unit.sourceVersion !== target.sourceVersion || this.store.getStatus(session.id) === 'conflict') return failure('stale_version', '原文或单元目标已变化，请读取当前单元。')
+    if (image && !unit.source.trim()) return failure('empty_source', '请先登记图片原文。')
     const key = this.key(ownerId, input.operationId), cached = this.unitSnapshots.get(key)
-    if (cached) return cached.material.translationSessionId === session.id && cached.material.unitReference?.unitId === unit.id && cached.material.sourceVersion === target.sourceVersion
+    if (cached) return cached.material.translationSessionId === session.id && cached.material.unitReference?.unitId === unit.id && cached.material.unitReference.sourceVersion === target.sourceVersion
       ? { ok: true, value: { kind: 'normal_resolved', envelope: structuredClone(cached) } } : failure('idempotency_conflict', '此业务操作已冻结其他历史单元。')
     if (this.store.getAllSessions().some(candidate => this.store.getTranslationHistory(candidate.id)?.events.some(event => event.operationId === input.operationId))) return failure('idempotency_conflict', '此操作已有历史事实，请查询原操作。')
     if (!session.model) return failure('invalid_input', '请为此翻译会话选择模型。')
     if (Array.from(unit.source).length > session.maxInputChars) return failure('input_too_large', '当前原文超过此会话单次上限，未截断。')
+    const imageInputId = image ? this.imageInputs.get(unit.id) ?? crypto.randomUUID() : undefined
+    if (imageInputId) this.imageInputs.set(unit.id, imageInputId)
     const envelope = parseTranslationMaterialEnvelope({  mainSessionId: ownerId, requestId: `unit-request:${input.operationId}`, operationId: input.operationId, kind: 'material', material: {
-      materialId: unit.material?.materialId ?? unit.id, sourceVersion: target.sourceVersion, topicId: session.topicId, translationSessionId: session.id,
+      materialId: unit.material?.materialId ?? unit.id, sourceVersion: image?.original?.version ?? target.sourceVersion, topicId: session.topicId, translationSessionId: session.id,
       draftVersion: unit.material?.draftVersion ?? 1, sourceText: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      model: session.model, maxInputChars: session.maxInputChars, unitReference: { unitId: unit.id, sourceVersion: target.sourceVersion },
+      model: session.model, maxInputChars: session.maxInputChars, unitReference: image
+        ? { unitId: unit.id, backgroundDescription: image.backgroundDescription, imageInputId }
+        : { unitId: unit.id, sourceVersion: target.sourceVersion },
     } }) as Extract<TranslationMaterialEnvelope, { kind: 'material' }>
     this.unitSnapshots.set(key, envelope)
+    this.emit()
     return { ok: true, value: { kind: 'normal_resolved', envelope: structuredClone(envelope) } }
+  }
+
+  sourceEditBlockedReason(sessionId: string, unitId: string): string | undefined {
+    const session = this.store.getSession(sessionId), unit = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
+    if (!session || session.mode !== 'normal' || session.archivedAt !== null || !unit || !isTextUnit(unit) || unit.deletion) return '此普通翻译单元暂不可编辑。'
+    if (this.store.getStatus(sessionId) === 'conflict') return '本地历史已变化，请先核对当前副本。'
+    if (this.isBusy(sessionId) || this.options.isSessionBusy?.(sessionId) || this.store.hasDocumentLease(sessionId) ||
+      this.getRetranslationStatus(sessionId, unitId)?.pending ||
+      [...this.unitSnapshots.values()].some(({ material }) => material.translationSessionId === sessionId && material.unitReference?.unitId === unitId)) {
+      return '此单元仍在处理，请等待本次调用结束。'
+    }
+    const owner = this.store.getTopicStorageScope(session.topicId)
+    if (!isImageUnit(unit) && owner && this.options.canCorrectSource?.(owner, session.topicId, session.id, unit.id) === false) return '原文含原件位置关联，暂不可编辑。'
+    return undefined
+  }
+
+  editTextSource(sessionId: string, unitId: string, expectedVersion: number, sourceText: string): boolean {
+    if (!sourceText.trim() || this.sourceEditBlockedReason(sessionId, unitId)) return false
+    return this.saveTextSource(sessionId, unitId, { expectedVersion, text: sourceText, operationId: `source-edit:${crypto.randomUUID()}`, reason: '', at: new Date().toISOString() })
+  }
+
+  private saveTextSource(sessionId: string, unitId: string, edit: Parameters<typeof appendSourceCorrection>[2]): boolean {
+    return this.store.updateTranslationHistory(sessionId, history => appendSourceCorrection(history, unitId, edit))
+  }
+
+  updateImage(ownerId: string, input: ImageUnitUpdate): boolean {
+    const { target, sourceText, backgroundDescription } = parseImageUnitUpdate(input)
+    const session = this.store.getSession(target.translationSessionId)
+    if (target.mainSessionId !== ownerId || !session || session.mode !== 'normal' || session.archivedAt !== null ||
+      !this.store.canAccessUnit(ownerId, session.id, target.unitId)) return false
+    const updated = this.editImage(session.id, target.unitId, { sourceText, backgroundDescription })
+    const unit = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === target.unitId)
+    if (updated && sourceText !== undefined && unit && isImageUnit(unit) && unit.material && unit.original) {
+      const submission = this.materials.resolveSubmittedTarget({ kind: 'material', mainSessionId: ownerId,
+        requestId: unit.material.requestId, materialId: unit.material.materialId, sourceVersion: unit.original.version })
+      if (submission) this.materials.consumeSubmittedMaterial(submission)
+    }
+    return updated
+  }
+
+  editImage(sessionId: string, unitId: string, edits: { sourceText?: string | undefined; backgroundDescription?: string | undefined }): boolean {
+    const session = this.store.getSession(sessionId)
+    if (!session || session.archivedAt !== null || this.store.getStatus(sessionId) === 'conflict' || this.sourceEditBlockedReason(sessionId, unitId) ||
+      edits.sourceText !== undefined && Array.from(edits.sourceText).length > session.maxInputChars) return false
+    const previousInput = this.imageInputs.get(unitId)
+    if (previousInput) this.imageInputs.set(unitId, crypto.randomUUID())
+    const updated = this.store.updateTranslationHistory(sessionId, history => updateImageUnit(history, unitId,
+      { ...(edits.sourceText === undefined ? {} : { sourceText: edits.sourceText }),
+        ...(edits.backgroundDescription === undefined ? {} : { backgroundDescription: edits.backgroundDescription }) }))
+    if (!updated && previousInput) this.imageInputs.set(unitId, previousInput)
+    return updated
+  }
+
+  releaseUnitCalls(ownerId: string): void {
+    for (const { mainSessionId, operationId } of this.unitSnapshots.values()) if (mainSessionId === ownerId) this.finishUnitCall(ownerId, operationId)
+  }
+
+  finishUnitCall(ownerId: string, operationId: string): void {
+    const key = this.key(ownerId, operationId)
+    if (!this.unitSnapshots.has(key)) return
+    this.unitSnapshots.delete(key)
+    this.preparedHistory.delete(key)
+    this.emit()
   }
 
   correctSource(ownerId: string, input: NormalTranslationSourceCorrection): NormalTranslationReply {
@@ -153,11 +224,12 @@ export class NormalTranslationClient {
     if (this.unitSnapshots.has(this.key(ownerId, request.operationId)) || this.operations.has(this.key(ownerId, request.operationId))) return failure('idempotency_conflict', '此操作已用于翻译准备，纠错需要独立操作。')
     if (session.mode !== 'normal' || session.archivedAt !== null) return failure('invalid_state', '请先恢复普通会话再纠错。')
     if (unit.sourceVersion !== target.sourceVersion || this.store.getStatus(session.id) === 'conflict') return failure('stale_version', '原文已变化，未覆盖旧版本。')
-    if (this.options.canCorrectSource?.(ownerId, session.topicId, session.id, unit.id) === false) return failure('source_objects_linked', '原文含原件位置关联，暂不支持自动改写；原件与位置仍保留。')
+    const blocked = this.sourceEditBlockedReason(session.id, unit.id)
+    if (blocked) return failure('source_edit_blocked', blocked)
     if (request.sourceText === unit.source) return failure('unchanged_source', '原文内容未变化。')
     if (Array.from(request.sourceText).length > session.maxInputChars) return failure('input_too_large', '更正原文超过此会话上限，未截断。')
-    if (!this.store.updateTranslationHistory(session.id, current => appendSourceCorrection(current, unit.id, { operationId: request.operationId,
-      expectedVersion: target.sourceVersion, text: request.sourceText, reason: request.reason, at: new Date().toISOString() }))) return failure('history_update_failed', '原文纠错记录未完成，请读取当前版本。')
+    if (!this.saveTextSource(session.id, unit.id, { operationId: request.operationId,
+      expectedVersion: target.sourceVersion, text: request.sourceText, reason: request.reason, at: new Date().toISOString() })) return failure('history_update_failed', '原文纠错记录未完成，请读取当前版本。')
     return { ok: true, value: { kind: 'normal_source_corrected', correction: { operationId: request.operationId, mainSessionId: ownerId,
       translationSessionId: session.id, unitId: unit.id, previousSourceVersion: target.sourceVersion, sourceVersion: target.sourceVersion + 1,
       persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' } } }
@@ -179,7 +251,9 @@ export class NormalTranslationClient {
       const cached = this.unitSnapshots.get(this.key(ownerId, request.operationId)), unit = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === material.unitReference?.unitId)
       if (!cached || JSON.stringify(cached) !== JSON.stringify(envelope) || !unit || unit.deletion) return failure('out_of_scope', '历史处理材料未由当前 Client 冻结，或对应单元已删除。')
       if (unit && !isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
-      if (!unit || unit.sourceVersion !== material.sourceVersion || material.unitReference.sourceVersion !== unit.sourceVersion) return failure('stale_version', '准备后原文已变化，请使用新操作重新准备。')
+      if (!unit || (isImageUnit(unit)
+        ? unit.source !== material.sourceText || unit.backgroundDescription !== material.unitReference.backgroundDescription
+        : unit.sourceVersion !== material.sourceVersion || material.unitReference.sourceVersion !== unit.sourceVersion)) return failure('stale_version', '准备后原文已变化，请使用新操作重新准备。')
     } else {
       if (!this.materials.resolveSubmittedMaterial(envelope)) return failure('material_not_submitted', '未找到完全一致的已提交材料，草稿未受理。')
       if (material.sourceVersion !== 1 || material.revises) return failure('stale_version', '此材料的源版本尚不可受理。')
@@ -211,7 +285,7 @@ export class NormalTranslationClient {
     const basis = this.captureBasis(request)
     const targetUnit = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === basis.unitId)
     if (targetUnit && (!isTextUnit(targetUnit) || targetUnit.deletion)) return failure('direct_target_changed', '本次准确单元已删除或不是普通翻译正文，请读取当前记录后重新处理。')
-    if (targetUnit && targetUnit.sourceVersion !== material.sourceVersion) return failure('direct_target_changed', '本次准确单元的原文版本已变化，请读取当前记录后重新处理。')
+    if (targetUnit && !isImageUnit(targetUnit) && targetUnit.sourceVersion !== material.sourceVersion) return failure('direct_target_changed', '本次准确单元的原文版本已变化，请读取当前记录后重新处理。')
     let historyContext = this.captureHistory(envelope, basis.unitId)
     const termSnapshot = structuredClone({ ...snapshot, entries: selected.filter(entry => entry !== undefined) })
     const replyBytes = (): number => new TextEncoder().encode(JSON.stringify({ kind: 'normal_prepared', termSnapshot, historyContext, basis })).byteLength
@@ -249,10 +323,10 @@ export class NormalTranslationClient {
       if (!isTextUnit(candidate) || candidate.deletion || candidate.targetLanguage !== envelope.material.targetLanguage) continue
       const revision = currentResultRevision(candidate)
       if (!revision || Array.from(candidate.source).length > 1200 || Array.from(revision.text).length > 1200) continue
-      nearby.unshift({ unitId: candidate.id, sourceVersion: candidate.sourceVersion, revisionId: revision.id, source: candidate.source, text: revision.text })
+      nearby.unshift({ unitId: candidate.id, ...(candidate.sourceVersion === undefined ? {} : { sourceVersion: candidate.sourceVersion }), revisionId: revision.id, source: candidate.source, text: revision.text })
       if (nearby.length === 3) break
     }
-    return { ...(base && unit ? { base: { unitId: unit.id, sourceVersion: unit.sourceVersion, revisionId: base.id, text: base.text } } : {}), nearby }
+    return { ...(base && unit ? { base: { unitId: unit.id, ...(unit.sourceVersion === undefined ? {} : { sourceVersion: unit.sourceVersion }), revisionId: base.id, text: base.text } } : {}), nearby }
   }
 
   accept(ownerId: string, input: NormalTranslationAcceptance): NormalTranslationReply {
@@ -310,7 +384,8 @@ export class NormalTranslationClient {
         return failure('idempotency_conflict', '此业务操作已记录不同的译文，未覆盖。')
       }
       return { ok: true, value: { kind: 'normal_committed', receipt: { operationId: request.operationId, mainSessionId: ownerId,
-        translationSessionId: session.id, topicId: material.topicId, unitId, revisionId: recorded.id, sourceVersion: recorded.sourceVersion,
+        translationSessionId: session.id, topicId: material.topicId, unitId, revisionId: recorded.id,
+        ...(isImageUnit(existing!) ? {} : { sourceVersion: material.sourceVersion }),
         status: request.status, textCodePoints: Array.from(recorded.text).length,
         persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' } } }
     }
@@ -343,12 +418,12 @@ export class NormalTranslationClient {
     const at = new Date().toISOString()
     const updated = this.store.updateTranslationHistory(session.id, current => {
       const admitted = material.unitReference
-        ? acceptUnitRetranslation(current, material.unitReference.unitId, request.operationId, material.sourceVersion, at, ownerId)
+        ? acceptUnitRetranslation(current, material.unitReference.unitId, request.operationId, material.unitReference.sourceVersion, at, ownerId)
         : material.sourceText !== undefined
           // A material resubmitted in a later turn revises its own unit instead of failing as a duplicate.
           ? current.units.some(unit => unit.id === unitId && isTextUnit(unit))
             ? acceptUnitRetranslation(current, unitId, request.operationId, material.sourceVersion, at, ownerId)
-            : appendAdmittedTextUnit(current, envelope, request.operationId, at)
+            : appendAdmittedTextUnit(current, envelope, request.operationId, at, true)
           : appendAdmittedFileUnit(current, envelope, unitId, request.sourceText!, request.operationId, at)
       const recorded = appendTextRevision(admitted, unitId, { id: request.revisionId, operationId: request.operationId, model,
         draftVersion: material.draftVersion, createdAt: at, updatedAt: at, accepted: true, status: request.status,
@@ -364,18 +439,19 @@ export class NormalTranslationClient {
     }
     this.emit()
     return { ok: true, value: { kind: 'normal_committed', receipt: { operationId: request.operationId, mainSessionId: ownerId,
-      translationSessionId: session.id, topicId: material.topicId, unitId, revisionId: request.revisionId, sourceVersion: material.sourceVersion,
+      translationSessionId: session.id, topicId: material.topicId, unitId, revisionId: request.revisionId,
+      ...(existing && isImageUnit(existing) ? {} : { sourceVersion: material.sourceVersion }),
       status: request.status, textCodePoints: Array.from(request.text).length,
       persistence: this.store.getStatus(session.id) === 'saved' ? 'saved' : 'runtime_only' } } }
   }
 
-  exportResult(ownerId: string, request: { readonly target: NormalTranslationTarget; readonly totalCodePoints?: number }): NormalTranslationReply {
+  exportResult(ownerId: string, request: { readonly target: DirectTranslationTarget; readonly totalCodePoints?: number }): NormalTranslationReply {
     if (this.disposed) return failure('execution_unavailable', '普通翻译业务通道已关闭。')
-    const target = request.target, base = target.kind === 'unit' ? target.unitId : `unit:${target.materialId}`
+    const target = request.target, base = target.kind !== 'material' ? target.unitId : `unit:${target.materialId}`
     // A unit target is exact; only a material aggregates its range segments and organized body.
-    const owns = (unitId: string): boolean => target.kind === 'unit' ? unitId === base : unitId === base || unitId.startsWith(`${base}:`)
+    const owns = (unitId: string): boolean => target.kind !== 'material' ? unitId === base : unitId === base || unitId.startsWith(`${base}:`)
     let sessionId: string | undefined, totalCodePoints = request.totalCodePoints ?? 0
-    if (target.kind === 'unit') sessionId = target.translationSessionId
+    if (target.kind !== 'material') sessionId = target.translationSessionId
     else {
       const envelope = this.materials.resolveSubmittedTarget(target)
       if (envelope) {
@@ -389,7 +465,7 @@ export class NormalTranslationClient {
       }
     }
     const session = sessionId ? this.store.getSession(sessionId) : undefined
-    if (!session || this.store.isSessionDeleted(session.id) || target.kind === 'unit' && !this.store.canAccessUnit(ownerId, session.id, target.unitId)) return failure('out_of_scope', '译文结果不属于当前已打开的翻译会话或已删除。')
+    if (!session || this.store.isSessionDeleted(session.id) || target.kind !== 'material' && !this.store.canAccessUnit(ownerId, session.id, target.unitId)) return failure('out_of_scope', '译文结果不属于当前已打开的翻译会话或已删除。')
     const history = this.store.getTranslationHistory(session.id)
     if (!history) return failure('history_unavailable', '当前会话没有可导出的译文历史。')
     const scoped = history.units.filter(isTextUnit).filter(unit => owns(unit.id))
@@ -415,7 +491,7 @@ export class NormalTranslationClient {
     const missing: { readonly start: number; readonly end: number }[] = []
     const overlapping: { readonly start: number; readonly end: number }[] = []
     let complete: boolean
-    if (target.kind === 'unit') complete = segments.length === 1
+    if (target.kind !== 'material') complete = segments.length === 1
     else if (units.some(unit => unit.id.endsWith(':body'))) complete = segments.some(segment => segment.unitId.endsWith(':body'))
     else if (available.length) {
       let cursor = 0
@@ -431,7 +507,8 @@ export class NormalTranslationClient {
     } else complete = segments.some(segment => segment.range === null)
     const originalFilePath = this.materials.getFileUnits(session.id).find(file => file.unitId === base || units.some(unit => unit.material?.materialId === file.materialId))?.sourceRef?.originalFilePath
     const value: TopicBridgeValue = { kind: 'normal_exported', export: { mainSessionId: ownerId, translationSessionId: session.id,
-      topicId: session.topicId, materialId: target.kind === 'material' ? target.materialId : null, sourceVersion: target.sourceVersion,
+      topicId: session.topicId, materialId: target.kind === 'material' ? target.materialId : null,
+      ...(target.sourceVersion === undefined ? {} : { sourceVersion: target.sourceVersion }),
       totalCodePoints, complete, segments, missing, overlapping, ...(originalFilePath ? { originalFilePath } : {}) } }
     if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) {
       return failure('export_too_large', '本次译文总长度超过单次导出上限；请分段落保存或缩小范围。')
@@ -752,6 +829,7 @@ export class NormalTranslationClient {
     if (!session || session.mode !== 'normal' || !unit || this.store.isSessionDeleted(sessionId)) return '普通单元已不可用。'
     if (!isTextUnit(unit)) return '整篇文档重译尚未接通。'
     if (unit.deletion) return '此单元已删除。'
+    if ([...this.unitSnapshots.values()].some(({ material }) => material.translationSessionId === sessionId && material.unitReference?.unitId === unitId)) return '此单元仍在翻译。'
     if (session.archivedAt !== null) return '请先恢复归档会话。'
     if (!session.model) return '请先选择本次翻译模型。'
     if (this.store.getStatus(sessionId) === 'conflict') return '本地记录已变化，请核对当前副本。'
@@ -768,7 +846,8 @@ export class NormalTranslationClient {
     const key = JSON.stringify([sessionId, unitId]), old = this.unitRequests.get(key), operationId = old?.outcome === 'unknown' ? old.operationId : `unit-intent:${crypto.randomUUID()}`
     const locale = this.options.uiLocale?.()?.trim()
     const fileName = this.materials.getFileUnits(sessionId).find(file => file.unitId === unitId)?.name
-    const request: NormalTranslationUnitRequest = { operationId, target: { kind: 'unit', mainSessionId: executionOwner, translationSessionId: sessionId, unitId, sourceVersion: unit.sourceVersion },
+    const scope = { mainSessionId: executionOwner, translationSessionId: sessionId, unitId }
+    const request: DirectUnitRequest = { operationId, target: isImageUnit(unit) ? { kind: 'image_unit', ...scope } : { kind: 'unit', ...scope, sourceVersion: unit.sourceVersion! },
       ...(locale ? { uiLocale: locale.slice(0, 64) } : {}), ...(fileName ? { fileName } : {}) }
     const release = this.retain(executionOwner)
     old?.release?.()
@@ -886,6 +965,9 @@ export class NormalTranslationClient {
     this.disposed = true; this.stopBridge?.(); this.stopStore()
     for (const item of this.operations.values()) item.release?.()
     for (const item of this.unitRequests.values()) item.release?.()
-    this.operations.clear(); this.unitSnapshots.clear(); this.preparedHistory.clear(); this.unitRequests.clear(); this.listeners.clear()
+    this.operations.clear(); this.imageInputs.clear(); this.unitSnapshots.clear(); this.preparedHistory.clear(); this.unitRequests.clear(); this.listeners.clear()
   }
 }
+import { isImageUnit, updateImageUnit } from './translation-history.js'
+import { parseImageUnitUpdate, parseDirectTranslationTarget, type DirectUnitTarget, type DirectUnitRequest, type DirectTranslationTarget } from '../shared/normal-translation.js'
+import type { ImageUnitUpdate } from '../shared/image-translation.js'

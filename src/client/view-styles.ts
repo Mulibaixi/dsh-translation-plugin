@@ -97,6 +97,9 @@ export const styles = `
 .dsh-tp-translation + .dsh-tp-translation { border-top: 1px solid var(--dsw-alias-border-l2, #8883); padding-top: 18px; }
 .dsh-tp-translation > button:last-child { margin-bottom: 18px; }
 .dsh-tp-translation-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 12px; }
+.dsh-tp-image-background { position: relative; }
+.dsh-tp button.dsh-tp-image-background-edit { position: absolute; inset-block-start: 0; inset-inline-end: 0; padding-block: 0; white-space: nowrap; }
+.dsh-tp-image-background:not([open]) > .dsh-tp-image-background-edit { display: none; }
 .dsh-tp-source-collapsed { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
 .dsh-tp-unit-header, .dsh-tp-version-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
 .dsh-tp-source { display: flow-root; }

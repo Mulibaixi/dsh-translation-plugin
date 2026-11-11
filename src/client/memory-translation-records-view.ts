@@ -1,10 +1,12 @@
-import { isFileJobUnit, hasUnitBody } from './translation-history.js'
+import { SourceTextEditor } from './source-text-editor.js'
+import { ImageOriginalButton } from './image-unit-view.js'
+import { isEditableTextUnit, isFileJobUnit, isImageUnit, hasUnitBody } from './translation-history.js'
 import { h, react } from './react.js'
 import { downloadExport } from './browser-download.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
 import type { SessionStore } from './session-store.js'
 import type { QuickTranslationClient } from './quick-translation.js'
-import { currentFinalRevision, isDeletedUnit, isTextUnit, revisionDeletionChanged, type TextRevision } from './translation-history.js'
+import { currentFinalRevision, isDeletedUnit, isTextUnit, revisionDeletionChanged, revisionMatchesCurrentSource, type TextRevision } from './translation-history.js'
 import { DocumentUnitView, ResultOpenLink, SourceOpenLink, type DocumentViewProps } from './document-unit-view.js'
 import { FileJobView, type FileJobViewProps } from './file-job-view.js'
 import { allowPartialTranslationExport, type FileJobExportUnit, type TopicTranslationExport, type TranslationExportSession, type TranslationExportTopic } from './translation-export.js'
@@ -30,13 +32,15 @@ function editable(revision: TextRevision): boolean {
 function projectExport(request: Omit<PendingRecordsExport, 'result'>, documents: DocumentViewProps['documents']): Promise<TopicTranslationExport> {
   return buildRecordObjectExportAsync(request, documents, true)
 }
-export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, materials, mainSessionId, ownerId, topicId, associatedSessionId, navigationRevision, visible = true, onOpenAssets }: RecordObjectsProps & DocumentViewProps & FileJobViewProps & RecordIndexProps & {
+export function MemoryTranslationRecordsView({ store, quick, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, materials, normal, mainSessionId, ownerId, topicId, associatedSessionId, navigationRevision, visible = true, onOpenAssets }: RecordObjectsProps & DocumentViewProps & FileJobViewProps & RecordIndexProps & {
   readonly store: SessionStore; readonly quick: QuickTranslationClient; readonly ownerId: string; readonly topicId: string
   readonly associatedSessionId?: string | undefined; readonly navigationRevision?: number | undefined; readonly visible?: boolean
+  readonly normal?: import('./normal-translation.js').NormalTranslationClient | undefined
   readonly materials?: MaterialSubmissionsClient | undefined; readonly mainSessionId?: string | undefined
   readonly onOpenAssets?: ((ownerId: string, topicId: string, sessionId?: string, jobId?: string) => void) | undefined
 }): unknown {
   const [contentRevision, refresh] = react.useState(0)
+  react.useEffect(() => normal?.subscribe(() => refresh(value => value + 1)), [normal])
   react.useEffect(() => materials?.subscribe(() => refresh(value => value + 1)), [materials])
   const [searchSourceRevision, refreshSearchSources] = react.useState(0)
   const associated = associatedSessionId ? store.getSession(associatedSessionId) : undefined
@@ -44,6 +48,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   const [scope, setScope] = react.useState<RecordsScope>(() => validAssociated ? 'session' : 'topic')
   const [sessionId, setSessionId] = react.useState<string | undefined>(validAssociated)
   const [expanded, setExpanded] = react.useState(() => new Set<string>())
+  const [sourceEditKey, setSourceEditKey] = react.useState<string | undefined>(undefined)
   const [drafts, setDrafts] = react.useState(() => new Map<string, EditDraft>())
   const [message, setMessage] = react.useState<string | undefined>(undefined)
   const [query, setQuery] = react.useState(''), [searchRetry, setSearchRetry] = react.useState(0)
@@ -210,15 +215,19 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
         ...jobs.map(record => h('div', { key: record.summary.unitId }, h(FileJobView, { jobs: fileJobs, record, viewFiles, recordIndex, visible, onOpenAssets, ownerId: mainSessionId ?? ownerId }), ...excerpts(session.id, record.summary.unitId))),
         ...units.map(unit => {
           if (!isTextUnit(unit)) return h('div', { key: unit.id }, h(DocumentUnitView, { unit, session, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, recordIndex, materials, executionOwner: mainSessionId, visible, navigationRevision }), ...excerpts(session.id, unit.id))
+          const textUnit = unit
           const revisions = unit.revisions
           const key = JSON.stringify([session.id, unit.id]), draft = drafts.get(key), open = expanded.has(key)
           const pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
           const final = currentFinalRevision(unit)
-          const file = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
+          const image = isImageUnit(unit) ? unit : undefined
+          const file = image ? undefined : materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
           const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
           const latest = unit.revisions.at(-1)
           const candidate = latest?.accepted && latest.status === 'completed' && latest.text.trim() && latest.id !== final?.id ? latest : undefined
           const archived = session.archivedAt !== null
+          const sourceEditable = session.mode === 'normal' && !archived && !unit.deletion
+          const sourceBlocked = sourceEditable ? normal?.sourceEditBlockedReason(session.id, unit.id) : undefined
           const target = { ownerId: store.getTopicStorageScope(session.topicId)!, topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
           function startEditing(revision: TextRevision): void {
             setDrafts(current => {
@@ -232,7 +241,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
             const revisionDraft = draft?.baseRevisionId === revision.id ? draft : undefined
             const otherDraft = Boolean(draft && !revisionDraft)
             const blockedEdit = quick.manualEditBlockedReason(session.id, unit.id, revision.id)
-            const stale = revision.sourceVersion !== unit.sourceVersion
+            const stale = !revisionMatchesCurrentSource(textUnit, revision)
             const revisionTarget = { ...target, side: 'revision' as const, revisionId: revision.id }
             return [
               h('button', { type: 'button', 'aria-label': `${isCandidate ? '复制候选版本' : '复制最终译文'} ${revision.order}`, onClick: () => { void copy(recordObjectPlainText(revision.text, revisionTarget, objects?.getReferences(revisionTarget) ?? [])) } }, '复制'),
@@ -242,7 +251,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
             ]
           }
           function revisionStatus(revision: TextRevision, kind: 'final' | 'candidate'): string {
-            const stale = revision.sourceVersion !== unit.sourceVersion
+            const stale = !revisionMatchesCurrentSource(textUnit, revision)
             return kind === 'candidate'
               ? `候选 · 版本 ${revision.order}${stale ? ` · 已过时（原文版本 ${revision.sourceVersion}）` : ''}`
               : `版本 ${revision.order} · ${!isFileJobUnit(unit) && unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`
@@ -252,7 +261,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
             const revisionDraft = draft?.baseRevisionId === revision.id ? draft : undefined
             const blockedEdit = quick.manualEditBlockedReason(session.id, unit.id, revision.id)
             const revisionTarget = { ...target, side: 'revision' as const, revisionId: revision.id }
-            const stale = revision.sourceVersion !== unit.sourceVersion
+            const stale = !revisionMatchesCurrentSource(textUnit, revision)
             const canSave = Boolean(revisionDraft && revisionDraft.text.trim() && revisionDraft.text !== revisionDraft.original && !archived && !blockedEdit)
             function saveDraft(finalize: boolean): void {
               if (!revisionDraft) return
@@ -287,16 +296,23 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
             h('div', { className: 'dsh-tp-record-unit-heading' },
               h('button', { type: 'button', 'aria-label': `${session.name} · 单元 ${unit.order}`, 'aria-expanded': open, onClick: () => {
                 setExpanded(current => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
-              } }, `单元 ${unit.order} · ${candidate || !final ? '待定稿' : '已定稿'}`),
-              h('small', { className: 'dsh-tp-muted' }, `目标语言：${unit.targetLanguage}${unit.sourceVersion > 1 ? ` · 原文版本 ${unit.sourceVersion}` : ''}`)),
+              } }, `单元 ${unit.order}${image ? ` · 图片 · ${image.original?.name ?? '原图'}` : ''} · ${candidate || !final ? '待定稿' : '已定稿'}`),
+              h('small', { className: 'dsh-tp-muted' }, `目标语言：${unit.targetLanguage}${!isEditableTextUnit(unit) && (unit.sourceVersion ?? 0) > 1 ? ` · 原文版本 ${unit.sourceVersion}` : ''}`),
+              image ? h(ImageOriginalButton, { unit: image, session, materials, viewFiles }) : null),
             h('div', { className: 'dsh-tp-record-pair' },
               h('div', { className: 'dsh-tp-record-source', 'aria-label': '原文' },
                 h('div', { className: 'dsh-tp-record-column-heading' }, h('h4', null, '原文'),
                   indexTarget && recordIndex ? h('small', { className: 'dsh-tp-muted' }, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, visible })) : null,
                   h('div', { className: 'dsh-tp-record-heading-actions' },
+                    h('button', { type: 'button', 'aria-label': '复制原文', disabled: !unit.source,
+                      onClick: () => { void copy(recordObjectPlainText(unit.source, target, objects?.getReferences(target) ?? [])) } }, '复制'),
                     h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId, visible, disabled: !final || archived }),
+                    sourceEditable && normal ? h('button', { type: 'button', 'aria-label': '编辑原文', disabled: !!sourceBlocked || sourceEditKey === key,
+                      title: sourceBlocked, onClick: () => setSourceEditKey(key) }, '编辑') : null,
                     h(SourceOpenLink, { unit, session, objects, viewFiles, visible, navigationRevision }))),
-                h(RecordObjectText, { text: unit.source, target, objects, objectAssets, renderText: highlight(session.id, unit.id, 'source') }),
+                sourceEditable && normal && sourceEditKey === key ? h(SourceTextEditor, { unit, session, normal,
+                  executionOwner: mainSessionId && store.isSessionOpen(mainSessionId, session.id) ? mainSessionId : undefined, close: () => setSourceEditKey(undefined) }) :
+                  h(RecordObjectText, { text: unit.source, target, objects, objectAssets, renderText: highlight(session.id, unit.id, 'source') }),
                 open && unit.sourceVersions.length > 1 ? h('div', null, ...unit.sourceVersions.slice(0, -1).map(source => h('section', { key: source.version },
                   h('small', { className: 'dsh-tp-muted' }, `历史原文版本 ${source.version}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null),
               h('div', { className: 'dsh-tp-record-target', 'aria-label': '最终译文' },
@@ -310,7 +326,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
                 candidate ? revisionView(candidate, 'candidate', Boolean(final)) : null,
                 !final && !candidate ? h('p', { className: 'dsh-tp-muted' }, '尚无最终译文。') : null,
                 h('div', { className: 'dsh-tp-record-actions', hidden: !open },
-                  pointed && !final ? h('p', { className: 'dsh-tp-muted' }, pointed.sourceVersion !== unit.sourceVersion ? `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中`) : null))),
+                  pointed && !final ? h('p', { className: 'dsh-tp-muted' }, !revisionMatchesCurrentSource(unit, pointed) ? `原最终版本 ${pointed.order}已过时 · 原文版本 ${pointed.sourceVersion}` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中`) : null))),
             h('div', { className: 'dsh-tp-record-actions', hidden: !open }, h(RecordObjectEditor, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, session, unit, objects, objectAssets }))
           )
         })))))

@@ -76,10 +76,11 @@ export function SourceOpenLink({ unit, session, objects, viewFiles, visible = tr
     action: { label: '打开原稿', display: '打开', run: async () => ({ text: recordObjectPlainText(unit.source, target, objects?.getReferences(target) ?? []), fileName: `${session.name}-source.txt`, mimeType: 'text/plain;charset=utf-8' }) } })
 }
 /** Quiet link for the frozen final result, falling back to the latest complete revision when the unit has no effective final; it renders on the latest translation row. */
-export function ResultOpenLink({ unit, session, objects, viewFiles, visible = true, navigationRevision }: RecordObjectsProps & {
+export function ResultOpenLink({ unit, session, objects, viewFiles, visible = true, navigationRevision, revision }: RecordObjectsProps & {
+  readonly revision?: import('./translation-history.js').TextRevision | undefined
   readonly unit: TextUnit; readonly session: LocalSession; readonly visible?: boolean; readonly navigationRevision?: number | undefined
 }): unknown {
-  const result = currentResultRevision(unit), identity = JSON.stringify([session.topicId, session.topicId, session.id, unit.id, unit.sourceVersion, result?.id])
+  const result = revision ? revision.status === 'completed' ? revision : undefined : currentResultRevision(unit), identity = JSON.stringify([session.topicId, session.topicId, session.id, unit.id, unit.sourceVersion, result?.id])
   const target = { ownerId: session.topicId, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
   return h(RecordOpenLink, { identity, visible, navigationRevision, viewFiles, slot: recordOpenSlot(session, unit, 'result', '结果'),
     action: { label: '打开结果', display: '打开', run: async () => {

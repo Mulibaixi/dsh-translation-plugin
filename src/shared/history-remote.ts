@@ -17,7 +17,7 @@ export interface CurrentHistoryRead extends HistoryScope { readonly token: strin
 export interface HistoryTextSearch extends CurrentHistoryRead { readonly query: string }
 export interface HistoryTextMatches { readonly matches: readonly { readonly start: number; readonly end: number }[]; readonly next: number | null }
 export interface HistoryCurrentPage {
-  readonly token: string; readonly unitId: string; readonly kind: 'text' | 'document' | 'file_job'; readonly sourceVersion: number
+  readonly token: string; readonly unitId: string; readonly kind: 'text' | 'document' | 'file_job' | 'image'; readonly sourceVersion?: number
   readonly finalId: string | null; readonly targetLanguage: string; readonly text: string | null; readonly totalCodePoints: number; readonly next: number | null; readonly reason?: string
 }
 export interface HistoryRemotePort {
@@ -108,10 +108,12 @@ export function parseHistoryResult(method: keyof HistoryRemotePort, value: unkno
     for (const match of value.matches) { referenceObject(match); referenceExact(match, ['start', 'end']); referenceInteger(match.start); referenceInteger(match.end, (match.start as number) + 1); if ((match.start as number) < end) throw new TypeError('Unordered history matches'); end = match.end as number }
     if (value.next !== null) referenceInteger(value.next, Math.max(1, end))
   } else {
-    referenceExact(value, ['token', 'unitId', 'kind', 'sourceVersion', 'finalId', 'targetLanguage', 'text', 'totalCodePoints', 'next'], ['reason'])
+    referenceExact(value, ['token', 'unitId', 'kind', 'finalId', 'targetLanguage', 'text', 'totalCodePoints', 'next'], ['reason', 'sourceVersion'])
     referenceString(value.token); referenceString(value.unitId); referenceString(value.targetLanguage, 80)
-    if (!['text', 'document', 'file_job'].includes(String(value.kind))) throw new TypeError('Invalid history unit kind')
-    referenceInteger(value.sourceVersion, 1); referenceInteger(value.totalCodePoints)
+    if (!['text', 'document', 'file_job', 'image'].includes(String(value.kind))) throw new TypeError('Invalid history unit kind')
+    if (value.kind !== 'image') referenceInteger(value.sourceVersion, 1)
+    else if (Object.hasOwn(value, 'sourceVersion')) throw new TypeError('Image source is unversioned')
+    referenceInteger(value.totalCodePoints)
     if (value.finalId !== null) referenceString(value.finalId)
     if (value.text !== null) { if (typeof value.text !== 'string' || Array.from(value.text).length > 4000) throw new TypeError('Invalid current text') }
     if (value.next !== null) referenceInteger(value.next, 1)

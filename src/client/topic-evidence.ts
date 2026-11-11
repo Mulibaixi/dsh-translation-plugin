@@ -4,7 +4,7 @@ import type { EvidenceReadRequest, EvidenceReadResult } from '../shared/translat
 import { TranslationSourceReader, type TranslationEvidenceReader } from './source-reader.js'
 import type { SessionStore } from './session-store.js'
 import { isDocumentEvidenceUnloaded } from './document-evidence.js'
-import { isTextUnit } from './translation-history.js'
+import { isImageUnit, isTextUnit } from './translation-history.js'
 
 type Scope = { readonly ownerId: string; readonly topicId: string }
 function requestKey(request: EvidenceReadRequest | null): string {
@@ -24,7 +24,7 @@ function sameFact(left: unknown, right: unknown): boolean {
 function referencedFacts(sessions: SessionStore, ref: TermEvidenceRef): unknown {
   const history = sessions.getTranslationHistory(ref.sessionId), unit = history?.units.find(unit => unit.id === ref.unitId)
   if (unit && isFileJobUnit(unit)) return { sourceVersion: unit.sourceVersion }
-  const source = unit?.sourceVersions.find(source => source.version === unit.sourceVersion)
+  const source = unit && isImageUnit(unit) ? unit.source : unit?.sourceVersions.find(source => source.version === unit.sourceVersion)
   if (ref.kind === 'source') return { sourceVersion: unit?.sourceVersion, source }
   const revision = unit?.revisions.find(revision => revision.id === ref.revisionId)
   let selectionEventId: string | undefined
@@ -81,14 +81,15 @@ export async function prepareTopicEvidence(sessions: SessionStore, scope: Scope,
   const unique = [...new Map(refs.map(ref => [termEvidenceKey(scope, ref), structuredClone(ref)])).values()]
   const captures = unique.map(ref => {
     const unit = sessions.getTranslationHistory(ref.sessionId)?.units.find(unit => unit.id === ref.unitId)
-    return { ref, captured: reader.capture(scope.ownerId, scope.topicId, ref), inline: !!unit && isTextUnit(unit),
+    const image = !!unit && isImageUnit(unit) && !unit.deletion
+    return { ref, captured: image ? null : reader.capture(scope.ownerId, scope.topicId, ref), inline: !!unit && isTextUnit(unit),
       facts: referencedFacts(sessions, ref) }
   })
   const results = new Map<string, EvidenceReadResult>()
-  const inline = new Set(captures.filter(value => value.inline && !('status' in value.captured)).map(value => termEvidenceKey(scope, value.ref)))
+  const inline = new Set(captures.filter(value => value.inline && (!value.captured || !('status' in value.captured))).map(value => termEvidenceKey(scope, value.ref)))
   for (const { ref, captured, inline } of captures) {
     // Existing authoritative text bodies require no remote paging, including legacy whole refs over one page.
-    if (inline && !('status' in captured)) continue
+    if (!captured || inline && !('status' in captured)) continue
     let result: EvidenceReadResult
     if ('status' in captured) result = captured
     else {
@@ -114,8 +115,10 @@ export async function prepareTopicEvidence(sessions: SessionStore, scope: Scope,
   })
   return { resolver, isUnloaded,
     isCurrent: () => captures.every(({ ref, captured, facts }) => {
+      if (!sameFact(referencedFacts(sessions, ref), facts)) return false
+      if (!captured) return !isTopicEvidenceUnloaded(sessions, scope, ref)
       const current = reader.capture(scope.ownerId, scope.topicId, ref)
-      return sameFact(referencedFacts(sessions, ref), facts) && captureKey(current) === captureKey(captured) &&
+      return captureKey(current) === captureKey(captured) &&
         ('status' in captured || reader.isCurrent(captured))
     }),
   }

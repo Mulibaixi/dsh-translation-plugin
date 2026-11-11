@@ -1,4 +1,4 @@
-import { isFileJobUnit } from './translation-history.js'
+import { isFileJobUnit, isImageUnit } from './translation-history.js'
 import { ReferenceStore } from './reference-store.js'
 import {
   MAX_TOPIC_BRIDGE_REPLY_BYTES, parseLibraryConnection, parseTopicBridgeCapability, parseTopicBridgeV2Capability, parseTopicBridgeDown, parseTopicBridgeReply,
@@ -26,6 +26,8 @@ import type { DocumentReviewClient } from './document-review-client.js'
 import { planDocumentTermSedimentation } from './document-term-sedimentation.js'
 import { NumberedUnits } from './numbered-units.js'
 import { HISTORY_TEXT_REPLY_BYTES } from '../shared/history-text.js'
+
+const TOPIC_BRIDGE_RECONNECT_MS = 250
 
 async function sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
@@ -83,16 +85,19 @@ export interface DocumentTermSedimentResult {
 }
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
 interface NormalPort {
+  updateImage(ownerId: string, request: import('../shared/image-translation.js').ImageUnitUpdate): boolean
+  finishUnitCall(ownerId: string, operationId: string): void
+  releaseUnitCalls(ownerId: string): void
   recoverInterrupted(sessionId: string, ownerId?: string): Promise<void>
   prepare(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
   accept(ownerId: string, request: NormalTranslationAcceptance): NormalTranslationReply
   commitResult(ownerId: string, request: DirectTranslationCommit): NormalTranslationReply
-  exportResult(ownerId: string, request: { readonly target: NormalTranslationTarget; readonly totalCodePoints?: number }): NormalTranslationReply
+  exportResult(ownerId: string, request: { readonly target: import('../shared/normal-translation.js').DirectTranslationTarget; readonly totalCodePoints?: number }): NormalTranslationReply
   update(ownerId: string, request: NormalTranslationUpdate): NormalTranslationReply
   updateV2(ownerId: string, request: { readonly mainSessionId: string; readonly translationSessionId: string; readonly unitId: string; readonly operationId: string; readonly sourceVersion: number; readonly event: NormalTranslationV2Event }): NormalTranslationReply
   resolveExchange(ownerId: string, request: { readonly translationSessionId: string; readonly exchangeId: string; readonly resolution: NormalTranslationResolution }): NormalTranslationReply
   observe(ownerId: string, request: { readonly translationSessionId: string; readonly operationId: string }): NormalTranslationReply
-  resolve(ownerId: string, request: NormalTranslationUnitRequest): NormalTranslationReply
+  resolve(ownerId: string, request: import('../shared/normal-translation.js').DirectUnitRequest): NormalTranslationReply
   correctSource(ownerId: string, request: NormalTranslationSourceCorrection): NormalTranslationReply
 }
 interface Connection {
@@ -118,22 +123,40 @@ export class TopicBridgeClient {
   private libraryReason: string | undefined
   getLibraryStatus(): { readonly ready: boolean; readonly reason: string | undefined } { return { ready: this.libraryReady, reason: this.libraryReason } }
   async connectLibrary(): Promise<void> {
-    this.libraryController?.abort(); await this.closeHandle(this.libraryHandle)
-    const controller = new AbortController(); this.libraryController = controller; this.libraryReady = false
+    const previous = this.libraryHandle
+    this.libraryController?.abort()
+    const controller = new AbortController()
+    this.libraryController = controller; this.libraryHandle = undefined; this.libraryReady = false
+    const current = (): boolean => !this.disposed && this.libraryController === controller && !controller.signal.aborted
+    let opened = false
     try {
+      await this.closeHandle(previous)
+      if (!current()) return
       const remote = typeof this.remote === 'function' ? await this.remote() : this.remote
-      if (controller.signal.aborted || this.disposed) return
+      if (!current()) return
       if (!remote?.connectLibrary) throw new Error('宿主不支持独立资料库连接，请加载匹配版本。')
-      const namespaceId = this.sessions.getNamespaceId(), handle = remote.connectLibrary({ namespaceId }, controller.signal)
+      const namespaceId = this.sessions.getNamespaceId()
+      const handle = remote.connectLibrary({ namespaceId }, controller.signal)
       this.libraryHandle = handle
       for await (const raw of handle) {
-        if (controller.signal.aborted || this.disposed) return
+        if (!current()) return
         const reply = parseLibraryConnection(raw)
         if (reply.namespaceId !== namespaceId) throw new Error('资料库连接身份不一致。')
-        this.libraryReady = true; this.libraryReason = undefined; this.emit()
+        opened = true; this.libraryReady = true; this.libraryReason = undefined; this.emit()
       }
-    } catch (error) { if (!controller.signal.aborted) this.libraryReason = error instanceof Error ? error.message : '资料库连接中断。' }
-    finally { if (this.libraryController === controller) { this.libraryReady = false; this.emit() } }
+      if (current()) throw new Error('资料库连接已结束。')
+    } catch (error) { if (current()) this.libraryReason = error instanceof Error ? error.message : '资料库连接中断。' }
+    finally {
+      if (current()) {
+        const handle = this.libraryHandle
+        this.libraryHandle = undefined; this.libraryReady = false; this.emit()
+        await this.closeHandle(handle)
+      }
+    }
+    if (opened && current()) {
+      await new Promise<void>(resolve => setTimeout(resolve, TOPIC_BRIDGE_RECONNECT_MS))
+      if (current()) void this.connectLibrary()
+    }
   }
   private references: ReferenceStore | undefined
   setReferences(references: ReferenceStore): void { this.references = references }
@@ -201,6 +224,7 @@ export class TopicBridgeClient {
   private async open(ownerId: string, connection: Connection): Promise<void> {
     const generation = connection.generation
     const current = (): boolean => !this.disposed && this.connections.get(ownerId) === connection && connection.generation === generation
+    let opened = false
     try {
       const remote = typeof this.remote === 'function' ? await this.remote() : this.remote
       if (!current()) return
@@ -223,7 +247,6 @@ export class TopicBridgeClient {
       const protocol = 4
       const handle = remote.connectV4({ mainSessionId: ownerId, namespaceId: this.sessions.getNamespaceId() }, connection.controller.signal)
       connection.handle = handle
-      let opened = false
       for await (const raw of handle) {
         if (!current()) return
         const frame = parseTopicBridgeDown(raw, protocol)
@@ -254,7 +277,17 @@ export class TopicBridgeClient {
         this.emit()
       }
     } finally {
-      if (current()) { const handle = connection.handle; connection.handle = undefined; await this.closeHandle(handle) }
+      if (current()) {
+        this.normal?.releaseUnitCalls?.(ownerId)
+        const handle = connection.handle; connection.handle = undefined; await this.closeHandle(handle)
+      }
+    }
+    if (opened && current()) {
+      await new Promise<void>(resolve => setTimeout(resolve, TOPIC_BRIDGE_RECONNECT_MS))
+      if (current()) {
+        connection.requests.clear()
+        void this.open(ownerId, connection)
+      }
     }
   }
   private async closeHandle(handle: { dispose(): void | Promise<void> } | undefined): Promise<void> {
@@ -269,7 +302,7 @@ export class TopicBridgeClient {
     if (ref.kind === 'source') {
       const source = unit.sourceVersions.find(source => source.version === unit.sourceVersion)!
       const total = isTextUnit(unit) ? Array.from(unit.source).length : 'body' in source ? (source.body.kind === 'inline' ? Array.from(source.body.text).length : source.body.reference.totalCodePoints) : 0
-      return (ref.sourceVersion ?? 1) === unit.sourceVersion && (ref.range === null || ref.range.start >= 0 && ref.range.end > ref.range.start && ref.range.end <= total)
+      return (isImageUnit(unit) ? ref.sourceVersion === undefined : (ref.sourceVersion ?? 1) === unit.sourceVersion) && (ref.range === null || ref.range.start >= 0 && ref.range.end > ref.range.start && ref.range.end <= total)
     }
     const final = isTextUnit(unit) ? currentFinalRevision(unit) : currentDocumentFinalRevision(unit)
     const selection = [...(history?.events ?? [])].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
@@ -439,11 +472,21 @@ export class TopicBridgeClient {
       if (new TextEncoder().encode(JSON.stringify(success(value))).byteLength > MAX_ANALYSIS_PAGE_BYTES) return error(request.requestId, 'reply_too_large', '完整准备回执超过 32768 字节，未截断字段。')
       return success(value)
     }
+    if (command.kind === 'image_update') {
+      const { kind: _kind, ...update } = command
+      return this.normal?.updateImage(ownerId, update)
+        ? success({ kind: 'image_updated', unitId: command.target.unitId })
+        : error(request.requestId, 'image_update_failed', '图片单元不可编辑，或当前内容超过会话上限。')
+    }
+    if (command.kind === 'normal_call_finished') {
+      this.normal?.finishUnitCall(ownerId, command.operationId)
+      return success({ kind: 'normal_call_finished' })
+    }
     if (command.kind === 'normal_resolve' || command.kind === 'normal_correct_source') {
       const target = command.target
       if (target.mainSessionId !== ownerId || !this.sessions.canAccessUnit(ownerId, target.translationSessionId, target.unitId)) return error(request.requestId, 'out_of_scope', '请先在当前主会话打开此翻译会话，并核对单元是否存在。')
       const { kind, ...payload } = command
-      const result = kind === 'normal_resolve' ? this.normal?.resolve(ownerId, payload as NormalTranslationUnitRequest) : this.normal?.correctSource(ownerId, payload as NormalTranslationSourceCorrection)
+      const result = kind === 'normal_resolve' ? this.normal?.resolve(ownerId, payload as import('../shared/normal-translation.js').DirectUnitRequest) : this.normal?.correctSource(ownerId, payload as NormalTranslationSourceCorrection)
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通单元处理通道尚未就绪。')
     }
     if (command.kind === 'normal_export') {
@@ -615,8 +658,9 @@ export class TopicBridgeClient {
   private unitFact(history: TranslationHistory, unit: TextUnit): TopicUnitFact {
     const event = [...history.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
     const final = currentFinalRevision(unit)
-    return { id: unit.id, order: unit.order, source: unit.source, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, sourceVersion: revision.sourceVersion }]),
+    return { id: unit.id, order: unit.order, source: unit.source, ...(isImageUnit(unit) ? { backgroundDescription: unit.backgroundDescription } : { sourceVersion: unit.sourceVersion }),
+      targetLanguage: unit.targetLanguage, instruction: unit.instruction,
+      revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, ...(revision.sourceVersion === undefined ? {} : { sourceVersion: revision.sourceVersion }) }]),
       final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }
   }
   /** Read the exact preparation version this result belongs to; an older source version is never substituted. */

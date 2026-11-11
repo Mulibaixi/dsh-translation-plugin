@@ -2,7 +2,7 @@
 export interface HistoryTextRead {
   readonly translationSessionId: string
   readonly unitId: string
-  readonly sourceVersion: number
+  readonly sourceVersion?: number | undefined
   readonly side: 'source' | 'translation'
   readonly revisionId?: string
   readonly start?: number
@@ -28,21 +28,21 @@ function identity(value: unknown): asserts value is string {
 function integer(value: unknown, minimum = 0): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < minimum) throw new TypeError('Invalid history text position or version')
 }
-const identityFields = ['translationSessionId', 'unitId', 'sourceVersion', 'side'] as const
+const identityFields = ['translationSessionId', 'unitId', 'side'] as const
 function version(value: Record<string, unknown>): void {
-  identity(value.translationSessionId); identity(value.unitId); integer(value.sourceVersion, 1)
+  identity(value.translationSessionId); identity(value.unitId); if (Object.hasOwn(value, 'sourceVersion')) integer(value.sourceVersion, 1)
   if (value.side !== 'source' && value.side !== 'translation') throw new TypeError('Invalid history text side')
   if (value.side === 'source') {
     if (Object.hasOwn(value, 'revisionId')) throw new TypeError('A source page cannot select a translation revision')
   } else identity(value.revisionId)
 }
 export function parseHistoryTextRead(value: unknown): HistoryTextRead {
-  object(value); fields(value, identityFields, ['revisionId', 'start']); version(value)
+  object(value); fields(value, identityFields, ['sourceVersion', 'revisionId', 'start']); version(value)
   if (value.start !== undefined) integer(value.start)
   return structuredClone(value) as unknown as HistoryTextRead
 }
 export function parseHistoryTextPage(value: unknown): HistoryTextPage {
-  object(value); fields(value, [...identityFields, 'start', 'text', 'totalCodePoints', 'nextStart'], ['revisionId']); version(value)
+  object(value); fields(value, [...identityFields, 'start', 'text', 'totalCodePoints', 'nextStart'], ['sourceVersion', 'revisionId']); version(value)
   integer(value.start); integer(value.totalCodePoints)
   if (typeof value.text !== 'string') throw new TypeError('Invalid history text body')
   const length = Array.from(value.text).length, end = value.start + length

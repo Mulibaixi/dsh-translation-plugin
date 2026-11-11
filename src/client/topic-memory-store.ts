@@ -105,11 +105,11 @@ export class TopicMemoryStore {
     const session = this.sessions.getSession(sessionId), history = this.sessions.getTranslationHistory(sessionId)
     if (!session || !history || this.sessions.isSessionDeleted(sessionId) || this.sessions.getStatus(sessionId) === 'conflict') return undefined
     const unit = history.units.find(unit => unit.id === unitId)
-    if (!unit || !isTextUnit(unit)) return undefined
+    if (!unit || !isTextUnit(unit) || unit.deletion) return undefined
     const revision = currentFinalRevision(unit)
     const event = [...history.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
     return { ownerId: this.sessions.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sourceVersion: unit.sourceVersion, source: unit.source,
-      final: revision && event?.revisionId === revision.id ? { revisionId: revision.id, selectionEventId: event.id, sourceVersion: revision.sourceVersion, text: revision.text } : null }
+      final: revision && event?.revisionId === revision.id ? { revisionId: revision.id, selectionEventId: event.id, sourceVersion: unit.sourceVersion, text: revision.text } : null }
   }
   private available(topicId: string): boolean { return !this.disposed && !this.sessions.isTopicDeleted(topicId) && this.sessions.getTopics().some(topic => topic.id === topicId) }
   private seat(ownerId: string, topicId: string): Seat {

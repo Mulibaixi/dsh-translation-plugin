@@ -1,5 +1,7 @@
-import { isDocumentUnit, isFileJobUnit } from './translation-history.js'
+import { isDocumentUnit, isFileJobUnit, isImageUnit } from './translation-history.js'
 import { DirectFileLink, type DirectFile } from './direct-file-view.js'
+import { ImageBackground, ImageExportMenu, ImageOriginalButton } from './image-unit-view.js'
+import { SourceTextEditor } from './source-text-editor.js'
 import { MemoryAssetsView } from './memory-assets-view.js'
 import { LocalDataClearView, type LocalDataClient } from './local-data.js'
 import { styles, TOPIC_SUBMENU_WIDTH } from './view-styles.js'
@@ -11,7 +13,7 @@ import { RecordIndexControl, RecordIndexStatus, supportsRecordIndex, type Record
 import { ModelPicker } from './model-picker.js'
 import { type ModelCatalog } from './models.js'
 import { type QuickTranslationClient, type QuickRecord } from './quick-translation.js'
-import { currentFinalRevision, isTextUnit, revisionDeletionChanged, type TextUnit, type TextRevision } from './translation-history.js'
+import { currentFinalRevision, isTextUnit, revisionDeletionChanged, revisionMatchesCurrentSource, type TextUnit, type TextRevision } from './translation-history.js'
 import { DocumentUnitView, ResultOpenLink, SourceOpenLink, type DocumentViewProps } from './document-unit-view.js'
 import { FileJobView, type FileJobViewProps } from './file-job-view.js'
 import { allowPartialTranslationExport, type FileJobExportUnit, type TranslationExport, type TranslationExportTopic, type TranslationExportSession } from './translation-export.js'
@@ -178,7 +180,7 @@ export function PanelRouter({ store, models, quick, normal, sessionId, topics, m
     },
   }
   if (assetTopic && terms && archive) return h('section', { className: 'dsh-tp dsh-tp-panel' }, button('返回翻译资料库', () => setAssetTopic(undefined)),
-    h(MemoryAssetsView, { store, terms, archive, otherMemory, memoryIndex, recordIndex, materials, mainSessionId: sessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing,
+    h(MemoryAssetsView, { store, terms, archive, otherMemory, memoryIndex, recordIndex, materials, normal, mainSessionId: sessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing,
       ownerId: sessionId ?? store.getNamespaceId(), topicId: assetTopic, onSelectTopic: setAssetTopic, onDeleteTerm: onDeleteTerm ?? (async () => false) }))
   const openAssets = onOpenAssets ?? (terms && archive ? (_entryId: string, topicId: string) => setAssetTopic(topicId) : undefined)
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
@@ -378,14 +380,14 @@ function TextRevisionActions({ store, session, unit, revision, quick, normal, ma
     return objects?.revisionDeletionBlockedReason({ ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id })
   }
   const blocked = store.getTextRevisionDeletionBlockedReason(session.id, unit.id, revision.id) ?? externalBlocked()
-  const label = `${file ? '文件' : '文本'} ${unit.order} 版本 ${revision.order}`
-  const eligible = revision.sourceVersion === unit.sourceVersion && revision.accepted && revision.status === 'completed' && !!revision.text.trim()
+  const label = `${isImageUnit(unit) ? '图片' : file ? '文件' : '文本'} ${unit.order} 版本 ${revision.order}`
+  const eligible = revisionMatchesCurrentSource(unit, revision) && revision.accepted && revision.status === 'completed' && !!revision.text.trim()
   const fixed = unit.final?.revisionId === revision.id && unit.final.selection === 'user_fixed'
   async function exportFile(): Promise<void> {
     if (lifetime.current.exporting) return
     lifetime.current.exporting = true; setExportBusy(true); setMessage(undefined); setExportError(undefined); setOpen(false)
     try {
-      const result = buildRevisionExport(unit, revision, file?.name)
+      const result = buildRevisionExport(unit, revision, file?.name ?? (isImageUnit(unit) ? unit.original?.name : undefined))
       const outcome = await saveExport(result)
       if (lifetime.current.mounted && outcome !== 'cancelled') setMessage(outcome === 'saved' ? '文件已保存。' : `已发起下载：${result.fileName}`)
     } catch (error) { if (lifetime.current.mounted) setExportError(error instanceof Error ? error.message : '文件导出失败，请重试。') }
@@ -491,8 +493,8 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断', context_requested: '等待补充背景', deleted: '已删除' }[revision.status]
   const record = quick.getRecords(session.id).find(record => record.id === revision.operationId)
-  const currentSource = revision.sourceVersion === unit.sourceVersion
-  const label = `${file ? '文件' : '文本'} ${unit.order} 版本 ${revision.order}`
+  const currentSource = revisionMatchesCurrentSource(unit, revision)
+  const label = `${isImageUnit(unit) ? '图片' : file ? '文件' : '文本'} ${unit.order} 版本 ${revision.order}`
   const key = editKey(session.id, unit.id, revision.id)
   const draft = editor.drafts.get(key)
   const otherEdit = [...editor.drafts.values()].some(edit => edit.sessionId === session.id && edit.unitId === unit.id && edit.baseRevisionId !== revision.id)
@@ -508,12 +510,13 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
   }
   return h('section', { className: 'dsh-tp-version', 'aria-label': label },
     h('div', { className: 'dsh-tp-version-header' },
-      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.status === 'deleted' ? status : revision.kind === 'manual' ? '人工修订' : status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}${revision.sourceVersion === unit.sourceVersion ? '' : ` · 已过时（原文版本 ${revision.sourceVersion}）`}`),
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.status === 'deleted' ? status : revision.kind === 'manual' ? '人工修订' : status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}${revisionMatchesCurrentSource(unit, revision) ? '' : ` · 已过时（原文版本 ${revision.sourceVersion}）`}`),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
         revision.status === 'deleted' ? null : h('button', { type: 'button', 'aria-label': `复制${label}`, disabled: !revision.text, onClick: () => { void copy() } }, copyState === 'copied' ? '已复制' : '复制'),
         revision.status === 'deleted' ? null : h('button', { type: 'button', 'aria-label': `编辑${label}`, disabled: !!editBlocked || !canEdit || !!draft || otherEdit, title: editBlocked ?? (otherEdit ? '请先保存或取消此段的当前编辑。' : undefined), onClick: () => editor.start(session.id, unit.id, revision.id, revision.text) }, draft ? '编辑中' : '编辑'),
         h('button', { type: 'button', 'aria-label': `${label}详情`, 'aria-expanded': details, onClick: () => setDetails(value => !value) }, '详情'),
         versionsToggle ?? null,
+        isImageUnit(unit) ? h(ImageExportMenu, { unit, session, revision, materials, viewFiles }) : null,
         h(TextRevisionActions, { store, session, unit, revision, quick, normal, materials, topics, editor, objects, file }),
         resultOpen ?? null,
       ),
@@ -548,6 +551,7 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
 
 function TranslationUnit({ store, unit, quick, normal, materials, session, editor, topics, objects, objectAssets, viewFiles, executionOwner, recordIndex }: StoreProps & TopicUiProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly executionOwner?: string }): unknown {
   const [expanded, setExpanded] = react.useState(false)
+  const [sourceEditing, setSourceEditing] = react.useState(false)
   const [sourcesExpanded, setSourcesExpanded] = react.useState(false)
   const [exchangeExpanded, setExchangeExpanded] = react.useState(false)
   // 大段原文可收起为三行，避免挤占译文；只在明显超出（约六行以上）时提供入口。
@@ -574,6 +578,23 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   }
   const collapsibleSource = Array.from(unit.source).length > 280 || unit.source.split('\n').length > 5
   const latest = unit.revisions.at(-1)
+  const image = isImageUnit(unit) ? unit : undefined
+  const intake = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
+  const sourceEditable = session.mode === 'normal' && session.archivedAt === null
+  const sourceBlocked = sourceEditable ? normal?.sourceEditBlockedReason(session.id, unit.id) : undefined
+  const imageHeader = image ? h('div', { className: 'dsh-tp-unit-header' },
+    h('span', { className: 'dsh-tp-muted' }, `单元 ${unit.order} · 图片 · ${image.original?.name ?? '原图'}`),
+    h(ImageOriginalButton, { unit: image, session, materials, viewFiles })) : null
+  const sourceEditButton = sourceEditable && normal ? h('button', { type: 'button', 'aria-label': '编辑原文',
+    disabled: sourceEditing || !!sourceBlocked, title: sourceBlocked, onClick: () => setSourceEditing(true) }, '编辑') : null
+  const sourceEditor = sourceEditable && normal && sourceEditing ? h(SourceTextEditor, { unit, session, normal, executionOwner, close: () => setSourceEditing(false) }) : null
+  const imageBackground = image ? h(ImageBackground, { unit: image, session, normal }) : null
+  const imageIntakeStatus = image && intake && materials && (!unit.source.trim() || intake.storageError) ? h('div', { className: 'dsh-tp-muted' },
+    intake.storageError ? h('p', { role: 'status' }, intake.storageError) : null,
+    intake.status === 'failed' ? h('div', null,
+      h('p', { role: 'alert' }, intake.message ?? '原图提交失败。'),
+      button('重新发送', () => { void materials.recoverFile(session.id, unit.id, 'retry') }, intake.busy || intake.unknown)) : null,
+    intake.status === 'unknown' || intake.status === 'frozen' ? button('检查状态', () => { void materials.queryFile(session.id, unit.id) }, intake.querying) : null) : null
   const retranslation = normal?.getRetranslationStatus(session.id, unit.id)
   const sourceHistory = unit.sourceVersions.length > 1 ? h('div', { className: 'dsh-tp-source-versions' },
     h('small', { className: 'dsh-tp-muted' }, `当前原文版本 ${unit.sourceVersion}`),
@@ -610,7 +631,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
       h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · 文本 · 已删除`),
       h('time', { dateTime: unit.deletion.at, className: 'dsh-tp-muted' }, new Date(unit.deletion.at).toLocaleString())),
     h('p', { className: 'dsh-tp-muted' }, '正文已清除；编号保留，不再参与导出或记忆依据。'))
-  if (!latest) return h('article', { className: 'dsh-tp-translation dsh-tp-source', 'data-unit-id': unit.id, 'aria-label': `文本 ${unit.order}` },
+  if (!latest && !image && !sourceEditable) return h('article', { className: 'dsh-tp-translation dsh-tp-source', 'data-unit-id': unit.id, 'aria-label': `文本 ${unit.order}` },
     h('div', { className: 'dsh-tp-unit-header' },
       h('span', { className: 'dsh-tp-muted' }, '原文'),
       h('div', { className: 'dsh-tp-actions' }, h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
@@ -618,32 +639,37 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
     h(RecordObjectText, { text: unit.source, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
     sourceHistory, execution ?? h('p', { className: 'dsh-tp-muted', role: 'status' }, '材料已受理，等待翻译执行。'))
   const final = currentFinalRevision(unit), pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
-  const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : pointed ? pointed.sourceVersion !== unit.sourceVersion ? `原最终版本 ${pointed.order}已过时，待新原文定稿` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中` : '待定稿'
+  const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : pointed ? !revisionMatchesCurrentSource(unit, pointed) ? `原最终版本 ${pointed.order}已过时，待新原文定稿` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中` : '待定稿'
   const blocked = session.mode === 'normal' ? !executionOwner ? '请选择本次任务使用的主会话。' : normal?.retranslateBlockedReason(session.id, unit.id) ?? (normal ? undefined : '普通重译入口未就绪。') : quick.retranslateBlockedReason(session, unit.id)
-  const file = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
+  const file = image ? undefined : intake
   const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
-  return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `${file ? '文件' : '文本'} ${unit.order}` },
+  return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `${image ? '图片' : file ? '文件' : '文本'} ${unit.order}` },
+    imageHeader,
     h('div', { className: 'dsh-tp-source' },
       h('div', { className: 'dsh-tp-unit-header', ref: sourceHeading },
-        h('span', { className: 'dsh-tp-muted', role: 'status' }, `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
+        h('span', { className: 'dsh-tp-muted', role: 'status' }, image ? `原文 · ${finalLabel}` : `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
         h('div', { className: 'dsh-tp-actions' },
           collapsibleSource && !file ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文${sourceCollapsed ? '展开' : '收起'}`, 'aria-expanded': !sourceCollapsed,
             title: sourceCollapsed ? '展开原文' : '收起原文，只显示前三行', onClick: toggleSource }, sourceCollapsed ? '展开' : '收起') : null,
-          h('button', { type: 'button', 'aria-label': `重译文本 ${unit.order}`, disabled: !!blocked, title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
+          sourceEditButton,
+          h('button', { type: 'button', 'aria-label': `重译${image ? '图片' : '文本'} ${unit.order}`, disabled: !!blocked || !!image && !unit.source.trim(), title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
           h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, disabled: !final || session.archivedAt !== null }),
           h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
           file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
       ),
-      file ? h(DirectFileLink, { file, unit, session, materials, viewFiles }) : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
+      sourceEditor ?? (image && !unit.source ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '等待提取文字。') : file ? h(DirectFileLink, { file, unit, session, materials, viewFiles }) : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets })),
+      imageBackground,
+      imageIntakeStatus,
       sourceHistory,
       retranslation ? h('p', { className: 'dsh-tp-muted', role: 'status' }, retranslation.message) : null,
       execution,
     ),
-    h(TranslationRevision, { executionOwner, key: latest.id, store, unit, revision: latest, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles,
-      resultOpen: file ? null : h(ResultOpenLink, { unit, session, objects, viewFiles }),
-      versionsToggle: unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, title: expanded ? '收起旧版本' : '展开旧版本', onClick: () => setExpanded(value => !value) }, `旧版(${unit.revisions.length - 1})`) : null }),
+    latest ? h(TranslationRevision, { executionOwner, key: latest.id, store, unit, revision: latest, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles,
+      resultOpen: file ? null : h(ResultOpenLink, { unit, session, objects, viewFiles, revision: image ? latest : undefined }),
+      versionsToggle: unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, title: expanded ? '收起旧版本' : '展开旧版本', onClick: () => setExpanded(value => !value) }, `旧版(${unit.revisions.length - 1})`) : null }) : null,
     expanded ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
-      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles })),
+      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles,
+        resultOpen: image ? h(ResultOpenLink, { unit, session, objects, viewFiles, revision }) : undefined })),
     ) : null,
   )
 }
@@ -1035,7 +1061,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
             },
           }),
           h('button', { type: 'button', className: 'dsh-tp-attach', 'aria-label': '选择待译文件', disabled: current.mode === 'quick',
-            title: current.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择原稿（最多 2 MiB，任意格式）', onClick: () => fileInput.current?.click(),
+            title: current.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择原稿（图片最多 50 MiB，其他文件最多 2 MiB）', onClick: () => fileInput.current?.click(),
           }, h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
             h('path', { d: 'm8 12 7-7a4 4 0 0 1 6 6L10 22a6 6 0 0 1-8-8L13 3M6 15l9-9a2 2 0 0 1 3 3l-9 9' }),
           )),

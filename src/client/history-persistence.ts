@@ -1,5 +1,5 @@
 import { HistorySessionTransport, type HistoryTransferReceipt } from './history-transport.js'
-import { encodeHistoryBundle, parseHistoryBundle, type HistoryBundle, type HistoryScope } from '../shared/history-bundle.js'
+import { encodeHistoryBundle, encodeLegacySessionSnapshot, parseHistoryBundle, type HistoryBundle, type HistoryScope } from '../shared/history-bundle.js'
 import type { HistoryRemoteClientPort, HistoryMutation } from '../shared/history-remote.js'
 import type { LocalSession } from './sessions.js'
 import type { TranslationHistory } from './translation-history.js'
@@ -9,6 +9,7 @@ export type HistoryRecordKind = 'fileJobs' | 'intakes' | 'preparations'
 export interface HistoryRecordRegistration {
   current(): readonly string[]
   restore(records: readonly string[]): void
+  acknowledge?(records: readonly string[]): void
 }
 export interface SessionHistoryBackend {
   snapshot(id: string): string | null
@@ -69,7 +70,7 @@ export class HistoryPersistenceClient implements SessionHistoryBackend {
   private check(): void { if (this.disposed) throw new Error('会话历史连接已关闭。') }
   snapshot(id: string): string | null {
     const saved = this.seats.get(id)?.saved
-    return saved ? JSON.stringify({ schemaVersion: 14, token: 'host-saved', session: saved.session, translationHistory: saved.history }) : null
+    return saved ? encodeLegacySessionSnapshot(saved.session, 'host-saved', saved.history) : null
   }
   private scope(session: LocalSession): HistoryScope { return { namespaceId: this.sessions.getNamespaceId(), topicId: session.topicId, sessionId: session.id } }
   private bundle(session: LocalSession, history: TranslationHistory, override?: { kind: HistoryRecordKind; key: string; value: string }): HistoryBundle {
@@ -98,7 +99,15 @@ export class HistoryPersistenceClient implements SessionHistoryBackend {
     const receipt = before?.state.switched
       ? await this.transport.replace(scope, before.state, current, before)
       : await this.transport.create(scope, current)
-    this.check(); this.seats.set(session.id, receipt); this.sessions.confirmHostHistory(receipt); return receipt
+    this.check()
+    this.seats.set(session.id, receipt)
+    // A save may confirm an older snapshot while a record advances locally.
+    // Update its saved baseline before the Session publishes this receipt.
+    if (receipt.saved) for (const [kind, port] of this.records) {
+      port.acknowledge?.(receipt.saved[kind].map(record => JSON.stringify(record)))
+    }
+    this.sessions.confirmHostHistory(receipt)
+    return receipt
   }
   save(session: LocalSession, history: TranslationHistory): Promise<HistoryTransferReceipt> { return this.commit(session, history) }
   async mutate(session: LocalSession, history: TranslationHistory, command: HistoryMutation['command'], operationId: string): Promise<HistoryTransferReceipt> {

@@ -71,13 +71,14 @@ export interface TopicUnitFact {
   readonly id: string
   readonly order: number
   readonly source: string
-  readonly sourceVersion: number
+  readonly sourceVersion?: number | undefined
+  readonly backgroundDescription?: string
   readonly targetLanguage: string
   readonly instruction: string
   readonly revisions: readonly {
     readonly id: string; readonly order: number; readonly kind: 'machine' | 'manual'
     readonly status: 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted' | 'context_requested'
-    readonly text: string; readonly baseRevisionId: string | null; readonly sourceVersion: number
+    readonly text: string; readonly baseRevisionId: string | null; readonly sourceVersion?: number | undefined
   }[]
   readonly final: { readonly revisionId: string; readonly selection: 'automatic' | 'user_fixed'; readonly selectionEventId: string } | null
 }
@@ -117,12 +118,14 @@ export type TopicBridgeCommand =
   | { readonly kind: 'preparation_status'; readonly request: TranslationPreparationQuery }
   | { readonly kind: 'preparation_read'; readonly request: TranslationPreparationRead }
   | { readonly kind: 'preparation_capture'; readonly request: TranslationPreparationQuery; readonly relevantFixedIds: readonly string[]; readonly topicTermsVersion: number }
-  | { readonly kind: 'normal_resolve'; readonly target: NormalTranslationUnitTarget; readonly operationId: string }
+  | { readonly kind: 'normal_resolve'; readonly target: DirectUnitTarget; readonly operationId: string }
+  | ({ readonly kind: 'image_update' } & ImageUnitUpdate)
+  | { readonly kind: 'normal_call_finished'; readonly operationId: string }
   | ({ readonly kind: 'normal_correct_source' } & NormalTranslationSourceCorrection)
   | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
   | ({ readonly kind: 'normal_prepare' } & NormalTranslationAcceptance)
   | ({ readonly kind: 'normal_commit' } & DirectTranslationCommit)
-  | { readonly kind: 'normal_export'; readonly target: NormalTranslationTarget; readonly totalCodePoints?: number }
+  | { readonly kind: 'normal_export'; readonly target: DirectTranslationTarget; readonly totalCodePoints?: number }
   | ({ readonly kind: 'normal_update' } & NormalTranslationUpdate)
   | { readonly kind: 'normal_v2_update'; readonly mainSessionId: string; readonly translationSessionId: string; readonly unitId: string; readonly operationId: string; readonly sourceVersion: number; readonly event: NormalTranslationV2Event }
   | { readonly kind: 'normal_exchange_resolve'; readonly translationSessionId: string; readonly exchangeId: string; readonly resolution: NormalTranslationResolution }
@@ -159,6 +162,8 @@ export type TopicWriteReceipt = {
       readonly affected?: readonly { readonly id: string; readonly version: number; readonly status: 'review_required' }[] })
 export type TopicBridgeValue =
   | TopicWriteReceipt
+  | { readonly kind: 'image_updated'; readonly unitId: string }
+  | { readonly kind: 'normal_call_finished' }
   | { readonly kind: 'memory_asset_removed'; readonly topicId: string; readonly id: string; readonly version: number }
   | { readonly kind: 'direct_proposals'; readonly receipt: DirectProposalReceipt }
   | { readonly kind: 'settings_scope'; readonly scope: OtherMemoryScope }
@@ -314,9 +319,17 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
       case 'preparation_capture': exact(value, ['kind', 'request', 'relevantFixedIds', 'topicTermsVersion']); strings(value.relevantFixedIds); integer(value.topicTermsVersion); return { kind: 'preparation_capture', request: parseTranslationPreparationQuery(value.request), relevantFixedIds: value.relevantFixedIds, topicTermsVersion: value.topicTermsVersion }
       case 'normal_resolve': {
         exact(value, ['kind', 'target', 'operationId']); text(value.operationId)
-        const target = parseNormalTranslationTarget(value.target)
-        if (target.kind !== 'unit') throw new TypeError('Normal resolve requires a unit')
+        const target = parseDirectTranslationTarget(value.target)
+        if (target.kind === 'material') throw new TypeError('Normal resolve requires a unit')
         return { kind: 'normal_resolve', target, operationId: value.operationId }
+      }
+      case 'image_update': {
+        const { kind: _kind, ...update } = value
+        return { kind: 'image_update', ...parseImageUnitUpdate(update) }
+      }
+      case 'normal_call_finished': {
+        exact(value, ['kind', 'operationId']); text(value.operationId)
+        return { kind: 'normal_call_finished', operationId: value.operationId }
       }
       case 'normal_correct_source': {
         const { kind, ...correction } = value
@@ -333,7 +346,7 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
       case 'normal_export': {
         exact(value, ['kind', 'target', ...(value.totalCodePoints === undefined ? [] : ['totalCodePoints'])])
         if (value.totalCodePoints !== undefined) integer(value.totalCodePoints, 1)
-        return { kind: 'normal_export', target: parseNormalTranslationTarget(value.target),
+        return { kind: 'normal_export', target: parseDirectTranslationTarget(value.target),
           ...(value.totalCodePoints === undefined ? {} : { totalCodePoints: value.totalCodePoints as number }) }
       }
       case 'normal_update': {
@@ -424,9 +437,12 @@ export function parseTopicBridgeDown(value: unknown, protocol: 1 | 2 | 3 | 4 = 1
   return { kind: 'request', requestId: value.requestId, mainSessionId: value.mainSessionId, callId: value.callId, command: parseTopicBridgeCommand(value.command, protocol) }
 }
 function parseUnit(value: unknown, protocol: 1 | 2 | 3 | 4): TopicUnitFact {
-  object(value); exact(value, ['id', 'order', 'source', 'targetLanguage', 'instruction', 'revisions', 'final', ...(value.sourceVersion === undefined ? [] : ['sourceVersion'])])
+  object(value)
+  const image = Object.hasOwn(value, 'backgroundDescription')
+  exact(value, ['id', 'order', 'source', 'targetLanguage', 'instruction', 'revisions', 'final', ...(value.sourceVersion === undefined ? [] : ['sourceVersion']), ...(image ? ['backgroundDescription'] : [])])
+  if (image) text(value.backgroundDescription, 2000, true)
   const sourceVersion = value.sourceVersion ?? 1; integer(sourceVersion, 1)
-  text(value.id); integer(value.order, 1); text(value.source, 2_000_000); text(value.targetLanguage, 200); text(value.instruction, 20_000, true)
+  text(value.id); integer(value.order, 1); text(value.source, 2_000_000, image); text(value.targetLanguage, 200); text(value.instruction, 20_000, true)
   if (!Array.isArray(value.revisions)) throw new TypeError('Invalid topic unit versions')
   for (const revision of value.revisions) {
     object(revision); exact(revision, ['id', 'order', 'kind', 'status', 'text', 'baseRevisionId', ...(revision.sourceVersion === undefined ? [] : ['sourceVersion'])])
@@ -439,7 +455,8 @@ function parseUnit(value: unknown, protocol: 1 | 2 | 3 | 4): TopicUnitFact {
     object(value.final); exact(value.final, ['revisionId', 'selection', 'selectionEventId']); text(value.final.revisionId); text(value.final.selectionEventId)
     if (!['automatic', 'user_fixed'].includes(value.final.selection as string) || !value.revisions.some(revision => revision.id === (value.final as Data).revisionId)) throw new TypeError('Invalid topic unit final')
   }
-  return { ...structuredClone(value), sourceVersion, revisions: value.revisions.map(revision => ({ ...structuredClone(revision), sourceVersion: revision.sourceVersion ?? 1 })) } as unknown as TopicUnitFact
+  return (image ? structuredClone(value) : { ...structuredClone(value), sourceVersion,
+    revisions: protocol === 4 ? structuredClone(value.revisions) : value.revisions.map(revision => ({ ...structuredClone(revision), sourceVersion: revision.sourceVersion ?? 1 })) }) as unknown as TopicUnitFact
 }
 function sessionSummary(value: unknown): void {
   object(value); exact(value, ['id', 'topicId', 'name', 'mode', 'active', 'topicName', 'sequence', 'remark', 'archived'])
@@ -531,6 +548,8 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
       if (envelope.kind !== 'material' || !envelope.material.unitReference) throw new TypeError('Invalid unit resolution')
       return { kind: 'normal_resolved', envelope }
     }
+    case 'image_updated': exact(value, ['kind', 'unitId']); text(value.unitId); return { kind: 'image_updated', unitId: value.unitId }
+    case 'normal_call_finished': exact(value, ['kind']); return { kind: 'normal_call_finished' }
     case 'normal_source_corrected': exact(value, ['kind', 'correction']); return { kind: 'normal_source_corrected', correction: parseNormalTranslationCorrectionReceipt(value.correction) }
     case 'normal_observed': exact(value, ['kind', 'operation']); return { kind: 'normal_observed', operation: value.operation === null ? null : parseNormalTranslationOperation(value.operation) }
     case 'normal_prepared': {
@@ -656,3 +675,5 @@ export const TOPIC_BRIDGE_REMOTE = { package: packageName, descriptors: [
     invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: codec('openV3', parseTopicBridgeOpen) }], cancellation: { parameter: 'signal' },
     result: codec('downV3', value => parseTopicBridgeDown(value, 3)), uplink: { codec: codec('replyV3', value => parseTopicBridgeReply(value, 3)) } }
 ] }
+import { parseImageUnitUpdate, parseDirectTranslationTarget, type DirectUnitTarget, type DirectTranslationTarget } from './normal-translation.js'
+import type { ImageUnitUpdate } from './image-translation.js'

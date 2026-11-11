@@ -16,7 +16,9 @@ export interface TranslationMaterialRoute {
 
 export interface TranslationMaterialUnitReference {
   readonly unitId: string
-  readonly sourceVersion: number
+  readonly sourceVersion?: number
+  readonly backgroundDescription?: string
+  readonly imageInputId?: string
 }
 
 /** A reference only. Applying a source correction requires a separate business operation. */
@@ -119,9 +121,19 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
   }
   let unitReference: TranslationMaterialUnitReference | undefined
   if (material.unitReference !== undefined) {
-    object(material.unitReference); fields(material.unitReference, ['unitId', 'sourceVersion'])
-    text(material.unitReference.unitId, 2048); integer(material.unitReference.sourceVersion)
-    unitReference = { unitId: material.unitReference.unitId, sourceVersion: material.unitReference.sourceVersion }
+    object(material.unitReference)
+    const reference = material.unitReference
+    text(reference.unitId, 2048)
+    if (Object.hasOwn(reference, 'backgroundDescription')) {
+      fields(reference, ['unitId', 'backgroundDescription', 'imageInputId'])
+      text(reference.imageInputId, 64)
+      text(reference.backgroundDescription, 2000, true)
+      unitReference = { unitId: reference.unitId, backgroundDescription: reference.backgroundDescription, imageInputId: reference.imageInputId }
+    } else {
+      fields(reference, ['unitId', 'sourceVersion'])
+      integer(reference.sourceVersion)
+      unitReference = { unitId: reference.unitId, sourceVersion: reference.sourceVersion }
+    }
   }
   let revises: TranslationMaterialRevisionReference | undefined
   if (material.revises !== undefined) {

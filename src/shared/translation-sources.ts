@@ -1,6 +1,8 @@
 import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength,
   type TranslationSourceRange } from './translation-source-read.js'
 
+import { imageFileFormat, MAX_IMAGE_ORIGINAL_BYTES } from './image-translation.js'
+
 export const MAX_TRANSLATION_SOURCE_BYTES = 2 * 1024 * 1024
 
 /** Fixed source storage scope; it does not create a translation unit or a history row. */
@@ -98,7 +100,7 @@ function fileName(value: unknown): asserts value is string {
 export function parseSourceIdentity(value: unknown): SourceIdentity {
   exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256'], ['originalFilePath'])
   sourceId(value.sourceId); fileName(value.name)
-  integer(value.bytes, 1, MAX_TRANSLATION_SOURCE_BYTES)
+  integer(value.bytes, 1, value.encoding === 'binary' && imageFileFormat(value.name) ? MAX_IMAGE_ORIGINAL_BYTES : MAX_TRANSLATION_SOURCE_BYTES)
   if (value.version !== 1 || value.encoding !== 'utf-8' && value.encoding !== 'binary' || typeof value.bom !== 'boolean' ||
     typeof value.sha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sha256)) throw new TypeError('Invalid immutable source descriptor')
   integer(value.totalCodePoints, 0, value.bytes)

@@ -63,6 +63,25 @@ export class ViewFilesClient {
   async openCapturedTxt(request: ViewSourceOpenRequest, file: Blob, signal?: AbortSignal): Promise<ViewOpenOutcome> {
     return await this.operation(async signal => this.openRequest({ ...request, text: await this.capturedText(file, signal, request.fileName), format: textFileFormat(request.fileName ?? (file as File).name) }, signal), request, signal)
   }
+  async readImageOriginal(snapshot: ViewSourceSnapshot, original: import('../shared/translation-sources.js').SourceIdentity): Promise<Uint8Array<ArrayBuffer>> {
+    let bytes: Uint8Array<ArrayBuffer>
+    if (snapshot.librarySource && this.sourceOptions.library) {
+      if (snapshot.librarySource.namespaceId !== this.sessions.getNamespaceId() || !same(snapshot.librarySource.stored.source, original)) throw new Error('原图保存引用与当前单元不一致。')
+      const result = await this.sourceOptions.library.readLibrarySource({ ...snapshot.librarySource, action: 'image' })
+      if (!result.ok) throw new Error(result.error.message)
+      if (result.value.kind !== 'image') throw new Error('原图读取回执无效。')
+      const binary = atob(result.value.base64)
+      bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    } else if (snapshot.file) {
+      bytes = new Uint8Array(await snapshot.file.arrayBuffer())
+    } else throw new Error('原图暂不可读取。')
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+    const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+    if (bytes.byteLength !== original.bytes || hash !== original.sha256) throw new Error('原图与已登记的文件不一致。')
+    return bytes
+  }
+
   /** Saved non-Markdown opens the original; Markdown uses verified text to resolve images in an opening copy. */
   async openSource(request: ViewSourceOpenRequest, snapshot: ViewSourceSnapshot, signal?: AbortSignal): Promise<ViewOpenOutcome> {
     return await this.operation(async signal => {

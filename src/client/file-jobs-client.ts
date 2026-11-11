@@ -15,7 +15,7 @@ import type { FileJobExportUnit } from './translation-export.js'
 import { reviewFileProposals, fileRevisionEvidence, type FileProposalReviews } from './file-proposal-revisions.js'
 import { applyFileJobEdits } from '../shared/file-job-edits.js'
 import type { FileJobRevision } from '../shared/file-jobs.js'
-import { isDocumentUnit, isFileJobUnit, isTextUnit, type FileJobUnit } from './translation-history.js'
+import { isDocumentUnit, isFileJobUnit, isTextUnit, revisionMatchesCurrentSource, type FileJobUnit } from './translation-history.js'
 import { parseDirectProposalSubmission, type DirectProposalSubmission, type DirectProposalReceipt } from '../shared/direct-proposals.js'
 import { putAssetProposals } from './topic-asset-actions.js'
 export type { FileJobRecord, FileJobCardState } from './file-jobs-store.js'
@@ -115,7 +115,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const unit = this.sessions.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
     const revision = unit && isTextUnit(unit) ? unit.revisions.at(-1) : undefined
     if (ownerId !== target.mainSessionId || !session || !this.sessions.isSessionOpen(ownerId, session.id) || !unit || !isTextUnit(unit) || unit.deletion ||
-      unit.sourceVersion !== target.sourceVersion || !revision || revision.id !== request.revisionId || revision.status !== 'completed' || revision.sourceVersion !== unit.sourceVersion)
+      unit.sourceVersion !== target.sourceVersion || !revision || revision.id !== request.revisionId || revision.status !== 'completed' || !revisionMatchesCurrentSource(unit, revision))
       throw Object.assign(new Error('原文或译文版本已变化，或不属于已打开会话，请重新读取后总结提案。'), { code: 'stale_proposals' })
     const proposals: FileJobProposal[] = request.proposals.map(({ quotes, ...proposal }) => ({ ...proposal, origin: 'inferred', disposition: 'pending', evidence: quotes.map((quote, index) => {
       const offset = unit.source.indexOf(quote)
@@ -127,7 +127,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
     if (!this.assets) throw new Error('主题记忆尚未就绪，请重新打开记忆资产。')
     const check = (): void => {
       const current = this.sessions.getTranslationHistory(session.id)?.units.find(item => item.id === unit.id)
-      if (!current || !isTextUnit(current) || current.deletion || current.sourceVersion !== unit.sourceVersion || current.revisions.at(-1)?.id !== revision.id || !this.sessions.isSessionOpen(ownerId, session.id))
+      if (!current || !isTextUnit(current) || current.deletion || current.sourceVersion !== unit.sourceVersion || current.source !== unit.source || current.revisions.at(-1)?.id !== revision.id || !this.sessions.isSessionOpen(ownerId, session.id))
         throw Object.assign(new Error('原文或译文已变化，请重新总结。'), { code: 'stale_proposals' })
     }
     const result = await putAssetProposals(this.assets.terms, this.assets.archive, { ownerId, topicId: session.topicId, sessionId: session.id,

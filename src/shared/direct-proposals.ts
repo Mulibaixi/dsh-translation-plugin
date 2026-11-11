@@ -1,15 +1,15 @@
-import { parseNormalTranslationUnitRequest, type NormalTranslationUnitTarget } from './normal-translation.js'
+import { parseDirectUnitRequest, type DirectUnitTarget } from './normal-translation.js'
 import { referenceExact, referenceObject, referenceString } from './reference-memory.js'
 import type { FileJobProposal } from './file-jobs.js'
 
 export type DirectAssetProposal = FileJobProposal extends infer P ? P extends FileJobProposal
   ? Omit<P, 'evidence' | 'origin' | 'disposition'> & { readonly quotes: readonly string[] } : never : never
-export interface DirectProposalSubmission { readonly target: NormalTranslationUnitTarget; readonly revisionId: string; readonly proposals: readonly DirectAssetProposal[] }
+export interface DirectProposalSubmission { readonly target: DirectUnitTarget; readonly revisionId: string; readonly proposals: readonly DirectAssetProposal[] }
 export interface DirectProposalReceipt { readonly count: number; readonly skipped: readonly string[]; readonly persistence: 'saved' | 'runtime_only' }
 
 export function parseDirectProposalSubmission(value: unknown): DirectProposalSubmission {
   referenceObject(value); referenceExact(value, ['target', 'revisionId', 'proposals']); referenceString(value.revisionId)
-  const target = parseNormalTranslationUnitRequest({ target: value.target, operationId: 'asset-proposal-read' }).target, revisionId = value.revisionId
+  const target = parseDirectUnitRequest({ target: value.target, operationId: 'asset-proposal-read' }).target, revisionId = value.revisionId
   if (!Array.isArray(value.proposals) || value.proposals.length > 100) throw new TypeError('资产提案每次最多 100 条。')
   const ids = new Set<string>(), entities = new Set<string>()
   // Omitted descriptive fields have simple defaults; no second candidate schema is stored.

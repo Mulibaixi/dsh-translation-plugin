@@ -64,9 +64,9 @@ export interface TermEvidenceFact {
   readonly ownerId: string
   readonly topicId: string
   /** Version of the current source body returned by the authoritative unit. */
-  readonly sourceVersion: number
+  readonly sourceVersion?: number | undefined
   readonly source: string
-  readonly final: { readonly revisionId: string; readonly selectionEventId: string; readonly sourceVersion: number; readonly text: string } | null
+  readonly final: { readonly revisionId: string; readonly selectionEventId: string; readonly sourceVersion?: number | undefined; readonly text: string } | null
 }
 /** Pure access to previously resolved facts. resolveRef returns exactly the requested range, never a partial whole body. */
 export type TermEvidenceResolver = ((sessionId: string, unitId: string) => TermEvidenceFact | undefined) & {
@@ -188,14 +188,14 @@ export function resolveTermEvidence(snapshot: Pick<TopicTermSnapshot, 'ownerId' 
     return typeof body === 'string' && body.trim() ? body : undefined
   }
   const fact = resolver(ref.sessionId, ref.unitId)
-  if (!fact || fact.topicId !== snapshot.topicId || !integer(fact.sourceVersion, 1)) return undefined
+  if (!fact || fact.topicId !== snapshot.topicId || fact.sourceVersion !== undefined && !integer(fact.sourceVersion, 1)) return undefined
   let body: string
   if (ref.kind === 'source') {
-    if ((ref.sourceVersion ?? 1) !== fact.sourceVersion) return undefined
+    if (fact.sourceVersion === undefined ? ref.sourceVersion !== undefined : (ref.sourceVersion ?? 1) !== fact.sourceVersion) return undefined
     body = fact.source
   }
   else {
-    if (!fact.final || !integer(fact.final.sourceVersion, 1) || fact.final.sourceVersion !== fact.sourceVersion ||
+    if (!fact.final || fact.final.sourceVersion !== fact.sourceVersion ||
       fact.final.revisionId !== ref.revisionId || fact.final.selectionEventId !== ref.selectionEventId) return undefined
     body = fact.final.text
   }

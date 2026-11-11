@@ -1,7 +1,7 @@
 import { diagnosticSpan } from './diagnostics.js'
 import { parseHistoryBundle, encodeHistoryBundle, persistableHistoryBundle, historyUnsettled, type HistoryBundle, type HistoryScope } from '../shared/history-bundle.js'
 import { parseHistoryRequest, HISTORY_BUNDLE_BYTES, type HistoryBegin, type HistoryRead, type HistoryPartUpload, type HistoryTransfer, type HistoryMutation, type HistoryStatus, type CurrentHistoryRead, type HistoryCurrentPage } from '../shared/history-remote.js'
-import { deleteTextRevision, deleteUnit, isTextUnit, isDocumentUnit, isFileJobUnit, isDeletedUnit, appendTranslationEvent, type TranslationHistory } from '../memory/translation-history.js'
+import { deleteTextRevision, deleteUnit, isTextUnit, isEditableTextUnit, isImageUnit, isDocumentUnit, isFileJobUnit, isDeletedUnit, appendTranslationEvent, type TranslationHistory } from '../memory/translation-history.js'
 import { fileResultDeletionBlockedReason, deleteFileResult, fileSourceDeletionBlockedReason, deleteFileSource } from '../memory/file-job-deletion.js'
 import { fileResultSourceVersion } from '../memory/file-job-current.js'
 import { documentRevisionDeletionBlockedReason, deleteDocumentRevision, documentSourceDeletionBlockedReason, deleteDocumentSource, documentOrphanChunks, documentChunkCleanupBlockedReason, deleteDocumentChunks } from '../memory/document-deletion.js'
@@ -223,11 +223,25 @@ export class HistoryService {
     if (!same(immutable(before), immutable(next))) throw failure('history_identity', '历史更新不能更改已发放的会话身份。')
     for (const unit of before.history.units) {
       const candidate = next.history.units.find(item => item.id === unit.id)
-      if (!candidate || candidate.order !== unit.order || isTextUnit(candidate) !== isTextUnit(unit) || isDeletedUnit(unit) && (!isDeletedUnit(candidate) || !same(unit.deletion, candidate.deletion))) throw failure('history_deleted', '历史更新不能丢失编号或恢复已删除单元。')
+      if (!candidate || candidate.order !== unit.order || isTextUnit(candidate) !== isTextUnit(unit) || isImageUnit(candidate) !== isImageUnit(unit) ||
+        isEditableTextUnit(unit) && !isEditableTextUnit(candidate) || isDeletedUnit(unit) && (!isDeletedUnit(candidate) || !same(unit.deletion, candidate.deletion))) throw failure('history_deleted', '历史更新不能丢失编号或恢复已删除单元。')
       if (!isDeletedUnit(unit) && isDeletedUnit(candidate)) throw failure('history_deleted', '单元删除须使用宿主删除命令，未接受快照覆盖。')
+      let replacedSource = false
+      if (isEditableTextUnit(candidate) && isTextUnit(unit) && unit.sourceVersion !== undefined) {
+        const previousVersion = unit.sourceVersion
+        if (candidate.sourceVersion > previousVersion) {
+          const edits = next.history.events.filter(event => event.type === 'source.corrected' && event.unitId === unit.id && event.sourceVersion! > previousVersion)
+          const latest = candidate.sourceVersions[0]!
+          replacedSource = edits.length === candidate.sourceVersion - previousVersion &&
+            edits.every((event, index) => event.sourceVersion === previousVersion + index + 1) &&
+            latest.operationId === edits.at(-1)?.operationId && latest.createdAt === edits.at(-1)?.at
+        }
+        if (!replacedSource && (!isEditableTextUnit(unit) || !same(unit.sourceVersions, candidate.sourceVersions))) throw failure('history_versions', '当前原文更新缺少对应编辑记录。')
+      }
       const arrays = ['sourceVersions', 'revisions', 'preparations', 'plans', 'tasks', 'chunkRevisions', 'corrections', 'reuseApprovals', 'reviewAudits']
       const identity = (value: any): string => JSON.stringify([value.id ?? value.taskId ?? value.version, value.version ?? null])
       for (const field of arrays) {
+        if (field === 'sourceVersions' && replacedSource) continue
         const old = (unit as unknown as Record<string, unknown>)[field], current = (candidate as unknown as Record<string, unknown>)[field]
         if (Array.isArray(old) && (!Array.isArray(current) || old.some(value => !current.some(item => identity(item) === identity(value))))) throw failure('history_versions', '历史更新不能丢弃已保留的原稿、修订、准备或调用版本。')
       }
@@ -427,7 +441,7 @@ export class HistoryService {
         for (const bundle of [seat.current, seat.saved]) if (bundle) {
           const target = bundle.history.units.find(item => item.id === command.unitId), records = bundle.fileJobs.filter(record => record.summary.unitId === command.unitId)
           if (!target || !records.some(record => record.sources.some(source => source.version === command.version && !source.deletion))) continue
-          const blocked = fileSourceDeletionBlockedReason(records, target.sourceVersion, command.version)
+          const blocked = fileSourceDeletionBlockedReason(records, target.sourceVersion!, command.version)
           if (blocked) return { status: 'blocked', state: this.describe(seat), reason: blocked }
           const versions = bundle.preparations.flatMap(record => record.versions.filter(version => historyTargetMatches(guard.scope, target.id, { ...version.scope, ...version.target }, command.version)))
           if (bundle.history.units.some(other => other.id !== target.id && isDocumentUnit(other) && other.preparations.some(ref => versions.some(version => version.id === ref.id && version.version === ref.version)))) return { status: 'blocked', state: this.describe(seat), reason: '其他文档仍在使用此原稿的准备记录。' }
@@ -439,7 +453,7 @@ export class HistoryService {
         for (const bundle of [seat.current, seat.saved]) if (bundle) {
           const records = bundle.fileJobs.filter(record => record.summary.unitId === command.unitId), target = records.flatMap(record => record.results).find(result => result.version === command.version)
           if (target?.deletion) continue
-          if (target) { const version = bundle.history.units.find(unit => unit.id === command.unitId)!.sourceVersion, blocked = fileResultDeletionBlockedReason(records, version, command.version); if (blocked) return { status: 'blocked', state: this.describe(seat), reason: blocked } }
+          if (target) { const version = bundle.history.units.find(unit => unit.id === command.unitId)!.sourceVersion, blocked = fileResultDeletionBlockedReason(records, version!, command.version); if (blocked) return { status: 'blocked', state: this.describe(seat), reason: blocked } }
           else if (bundle === seat.current) return { status: 'blocked', state: this.describe(seat), reason: '此文件译文版本不存在。' }
         }
       }
@@ -472,7 +486,7 @@ export class HistoryService {
         if (command.kind === 'delete_file_source') {
           const records = bundle.fileJobs.filter(record => record.summary.unitId === target.id)
           if (!records.some(record => record.sources.some(source => source.version === command.version && !source.deletion))) return bundle
-          const updated = deleteFileSource(records, target.sourceVersion, command.version, operation)
+          const updated = deleteFileSource(records, target.sourceVersion!, command.version, operation)
           const preparations = bundle.preparations.flatMap(record => {
             const versions = record.versions.filter(version => !historyTargetMatches(guard.scope, target.id, { ...version.scope, ...version.target }, command.version))
             return versions.length === record.versions.length ? [record] : versions.length ? [{ ...record, schemaVersion: 3 as const, versions, prepareSignature: '', operations: Object.fromEntries(Object.entries(record.operations).filter(([, entry]) => versions.some(version => version.version === entry.version))) }] : []
@@ -500,7 +514,7 @@ export class HistoryService {
         if (command.kind === 'delete_file_result') {
           const records = bundle.fileJobs.filter(record => record.summary.unitId === command.unitId)
           if (!records.some(record => record.results.some(result => result.version === command.version && !result.deletion))) return bundle
-          const updated = deleteFileResult(records, target.sourceVersion, command.version, operation)
+          const updated = deleteFileResult(records, target.sourceVersion!, command.version, operation)
           const history = appendTranslationEvent(bundle.history, { id: request.operationId, at, type: 'file_result.deleted', unitId: command.unitId, resultVersion: command.version, revisionId: null, operationId: null, status: 'deleted', reason: 'user_deletion' })
           return { ...bundle, session: { ...bundle.session, updatedAt: at }, history, fileJobs: bundle.fileJobs.map(record => updated.find(item => item.summary.jobId === record.summary.jobId) ?? record) }
         }

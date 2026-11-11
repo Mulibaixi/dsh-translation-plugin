@@ -1,4 +1,4 @@
-import { parseNormalTranslationTarget, type NormalTranslationUnitTarget } from './normal-translation.js'
+import { parseDirectTranslationTarget, type DirectUnitTarget } from './normal-translation.js'
 
 export interface UnitDirectoryRequest { readonly translationSessionId?: string; readonly offset?: number; readonly limit?: number }
 export interface UnitReadRequest {
@@ -10,9 +10,9 @@ export interface UnitReadRequest {
   readonly start?: number
 }
 export interface NumberedUnit {
-  readonly target: NormalTranslationUnitTarget
+  readonly target: DirectUnitTarget
   readonly number: number
-  readonly kind: 'text' | 'file'
+  readonly kind: 'text' | 'file' | 'image'
   readonly status: string
   readonly versions: readonly number[]
   readonly finalVersion: number | null
@@ -54,8 +54,8 @@ export function parseUnitRequest(value: unknown, read: boolean): UnitDirectoryRe
 export function parseNumberedUnit(value: unknown): NumberedUnit {
   object(value); fields(value, ['target', 'number', 'kind', 'status', 'versions', 'finalVersion', 'finalSelection'])
   if (value.finalSelection !== undefined && !['automatic', 'user_fixed'].includes(value.finalSelection as string)) throw new TypeError('Invalid final selection')
-  const target = parseNormalTranslationTarget(value.target)
-  if (target.kind !== 'unit' || !['text', 'file'].includes(value.kind as string) || typeof value.status !== 'string' || !Array.isArray(value.versions)) throw new TypeError('Invalid unit directory item')
+  const target = parseDirectTranslationTarget(value.target)
+  if (target.kind === 'material' || !['text', 'file', 'image'].includes(value.kind as string) || (target.kind === 'image_unit') !== (value.kind === 'image') || typeof value.status !== 'string' || !Array.isArray(value.versions)) throw new TypeError('Invalid unit directory item')
   integer(value.number, 1); value.versions.forEach(n => integer(n, 1))
   if (value.finalVersion !== null) { integer(value.finalVersion, 1); if (!value.versions.includes(value.finalVersion)) throw new TypeError('Invalid final version') }
   return { ...structuredClone(value), target } as unknown as NumberedUnit

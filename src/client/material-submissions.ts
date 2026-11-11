@@ -3,6 +3,8 @@ import { parseTranslationMaterialResult, type TranslationMaterialsPort, type Tra
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES } from '../shared/topic-bridge.js'
 import { INLINE_TRANSLATION_SOURCE_CODE_POINTS } from '../shared/translation-source-read.js'
 import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
+import { imageFileFormat, MAX_IMAGE_ORIGINAL_BYTES } from '../shared/image-translation.js'
+import { appendImageUnit } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
@@ -554,6 +556,7 @@ export class MaterialSubmissionsClient {
     if (file) {
       if (session.input.trim()) return FILE_AND_TEXT
       if (!file.size) return '文件为空，请选择有内容的文件。'
+      if (imageFileFormat(file.name)) return file.size > MAX_IMAGE_ORIGINAL_BYTES ? '原图超过 50 MiB 上限；所选文件保留。' : undefined
       if (file.size > MAX_TRANSLATION_SOURCE_BYTES) return '文件超过 2 MiB 上限；所选文件保留。'
       return undefined
     }
@@ -757,6 +760,12 @@ export class MaterialSubmissionsClient {
       // cache is independent of chat history; a host without storage keeps the runtime original.
       await this.fileIntakes.saveSource(`unit:${draft.materialId}`, this.options.sourceStorage)
       this.active(item, signal)
+      if (source.value.encoding === 'binary' && imageFileFormat(source.value.name) && item.envelope.kind === 'material') {
+        const envelope = item.envelope
+        if (!this.options.store.updateTranslationHistory(draft.session.id, history => appendImageUnit(history, envelope, item.createdAt))) {
+          throw new Error('图片单元登记失败，原图仍保留。')
+        }
+      }
     }
     return item.envelope
   }

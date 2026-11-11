@@ -317,7 +317,7 @@ export class ReferenceFilesService {
             throw failure('history_unavailable', '同一记录的当前原文或有效最终译文不可读取。')
           const source = task.side === 'source' ? body : null, translation = task.side === 'translation' ? body : null
           const sha256 = await sourceSha256(new TextEncoder().encode(JSON.stringify([page.targetLanguage, source, translation])))
-          const excerpt = parseTranslationRecordExcerpt({ selection: { sessionId: snapshot.scope.sessionId, unitId: task.unitId, sourceVersion: page.sourceVersion, finalId: page.finalId,
+          const excerpt = parseTranslationRecordExcerpt({ selection: { sessionId: snapshot.scope.sessionId, unitId: task.unitId, ...(page.sourceVersion === undefined ? {} : { sourceVersion: page.sourceVersion }), finalId: page.finalId,
             sourceRange: task.side === 'source' ? range : null, translationRange: task.side === 'translation' ? range : null, sha256 }, targetLanguage: page.targetLanguage,
             source, translation, sourceTotalCodePoints: task.side === 'source' ? page.totalCodePoints : other.totalCodePoints, translationTotalCodePoints: task.side === 'translation' ? page.totalCodePoints : other.totalCodePoints })
           const match = { side: task.side, excerpt }
@@ -445,7 +445,9 @@ export function registerReferenceTools(service: ReferenceFilesService, topics: T
   const range = { oneOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, properties: { start: integer, end: integer } }], required: true }
   const fileSelection = { type: 'object', additionalProperties: false, properties: { id: text, version: integer, sha256: text,
     range: { type: 'object', required: true, additionalProperties: false, properties: { start: integer, end: integer } } } }
-  const recordSelection = { type: 'object', additionalProperties: false, properties: { sessionId: text, unitId: text, sourceVersion: integer, finalId: text, sourceRange: range, translationRange: range, sha256: text } }
+  const recordSelection = { type: 'object', additionalProperties: false, properties: { sessionId: text, unitId: text,
+    sourceVersion: { type: 'integer', description: 'Copy the returned sourceVersion for versioned records. Omit it for image records.' },
+    finalId: text, sourceRange: range, translationRange: range, sha256: text } }
   const definitions: { name: string; description: string; parameters: object; run(args: Record<string, unknown>, exec: ToolExecution): Promise<unknown> }[] = [
     { name: 'translation_search_memory', description: 'Find current-topic archive, registered original/bilingual files and current translation records by keyword plus available semantic vectors. Records are filtered to Sessions currently opened by this main Agent BEFORE ranking. File records contribute only manually selected current originals with complete main-model segmentation/exclusion plans; translated file bodies, excluded code/Markdown structure/metadata, unselected files and incomplete plans are not semantic inputs. Ordinary text records retain their existing current-source/effective-final search. Supply topicId, a short source-meaning query and optional targetLanguage. For a remembered translation phrase, use translation_record_find to locate its record and translation_record_read to verify its actual source; an inferred search wording is not a source quote. Returns at most 8 excerpts, at most 2 per object, with exact refs for translation_reference_select assets/files/records. Units without an effective final are excluded without counting as read failures. Use translation_record_read for context or the same record current translation; never guess sentence alignment or treat a final version as a quality endorsement. Queries reach the embedding service only after indexing is enabled. Report incomplete coverage honestly.',
       parameters: { ...topic, query: text, targetLanguage: { type: 'string' } }, run: (args, exec) => service.searchMemory(args, exec) },

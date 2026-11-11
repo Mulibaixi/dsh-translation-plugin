@@ -4,6 +4,7 @@ import { parseReferenceContextRef, type ReferenceContextRef } from './reference-
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type NormalTranslationTerm, type TranslationCallMetadata } from './translation-call.js'
 import { parseDirectContextResponse, parseDirectContextSupplement, type DirectContextResponse, type DirectContextSupplement } from './direct-context.js'
+import { IMAGE_BACKGROUND_LIMIT, type ImageUnitTarget, type ImageUnitUpdate } from './image-translation.js'
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
 export interface NormalTranslationMaterialTarget {
   readonly kind: 'material'
@@ -19,7 +20,9 @@ export interface NormalTranslationUnitTarget {
   readonly unitId: string
   readonly sourceVersion: number
 }
+export type DirectUnitTarget = NormalTranslationUnitTarget | ImageUnitTarget
 export type NormalTranslationTarget = NormalTranslationMaterialTarget | NormalTranslationUnitTarget
+export type DirectTranslationTarget = NormalTranslationTarget | ImageUnitTarget
 export interface NormalTranslationSourceCorrection {
   readonly target: NormalTranslationUnitTarget
   readonly operationId: string
@@ -28,7 +31,8 @@ export interface NormalTranslationSourceCorrection {
 }
 /** `uiLocale` is the submitting Client's interface locale; the Host uses it only for the notice's reply-language line. */
 export interface NormalTranslationUnitRequest { readonly target: NormalTranslationUnitTarget; readonly operationId: string; readonly uiLocale?: string; readonly fileName?: string }
-export interface NormalTranslationUnitReceipt extends NormalTranslationUnitRequest { readonly status: 'submitted' }
+export interface DirectUnitRequest extends Omit<NormalTranslationUnitRequest, 'target'> { readonly target: DirectUnitTarget }
+export interface NormalTranslationUnitReceipt extends DirectUnitRequest { readonly status: 'submitted' }
 export interface NormalTranslationCorrectionReceipt {
   readonly operationId: string
   readonly mainSessionId: string
@@ -82,7 +86,7 @@ export function draftTranslationTerms(draft: readonly DirectTranslationDraftTerm
  * a main-model-organized body for a non-text original (for example extracted PDF or image text).
  */
 export interface DirectTranslationRequest {
-  readonly target: NormalTranslationTarget
+  readonly target: DirectTranslationTarget
   readonly operationId: string
   /** Verbatim user requirements for this task; never a model paraphrase. */
   readonly userRequirements: string
@@ -128,7 +132,7 @@ export interface DirectTranslationReceipt {
   readonly topicId: string
   readonly unitId: string
   readonly revisionId: string
-  readonly sourceVersion: number
+  readonly sourceVersion?: number | undefined
   readonly status: 'completed' | 'failed' | 'cancelled'
   readonly textCodePoints: number
   readonly persistence: 'saved' | 'runtime_only'
@@ -194,15 +198,31 @@ function text(value: unknown, maximum = 2048, empty = false): asserts value is s
 function version(value: unknown): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) throw new TypeError('Invalid normal translation version')
 }
-export function parseNormalTranslationTarget(value: unknown): NormalTranslationTarget {
+export function parseDirectTranslationTarget(value: unknown): DirectTranslationTarget {
   object(value)
   if (value.kind === 'material') {
     exact(value, ['kind', 'mainSessionId', 'requestId', 'materialId', 'sourceVersion']); text(value.requestId); text(value.materialId)
-  } else if (value.kind === 'unit') {
-    exact(value, ['kind', 'mainSessionId', 'translationSessionId', 'unitId', 'sourceVersion']); text(value.translationSessionId); text(value.unitId)
+  } else if (value.kind === 'unit' || value.kind === 'image_unit') {
+    exact(value, ['kind', 'mainSessionId', 'translationSessionId', 'unitId', ...(value.kind === 'unit' ? ['sourceVersion'] : [])]); text(value.translationSessionId); text(value.unitId)
   } else throw new TypeError('Unsupported normal translation target')
-  text(value.mainSessionId); version(value.sourceVersion)
-  return structuredClone(value) as unknown as NormalTranslationTarget
+  text(value.mainSessionId); if (value.kind !== 'image_unit') version(value.sourceVersion)
+  return structuredClone(value) as unknown as DirectTranslationTarget
+}
+export function parseNormalTranslationTarget(value: unknown): NormalTranslationTarget {
+  const target = parseDirectTranslationTarget(value)
+  if (target.kind === 'image_unit') throw new TypeError('Use direct translation for an image unit')
+  return target
+}
+export function parseImageUnitUpdate(value: unknown): ImageUnitUpdate {
+  object(value)
+  exact(value, ['target', 'operationId', ...['sourceText', 'backgroundDescription'].filter(field => Object.hasOwn(value, field))])
+  const target = parseDirectTranslationTarget(value.target)
+  if (target.kind !== 'image_unit' || value.sourceText === undefined && value.backgroundDescription === undefined) throw new TypeError('An image unit update needs text or background')
+  text(value.operationId)
+  if (value.sourceText !== undefined) text(value.sourceText, 200000, true)
+  if (value.backgroundDescription !== undefined) text(value.backgroundDescription, IMAGE_BACKGROUND_LIMIT, true)
+  return { target, operationId: value.operationId, ...(value.sourceText === undefined ? {} : { sourceText: value.sourceText }),
+    ...(value.backgroundDescription === undefined ? {} : { backgroundDescription: value.backgroundDescription }) }
 }
 export function parseNormalTranslationSourceCorrection(value: unknown): NormalTranslationSourceCorrection {
   object(value); exact(value, ['target', 'operationId', 'sourceText', 'reason'])
@@ -211,13 +231,18 @@ export function parseNormalTranslationSourceCorrection(value: unknown): NormalTr
   text(value.operationId); text(value.sourceText, 200000); text(value.reason, 1000, true)
   return { target, operationId: value.operationId, sourceText: value.sourceText, reason: value.reason }
 }
-export function parseNormalTranslationUnitRequest(value: unknown): NormalTranslationUnitRequest {
+export function parseDirectUnitRequest(value: unknown): DirectUnitRequest {
   object(value); exact(value, ['target', 'operationId', ...(Object.hasOwn(value, 'uiLocale') ? ['uiLocale'] : []), ...(Object.hasOwn(value, 'fileName') ? ['fileName'] : [])]); text(value.operationId)
   if (value.uiLocale !== undefined) text(value.uiLocale, 64)
   if (value.fileName !== undefined) text(value.fileName, 512)
-  const target = parseNormalTranslationTarget(value.target)
-  if (target.kind !== 'unit') throw new TypeError('Retranslation requires a unit')
+  const target = parseDirectTranslationTarget(value.target)
+  if (target.kind === 'material') throw new TypeError('Retranslation requires a unit')
   return { target, operationId: value.operationId, ...(value.uiLocale === undefined ? {} : { uiLocale: value.uiLocale }), ...(value.fileName === undefined ? {} : { fileName: value.fileName }) }
+}
+export function parseNormalTranslationUnitRequest(value: unknown): NormalTranslationUnitRequest {
+  const request = parseDirectUnitRequest(value)
+  if (request.target.kind !== 'unit') throw new TypeError('This request requires a versioned unit')
+  return { ...request, target: request.target }
 }
 export function parseNormalTranslationCorrectionReceipt(value: unknown): NormalTranslationCorrectionReceipt {
   object(value); exact(value, ['operationId', 'mainSessionId', 'translationSessionId', 'unitId', 'previousSourceVersion', 'sourceVersion', 'persistence'])
@@ -282,7 +307,7 @@ export function parseDirectTranslationRequest(value: unknown): RawDirectTranslat
   const optional = ['organizedNotes', 'auxiliaryContext', 'userRequirements', 'termReferences', 'range', 'body', 'draftTerms', 'contextResponse'].filter(field => Object.hasOwn(value, field))
   exact(value, ['target', 'operationId', ...optional,
     ...(Object.hasOwn(value, 'referenceContextRef') ? ['referenceContextRef'] : [])])
-  const target = parseNormalTranslationTarget(value.target)
+  const target = parseDirectTranslationTarget(value.target)
   text(value.operationId)
   const organizedNotes = value.organizedNotes ?? '', auxiliaryContext = value.auxiliaryContext ?? ''
   const userRequirements = value.userRequirements ?? '', termReferences = value.termReferences ?? []
@@ -294,7 +319,7 @@ export function parseDirectTranslationRequest(value: unknown): RawDirectTranslat
   const contextResponse = value.contextResponse === undefined ? undefined : parseDirectContextResponse(value.contextResponse)
   if (contextResponse?.operationId === value.operationId) throw new TypeError('A context response requires a new operation id')
   if (range && value.body !== undefined) throw new TypeError('A direct call takes either a frozen range or an organized body, not both')
-  if (target.kind === 'unit' && (range || value.body !== undefined)) throw new TypeError('Unit calls have no range or replacement body')
+  if (target.kind !== 'material' && (range || value.body !== undefined)) throw new TypeError('Unit calls have no range or replacement body')
   return { target, operationId: value.operationId, userRequirements, organizedNotes, auxiliaryContext,
     termReferences: structuredClone(termReferences), ...(range ? { range } : {}), ...(value.body === undefined ? {} : { body: value.body as string }),
     ...(draftTerms === undefined ? {} : { draftTerms }),
@@ -351,9 +376,9 @@ export function parseDirectTranslationCommit(value: unknown): DirectTranslationC
 }
 export function parseDirectTranslationReceipt(value: unknown): DirectTranslationReceipt {
   object(value)
-  exact(value, ['operationId', 'mainSessionId', 'translationSessionId', 'topicId', 'unitId', 'revisionId', 'sourceVersion', 'status', 'textCodePoints', 'persistence'])
+  exact(value, ['operationId', 'mainSessionId', 'translationSessionId', 'topicId', 'unitId', 'revisionId', ...(Object.hasOwn(value, 'sourceVersion') ? ['sourceVersion'] : []), 'status', 'textCodePoints', 'persistence'])
   for (const field of ['operationId', 'mainSessionId', 'translationSessionId', 'topicId', 'unitId', 'revisionId']) text(value[field])
-  version(value.sourceVersion)
+  if (Object.hasOwn(value, 'sourceVersion')) version(value.sourceVersion)
   if (!Number.isSafeInteger(value.textCodePoints) || (value.textCodePoints as number) < 0) throw new TypeError('Invalid direct translation length')
   if (!['completed', 'failed', 'cancelled'].includes(value.status as string) || !['saved', 'runtime_only'].includes(value.persistence as string)) throw new TypeError('Invalid direct translation receipt')
   return structuredClone(value) as unknown as DirectTranslationReceipt
@@ -371,7 +396,7 @@ export interface NormalTranslationExport {
   readonly translationSessionId: string
   readonly topicId: string
   readonly materialId: string | null
-  readonly sourceVersion: number
+  readonly sourceVersion?: number
   readonly totalCodePoints: number
   readonly complete: boolean
   readonly segments: readonly NormalTranslationExportSegment[]
@@ -381,13 +406,13 @@ export interface NormalTranslationExport {
 }
 export function parseDirectTranslationExport(value: unknown): NormalTranslationExport {
   object(value)
-  exact(value, ['mainSessionId', 'translationSessionId', 'topicId', 'materialId', 'sourceVersion', 'totalCodePoints', 'complete', 'segments', 'missing', 'overlapping', ...(Object.hasOwn(value, 'originalFilePath') ? ['originalFilePath'] : [])])
+  exact(value, ['mainSessionId', 'translationSessionId', 'topicId', 'materialId', ...(Object.hasOwn(value, 'sourceVersion') ? ['sourceVersion'] : []), 'totalCodePoints', 'complete', 'segments', 'missing', 'overlapping', ...(Object.hasOwn(value, 'originalFilePath') ? ['originalFilePath'] : [])])
   const mainSessionId = value.mainSessionId, translationSessionId = value.translationSessionId
   const topicId = value.topicId, materialId = value.materialId, sourceVersion = value.sourceVersion
   const totalCodePoints = value.totalCodePoints, complete = value.complete
   text(mainSessionId); text(translationSessionId); text(topicId)
   if (materialId !== null) text(materialId)
-  if (!Number.isSafeInteger(sourceVersion) || (sourceVersion as number) < 1) throw new TypeError('Invalid export source version')
+  if (Object.hasOwn(value, 'sourceVersion')) version(sourceVersion)
   if (!Number.isSafeInteger(totalCodePoints) || (totalCodePoints as number) < 0) throw new TypeError('Invalid export length')
   if (typeof complete !== 'boolean') throw new TypeError('Invalid export completeness')
   if (!Array.isArray(value.segments) || value.segments.length > 200 || !Array.isArray(value.missing) || value.missing.length > 200 || !Array.isArray(value.overlapping) || value.overlapping.length > 200) throw new TypeError('Invalid export segments')
@@ -398,7 +423,7 @@ export function parseDirectTranslationExport(value: unknown): NormalTranslationE
     return { unitId: segment.unitId, range: segment.range === null ? null : parseDirectRange(segment.range), revisionId: segment.revisionId,
       status: segment.status as NormalTranslationExportSegment['status'], text: segment.text }
   })
-  return { mainSessionId, translationSessionId, topicId, materialId, sourceVersion: sourceVersion as number,
+  return { mainSessionId, translationSessionId, topicId, materialId, ...(sourceVersion === undefined ? {} : { sourceVersion: sourceVersion as number }),
     totalCodePoints: totalCodePoints as number, complete, segments, missing: value.missing.map(range => parseDirectRange(range)),
     overlapping: value.overlapping.map(range => parseDirectRange(range)),
     ...(value.originalFilePath === undefined ? {} : { originalFilePath: parseOriginalFilePath(value.originalFilePath) }) }
@@ -475,7 +500,7 @@ function parseResult(method: 'capabilities' | 'status' | 'cancel' | 'requestUnit
   if (method === 'requestUnit') {
     object(value.value); exact(value.value, ['target', 'operationId', 'status'])
     if (value.value.status !== 'submitted') throw new TypeError('Invalid unit submission state')
-    return { ok: true, value: { ...parseNormalTranslationUnitRequest({ target: value.value.target, operationId: value.value.operationId }), status: 'submitted' } }
+    return { ok: true, value: { ...parseDirectUnitRequest({ target: value.value.target, operationId: value.value.operationId }), status: 'submitted' } }
   }
   if (method !== 'capabilities') return { ok: true, value: parseNormalTranslationJob(value.value) }
   object(value.value)
@@ -488,6 +513,6 @@ const packageName = 'dsh-translation-plugin'
 export const NORMAL_TRANSLATION_REMOTE = { package: packageName, descriptors: [...(['capabilities', 'status', 'cancel', 'requestUnit'] as const).map(method => ({
   id: `${packageName}#translationNormal/${method}`, service: 'translationNormal', namespace: 'translationNormal', method,
   invocation: { kind: 'direct' as const }, parameters: method === 'capabilities' ? [] : [{ name: 'request', wire: 'request', source: 'json' as const,
-    codec: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Request`, create: () => ({ parse: (value: unknown) => method === 'requestUnit' ? parseNormalTranslationUnitRequest(value) : parseNormalTranslationQuery(value) }) } }],
+    codec: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Request`, create: () => ({ parse: (value: unknown) => method === 'requestUnit' ? parseDirectUnitRequest(value) : parseNormalTranslationQuery(value) }) } }],
   result: { mode: 'strict' as const, typeSymbol: `${packageName}#normal/${method}Result`, create: () => ({ parse: (value: unknown) => parseResult(method, value) }) },
 })), ...TRANSLATION_LOG_REMOTE.descriptors] }

@@ -13,13 +13,19 @@ export interface HistoryBundle {
   readonly fileJobs: readonly FileJobRecord[]; readonly intakes: readonly FileIntakeRecord[]; readonly preparations: readonly StoredPreparation[]
 }
 export interface HistoryScope { readonly namespaceId: string; readonly topicId: string; readonly sessionId: string }
+export function encodeLegacySessionSnapshot(session: LocalSession, token: string, history?: TranslationHistory): string {
+  return JSON.stringify({ schemaVersion: history ? history.schemaVersion + 3 : 3, token, session,
+    ...(history ? { translationHistory: persistedTranslationHistory(history) } : {}) })
+}
 export function readLegacySessionSnapshot(raw: string): { readonly session: LocalSession; readonly translationHistory: TranslationHistory } | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown>
-    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
     const hasHistory = (value.schemaVersion as number) >= 4
     referenceExact(value, ['schemaVersion', 'token', 'session', ...(hasHistory ? ['translationHistory'] : [])])
-    if (hasHistory && (value.translationHistory as { schemaVersion?: unknown })?.schemaVersion !== (value.schemaVersion as number) - 3) return undefined
+    const historyVersion = (value.translationHistory as { schemaVersion?: unknown })?.schemaVersion
+    // Development builds wrote v12 history inside the previous v14 snapshot wrapper.
+    if (hasHistory && historyVersion !== (value.schemaVersion as number) - 3 && !(value.schemaVersion === 14 && historyVersion === 12)) return undefined
     const session = decodeSession(value.session), translationHistory = hasHistory ? decodeTranslationHistory(value.translationHistory) : emptyTranslationHistory()
     return session && translationHistory ? { session, translationHistory } : undefined
   } catch { return undefined }

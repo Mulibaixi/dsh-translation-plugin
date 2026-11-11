@@ -16,10 +16,10 @@ export function DirectFileLink({ file, unit, revision, session, materials, viewF
   lifetime.current.identity = identity
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false; lifetime.current.controller?.abort() } }, [])
   react.useEffect(() => { lifetime.current.controller?.abort() }, [identity])
-  const correctedSource = !revision && unit.sourceVersion > 1
+  const correctedSource = !revision && (unit.sourceVersion ?? 0) > 1
   const format = /\.md$/iu.test(file.name) ? 'md' : 'txt'
   const name = revision ? `${file.name.replace(/\.[^.]+$/u, '')}-译文-v${revision.order}.${format}`
-    : correctedSource ? `${file.name.replace(/\.[^.]+$/u, '')}-原稿-v${unit.sourceVersion}.${format}` : file.name
+    : correctedSource ? `${file.name.replace(/\.[^.]+$/u, '')}-原文.${format}` : file.name
   async function open(): Promise<void> {
     if (lifetime.current.controller || !viewFiles) return
     const controller = new AbortController(), key = identity

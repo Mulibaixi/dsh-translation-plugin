@@ -14,15 +14,18 @@ export type TopicAssetKind = 'terms' | TopicArchiveEntry['kind']
 
 /** All new candidates use the ordinary four archives and remain pending human adoption. */
 export async function putAssetProposals(terms: TopicMemoryStore, archive: TopicArchiveStore,
-  scope: { ownerId: string; topicId: string; sessionId: string; unitId: string; sourceVersion: number; targetLanguage: string },
+  scope: { ownerId: string; topicId: string; sessionId: string; unitId: string; sourceVersion?: number | undefined; targetLanguage: string },
   proposals: readonly FileJobProposal[], check: () => void): Promise<{ count: number; skipped: string[] }> {
   await terms.ensureLoaded(scope.ownerId, scope.topicId); await archive.ensureLoaded(scope.ownerId, scope.topicId)
   const entities = new Map<string, string>(), saved = new Set<string>(), skipped: string[] = []
   for (const p of [...proposals.filter(p => p.kind === 'entity'), ...proposals.filter(p => p.kind === 'term'), ...proposals.filter(p => p.kind === 'fact'), ...proposals.filter(p => p.kind === 'relation')]) {
     check()
     const title = p.kind === 'term' ? p.sourceForms.join('、') : p.kind === 'entity' ? p.name : p.kind === 'fact' ? p.title : p.relation
-    const evidence: TermEvidenceRef[] = p.evidence.map(e => ({ kind: 'source', sessionId: scope.sessionId, unitId: scope.unitId,
-      sourceVersion: scope.sourceVersion, revisionId: null, selectionEventId: null, role: 'basis', range: e.range }))
+    const evidence: TermEvidenceRef[] = (scope.sourceVersion === undefined ? p.evidence.slice(0, 1) : p.evidence).map(e => ({
+      kind: 'source', sessionId: scope.sessionId, unitId: scope.unitId,
+      ...(scope.sourceVersion === undefined ? {} : { sourceVersion: scope.sourceVersion }),
+      revisionId: null, selectionEventId: null, role: 'basis', range: scope.sourceVersion === undefined ? null : e.range,
+    }))
     if (p.kind === 'term') {
       const entitiesInTopic = archive.getSnapshot(scope.ownerId, scope.topicId).entries.filter(entry => entry.kind === 'entity')
       if (namesEntity(p.sourceForms, p.preferred, entitiesInTopic)) {

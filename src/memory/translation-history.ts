@@ -6,6 +6,8 @@ import type { NormalTranslationResolution } from '../shared/normal-translation-v
 import { advanceDocumentFinal, createDocumentUnit, currentDocumentFinal, parseDocumentUnit, reduceDocumentUnit,
   restoreDocumentUnit, type DocumentMutation, type NewDocumentUnit } from '../memory/document-task.js'
 import type { DocumentRevision, DocumentUnit, DocumentTaskStatus } from '../shared/translation-batch.js'
+import { parseSourceIdentity, toSourceIdentity, type SourceIdentity } from '../shared/translation-sources.js'
+import { IMAGE_BACKGROUND_LIMIT, imageFileFormat } from '../shared/image-translation.js'
 export type { DocumentRevision, DocumentSourceVersion, DocumentSourceHistoryCommit, DocumentUnit } from '../shared/translation-batch.js'
 export type { DocumentMutation, NewDocumentUnit } from '../memory/document-task.js'
 
@@ -27,7 +29,7 @@ export interface TextRevision {
   readonly kind: 'machine' | 'manual'
   readonly model: ModelRoute | null
   readonly draftVersion: number | null
-  readonly sourceVersion: number
+  readonly sourceVersion?: number | undefined
   readonly baseRevisionId: string | null
   readonly callRecord: TranslationCallMetadata | null
   readonly createdAt: string
@@ -44,13 +46,14 @@ export interface FinalPointer {
   readonly selectedAt: string
 }
 export interface TextUnit {
+  readonly kind?: 'image' | 'text'
   readonly id: string
   readonly order: number
-  /** Compatibility projection of sourceVersions[sourceVersion - 1].text; never persisted twice. */
+  /** Current source text. Editable text units keep only one entry in sourceVersions. */
   readonly source: string
   readonly targetLanguage: string
   readonly instruction: string
-  readonly sourceVersion: number
+  readonly sourceVersion?: number | undefined
   readonly sourceVersions: readonly TextSourceVersion[]
   readonly material: TextMaterialIdentity | null
   readonly createdAt: string
@@ -59,6 +62,14 @@ export interface TextUnit {
   /** Immutable user deletion; the unit keeps its identity, number and event trail. */
   readonly deletion: TextUnitDeletion | null
 }
+export interface ImageUnit extends TextUnit {
+  readonly kind: 'image'
+  readonly original: SourceIdentity | null
+  readonly backgroundDescription: string
+  readonly sourceVersion?: undefined
+}
+export function isImageUnit(unit: TranslationUnit): unit is ImageUnit { return 'kind' in unit && unit.kind === 'image' }
+export function isEditableTextUnit(unit: TranslationUnit): unit is TextUnit & { readonly kind: 'text'; readonly sourceVersion: number } { return 'kind' in unit && unit.kind === 'text' }
 export interface TextSourceVersion {
   readonly version: number
   readonly text: string
@@ -78,7 +89,7 @@ export type TranslationUnit = TextUnit | DocumentUnit | FileJobUnit
 export function isFileJobUnit(unit: TranslationUnit): unit is FileJobUnit { return 'kind' in unit && unit.kind === 'file_job' }
 export function hasUnitBody(unit: TranslationUnit): unit is TextUnit | DocumentUnit { return !isFileJobUnit(unit) }
 export function isDocumentUnit(unit: TranslationUnit): unit is DocumentUnit { return 'kind' in unit && unit.kind === 'document' }
-export function isTextUnit(unit: TranslationUnit): unit is TextUnit { return !('kind' in unit) }
+export function isTextUnit(unit: TranslationUnit): unit is TextUnit { return !('kind' in unit) || isEditableTextUnit(unit) || isImageUnit(unit) }
 export function isDeletedTextUnit(unit: TranslationUnit): boolean { return isTextUnit(unit) && unit.deletion !== null }
 export function isDeletedDocumentUnit(unit: TranslationUnit): boolean { return isDocumentUnit(unit) && unit.deletion !== undefined }
 export function isDeletedUnit(unit: TranslationUnit): boolean { return isDocumentUnit(unit) ? unit.deletion !== undefined : unit.deletion !== null }
@@ -103,7 +114,7 @@ export interface TranslationEvent {
   readonly reason: 'advance' | 'user_selection' | 'restored' | 'export' | 'user_deletion' | null
   /** Last ordinary stream receipt applied to this history; absent on quick and legacy facts. */
   readonly normalSequence?: number
-  readonly sourceVersion?: number
+  readonly sourceVersion?: number | undefined
   readonly sourceReason?: string
   readonly resultVersion?: number
   readonly chunkRevisionIds?: readonly string[]
@@ -138,7 +149,7 @@ export interface TranslationExchangeRecord {
 }
 /** One browser snapshot; events and final pointers reference the sole revision body. */
 export interface TranslationHistory {
-  readonly schemaVersion: 11
+  readonly schemaVersion: 11 | 12
   readonly units: readonly TranslationUnit[]
   readonly events: readonly TranslationEvent[]
   readonly exchanges: readonly TranslationExchangeRecord[]
@@ -165,20 +176,23 @@ function time(value: unknown): value is string { return text(value, 40, true) &&
 function order(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) >= 1 }
 function status(value: unknown): value is TextRevisionStatus { return typeof value === 'string' && statuses.includes(value as TextRevisionStatus) }
 function eligible(revision: TextRevision): boolean { return revision.accepted && revision.status === 'completed' && !!revision.text.trim() }
+export function revisionMatchesCurrentSource(unit: TextUnit, revision: TextRevision): boolean {
+  return isEditableTextUnit(unit) || revision.sourceVersion === unit.sourceVersion
+}
 export function currentFinalRevision(unit: TranslationUnit): TextRevision | undefined {
   if (!isTextUnit(unit) || unit.deletion) return undefined
   if (unit.final?.selection === 'automatic') {
-    const latest = [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
+    const latest = [...unit.revisions].reverse().find(revision => revisionMatchesCurrentSource(unit, revision))
     if (!latest || !eligible(latest)) return undefined
   }
-  return unit.revisions.find(revision => revision.id === unit.final?.revisionId && revision.sourceVersion === unit.sourceVersion && eligible(revision))
+  return unit.revisions.find(revision => revision.id === unit.final?.revisionId && revisionMatchesCurrentSource(unit, revision) && eligible(revision))
 }
 /** The revision a result entry resolves to: the effective final when there is one, otherwise the latest complete revision of the current source version. A failed, running or deleted latest attempt resolves to nothing rather than to an older success. */
 export function currentResultRevision(unit: TranslationUnit): TextRevision | undefined {
   if (isDeletedTextUnit(unit)) return undefined
   const final = currentFinalRevision(unit)
   if (final || !isTextUnit(unit)) return final
-  const latest = [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
+  const latest = [...unit.revisions].reverse().find(revision => revisionMatchesCurrentSource(unit, revision))
   return latest && eligible(latest) ? latest : undefined
 }
 export function currentDocumentFinalRevision(unit: TranslationUnit): DocumentRevision | undefined {
@@ -194,9 +208,9 @@ export function canEditTextRevision(revision: TextRevision): boolean {
   return ['completed', 'failed', 'cancelled', 'interrupted', 'context_requested'].includes(revision.status) && !!revision.text.trim()
 }
 
-function decodeRevision(value: unknown, schemaVersion = 3, parseCall = true): TextRevision | undefined {
+function decodeRevision(value: unknown, schemaVersion = 3, parseCall = true, independentSource = false): TextRevision | undefined {
   const fields = ['id', 'operationId', 'order', 'model', 'draftVersion', 'createdAt', 'updatedAt', 'accepted', 'status', 'text', 'message']
-  if (!record(value) || !exact(value, schemaVersion === 1 ? fields : [...fields, 'kind', 'baseRevisionId', 'callRecord', ...(schemaVersion >= 3 ? ['sourceVersion'] : []), ...(schemaVersion >= 8 ? ['deletion'] : [])]) ||
+  if (!record(value) || !exact(value, schemaVersion === 1 ? fields : [...fields, 'kind', 'baseRevisionId', 'callRecord', ...(schemaVersion >= 3 && !independentSource ? ['sourceVersion'] : []), ...(schemaVersion >= 8 ? ['deletion'] : [])]) ||
     !identity(value.id) || !identity(value.operationId) || !order(value.order) || !time(value.createdAt) || !time(value.updatedAt) ||
     typeof value.accepted !== 'boolean' || !status(value.status) || !text(value.text, 2_000_000) || !(value.message === null || text(value.message, 1000))) return undefined
   const kind = schemaVersion === 1 ? 'machine' : value.kind
@@ -214,7 +228,7 @@ function decodeRevision(value: unknown, schemaVersion = 3, parseCall = true): Te
     try { if (removed.callFacts !== null) callFacts = parseTranslationCallFacts(removed.callFacts) } catch { return undefined }
     deletion = { eventId: removed.eventId, at: removed.at, originalStatus: removed.originalStatus as TextRevisionDeletion['originalStatus'], callFacts }
   } else if (schemaVersion >= 8 && value.deletion !== null) return undefined
-  if (!order(sourceVersion)) return undefined
+  if (!independentSource && !order(sourceVersion)) return undefined
   if (kind !== 'machine' && kind !== 'manual') return undefined
   const model = decodeRoute(value.model)
   if (kind === 'machine' ? (!model || !order(value.draftVersion) || baseRevisionId !== null) :
@@ -224,7 +238,7 @@ function decodeRevision(value: unknown, schemaVersion = 3, parseCall = true): Te
   if (parseCall && callRecord !== null) {
     try { callRecord = parseTranslationCallMetadata(callRecord) } catch { return undefined }
   }
-  return { ...value, kind, model, baseRevisionId, callRecord, sourceVersion, deletion } as unknown as TextRevision
+  return { ...value, kind, model, baseRevisionId, callRecord, ...(independentSource ? {} : { sourceVersion }), deletion } as unknown as TextRevision
 }
 
 function decodeMaterial(value: unknown): TextMaterialIdentity | null | undefined {
@@ -262,11 +276,12 @@ function decodeExchange(value: unknown, units: readonly TranslationUnit[]): Tran
     !['open', 'waiting_user', 'resuming', 'resolved', 'cancelled', 'unknown'].includes(value.status as string) || !Array.isArray(value.resolutions) || value.resolutions.length > 20) return undefined
   const unit = units.filter(isTextUnit).find(item => item.id === value.unitId), source = unit?.sourceVersions.find(item => item.version === value.sourceVersion)
   const revision = unit?.revisions.find(item => item.id === value.callId)
-  if (!unit || !source || !revision || revision.operationId !== value.operationId || revision.sourceVersion !== value.sourceVersion ||
+  const priorEditableSource = !!unit && isEditableTextUnit(unit) && (value.sourceVersion as number) < unit.sourceVersion && ['resolved', 'cancelled'].includes(value.status as string)
+  if (!unit || (!source && !priorEditableSource) || !revision || revision.operationId !== value.operationId || (!isEditableTextUnit(unit) && revision.sourceVersion !== value.sourceVersion) ||
     !isNormalExchangePromptVersion((revision.callRecord ?? revision.deletion?.callFacts)?.promptVersion)) return undefined
   let questions: RequestContextInput
   // A deleted unit keeps its settled exchanges as audit while clearing the source body.
-  try { questions = parseRequestContextInput(value.questions, unit.deletion ? Number.MAX_SAFE_INTEGER : Array.from(source.text).length) } catch { return undefined }
+  try { questions = parseRequestContextInput(value.questions, unit.deletion || !source ? Number.MAX_SAFE_INTEGER : Array.from(source.text).length) } catch { return undefined }
   const resolutions = value.resolutions.map(decodeExchangeResolution)
   if (resolutions.some(item => !item) || new Set(resolutions.map(item => item!.resolutionId)).size !== resolutions.length ||
     resolutions.some((item, index) => resolutions.slice(0, index).some(previous => previous!.observedVersion === item!.observedVersion))) return undefined
@@ -276,7 +291,7 @@ function decodeExchange(value: unknown, units: readonly TranslationUnit[]): Tran
     if (!record(intent) || !exact(intent, ['resolutionId', 'candidateCallId', 'contextVersion', 'status']) || !identity(resolutionId) || !identity(intent.candidateCallId) ||
       !order(intent.contextVersion) || intent.contextVersion !== (value.contextVersion as number) + 1 || !['registered', 'started', 'unknown'].includes(intent.status as string) ||
       !resolutions.some(item => item?.resolutionId === resolutionId && item.kind === 'answer')) return undefined
-    if (intent.status === 'started' && !unit.revisions.some(item => item.id === intent.candidateCallId && item.operationId === value.operationId && item.sourceVersion === value.sourceVersion)) return undefined
+    if (intent.status === 'started' && !unit.revisions.some(item => item.id === intent.candidateCallId && item.operationId === value.operationId && (isEditableTextUnit(unit) || item.sourceVersion === value.sourceVersion))) return undefined
     resumeIntent = { resolutionId, candidateCallId: intent.candidateCallId, contextVersion: intent.contextVersion as number, status: intent.status as TranslationResumeIntent['status'] }
   }
   return { mainSessionId: value.mainSessionId, topicId: value.topicId, translationSessionId: value.translationSessionId, unitId: value.unitId,
@@ -287,7 +302,7 @@ function decodeExchange(value: unknown, units: readonly TranslationUnit[]): Tran
 
 /** Validation does not turn live requests into restored requests. Unknown fields are rejected. */
 export function decodeTranslationHistory(value: unknown): TranslationHistory | undefined {
-  if (!record(value) || !exact(value, (value.schemaVersion as number) >= 6 ? ['schemaVersion', 'units', 'events', 'exchanges'] : ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events) ||
+  if (!record(value) || !exact(value, (value.schemaVersion as number) >= 6 ? ['schemaVersion', 'units', 'events', 'exchanges'] : ['schemaVersion', 'units', 'events']) || ![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].includes(value.schemaVersion as number) || !Array.isArray(value.units) || !Array.isArray(value.events) ||
     ((value.schemaVersion as number) >= 6 && !Array.isArray(value.exchanges))) return undefined
   const units: TranslationUnit[] = [], revisionIds = new Set<string>(), callIds = new Set<string>(), operationUnits = new Map<string, string>(), unitIds = new Set<string>()
   for (const item of value.units) {
@@ -315,7 +330,12 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       unitIds.add(unit.id); units.push(unit); continue
     }
     const schemaVersion = value.schemaVersion as number
-    if (!record(item) || !exact(item, ['id', 'order', ...((schemaVersion < 3 || Object.hasOwn(item, 'source')) ? ['source'] : []), 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final', ...(schemaVersion >= 3 ? ['sourceVersion', 'sourceVersions', 'material'] : []), ...(schemaVersion >= 10 ? ['deletion'] : [])]) ||
+    const image = record(item) && item.kind === 'image'
+    const editable = record(item) && item.kind === 'text'
+    if (editable && schemaVersion < 12) return undefined
+    const sourceFields = image ? ['kind', 'original', 'backgroundDescription', 'material', ...(Object.hasOwn(item, 'sourceVersions') ? ['sourceVersions'] : [])]
+      : schemaVersion >= 3 ? ['sourceVersion', 'sourceVersions', 'material', ...(editable ? ['kind'] : [])] : []
+    if (!record(item) || !exact(item, ['id', 'order', ...((image || schemaVersion < 3 || Object.hasOwn(item, 'source')) ? ['source'] : []), 'targetLanguage', 'instruction', 'createdAt', 'revisions', 'final', ...sourceFields, ...(schemaVersion >= 10 ? ['deletion'] : [])]) ||
       !identity(item.id) || unitIds.has(item.id) || item.order !== units.length + 1 || (schemaVersion < 3 && !text(item.source, 200000, true)) || !text(item.targetLanguage, 80, true) ||
       !text(item.instruction, 4000) || !time(item.createdAt) || !Array.isArray(item.revisions)) return undefined
     let deletion: TextUnitDeletion | null = null
@@ -325,26 +345,36 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       deletion = { eventId: removed.eventId, at: removed.at }
     }
     const material = schemaVersion >= 3 ? decodeMaterial(item.material) : null
-    const sourceVersion = schemaVersion >= 3 ? item.sourceVersion : 1
+    const sourceVersion = image ? undefined : schemaVersion >= 3 ? item.sourceVersion : 1
     const sourceVersions: TextSourceVersion[] = []
-    if (material === undefined || !order(sourceVersion) || (!item.revisions.length && material === null && !deletion)) return undefined
-    if (schemaVersion >= 3) {
-      if (!Array.isArray(item.sourceVersions) || !item.sourceVersions.length) return undefined
+    let original: SourceIdentity | null = null
+    if (material === undefined || !image && (!order(sourceVersion) || (!item.revisions.length && material === null && !deletion))) return undefined
+    if (image) {
+      if (schemaVersion < 12 || !text(item.source, 200000) || !text(item.backgroundDescription, IMAGE_BACKGROUND_LIMIT) ||
+        Object.hasOwn(item, 'sourceVersions') && (!Array.isArray(item.sourceVersions) || item.sourceVersions.length !== 0)) return undefined
+      if (deletion) {
+        if (item.original !== null || item.source !== '' || item.backgroundDescription !== '') return undefined
+      } else {
+        try { original = parseSourceIdentity(item.original) } catch { return undefined }
+        if (!imageFileFormat(original.name) || original.encoding !== 'binary') return undefined
+      }
+    } else if (schemaVersion >= 3) {
+      if (!Array.isArray(item.sourceVersions) || !item.sourceVersions.length || editable && item.sourceVersions.length !== 1) return undefined
       for (const raw of item.sourceVersions) {
-        if (!record(raw) || !exact(raw, ['version', 'text', 'createdAt', 'operationId']) || raw.version !== sourceVersions.length + 1 ||
+        if (!record(raw) || !exact(raw, ['version', 'text', 'createdAt', 'operationId']) || raw.version !== (editable ? sourceVersion : sourceVersions.length + 1) ||
           !text(raw.text, 200000, !deletion) || !time(raw.createdAt) || !(raw.operationId === null || identity(raw.operationId))) return undefined
         sourceVersions.push({ ...raw } as unknown as TextSourceVersion)
       }
-      if (sourceVersion !== sourceVersions.length || (Object.hasOwn(item, 'source') && item.source !== sourceVersions.at(-1)!.text)) return undefined
+      if ((!editable && sourceVersion !== sourceVersions.length) || (Object.hasOwn(item, 'source') && item.source !== sourceVersions.at(-1)!.text)) return undefined
     } else sourceVersions.push({ version: 1, text: item.source as string, createdAt: item.createdAt, operationId: null })
     const revisions: TextRevision[] = []
     for (const raw of item.revisions) {
-      const revision = decodeRevision(raw, schemaVersion)
+      const revision = decodeRevision(raw, schemaVersion, true, image || editable)
       if (!revision || revision.order !== revisions.length + 1 || revisionIds.has(revision.id) ||
         (operationUnits.has(revision.operationId) && (schemaVersion < 4 || operationUnits.get(revision.operationId) !== item.id))) return undefined
       if (revision.kind === 'machine' && callIds.has(revision.id)) return undefined
       if (revision.kind === 'machine') callIds.add(revision.id)
-      if (!sourceVersions.some(source => source.version === revision.sourceVersion)) return undefined
+      if (!image && !editable && !sourceVersions.some(source => source.version === revision.sourceVersion)) return undefined
       if (revision.kind === 'manual' && !revisions.some(base => base.id === revision.baseRevisionId && base.sourceVersion === revision.sourceVersion &&
         (canEditTextRevision(base) || deletion !== null && base.status === 'deleted'))) return undefined
       revisions.push(revision); revisionIds.add(revision.id); operationUnits.set(revision.operationId, item.id)
@@ -362,8 +392,15 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       final = { revisionId: pointer.revisionId, selection: pointer.selection as FinalPointer['selection'], selectedAt: pointer.selectedAt }
     }
     unitIds.add(item.id)
-    units.push({ id: item.id, order: item.order as number, source: sourceVersions[sourceVersion - 1]!.text, targetLanguage: item.targetLanguage, instruction: item.instruction,
-      sourceVersion, sourceVersions, material, createdAt: item.createdAt, revisions, final, deletion })
+    const common = { id: item.id, order: item.order as number, targetLanguage: item.targetLanguage, instruction: item.instruction,
+      sourceVersions, material, createdAt: item.createdAt, revisions, final, deletion }
+    if (image) {
+      const unit: ImageUnit = { ...common, kind: 'image', original, source: item.source as string, backgroundDescription: item.backgroundDescription as string }
+      units.push(unit)
+    } else {
+      const version = sourceVersion as number
+      units.push({ ...common, ...(editable ? { kind: 'text' as const } : {}), sourceVersion: version, source: sourceVersions.at(-1)!.text })
+    }
   }
   const events: TranslationEvent[] = [], eventIds = new Set<string>()
   for (const item of value.events) {
@@ -378,7 +415,8 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       (Object.hasOwn(item, 'mainSessionId') && !identity(item.mainSessionId)) ||
       (Object.hasOwn(item, 'normalSequence') && (!order(item.normalSequence) || item.type !== 'operation.updated' || !identity(item.operationId))) ||
       (Object.hasOwn(item, 'normalV2Sequence') && (!order(item.normalV2Sequence) || !['operation.call_event', 'exchange.needs_context', 'exchange.resolution_registered', 'exchange.resume_registered', 'exchange.control', 'exchange.call_started', 'exchange.resolved', 'exchange.invalidated'].includes(item.type as string) || !identity(item.operationId) || !identity(item.callId) || !order(item.contextVersion))) ||
-      (Object.hasOwn(item, 'sourceVersion') && (!order(item.sourceVersion) || !deletedDocument && !(item.type === 'source.deleted' && eventUnit && isFileJobUnit(eventUnit)) && !units.filter(hasUnitBody).find(unit => unit.id === item.unitId)?.sourceVersions.some(source => source.version === item.sourceVersion))) ||
+      (Object.hasOwn(item, 'sourceVersion') && (!order(item.sourceVersion) || !deletedDocument && !(item.type === 'source.deleted' && eventUnit && isFileJobUnit(eventUnit)) &&
+        !(eventUnit && isEditableTextUnit(eventUnit) ? (item.sourceVersion as number) <= eventUnit.sourceVersion : eventUnit && hasUnitBody(eventUnit) && eventUnit.sourceVersions.some(source => source.version === item.sourceVersion)))) ||
       (Object.hasOwn(item, 'sourceReason') && (item.type !== 'source.corrected' || !text(item.sourceReason, 1000))) ||
       (item.type === 'source.corrected' && (!order(item.sourceVersion) || item.revisionId !== null || !identity(item.operationId) || !text(item.sourceReason, 1000))) || !identity(item.id) || eventIds.has(item.id) ||
       item.order !== events.length + 1 || !['operation.submitted', 'operation.accepted', 'operation.retranslation_accepted', 'operation.updated', 'operation.call_event', 'final.selected', 'operation.restored', 'revision.manual_saved', 'source.corrected', 'exchange.needs_context', 'exchange.resolution_registered', 'exchange.resume_registered', 'exchange.control', 'exchange.call_started', 'exchange.resolved', 'exchange.invalidated', ...((value.schemaVersion as number) >= 7 ? ['document.admitted', 'document.updated', 'document.restored'] : []), ...((value.schemaVersion as number) >= 8 ? ['revision.deleted'] : []), ...((value.schemaVersion as number) >= 10 ? ['unit.deleted', 'document.deleted'] : []), ...((value.schemaVersion as number) >= 11 ? ['file_result.deleted', 'manifest.deleted', 'chunks.deleted', 'source.deleted'] : [])].includes(item.type as string) || !time(item.at) ||
@@ -406,12 +444,12 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       ['exchangeId', 'resolutionId'].some(field => Object.hasOwn(item, field)) || (item.type !== 'operation.call_event' && ['callId', 'contextVersion'].some(field => Object.hasOwn(item, field)))) return undefined
     if (item.revisionId !== null && !deletedDocument && item.type !== 'manifest.deleted') {
       const unit = units.filter(hasUnitBody).find(unit => unit.id === item.unitId), revision = unit?.revisions.find(revision => revision.id === item.revisionId)
-      if (!revision || !unit || item.operationId !== revisionOperationId(unit, revision) || (item.sourceVersion !== undefined && item.sourceVersion !== revision.sourceVersion)) return undefined
+      if (!revision || !unit || item.operationId !== revisionOperationId(unit, revision) || (!isEditableTextUnit(unit) && item.sourceVersion !== undefined && item.sourceVersion !== revision.sourceVersion)) return undefined
       if (isTextUnit(unit)) {
         const textRevision = revision as TextRevision, originalStatus = textRevision.deletion?.originalStatus ?? textRevision.status
         if ((item.status === 'completed' || item.type === 'final.selected' || item.type === 'revision.manual_saved') && originalStatus !== 'completed') return undefined
         if (item.type === 'revision.deleted' && (textRevision.status !== 'deleted' || item.id !== textRevision.deletion?.eventId || item.at !== textRevision.deletion.at ||
-          item.status !== 'deleted' || item.reason !== 'user_deletion' || item.sourceVersion !== textRevision.sourceVersion)) return undefined
+          item.status !== 'deleted' || item.reason !== 'user_deletion' || !isEditableTextUnit(unit) && item.sourceVersion !== textRevision.sourceVersion)) return undefined
       } else if (item.type === 'revision.deleted') return undefined
     } else if (item.type === 'revision.deleted') return undefined
     if (item.type === 'unit.deleted') {
@@ -448,15 +486,27 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
     const deletion = unit.deletion
     if (deletion && events.filter(event => event.type === 'document.deleted' && event.unitId === unit.id && event.id === deletion.eventId).length !== 1) return undefined
   }
-  return { schemaVersion: 11, units, events, exchanges: exchanges as TranslationExchangeRecord[] }
+  return { schemaVersion: value.schemaVersion === 12 ? 12 : 11, units, events, exchanges: exchanges as TranslationExchangeRecord[] }
 }
 
 /** Version records own source bodies; storage and full-record exports omit the compatibility projection. */
 export function persistedTranslationHistory(history: TranslationHistory): unknown {
-  return { ...history, units: history.units.map(unit => { if (!isTextUnit(unit)) return unit; const { source: _source, ...stored } = unit; return stored }) }
+  return { ...history, units: history.units.map(unit => {
+    if (isImageUnit(unit)) {
+      const { sourceVersions: _sources, ...stored } = unit
+      return stored
+    }
+    if (!isTextUnit(unit)) return unit
+    const { source: _source, ...stored } = unit
+    return stored
+  }) }
 }
 
 export function appendTranslationEvent(history: TranslationHistory, event: Omit<TranslationEvent, 'order'>): TranslationHistory {
+  if (event.sourceVersion === undefined && Object.hasOwn(event, 'sourceVersion')) {
+    const { sourceVersion: _version, ...unversioned } = event
+    event = unversioned
+  }
   if (history.events.some(old => old.id === event.id)) throw new Error('Duplicate translation event')
   return { ...history, events: [...history.events, { ...event, order: history.events.length + 1 }] }
 }
@@ -618,6 +668,7 @@ export function deleteTextUnit(history: TranslationHistory, unitId: string, inpu
         callFacts: revision.callRecord === null ? null : translationCallFacts(revision.callRecord) } } satisfies TextRevision
   })
   const deleted: TextUnit = { ...unit, source: '', instruction: '', sourceVersions: unit.sourceVersions.map(source => ({ ...source, text: '' })),
+    ...(isImageUnit(unit) ? { original: null, backgroundDescription: '' } : {}),
     revisions, final: null, deletion: { eventId: input.eventId, at: input.at } }
   next = replaceUnit(next, deleted)
   next = appendTranslationEvent(next, { id: input.eventId, type: 'unit.deleted', at: input.at, unitId, revisionId: null,
@@ -682,7 +733,10 @@ export function deleteUnit(history: TranslationHistory, unitId: string, input: {
   return unit && isDocumentUnit(unit) ? deleteDocumentUnit(history, unitId, input) : deleteTextUnit(history, unitId, input)
 }
 function newRevision(history: TranslationHistory, data: NewTextRevision, revisionOrder: number, unitId: string): TextRevision {
-  const revision = decodeRevision({ kind: 'machine', baseRevisionId: null, callRecord: null, sourceVersion: 1, deletion: null, ...data, order: revisionOrder }, 8, false)
+  const independentSource = history.units.some(unit => unit.id === unitId && (isImageUnit(unit) || isEditableTextUnit(unit)))
+  const { sourceVersion = 1, ...fields } = data
+  const revision = decodeRevision({ kind: 'machine', baseRevisionId: null, callRecord: null, deletion: null, ...fields,
+    ...(independentSource ? {} : { sourceVersion }), order: revisionOrder }, 8, false, independentSource)
   if (!revision || history.units.some(unit => isTextUnit(unit) ? unit.revisions.some(old => old.id === revision.id || (unit.id !== unitId && old.operationId === revision.operationId)) :
     isDocumentUnit(unit) && ([...unit.chunkRevisions, ...unit.revisions].some(old => old.id === revision.id) || documentOperationIds(unit).includes(revision.operationId))) ||
     history.events.some(event => event.operationId === revision.operationId && event.unitId !== unitId)) throw new Error('Invalid or duplicate translation revision')
@@ -692,7 +746,7 @@ function newRevision(history: TranslationHistory, data: NewTextRevision, revisio
 /** Latest attempt means admission order, including a later failed or unaccepted revision. */
 function advanceFinal(history: TranslationHistory, unit: TextUnit, at: string, reason: 'advance' | 'export' | 'restored' = 'advance'): TranslationHistory {
   if (unit.final?.selection === 'user_fixed' && currentFinalRevision(unit)) return history
-  const latest = [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
+  const latest = [...unit.revisions].reverse().find(revision => revisionMatchesCurrentSource(unit, revision))
   if (!latest || !eligible(latest) || unit.final?.revisionId === latest.id) return history
   const updated: TextUnit = { ...unit, final: { revisionId: latest.id, selection: 'automatic', selectedAt: at } }
   return event(replaceUnit(history, updated), updated, latest, 'final.selected', at, reason)
@@ -701,7 +755,7 @@ function advanceFinal(history: TranslationHistory, unit: TextUnit, at: string, r
 function advanceSettledAutomaticFinal(history: TranslationHistory, unitId: string, revisionId: string, at: string): TranslationHistory {
   const unit = findUnit(history, unitId)
   if (unit.final?.selection !== 'automatic') return history
-  const latest = [...unit.revisions].reverse().find(revision => revision.sourceVersion === unit.sourceVersion)
+  const latest = [...unit.revisions].reverse().find(revision => revisionMatchesCurrentSource(unit, revision))
   return latest?.id === revisionId ? advanceFinal(history, unit, at) : history
 }
 function advanceUnitFinal(history: TranslationHistory, unit: TranslationUnit, at: string, reason: 'advance' | 'export' = 'advance'): TranslationHistory {
@@ -751,19 +805,45 @@ export function appendTextUnit(history: TranslationHistory, data: NewTextUnit, r
 }
 
 /** Business admission is a material fact; an actual model invocation is appended separately. */
-export function appendAdmittedTextUnit(history: TranslationHistory, envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }, operationId: string, at: string): TranslationHistory {
+export function appendAdmittedTextUnit(history: TranslationHistory, envelope: TranslationMaterialEnvelope & { readonly kind: 'material' }, operationId: string, at: string, editable = false): TranslationHistory {
   const snapshot = envelope.material, unitId = `unit:${snapshot.materialId}`
   if (snapshot.sourceText === undefined) throw Object.assign(new Error('Asset material requires batch admission'), { code: 'requires_batch' })
   if (!identity(operationId) || !time(at) || snapshot.sourceVersion !== 1 || history.units.some(unit => unit.id === unitId) || history.events.some(event => event.operationId === operationId)) throw new Error('Invalid or duplicate admitted material')
-  const unit: TextUnit = { id: unitId, order: history.units.length + 1, source: snapshot.sourceText, targetLanguage: snapshot.targetLanguage,
+  const unit: TextUnit = { ...(editable ? { kind: 'text' as const } : {}), id: unitId, order: history.units.length + 1, source: snapshot.sourceText, targetLanguage: snapshot.targetLanguage,
     instruction: snapshot.instruction, sourceVersion: snapshot.sourceVersion,
     sourceVersions: [{ version: snapshot.sourceVersion, text: snapshot.sourceText, createdAt: at, operationId: envelope.operationId }],
     material: { materialId: snapshot.materialId, mainSessionId: envelope.mainSessionId, requestId: envelope.requestId, draftVersion: snapshot.draftVersion,
       model: snapshot.model, maxInputChars: snapshot.maxInputChars }, createdAt: at, revisions: [], final: null, deletion: null }
   const previous = history.units.at(-1)
   const next = previous ? advanceUnitFinal(history, previous, at) : history
-  return appendTranslationEvent({ ...next, units: [...next.units, unit] }, { id: `text-event:${next.events.length + 1}`,
+  return appendTranslationEvent({ ...next, schemaVersion: editable ? 12 : next.schemaVersion, units: [...next.units, unit] }, { id: `text-event:${next.events.length + 1}`,
     type: 'operation.accepted', mainSessionId: envelope.mainSessionId, at, unitId, revisionId: null, operationId, status: 'submitting', reason: null, sourceVersion: snapshot.sourceVersion })
+}
+
+export function appendImageUnit(history: TranslationHistory, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>, at: string): TranslationHistory {
+  const material = envelope.material, original = material.sourceRef, id = `unit:${material.materialId}`
+  if (!original || original.encoding !== 'binary' || !imageFileFormat(original.name)) throw new Error('Invalid image original')
+  const existing = history.units.find(unit => unit.id === id)
+  if (existing) {
+    if (!isImageUnit(existing) || existing.original?.sha256 !== original.sha256 || existing.deletion) throw new Error('Image unit identity already used')
+    return history
+  }
+  const unit: ImageUnit = {
+    kind: 'image', id, order: history.units.length + 1, original: toSourceIdentity(original),
+    source: '', sourceVersions: [], backgroundDescription: '', targetLanguage: material.targetLanguage,
+    instruction: material.instruction, createdAt: at, revisions: [], final: null, deletion: null,
+    material: { materialId: material.materialId, mainSessionId: envelope.mainSessionId, requestId: envelope.requestId,
+      draftVersion: material.draftVersion, model: material.model, maxInputChars: material.maxInputChars },
+  }
+  const previous = history.units.at(-1), next = previous ? advanceUnitFinal(history, previous, at) : history
+  return { ...next, schemaVersion: 12, units: [...next.units, unit] }
+}
+
+export function updateImageUnit(history: TranslationHistory, unitId: string, changes: { readonly sourceText?: string; readonly backgroundDescription?: string }): TranslationHistory {
+  const unit = findUnit(history, unitId)
+  if (!isImageUnit(unit) || unit.deletion) throw new Error('Image unit unavailable')
+  const updated: ImageUnit = { ...unit, source: changes.sourceText ?? unit.source, backgroundDescription: changes.backgroundDescription ?? unit.backgroundDescription }
+  return replaceUnit(history, updated)
 }
 
 /** Admit one file segment (or one organized file body) as its own text unit. */
@@ -782,25 +862,28 @@ export function appendAdmittedFileUnit(history: TranslationHistory, envelope: Tr
   } else if (body ? length === 0 : length !== snapshot.sourceRef.totalCodePoints) throw new Error('File body length does not match the frozen original')
   if (!identity(operationId) || !time(at) || !text(sourceText, 2_000_000) || history.units.some(unit => unit.id === unitId) ||
     history.events.some(event => event.operationId === operationId)) throw new Error('Invalid or duplicate admitted file material')
-  const unit: TextUnit = { id: unitId, order: history.units.length + 1, source: sourceText, targetLanguage: snapshot.targetLanguage,
+  const unit: TextUnit = { kind: 'text', id: unitId, order: history.units.length + 1, source: sourceText, targetLanguage: snapshot.targetLanguage,
     instruction: snapshot.instruction, sourceVersion: snapshot.sourceVersion,
     sourceVersions: [{ version: snapshot.sourceVersion, text: sourceText, createdAt: at, operationId: envelope.operationId }],
     material: { materialId: snapshot.materialId, mainSessionId: envelope.mainSessionId, requestId: envelope.requestId, draftVersion: snapshot.draftVersion,
       model: snapshot.model, maxInputChars: snapshot.maxInputChars }, createdAt: at, revisions: [], final: null, deletion: null }
   const previous = history.units.at(-1)
   const next = previous ? advanceUnitFinal(history, previous, at) : history
-  return appendTranslationEvent({ ...next, units: [...next.units, unit] }, { id: `text-event:${next.events.length + 1}`,
+  return appendTranslationEvent({ ...next, schemaVersion: 12, units: [...next.units, unit] }, { id: `text-event:${next.events.length + 1}`,
     type: 'operation.accepted', mainSessionId: envelope.mainSessionId, at, unitId, revisionId: null, operationId, status: 'submitting', reason: null, sourceVersion: snapshot.sourceVersion })
 }
-/** Correct one admitted source without overwriting earlier bodies or the old final pointer. */
+/** Replace the unit's source while preserving its revision IDs and final selection. */
 export function appendSourceCorrection(history: TranslationHistory, unitId: string, data: { readonly operationId: string; readonly expectedVersion: number; readonly text: string; readonly reason: string; readonly at: string }): TranslationHistory {
   const unit = findUnit(history, unitId)
+  if (isImageUnit(unit)) throw new Error('Use the image unit text update')
   if (unit.deletion) throw new Error('Deleted translation units cannot be corrected')
   if (unit.sourceVersion !== data.expectedVersion || !identity(data.operationId) || !text(data.text, 200000, true) || data.text === unit.source ||
     !text(data.reason, 1000) || !time(data.at) || history.events.some(event => event.operationId === data.operationId)) throw new Error('Invalid or stale source correction')
-  const sourceVersion = unit.sourceVersion + 1, updated: TextUnit = { ...unit, source: data.text, sourceVersion,
-    sourceVersions: [...unit.sourceVersions, { version: sourceVersion, text: data.text, createdAt: data.at, operationId: data.operationId }] }
-  let next = appendTranslationEvent(replaceUnit(history, updated), { id: `text-event:${history.events.length + 1}`, type: 'source.corrected', at: data.at,
+  const sourceVersion = data.expectedVersion + 1
+  const updated: TextUnit = { ...unit, kind: 'text', source: data.text, sourceVersion,
+    sourceVersions: [{ version: sourceVersion, text: data.text, createdAt: data.at, operationId: data.operationId }],
+    revisions: unit.revisions.map(({ sourceVersion: _previousVersion, ...revision }) => revision) }
+  let next = appendTranslationEvent(replaceUnit({ ...history, schemaVersion: 12 }, updated), { id: `text-event:${history.events.length + 1}`, type: 'source.corrected', at: data.at,
     unitId, revisionId: null, operationId: data.operationId, status: null, reason: null, sourceVersion, sourceReason: data.reason })
   for (const exchange of history.exchanges.filter(item => item.unitId === unitId && item.sourceVersion === data.expectedVersion && ['open', 'waiting_user', 'resuming', 'unknown'].includes(item.status))) {
     const cancelled = { ...exchange, version: exchange.version + 1, status: 'cancelled' as const }
@@ -810,7 +893,7 @@ export function appendSourceCorrection(history: TranslationHistory, unitId: stri
   return next
 }
 
-export function acceptUnitRetranslation(history: TranslationHistory, unitId: string, operationId: string, sourceVersion: number, at: string, mainSessionId?: string): TranslationHistory {
+export function acceptUnitRetranslation(history: TranslationHistory, unitId: string, operationId: string, sourceVersion: number | undefined, at: string, mainSessionId?: string): TranslationHistory {
   const unit = findUnit(history, unitId)
   if (unit.deletion) throw new Error('Deleted translation units cannot be retranslated')
   if (!identity(operationId) || !time(at) || unit.sourceVersion !== sourceVersion || history.events.some(event => event.operationId === operationId)) throw new Error('Invalid or duplicate unit operation')
@@ -823,7 +906,7 @@ export function appendTextRevision(history: TranslationHistory, unitId: string, 
   const unit = findUnit(history, unitId)
   if (unit.deletion) throw new Error('Deleted translation units cannot receive revisions')
   const added = newRevision(history, { sourceVersion: unit.sourceVersion, ...revision }, unit.revisions.length + 1, unit.id)
-  if (!unit.sourceVersions.some(source => source.version === added.sourceVersion)) throw new Error('Translation source version unavailable')
+  if (!revisionMatchesCurrentSource(unit, added) && !unit.sourceVersions.some(source => source.version === added.sourceVersion)) throw new Error('Translation source version unavailable')
   const updated: TextUnit = { ...unit, revisions: [...unit.revisions, added] }
   const next = event(replaceUnit(history, updated), updated, added, revision.accepted ? 'operation.accepted' : 'operation.submitted', revision.createdAt)
   return advanceSettledAutomaticFinal(next, unitId, added.id, revision.updatedAt)
@@ -846,7 +929,7 @@ export function updateTextRevision(history: TranslationHistory, unitId: string, 
   if (unit.deletion) throw new Error('Deleted translation units cannot be updated')
   if (!old) throw new Error('Translation revision unavailable')
   if (old.status === 'deleted') throw new Error('Deleted translation revisions cannot be restored')
-  const revision = decodeRevision({ ...old, ...patch }, 8, false)
+  const revision = decodeRevision({ ...old, ...patch }, 8, false, isImageUnit(unit) || isEditableTextUnit(unit))
   if (!revision) throw new Error('Invalid translation revision')
   if (old.status === revision.status && old.text === revision.text && old.message === revision.message && JSON.stringify(old.callRecord) === JSON.stringify(revision.callRecord)) return history
   // A completed body is a version: another translation belongs in a new revision.
@@ -859,7 +942,7 @@ export function updateTextRevision(history: TranslationHistory, unitId: string, 
 
 export function selectFinalRevision(history: TranslationHistory, unitId: string, revisionId: string, at: string): TranslationHistory {
   const unit = findUnit(history, unitId), revision = unit.revisions.find(revision => revision.id === revisionId)
-  if (unit.deletion || !revision || revision.sourceVersion !== unit.sourceVersion || !eligible(revision) || !time(at)) throw new Error('Only complete current-source translations can be final')
+  if (unit.deletion || !revision || !revisionMatchesCurrentSource(unit, revision) || !eligible(revision) || !time(at)) throw new Error('Only complete eligible translations can be final')
   if (unit.final?.revisionId === revisionId && unit.final.selection === 'user_fixed') return history
   const updated: TextUnit = { ...unit, final: { revisionId, selection: 'user_fixed', selectedAt: at } }
   return event(replaceUnit(history, updated), updated, revision, 'final.selected', at, 'user_selection')
@@ -876,7 +959,7 @@ export function restoreTranslationHistory(history: TranslationHistory, at = new 
     const last = [...history.events].reverse().find(event => event.operationId === admitted.operationId)
     if (!last || !['submitting', 'running', 'unknown'].includes(last.status ?? '')) continue
     next = appendTranslationEvent(next, { id: `text-event:${next.events.length + 1}`, type: 'operation.restored', at,
-      unitId: unit.id, revisionId: null, operationId: admitted.operationId, status: 'interrupted', reason: 'restored', sourceVersion: admitted.sourceVersion ?? 1 })
+      unitId: unit.id, revisionId: null, operationId: admitted.operationId, status: 'interrupted', reason: 'restored', sourceVersion: admitted.sourceVersion })
   }
   for (const unit of history.units) {
     if (isFileJobUnit(unit)) continue

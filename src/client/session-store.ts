@@ -1,4 +1,4 @@
-import { readLegacySessionSnapshot } from '../shared/history-bundle.js'
+import { encodeLegacySessionSnapshot, readLegacySessionSnapshot } from '../shared/history-bundle.js'
 import { diagnosticSpan } from '../shared/diagnostics.js'
 import type { SessionHistoryBackend } from './history-persistence.js'
 import type { HistoryTransferReceipt } from './history-transport.js'
@@ -14,7 +14,7 @@ import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKe
 import { SESSION_ORDER_PREFIX, sessionOrderKey, encodeSessionOrder, decodeSessionOrder, moveSessionOrder } from './session-order.js'
 import { decodeTranslationHistory, emptyTranslationHistory, isDocumentUnit, isTextUnit, deleteTextRevision, textRevisionDeletionBlockedReason,
   deleteUnit, unitDeletionBlockedReason, isDeletedUnit,
-  persistedTranslationHistory, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
+  restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
 import { parseTranslationSourceReference, parseTranslationSourceStorageRequest, type TranslationSourceQueryReference, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
 import { parseTranslationSourceScope, type TranslationSourceScope } from '../shared/translation-sources.js'
 import type { TranslationSourceHistoryCallbacks, TranslationSourceHistoryCommit } from './source-storage-client.js'
@@ -312,7 +312,8 @@ export class SessionStore {
     const validKey = (key: string): void => { if (!key.startsWith(prefix)) throw new Error('File record storage key is outside its namespace') }
     return {
       ...(this.historyBackend ? { storage: this.historyBackend.recordStorage(retainConsumerHistory ? 'fileJobs' : 'intakes'),
-        registerHistory: (current: () => readonly string[], restore: (records: readonly string[]) => void) => this.historyBackend!.register(retainConsumerHistory ? 'fileJobs' : 'intakes', { current, restore }) } : (this.storage && this.locks ? { storage: {
+        registerHistory: (current, restore, acknowledge) => this.historyBackend!.register(retainConsumerHistory ? 'fileJobs' : 'intakes',
+          { current, restore, ...(acknowledge ? { acknowledge } : {}) }) } : (this.storage && this.locks ? { storage: {
         keys: () => {
           const keys: string[] = []
           for (let index = 0; index < this.storage!.length; index++) { const key = this.storage!.key(index); if (key?.startsWith(prefix)) keys.push(key) }
@@ -1287,7 +1288,7 @@ export class SessionStore {
       if (!this.storage || !seat.savedSession) return stopped('failed', '保存副本不可用，本次未删除正文。')
       const saved: SessionSnapshot = { session: { ...seat.savedSession, updatedAt: at },
         translationHistory: deleteTextRevision(seat.savedTranslationHistory, fixed.unitId, fixed.revisionId, input) }
-      const serialized = JSON.stringify({ schemaVersion: 14, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
+      const serialized = encodeLegacySessionSnapshot(saved.session, fixed.eventId, saved.translationHistory)
       const pending: PendingRevisionDeletion = { plan: fixed, at, saved, serialized, release }
       this.revisionDeletions.set(fixed.eventId, pending)
       try { this.storage.setItem(historyKey(fixed.sessionId), serialized) } catch { /* Read the original operation below; a thrown write is not proof of failure. */ }
@@ -1388,7 +1389,7 @@ export class SessionStore {
       if (!this.storage || !seat.savedSession) return stopped('failed', '保存副本不可用，本次未删除正文。')
       const saved: SessionSnapshot = { session: { ...seat.savedSession, updatedAt: at },
         translationHistory: deleteUnit(seat.savedTranslationHistory, fixed.unitId, input) }
-      const serialized = JSON.stringify({ schemaVersion: 14, token: fixed.eventId, session: saved.session, translationHistory: persistedTranslationHistory(saved.translationHistory) })
+      const serialized = encodeLegacySessionSnapshot(saved.session, fixed.eventId, saved.translationHistory)
       const pending: PendingUnitDeletion = { plan: fixed, at, saved, serialized, release }
       this.unitDeletions.set(fixed.eventId, pending)
       try { this.storage.setItem(historyKey(fixed.sessionId), serialized) } catch { /* Read the original operation below; a thrown write is not proof of failure. */ }
@@ -1641,8 +1642,7 @@ export class SessionStore {
         }
       }
       const hasTranslations = seat.translationHistory.units.length > 0 || seat.translationHistory.events.length > 0
-      const serialized = JSON.stringify({ schemaVersion: hasTranslations ? 14 : 3, token: `${Date.now()}-${Math.random()}`, session: seat.session,
-        ...(hasTranslations ? { translationHistory: persistedTranslationHistory(seat.translationHistory) } : {}) })
+      const serialized = encodeLegacySessionSnapshot(seat.session, `${Date.now()}-${Math.random()}`, hasTranslations ? seat.translationHistory : undefined)
       this.storage.setItem(historyKey(id), serialized)
       if (this.historyRaw(id) !== serialized) throw new Error('history read-back failed')
       seat.stored = serialized; seat.savedSession = seat.session; seat.savedTranslationHistory = seat.translationHistory; seat.status = 'saved'

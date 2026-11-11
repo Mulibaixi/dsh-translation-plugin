@@ -1,4 +1,4 @@
-import { currentFinalRevision, isDocumentUnit, isTextUnit, isDeletedUnit } from '../memory/translation-history.js'
+import { isImageUnit, currentFinalRevision, isDocumentUnit, isTextUnit, isDeletedUnit } from '../memory/translation-history.js'
 import { currentDocumentFinal } from '../memory/document-task.js'
 import type { DocumentUnit, DocumentSourceVersion } from '../shared/translation-batch.js'
 import type { HistoryBundle } from '../shared/history-bundle.js'
@@ -11,8 +11,8 @@ import { currentFileJob } from '../memory/file-job-current.js'
 export async function readCurrentHistory(bundle: HistoryBundle, request: CurrentHistoryRead, peer: string, sources: TranslationSourcesService | undefined, signal: AbortSignal, pagePoints = 4000): Promise<HistoryCurrentPage> {
   const unit = bundle.history.units.find(unit => unit.id === request.unitId)
   if (!unit || isDeletedUnit(unit)) throw new Error('此历史单元已删除或不可用。')
-  const kind = isTextUnit(unit) ? 'text' : unit.kind
-  const base = { token: request.token, unitId: unit.id, kind, sourceVersion: unit.sourceVersion, targetLanguage: isTextUnit(unit) || isDocumentUnit(unit) ? unit.targetLanguage : bundle.session.targetLanguage } as const
+  const kind = isImageUnit(unit) ? 'image' : isTextUnit(unit) ? 'text' : unit.kind
+  const base = { token: request.token, unitId: unit.id, kind, ...(unit.sourceVersion === undefined ? {} : { sourceVersion: unit.sourceVersion }), targetLanguage: isTextUnit(unit) || isDocumentUnit(unit) ? unit.targetLanguage : bundle.session.targetLanguage } as const
   const missing = (reason: string, finalId: string | null = null): HistoryCurrentPage => ({ ...base, finalId, text: null, totalCodePoints: 0, next: null, reason })
   const page = (text: string, finalId: string | null): HistoryCurrentPage => {
     const points = Array.from(text)
@@ -22,7 +22,7 @@ export async function readCurrentHistory(bundle: HistoryBundle, request: Current
   }
   if (isTextUnit(unit)) {
     const final = currentFinalRevision(unit)
-    return request.side === 'source' ? page(unit.sourceVersions.find(source => source.version === unit.sourceVersion)!.text, final?.id ?? null)
+    return request.side === 'source' ? page(unit.source, final?.id ?? null)
       : final ? page(final.text, final.id) : missing('此单元没有当前有效的最终译文。')
   }
   if (unit.kind === 'file_job') {

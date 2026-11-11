@@ -421,7 +421,7 @@ export function apply(ctx: ClientPluginContext): void {
       if (!scope) return h('section', { className: 'dsh-translation' },
         h('h2', null, '记忆资产不可用'), h('p', null, '资源地址无效。'),
         onClose ? h('button', { type: 'button', onClick: onClose }, '关闭') : null)
-      return h(MemoryAssetsView, { store, quick, topics, terms, archive, otherMemory, memoryIndex, recordIndex, materials, mainSessionId: scope.ownerId === store.getNamespaceId() ? undefined : scope.ownerId, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
+      return h(MemoryAssetsView, { store, quick, topics, terms, archive, otherMemory, memoryIndex, recordIndex, materials, normal, mainSessionId: scope.ownerId === store.getNamespaceId() ? undefined : scope.ownerId, objects, objectAssets, viewFiles, documents: evidence, fileJobs, memoryClearing, onDeleteTerm, ...scope,
         onSelectTopic: tabInfo ? (topicId: string) => {
           if (tabInfo.tab.signal.aborted || !store.getTopics(scope.ownerId).some(topic => topic.id === topicId)) return
           tabInfo.tab.actions.openResource(tabInfo.tab.navigation.address, { params: { topicId } })

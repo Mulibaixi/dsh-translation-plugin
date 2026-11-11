@@ -1,10 +1,10 @@
-import { parseNormalTranslationTarget, type NormalTranslationTarget } from './normal-translation.js'
+import { parseDirectTranslationTarget, type DirectTranslationTarget } from './normal-translation.js'
 
 export const TRANSLATION_ARTIFACT_FORMATS = ['txt', 'md', 'json', 'html'] as const
 export type TranslationArtifactFormat = typeof TRANSLATION_ARTIFACT_FORMATS[number]
 /** Save the exact current result of a material or unit as a real file; opening is a separate step. */
 export interface TranslationArtifactSave {
-  readonly target: NormalTranslationTarget
+  readonly target: DirectTranslationTarget
   readonly format: TranslationArtifactFormat
   /** Optional display name; the Host sanitizes it and always appends the real extension. */
   readonly fileName?: string
@@ -39,7 +39,7 @@ export function parseArtifactSave(value: unknown): TranslationArtifactSave {
     if (typeof value.fileName !== 'string' || !value.fileName.trim() || Array.from(value.fileName).length > 120 ||
       /[\\/<>:"|?*\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(value.fileName)) throw new TypeError('Invalid artifact file name')
   }
-  return { target: parseNormalTranslationTarget(value.target), format: value.format,
+  return { target: parseDirectTranslationTarget(value.target), format: value.format,
     ...(value.fileName === undefined ? {} : { fileName: value.fileName as string }) }
 }
 export function parseArtifactOpen(value: unknown): TranslationArtifactOpen {

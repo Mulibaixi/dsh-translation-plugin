@@ -6,7 +6,7 @@ import type { MainAgent, TopicHostContext, TopicToolsService } from './topic-too
 import type { HistoryService } from './history.js'
 import type { HistoryBundle } from '../shared/history-bundle.js'
 import { parseHistoryTextRead, type HistoryTextRead } from '../shared/history-text.js'
-import { isTextUnit } from '../memory/translation-history.js'
+import { isEditableTextUnit, isImageUnit, isTextUnit } from '../memory/translation-history.js'
 
 type Data = Record<string, unknown>
 interface ToolMessage extends Data {
@@ -37,8 +37,9 @@ function recordedText(bundle: HistoryBundle, request: HistoryTextRead, operation
   if (!unit || !isTextUnit(unit) || unit.deletion) return undefined
   const source = unit.sourceVersions.find(source => source.version === request.sourceVersion)
   const revision = unit.revisions.find(revision => revision.id === request.revisionId)
-  return source && revision?.status === 'completed' && !revision.deletion && revision.sourceVersion === request.sourceVersion && revision.operationId === operationId
-    ? { source: source.text, text: revision.text } : undefined
+  const matchesSource = isEditableTextUnit(unit) || (source || isImageUnit(unit) && request.sourceVersion === undefined) && revision?.sourceVersion === request.sourceVersion
+  return matchesSource && revision?.status === 'completed' && !revision.deletion && revision.operationId === operationId
+    ? { source: source?.text ?? unit.source, text: revision.text } : undefined
 }
 function bodyMatches(value: Data, text: string): boolean {
   const points = Array.from(text)
@@ -117,7 +118,7 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
       if (visible && visible.kind !== 'translation_result_history' && event.data.turn !== latestTranslationTurn && history?.compactionSnapshot &&
         visible.mainSessionId === agent.id && typeof visible.topicId === 'string' && (typeof visible.text === 'string' || typeof visible.textPreview === 'string')) {
         let request: HistoryTextRead | undefined
-        try { request = parseHistoryTextRead({ translationSessionId: visible.translationSessionId, unitId: visible.unitId, sourceVersion: visible.sourceVersion,
+        try { request = parseHistoryTextRead({ translationSessionId: visible.translationSessionId, unitId: visible.unitId, ...(visible.sourceVersion === undefined ? {} : { sourceVersion: visible.sourceVersion }),
           side: 'translation', revisionId: visible.revisionId, start: 0 }) } catch { /* Unknown historical result shapes retain their visible body. */ }
         if (request) {
           const { text: _text, textPreview: _preview, resultRef: _runtimeRef, truncated: _truncated, ...facts } = summary ?? visible

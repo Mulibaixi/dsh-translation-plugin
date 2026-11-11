@@ -18,7 +18,8 @@ export interface FileIntakeStoragePort {
   removeItem(key: string): void | Promise<void>
 }
 export interface FileIntakeStoreOptions {
-  readonly registerHistory?: (current: () => readonly string[], restore: (records: readonly string[]) => void) => void
+  readonly registerHistory?: (current: () => readonly string[], restore: (records: readonly string[]) => void,
+    acknowledge?: (records: readonly string[]) => void) => void
   readonly storage?: FileIntakeStoragePort
   readonly withLock: <T>(action: () => T | Promise<T>) => Promise<T>
   readonly isEnabled: () => boolean
@@ -47,8 +48,18 @@ export class FileIntakeStore {
     options.registerHistory?.(() => [...this.seats.values()].map(seat => JSON.stringify(seat.record)), records => {
       const previous = new Map(this.seats)
       this.seats.clear()
-      for (const raw of records) { const record = parse(JSON.parse(raw)); this.seats.set(record.unitId, { ...previous.get(record.unitId), record, stored: options.storage?.getItem(key(record)) ?? null }) }
+      for (const raw of records) {
+        const record = parse(JSON.parse(raw))
+        const seat = { ...previous.get(record.unitId), record, stored: options.storage?.getItem(key(record)) ?? null }
+        if (seat.conflict && seat.stored === raw) { delete seat.conflict; delete seat.storageError }
+        this.seats.set(record.unitId, seat)
+      }
       this.onChange()
+    }, saved => {
+      for (const raw of saved) {
+        const record = parse(JSON.parse(raw)), seat = this.seats.get(record.unitId)
+        if (seat && key(seat.record) === key(record)) seat.stored = raw
+      }
     })
   }
   private load(): void {
