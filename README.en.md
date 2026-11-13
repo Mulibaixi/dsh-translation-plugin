@@ -31,7 +31,8 @@ For example, say “this sentence is too literal” or “make this character's 
 | Source editing and final selection | Edit the current source in a Normal translation unit, retranslate it, or select a final. Existing translation revisions remain available after source edits. |
 | Quick translation | Translate independent plain text directly for short passages and occasional lookups. |
 | File delivery | Work primarily with TXT/Markdown sources, process ranges when needed, and open results through the session or save a translation version to a chosen location with **操作 → 另存为…… (Actions → Save as…)**. |
-| Single-image translation | The main model reads one PNG, JPEG, or static WebP. Edit the extracted source text and export a text PNG, a lettering prompt, or a ZIP with the original and the prompt. When available, the prompt includes the original pixel dimensions. The generated image may differ in size. |
+| Single-image translation | The main model reads one PNG, JPEG, or static WebP. Edit the extracted source, copy the lettering prompt, or export a text PNG, the prompt, or a ZIP with the original and the prompt. When available, the prompt includes the original pixel dimensions. The generated image may differ in size. |
+| Batch processing | In a Normal session, click the icon to the right of the file button to select multiple images. Confirm their order and translate them one at a time. Each image keeps its own unit. The batch bar above the input shows progress and lets you pause, resume, or retry a failed item. |
 | Topic memory | Share terms, entities, facts, relations, settings, and references across topic sessions, with optional semantic retrieval. |
 
 ## A translation and refinement workflow
@@ -80,6 +81,8 @@ Composer requires a normal full exit and reopen when a host patch actually needs
 
 Image units and Normal translation units with editable sources use a new session history format. Older plugin versions cannot read sessions saved in this format. To downgrade, restore a full library backup from before the upgrade.
 
+Saving the first Review Edit upgrades that session's history format. Restore a full library backup from before the upgrade to downgrade to a version without Review Edits.
+
 See the user guide for [backup and restoration](docs/user-guide.zh-CN.md#资料库备份与恢复), [data migration](docs/user-guide.zh-CN.md#已有资料的升级与迁移), and [detailed update steps](docs/user-guide.zh-CN.md#发行包与源码更新) (简体中文). See [CHANGELOG](CHANGELOG.md) for version changes.
 
 ## Usage
@@ -92,6 +95,8 @@ The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics
 
 Before discussing an older translation, open its translation session in the current main chat so the main model can read the source and existing translation by exact unit and version.
 
+Select source text or a completed translation in the translation session and choose **引用文本 (Quote text)** to insert the excerpt and its version details into the main chat draft.
+
 Session history saves automatically in the background. If saving fails, the workspace keeps the current content and offers **重试保存 (Retry saving)** without calling the translation model again.
 
 For withdrawn text, choose **清除 (Clear)** at the top right of its entry to remove the placeholder.
@@ -101,6 +106,10 @@ When reading long text, the current source or translation heading and its contro
 Organize terminology, style requirements, and references as [memory assets (简体中文)](docs/user-guide.zh-CN.md#记忆资产) to support later discussion and translation. See the guide for entry adoption, reference-file segmentation, source indexing, and saving rules.
 
 You can explicitly ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
+
+For Normal text and file translation, you can specify the target language for the current submission or set up Chinese–English mutual translation in the session's Translation Requirements. Each submission follows the direction implied by its main source language and records the actual target language. Wording specified for the current task applies directly. Reusable candidates can be submitted for adoption after review.
+
+After reviewing a Normal plain-text translation, the main model can replace exact passages and save a Review Edit in the same unit. This step uses no translation model and preserves user-fixed finals.
 
 Names of people, places, and organizations go into entities with their renderings. Established renderings of specialized concepts go into terminology. Each referent belongs in one category.
 

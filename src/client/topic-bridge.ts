@@ -1,3 +1,4 @@
+import { batchOperationId } from '../shared/batch-processing.js'
 import { isFileJobUnit, isImageUnit } from './translation-history.js'
 import { ReferenceStore } from './reference-store.js'
 import {
@@ -12,7 +13,7 @@ import { assetPriority } from '../memory/asset-priority.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { NormalTranslationAcceptance, NormalTranslationUpdate, DirectTranslationCommit, NormalTranslationTarget } from '../shared/normal-translation.js'
-import type { NormalTranslationUnitRequest, NormalTranslationSourceCorrection } from '../shared/normal-translation.js'
+import type { NormalTranslationUnitRequest, NormalTranslationSourceCorrection, DirectResultPatch } from '../shared/normal-translation.js'
 import type { NormalTranslationResolution, NormalTranslationV2Event } from '../shared/normal-translation-v2.js'
 import { currentFinalRevision, currentDocumentFinalRevision, isTextUnit, isDocumentUnit, applyDocumentMutation, type TranslationHistory, type TextUnit } from './translation-history.js'
 import type { NormalTranslationReply } from './normal-translation.js'
@@ -99,6 +100,7 @@ interface NormalPort {
   observe(ownerId: string, request: { readonly translationSessionId: string; readonly operationId: string }): NormalTranslationReply
   resolve(ownerId: string, request: import('../shared/normal-translation.js').DirectUnitRequest): NormalTranslationReply
   correctSource(ownerId: string, request: NormalTranslationSourceCorrection): NormalTranslationReply
+  patchResult(ownerId: string, request: DirectResultPatch): Promise<NormalTranslationReply>
 }
 interface Connection {
   refs: number
@@ -494,6 +496,11 @@ export class TopicBridgeClient {
         ...(command.totalCodePoints === undefined ? {} : { totalCodePoints: command.totalCodePoints }) })
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
     }
+    if (command.kind === 'normal_patch_result') {
+      const { kind: _kind, ...patch } = command
+      const result = await this.normal?.patchResult(ownerId, patch)
+      return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通单元处理通道尚未就绪。')
+    }
     if (command.kind === 'normal_observe') {
       const result = this.normal?.observe(ownerId, command)
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
@@ -503,6 +510,10 @@ export class TopicBridgeClient {
       if (envelope.mainSessionId !== ownerId) return error(request.requestId, 'out_of_scope', '译文结果不属于当前主会话。')
       await this.terms.reconcileAsync?.(ownerId, envelope.material.topicId)
       const result = this.normal?.commitResult(ownerId, payload as DirectTranslationCommit)
+      if (result?.ok && payload.status === 'completed' && batchOperationId(payload.operationId, payload.callRecord.context?.contextSupplement)) {
+        // Batch advancement needs saved history. The ordinary direct receipt keeps its own semantics.
+        await this.sessions.saveTranslationHistoryAsync(envelope.material.translationSessionId).catch(() => false)
+      }
       return result ? { requestId: request.requestId, ...result } : error(request.requestId, 'execution_unavailable', '普通翻译业务通道尚未就绪。')
     }
     if (command.kind === 'normal_accept' || command.kind === 'normal_prepare' || command.kind === 'normal_update') {

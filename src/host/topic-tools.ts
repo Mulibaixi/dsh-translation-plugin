@@ -2,7 +2,8 @@ import { parseLibraryConnection, type LibraryConnectionIdentity } from '../share
 import { registerReferenceTools, type ReferenceFilesService } from './reference-files.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
-import { parseNormalTranslationExecute, parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt } from '../shared/normal-translation.js'
+import { DIRECT_REQUIREMENTS_CODE_POINTS, DIRECT_AUXILIARY_CONTEXT_CODE_POINTS, MAX_DIRECT_RESULT_EDITS, parseNormalTranslationExecute, parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt } from '../shared/normal-translation.js'
+import { SOURCE_LAYOUT_GUIDANCE } from '../shared/translation-call.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TerminologyAnalysisService } from './terminology-analysis.js'
 import type { TranslationPreparationService } from './translation-preparation.js'
@@ -171,7 +172,7 @@ class ManagementConnection {
     const pending = this.pending
     if (!pending || reply.requestId !== pending.frame.requestId) throw bridgeError('invalid_reply', '主题管理回执与请求不一致。')
     if (reply.ok) {
-      const expected = { image_update: 'image_updated', normal_call_finished: 'normal_call_finished', direct_proposals: 'direct_proposals', settings_scope: 'settings_scope', list_units: 'unit_directory', read_units: 'unit_contents', read_history: 'history_text', reference_assets: 'reference_assets', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
+      const expected = { image_update: 'image_updated', normal_call_finished: 'normal_call_finished', normal_patch_result: 'normal_result_patched', direct_proposals: 'direct_proposals', settings_scope: 'settings_scope', list_units: 'unit_directory', read_units: 'unit_contents', read_history: 'history_text', reference_assets: 'reference_assets', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         file_history: 'file_history', document_review_page: 'document_review_page', document_review_read: 'document_review_text', document_review_begin: 'document_review_receipt', document_review_submit: 'document_review_receipt', document_review_manual: 'document_review_receipt', document_review_observe: 'document_review_observed', document_task_terms: 'document_task_terms',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'term_write', remove_memory_asset: 'memory_asset_removed',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive_write', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_commit: 'normal_committed', normal_export: 'normal_exported', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
@@ -697,6 +698,7 @@ export class TopicToolsService {
         })))
       }
       const normal = this.ctx.get?.('translationNormal') as { execute(args: unknown, exec: ToolExecution): Promise<unknown>; correctSource(args: unknown, exec: ToolExecution): Promise<NormalTranslationCorrectionReceipt>;
+        patchResult(args: unknown, exec: ToolExecution): Promise<unknown>;
         translate(args: unknown, exec: ToolExecution): Promise<unknown>; updateImageUnit(args: unknown, exec: ToolExecution): Promise<unknown>; readResult(args: unknown, exec: ToolExecution): unknown;
         extractAssets(args: unknown, exec: ToolExecution): Promise<unknown>; saveArtifact(args: unknown, exec: ToolExecution): Promise<unknown>;
         openArtifact(args: unknown, exec: ToolExecution): Promise<unknown>; readCallLog(args: unknown, exec: ToolExecution): import('../shared/translation-log.js').TranslationLogPage } | undefined
@@ -708,13 +710,25 @@ export class TopicToolsService {
         execute: (args: unknown, exec: ToolExecution) => normal.updateImageUnit(args, exec),
       })))
       if (normal) disposers.push(register(define({
-        name: 'translation_translate', description: 'Translate newly delivered frozen material or revise an existing direct text/file unit from an opened sidebar Session in one real call. This tool is already available: call it directly without loading direct. For existing units, discover numbered targets with translation_list_units, read requested context with translation_read_units, and pass the exact unit target with a new operationId. Reuse no old material requestId; saved history needs no reference grant or redelivery. Return its actual result in this turn. Each invocation calls the Session translation model once and waits for its result. A completed result contains the body (or a resultRef), status, usage and recorded revision. A needs_context result contains focused questions instead: use existing facts or ask the user, then make at most one automatic new call with a new operationId and contextResponse using the unchanged target; if it still asks, hand the questions to the user. Do not treat partial text as a translation or repeat the parent operation to continue. Pass userRequirements as the user verbatim requirements for this task (empty only when none; never a paraphrase), organizedNotes only for your own organization, auxiliaryContext only for background that must not be translated, termReferences as queried refs or query-issued termRefs from the translation memory tools, and draftTerms only for candidates you integrated from extraction. For a text file, omit range to translate the whole frozen original, or pass one exact [start,end) segment when it exceeds the single-call limit; every segment is recorded and translation_save_result refuses an incomplete cover. For a non-text original, pass body with the text you actually extracted and organized, and never pass source text for a text original. For an image_unit first register the extracted text with translation_update_image_unit, then pass that image unit target without body or range. Never choose a provider or claim completion before it returns. Review the returned body against the source before delivering; when the result carries checks, the body likely mixes a term with its source wording or adds an untranslated parenthetical, so judge it against the source before saving. For corrections to a historical direct text/file result, use this tool with its exact unit target. All current translation and retranslation requests use this direct tool; context questions end the current invocation and retain no background waiting job. Legacy asynchronous execution is retired. A call rejected before the translation model runs (invalid term reference, oversized source, missing model) translated nothing: fix the arguments and retry; when a reused operationId is reported as already used, retry with a new one. Never repeat a successful call merely to review it; use a new operationId for a justified correction or expression improvement after review. ' + TRANSLATION_SELF_REVIEW + ' ' + DIRECT_REVISION_GUIDANCE,
+        name: 'translation_translate', description: [
+          'Use this available tool directly for the current authorized translation or correction. Pass the exact material or unit target and a fresh operationId distinct from delivery. Find existing targets with translation_list_units or translation_read_units. Each invocation uses the Session model once and waits for its result.',
+          'For each new text/file material, resolve its target language before querying terms or calling this tool. Use the latest explicit choice, then the applicable mutual-translation agreement, then the Session default. Under Chinese–English mutual translation, independently translate Chinese main text into English and English main text into Chinese; names and brief quotations do not change direction. Read the agreement in material.instruction or the active chat. If no applicable agreement is visible and the direction is unclear or the source matches the default, check applicable translation_list_settings. Ask only when the direction is still genuinely unclear. Use the same target language for translation_query_terms and this call. Revisions and later file ranges keep the recorded direction.',
+          'Pass current user-specified wording and terminology verbatim in userRequirements. Skip unrelated terms and omit any saved term the user explicitly overrides for this task. Do not load memory_write or create formal terms just to apply current-task wording. After review, use translation_submit_proposals once for reusable candidates supported by the exact revision and source quotes, when warranted by a learning request or the material. With no candidates, deliver directly.',
+          'For a source-specific ambiguity, read relevant topic or reference evidence and pass a referenceContextRef from translation_reference_select when useful.',
+          'Read paged source with translation_read_source; inline sourceText is already complete. When the full source and page bounds are known, request independent pages together. Use exact contiguous translation ranges for oversized text originals. Register image text with translation_update_image_unit before translating an image_unit. An organized body is for extracted non-text originals only.',
+          SOURCE_LAYOUT_GUIDANCE,
+          'On needs_context, use existing facts or ask the user, then use a fresh operationId and contextResponse with the same target and language. Make at most one automatic supplemented call; ask the user if it still needs context. A rejected call before model dispatch translated nothing; correct the arguments and use a new operationId if the old one is reserved.',
+          'For a completed result, read the whole body, using translation_read_result if it returns resultRef. Evaluate any terminology checks against the source. Report the recorded result and material caveats briefly; context injection alone does not establish that a reference was applied correctly.',
+          TRANSLATION_SELF_REVIEW,
+          DIRECT_REVISION_GUIDANCE,
+        ].join(' '),
         parameters: {
           target: { required: true, description: 'Nested JSON object identifying the exact material or unit. Pass an object, never a JSON-encoded string or the result of JSON.stringify.', oneOf: [materialTargetParameter, unitTargetParameter, imageTargetParameter] },
           operationId: { type: 'string', required: true },
-          userRequirements: { type: 'string', description: 'Verbatim user requirements and corrections from the current main-chat command. Omit or pass an empty string only when there are none. Never a model paraphrase.' },
-          organizedNotes: { type: 'string', description: 'Only your own organization for this call, never presented as a user instruction.' },
-          auxiliaryContext: { type: 'string', description: 'Adjacent paragraphs, speaker or background that helps understanding and must not be translated.' },
+          targetLanguage: { type: 'string', description: 'Resolved language for new text/file material (e.g. en, zh-Hans, zh-Hant). Omit to use the frozen Session default or the direction already recorded for this material. Existing units, including images, keep their recorded language.' },
+          userRequirements: { type: 'string', description: `Verbatim current user requirements, including task-specific wording. Omit when absent. At most ${DIRECT_REQUIREMENTS_CODE_POINTS} Unicode code points.` },
+          organizedNotes: { type: 'string', description: `Your own organization for this call. At most ${DIRECT_REQUIREMENTS_CODE_POINTS} Unicode code points.` },
+          auxiliaryContext: { type: 'string', description: `Background for understanding only. At most ${DIRECT_AUXILIARY_CONTEXT_CODE_POINTS} Unicode code points.` },
           termReferences: { type: 'array', items: { oneOf: [
             { type: 'object', additionalProperties: false, properties: {
               id: { type: 'string', required: true }, entryVersion: { type: 'integer', required: true },
@@ -722,14 +736,14 @@ export class TopicToolsService {
             { type: 'object', additionalProperties: false, properties: {
               termRef: { type: 'string', required: true, description: 'Short handle returned by translation_query_terms in this run; the Host resolves it to that result\'s exact id and entry version.' },
             } },
-          ] }, description: 'Exact active term references for this text: either the queried id/entryVersion or the query-issued termRef. Omit when there are none.' },
+          ] }, description: 'Exact active term references for this text and its resolved target language. Use the queried id/entryVersion or termRef. Omit when there are none.' },
           draftTerms: { type: 'array', description: 'Candidates you integrated from extraction for this call only; authority 0, never formal memory.',
             items: { type: 'object', additionalProperties: false, properties: { sourceForms: { type: 'array', required: true, items: { type: 'string' } },
               preferred: { type: 'string', required: true }, forbidden: { type: 'array', items: { type: 'string' } }, sense: { type: 'string' } } } },
           range: { type: 'object', description: 'One exact Unicode code point interval [start,end) of a text file. Omit for the whole file.', additionalProperties: false,
             properties: { start: { type: 'integer', required: true }, end: { type: 'integer', required: true } } },
           body: { type: 'string', description: 'The exact text you extracted and organized from a non-text original (PDF, image, binary). Never a text original.' },
-          contextResponse: { type: 'object', additionalProperties: false, description: 'Answer a needs_context result from this same run using a NEW operationId and its unchanged target. Its frozen range/body are inherited. This starts one new direct call, not a background resume.', properties: {
+          contextResponse: { type: 'object', additionalProperties: false, description: 'Answer a needs_context result from this same run using a NEW operationId and the same target. Target language and frozen range/body are inherited.', properties: {
             operationId: { type: 'string', required: true, description: 'The exact operationId that returned needs_context.' },
             answerText: { type: 'string', required: true, description: 'One focused answer covering the returned questions; inferred information is background, not user authority.' },
           } },
@@ -740,6 +754,21 @@ export class TopicToolsService {
           if (exec.agent !== agent) throw bridgeError('scope_mismatch', '翻译工具不属于此 Agent。')
           return normal.translate(args, exec)
         },
+      })))
+      if (normal) disposers.push(register(define({
+        name: 'translation_patch_result',
+        description: 'After full review, make exact local replacements in the newest completed version of an editable Normal plain-text unit. Use the recorded unit target at its current sourceVersion, the exact baseRevisionId and a fresh operationId. Every from must occur exactly once in that same base, and matches cannot overlap. Applies all edits together, preserves other text and appends one review revision without calling the translation model. A user-fixed final stays selected. On a stale base or ambiguous match, read the current unit and verify before retrying; do not blindly apply to a different version. Read the returned revisionNumber via translation_read_units to verify if needed. Files, images and structural rewrites use their existing workflows.',
+        parameters: { target: { ...unitTargetParameter, required: true }, baseRevisionId: { type: 'string', required: true },
+          operationId: { type: 'string', required: true },
+          edits: { type: 'array', required: true, description: `1 to ${MAX_DIRECT_RESULT_EDITS} replacements against the same base.`,
+            items: { type: 'object', additionalProperties: false, properties: {
+              from: { type: 'string', required: true, description: 'Exact nonempty and unique fragment in the base translation.' },
+              to: { type: 'string', required: true, description: 'Replacement text. An empty string deletes the fragment.' },
+            } },
+          },
+        },
+        output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
+        execute: (args: unknown, exec: ToolExecution) => normal.patchResult(args, exec),
       })))
       if (normal) disposers.push(register(define({
         name: 'translation_read_call_log', description: 'Read a 4000-character page of the actual log for one ended direct translation or context-question call in this same run. Use the exact operationId and callId from its result. Contains source, prompts and output; use only when diagnosing that call. No model calls, task replay or deleted-content recovery.',

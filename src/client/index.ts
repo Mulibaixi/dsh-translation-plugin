@@ -13,6 +13,7 @@ import { ModelCatalog, type ModelCatalogPort } from './models.js'
 import { QuickTranslationClient } from './quick-translation.js'
 import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
+import type { BatchProcessingRemote, BatchRequest } from '../shared/batch-processing.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore, type TopicTermsRemotePort } from './topic-memory-store.js'
 import { EmbeddingClient } from './embedding-client.js'
@@ -70,6 +71,7 @@ interface SidebarRightTabDefinition {
 
 type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] & {
   get(name: 'remote.translationHistory'): HistoryRemoteClientPort | undefined
+  get(name: 'remote.translationBatchProcessing'): BatchProcessingRemote | undefined
   get(name: 'remote.translationMemorySearch'): MemorySearchRemotePort | undefined
   get(name: 'remote.translationRecordIndex'): RecordIndexRemotePort | undefined
   get(name: 'remote.translationEmbedding'): EmbeddingRemotePort | undefined
@@ -96,6 +98,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   readonly fileUpload: NativeFileUploadPort
   readonly remote: {
     readonly translationHistory?: HistoryRemoteClientPort
+    readonly translationBatchProcessing?: BatchProcessingRemote
     readonly translationMemorySearch?: MemorySearchRemotePort
     readonly translationRecordIndex?: RecordIndexRemotePort
     readonly translationEmbedding?: EmbeddingRemotePort
@@ -194,6 +197,12 @@ export function apply(ctx: ClientPluginContext): void {
       console.error(`[${CLIENT_ID}] Client translation remote mount failed: ${detail}`)
       return undefined
     })
+    const batchRemote = async (request: BatchRequest): Promise<unknown> => {
+      if (ctx.remote.$mount && !await mountedRemote) throw new Error('批量处理服务尚未就绪。')
+      const remote = ctx.get?.('remote.translationBatchProcessing') ?? ctx.remote.translationBatchProcessing
+      if (remoteDisposed || !remote) throw new Error('批量处理服务尚未就绪。')
+      return remote.batch(request)
+    }
     const sourcesRemote = ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationSources')
@@ -314,6 +323,7 @@ export function apply(ctx: ClientPluginContext): void {
       isSessionBusy: sessionId => quick.isBusy(sessionId), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
       uiLocale: () => activeUiLocale(ctx),
       canCorrectSource: (ownerId, topicId, sessionId, unitId) => !objects.getReferences({ ownerId, topicId, sessionId, unitId, side: 'source', revisionId: null }).length,
+      canPatchRevision: (ownerId, topicId, sessionId, unitId, revisionId) => !objects.hasRevisionObjects(ownerId, topicId, sessionId, unitId, revisionId),
       remote: ctx.remote.$mount ? async () => {
         const unmountRemote = await mountedRemote
         return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationNormal')
@@ -397,10 +407,12 @@ export function apply(ctx: ClientPluginContext): void {
       react.useEffect(() => store.subscribe(() => historyChanged(value => value + 1)), [])
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
+      const inputActions = props.inputActions as { insertQuote?(text: string): boolean } | undefined
       if (frozen) return h(ClearedDataView, null)
       if (!store.isHistoryReady()) return historyLoading()
       return h(PanelRouter, {
-        store, models, quick, normal, topics, materials, terms, archive, otherMemory, memoryIndex, recordIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
+        store, models, quick, normal, topics, materials, batchRemote, terms, archive, otherMemory, memoryIndex, recordIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents: evidence, documentTasks: documents, documentReviews, fileJobs, onDeleteTerm, sessionId,
+        insertQuote: sessionId && typeof inputActions?.insertQuote === 'function' ? inputActions.insertQuote : undefined,
         onOpenAssets: sessionId && tabInfo ? (ownerId: string, topicId: string, associatedSessionId?: string, jobId?: string) => {
           if (!store.getTopics(ownerId).some(topic => topic.id === topicId)) return
           openMemoryAssets(ctx.sidebarRight, { ownerId: sessionId, tab: tabInfo.tab }, { ownerId, topicId, sessionId: associatedSessionId, jobId },

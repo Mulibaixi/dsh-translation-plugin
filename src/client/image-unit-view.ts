@@ -68,7 +68,7 @@ export function ImageBackground({ unit, session, normal }: ImageViewProps & { re
 
 export function ImageExportMenu({ unit, session, revision, materials, viewFiles }: ImageViewProps & { readonly revision: TextRevision }): unknown {
   const [menu, setMenu] = react.useState<'exports' | 'text-image' | null>(null)
-  const [busy, setBusy] = react.useState(false)
+  const [busy, setBusy] = react.useState<'copy' | 'save' | null>(null)
   const saving = react.useRef(false)
   const [notice, setNotice] = react.useState('')
   const original = unit.original, format = original && imageFileFormat(original.name)
@@ -82,21 +82,27 @@ export function ImageExportMenu({ unit, session, revision, materials, viewFiles 
   async function makePrompt(bytes?: Uint8Array<ArrayBuffer>): Promise<string> {
     return imageLetteringPrompt(unit.source, revision.text, bytes && await readImageSize(bytes))
   }
-  async function save(kind: 'translation' | 'bilingual' | 'prompt' | 'package'): Promise<void> {
+  async function readPrompt(): Promise<string> {
+    const image = await readOriginal().catch(() => undefined)
+    return makePrompt(image?.bytes)
+  }
+  async function deliver(kind: 'translation' | 'bilingual' | 'copy-prompt' | 'prompt' | 'package'): Promise<void> {
     if (saving.current || revision.status !== 'completed' || !revision.text.trim()) return
     saving.current = true
     setMenu(null)
-    setBusy(true)
+    setBusy(kind === 'copy-prompt' ? 'copy' : 'save')
     setNotice('')
     try {
+      if (kind === 'copy-prompt') {
+        await navigator.clipboard.writeText(await readPrompt())
+        setNotice('已复制翻嵌提示词。')
+        return
+      }
       const fileName = `${name}-v${revision.order}-${kind === 'prompt' ? '翻嵌提示词.txt' : kind === 'package' ? '翻嵌素材包.zip' : kind === 'bilingual' ? '双语.png' : '译文.png'}`
       const mimeType = kind === 'prompt' ? 'text/plain;charset=utf-8' : kind === 'package' ? 'application/zip' : 'image/png'
       const result = await saveExport({ fileName, mimeType,
         content: async () => {
-          if (kind === 'prompt') {
-            const image = await readOriginal().catch(() => undefined)
-            return new Blob([await makePrompt(image?.bytes)], { type: mimeType })
-          }
+          if (kind === 'prompt') return new Blob([await readPrompt()], { type: mimeType })
           if (kind === 'package') {
             const { format, bytes } = await readOriginal()
             return imageLetteringArchive(format, bytes, await makePrompt(bytes))
@@ -108,25 +114,26 @@ export function ImageExportMenu({ unit, session, revision, materials, viewFiles 
         },
       })
       if (result !== 'cancelled') setNotice(result === 'saved' ? '文件已保存。' : `已发起下载：${fileName}`)
-    } catch (error) { setNotice(error instanceof Error ? error.message : '导出失败。') }
-    finally { saving.current = false; setBusy(false) }
+    } catch (error) { setNotice(kind === 'copy-prompt' ? '复制失败，请重试。' : error instanceof Error ? error.message : '导出失败。') }
+    finally { saving.current = false; setBusy(null) }
   }
   if (revision.status === 'deleted') return null
   const rows = menu === 'text-image' ? [
     h(MenuItemButton, { onSelect: () => setMenu('exports') }, '返回'),
-    h(MenuItemButton, { separatorBefore: true, onSelect: () => { void save('translation') } }, '译文'),
-    h(MenuItemButton, { disabled: !unit.source.trim(), onSelect: () => { void save('bilingual') } }, '双语'),
+    h(MenuItemButton, { separatorBefore: true, onSelect: () => { void deliver('translation') } }, '译文'),
+    h(MenuItemButton, { disabled: !unit.source.trim(), onSelect: () => { void deliver('bilingual') } }, '双语'),
   ] : [
     h(MenuItemButton, { onSelect: () => setMenu('text-image') },
       h('span', { className: 'dsh-tp-submenu-label' }, '导出文字图片……', h(IconChevronRightOutlineRegular, { size: 14 }))),
-    h(MenuItemButton, { disabled: !unit.source.trim(), onSelect: () => { void save('prompt') } }, '导出翻嵌提示词……'),
-    h(MenuItemButton, { disabled: !unit.source.trim() || !format || !materials || !viewFiles, onSelect: () => { void save('package') } }, '导出翻嵌素材包……'),
+    h(MenuItemButton, { disabled: !unit.source.trim(), onSelect: () => { void deliver('copy-prompt') } }, '复制翻嵌提示词'),
+    h(MenuItemButton, { disabled: !unit.source.trim(), onSelect: () => { void deliver('prompt') } }, '导出翻嵌提示词……'),
+    h(MenuItemButton, { disabled: !unit.source.trim() || !format || !materials || !viewFiles, onSelect: () => { void deliver('package') } }, '导出翻嵌素材包……'),
   ]
   return h('div', null,
     h(Menu, {
       open: menu !== null, onClose: () => setMenu(null), portal: true, align: 'end', compact: true, listClassName: 'dsh-tp-popup',
-      anchor: h('button', { type: 'button', 'aria-haspopup': 'menu', 'aria-expanded': menu !== null, disabled: busy || revision.status !== 'completed' || !revision.text.trim(),
-        onClick: () => setMenu(current => current ? null : 'exports') }, busy ? '正在导出…' : '导出'),
+      anchor: h('button', { type: 'button', 'aria-haspopup': 'menu', 'aria-expanded': menu !== null, disabled: !!busy || revision.status !== 'completed' || !revision.text.trim(),
+        onClick: () => setMenu(current => current ? null : 'exports') }, busy === 'copy' ? '正在复制…' : busy ? '正在导出…' : '导出'),
     }, ...rows),
     notice ? h('small', { role: 'status' }, notice) : null)
 }

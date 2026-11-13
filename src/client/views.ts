@@ -1,7 +1,9 @@
 import { isDocumentUnit, isFileJobUnit, isImageUnit } from './translation-history.js'
 import { DirectFileLink, type DirectFile } from './direct-file-view.js'
 import { ImageBackground, ImageExportMenu, ImageOriginalButton } from './image-unit-view.js'
+import { BatchProcessingView, type BatchRemoteCall } from './batch-processing-view.js'
 import { SourceTextEditor } from './source-text-editor.js'
+import { TranslationQuote, type InsertTranslationQuote } from './translation-quote.js'
 import { MemoryAssetsView } from './memory-assets-view.js'
 import { LocalDataClearView, type LocalDataClient } from './local-data.js'
 import { styles, TOPIC_SUBMENU_WIDTH } from './view-styles.js'
@@ -43,6 +45,7 @@ type TextEvent = { currentTarget: { value: string } }
 type CheckEvent = { currentTarget: { checked: boolean } }
 type FileEvent = { currentTarget: { files: FileList | null; value: string } }
 interface StoreProps { readonly store: SessionStore }
+interface QuoteProps { readonly insertQuote?: InsertTranslationQuote | undefined }
 interface TopicUiProps extends RecordObjectsProps, DocumentViewProps, FileJobViewProps, RecordIndexProps {
   readonly memoryIndex?: MemoryIndexClient | undefined
   readonly archive?: import('./topic-archive-store.js').TopicArchiveStore | undefined
@@ -50,6 +53,7 @@ interface TopicUiProps extends RecordObjectsProps, DocumentViewProps, FileJobVie
   readonly memoryClearing?: import('./theme-memory-clearing.js').ThemeMemoryClearing | undefined
   readonly normal?: NormalTranslationClient | undefined
   readonly materials?: MaterialSubmissionsClient | undefined
+  readonly batchRemote?: BatchRemoteCall | undefined
   readonly topics?: TopicBridgeClient | undefined
   readonly terms?: (TopicTermsViewPort & TopicMemoryStore) | undefined
   readonly topicDeletion?: TopicDeletionClient | undefined
@@ -143,7 +147,7 @@ interface RevisionEditor {
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
 
-export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, terms, archive, otherMemory, memoryIndex, recordIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
+export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, batchRemote, terms, archive, otherMemory, memoryIndex, recordIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets, insertQuote }: StoreProps & TopicUiProps & QuoteProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [assetTopic, setAssetTopic] = react.useState<string | undefined>(undefined)
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
   react.useEffect(() => {
@@ -184,7 +188,7 @@ export function PanelRouter({ store, models, quick, normal, sessionId, topics, m
       ownerId: sessionId ?? store.getNamespaceId(), topicId: assetTopic, onSelectTopic: setAssetTopic, onDeleteTerm: onDeleteTerm ?? (async () => false) }))
   const openAssets = onOpenAssets ?? (terms && archive ? (_entryId: string, topicId: string) => setAssetTopic(topicId) : undefined)
   return h('section', { className: 'dsh-tp dsh-tp-panel', 'aria-label': '翻译面板' }, h('style', null, styles),
-    h(WorkspaceView, { store, models, quick, normal, editor, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, onDeleteTerm, onOpenAssets: openAssets, ownerId: sessionId?.trim() || store.getNamespaceId(), key: sessionId ?? store.getNamespaceId() }),
+    h(WorkspaceView, { store, models, quick, normal, editor, topics, materials, batchRemote, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, onDeleteTerm, onOpenAssets: openAssets, insertQuote, ownerId: sessionId?.trim() || store.getNamespaceId(), key: sessionId ?? store.getNamespaceId() }),
   )
 }
 
@@ -208,6 +212,10 @@ function sessionTitle(session: LocalSession): string {
   return session.legacyName ? `${label}\n旧名称：${session.legacyName}` : label
 }
 function sessionDisplayName(session: LocalSession): string { return session.remark || session.name }
+function quoteSource(session: LocalSession, unit: TextUnit, side: string): string {
+  const name = (session.remark ? `${session.name} · ${session.remark}` : session.name).replace(/\s+/gu, ' ')
+  return `${name} · 单元 ${unit.order} · ${side}（单元 ID ${unit.id}）`
+}
 function sessionLabel(session: LocalSession): unknown {
   return h('span', { className: 'dsh-tp-session-choice-name' }, sessionDisplayName(session))
 }
@@ -501,6 +509,7 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
   const canEdit = !!revision.text.trim() && ['completed', 'failed', 'cancelled', 'interrupted'].includes(revision.status) && session.archivedAt === null
   const editBlocked = quick.manualEditBlockedReason(session.id, unit.id, revision.id)
   const base = unit.revisions.find(base => base.id === revision.baseRevisionId)
+  const editLabel = revision.kind === 'review_edit' ? '审阅修订' : revision.kind === 'manual' ? '人工修订' : null
   const metadata = revision.callRecord ?? revision.deletion?.callFacts
   const model = metadata?.model ?? revision.model
   const usage = (count: number | null | undefined): string => count === null || count === undefined ? '未提供' : String(count)
@@ -510,7 +519,7 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
   }
   return h('section', { className: 'dsh-tp-version', 'aria-label': label },
     h('div', { className: 'dsh-tp-version-header' },
-      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.status === 'deleted' ? status : revision.kind === 'manual' ? '人工修订' : status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}${revisionMatchesCurrentSource(unit, revision) ? '' : ` · 已过时（原文版本 ${revision.sourceVersion}）`}`),
+      h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.status === 'deleted' ? status : editLabel ?? status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}${revisionMatchesCurrentSource(unit, revision) ? '' : ` · 已过时（原文版本 ${revision.sourceVersion}）`}`),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
         revision.status === 'deleted' ? null : h('button', { type: 'button', 'aria-label': `复制${label}`, disabled: !revision.text, onClick: () => { void copy() } }, copyState === 'copied' ? '已复制' : '复制'),
         revision.status === 'deleted' ? null : h('button', { type: 'button', 'aria-label': `编辑${label}`, disabled: !!editBlocked || !canEdit || !!draft || otherEdit, title: editBlocked ?? (otherEdit ? '请先保存或取消此段的当前编辑。' : undefined), onClick: () => editor.start(session.id, unit.id, revision.id, revision.text) }, draft ? '编辑中' : '编辑'),
@@ -522,13 +531,13 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
       ),
     ),
     details ? h('div', { className: 'dsh-tp-muted dsh-tp-version-details' },
-      revision.kind === 'manual' ? h('div', null, '人工修订，未调用模型。') : h('div', null,
+      editLabel ? h('div', null, revision.kind === 'manual' ? '人工修订，未调用模型。' : '审阅修订，未调用翻译模型。') : h('div', null,
         h('div', null, model ? `${metadata ? '调用模型' : '选用模型'}：${model.provider}/${model.model} · 推理：${model.reasoningEffort ?? 'Default'}` : '选用模型：未提供'),
         h('div', null, `提示词版本：${metadata?.promptVersion ?? '未提供'}`),
         h('div', null, `用量：输入 ${usage(metadata?.usage.inputTokens)} · 输出 ${usage(metadata?.usage.outputTokens)} token`),
       ),
-      h('time', { dateTime: revision.createdAt }, `${revision.kind === 'manual' ? '保存' : '开始'}：${new Date(revision.createdAt).toLocaleString()}`),
-      revision.kind === 'manual' ? null : h('div', null, h('time', { dateTime: revision.updatedAt }, `更新：${new Date(revision.updatedAt).toLocaleString()}`)),
+      h('time', { dateTime: revision.createdAt }, `${editLabel ? '保存' : '开始'}：${new Date(revision.createdAt).toLocaleString()}`),
+      editLabel ? null : h('div', null, h('time', { dateTime: revision.updatedAt }, `更新：${new Date(revision.updatedAt).toLocaleString()}`)),
       revision.deletion ? h('div', null, h('time', { dateTime: revision.deletion.at }, `用户删除：${new Date(revision.deletion.at).toLocaleString()}`)) : null,
     ) : null,
     revision.text && revision.status !== 'completed' ? h('div', { className: 'dsh-tp-muted' }, '未完成输出') : null,
@@ -541,7 +550,11 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
         h('button', { type: 'button', 'aria-label': `取消${label}编辑`, onClick: () => editor.cancel(key) }, '取消'),
       ),
       draft.failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, draft.failure) : null,
-    ) : revision.text ? file ? h(DirectFileLink, { file, unit, revision, session, materials, viewFiles }) : h(RecordObjectText, { text: revision.text, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id }, objects, objectAssets }) : null,
+    ) : revision.text ? file ? h(DirectFileLink, { file, unit, revision, session, materials, viewFiles }) : h(RecordObjectText, {
+      text: revision.text, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id }, objects, objectAssets,
+      quoteSource: revision.status === 'completed'
+        ? quoteSource(session, unit, `译文 v${revision.order} · 译文版本 ID ${revision.id}${revision.sourceVersion === undefined ? '' : ` · 原文版本 ${revision.sourceVersion}`}`) : undefined,
+    }) : null,
     editBlocked ? h('small', { className: 'dsh-tp-muted' }, editBlocked) : null,
     revision.message ? h('p', { role: revision.status === 'failed' || revision.status === 'unknown' ? 'alert' : 'status', className: 'dsh-tp-muted' }, revision.message) : null,
     copyState === 'failed' ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '复制失败，请重试。') : null,
@@ -580,6 +593,8 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const latest = unit.revisions.at(-1)
   const image = isImageUnit(unit) ? unit : undefined
   const intake = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
+  const sourceQuote = image ? quoteSource(session, unit, '图片原文')
+    : intake ? undefined : quoteSource(session, unit, `原文 v${unit.sourceVersion ?? 1}`)
   const sourceEditable = session.mode === 'normal' && session.archivedAt === null
   const sourceBlocked = sourceEditable ? normal?.sourceEditBlockedReason(session.id, unit.id) : undefined
   const imageHeader = image ? h('div', { className: 'dsh-tp-unit-header' },
@@ -600,7 +615,8 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
     h('small', { className: 'dsh-tp-muted' }, `当前原文版本 ${unit.sourceVersion}`),
     h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文版本`, 'aria-expanded': sourcesExpanded, onClick: () => setSourcesExpanded(value => !value) }, sourcesExpanded ? '收起原文版本' : '查看原文版本'),
     sourcesExpanded ? h('div', { className: 'dsh-tp-old-versions' }, ...unit.sourceVersions.map(source => h('section', { key: source.version },
-      h('small', { className: 'dsh-tp-muted' }, `原文版本 ${source.version}${source.version === unit.sourceVersion ? '（当前）' : '（历史）'}`), h('div', { className: 'dsh-tp-translation-text' }, source.text)))) : null) : null
+      h('small', { className: 'dsh-tp-muted' }, `原文版本 ${source.version}${source.version === unit.sourceVersion ? '（当前）' : '（历史）'}`),
+      h('div', { className: 'dsh-tp-translation-text', 'data-translation-quote': sourceQuote ? quoteSource(session, unit, `原文 v${source.version}`) : undefined }, source.text)))) : null) : null
   const operation = normal?.getUnitStatus(session.id, unit.id)
   const exchange = operation ? store.getTranslationHistory(session.id)?.exchanges.filter(item => item.unitId === unit.id && item.operationId === operation.operationId).at(-1) : undefined
   const operationStatus: Record<string, string> = {
@@ -636,7 +652,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
       h('span', { className: 'dsh-tp-muted' }, '原文'),
       h('div', { className: 'dsh-tp-actions' }, h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
         h(SourceOpenLink, { unit, session, objects, viewFiles }))),
-    h(RecordObjectText, { text: unit.source, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets }),
+    h(RecordObjectText, { text: unit.source, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote }),
     sourceHistory, execution ?? h('p', { className: 'dsh-tp-muted', role: 'status' }, '材料已受理，等待翻译执行。'))
   const final = currentFinalRevision(unit), pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
   const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : pointed ? !revisionMatchesCurrentSource(unit, pointed) ? `原最终版本 ${pointed.order}已过时，待新原文定稿` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中` : '待定稿'
@@ -657,7 +673,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
           h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
           file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
       ),
-      sourceEditor ?? (image && !unit.source ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '等待提取文字。') : file ? h(DirectFileLink, { file, unit, session, materials, viewFiles }) : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets })),
+      sourceEditor ?? (image && !unit.source ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '等待提取文字。') : file ? h(DirectFileLink, { file, unit, session, materials, viewFiles }) : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote })),
       imageBackground,
       imageIntakeStatus,
       sourceHistory,
@@ -710,7 +726,7 @@ function FileUnitView({ file, session, materials, viewFiles }: {
     notice ? h('p', { role: 'status', className: 'dsh-tp-muted' }, notice) : null)
 }
 
-function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, materials, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, onDeleteTerm, onOpenAssets }: StoreProps & TopicUiProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
+function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, materials, batchRemote, terms, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, recordIndex, onDeleteTerm, onOpenAssets, insertQuote }: StoreProps & TopicUiProps & QuoteProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly ownerId: string }): unknown {
   useStore(store)
   const [, refreshQuick] = react.useState(0)
   const [, refreshViewFiles] = react.useState(0)
@@ -941,6 +957,51 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
         h('path', { d: 'M3.2 3.2l9.6 9.6M12.8 3.2l-9.6 9.6' }))),
     )
   }
+  function renderToolbar(session: LocalSession, batchInput?: unknown, batchButton?: unknown): unknown {
+    return h('div', { className: 'dsh-tp-composer-toolbar' },
+      h('div', { className: 'dsh-tp-composer-files' },
+        h('input', { type: 'file', hidden: true, ref: fileInput, key: `file:${session.id}`, 'aria-label': '待译文件', disabled: session.mode === 'quick',
+          onChange: (event: FileEvent) => {
+            const file = event.currentTarget.files?.[0]
+            if (file && session.mode === 'normal') materials?.setFileSelected(session.id, file)
+            event.currentTarget.value = ''
+          },
+        }),
+        h('button', { type: 'button', className: 'dsh-tp-attach', 'aria-label': '选择待译文件', disabled: session.mode === 'quick',
+          title: session.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择原稿（图片最多 50 MiB，其他文件最多 2 MiB）', onClick: () => fileInput.current?.click(),
+        }, h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+          h('path', { d: 'm8 12 7-7a4 4 0 0 1 6 6L10 22a6 6 0 0 1-8-8L13 3M6 15l9-9a2 2 0 0 1 3 3l-9 9' }),
+        )),
+        batchInput, batchButton,
+      ),
+      h(ModelPicker, { key: session.id, catalog: models, current: session.model, onSelect: (model: LocalSession['model']) => { store.updateSession(session.id, { model }) } }),
+      h('button', { type: 'button', className: 'dsh-tp-send', disabled: session.mode === 'normal' ? busy || !!blocked : !busy && !!blocked, title: session.mode === 'normal' ? blocked ?? '发送待译材料' : busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': session.mode === 'normal' ? busy ? '正在提交材料' : '发送待译材料' : busy ? '取消翻译' : '发送快译', 'aria-description': busy ? undefined : blocked,
+        onClick: () => { if (session.mode === 'normal') void materials?.send(session.id, ownerId); else if (busy) quick.cancel(session.id); else void quick.send(session.id) },
+        style: { width: 38, height: 38, minWidth: 38, maxWidth: 38, minHeight: 38, maxHeight: 38, padding: 0, borderRadius: '50%', cornerShape: 'round', aspectRatio: '1 / 1', flex: '0 0 38px' },
+      }, busy ? h('span', { 'aria-hidden': true, style: { fontSize: 18, lineHeight: 1 } }, '■') : h(IconSendOutlineMedium, { size: 20 })),
+    )
+  }
+  function renderComposer(session: LocalSession, batchInput?: unknown, batchButton?: unknown): unknown {
+    return h('div', { className: 'dsh-tp-composer' },
+      session.mode === 'normal' && selectedFile ? h('div', null,
+        h('div', { className: 'dsh-tp-attachment' },
+          h('span', { className: 'dsh-tp-attachment-name', title: selectedFile.name }, selectedFile.name),
+          h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => { materials?.setFileSelected(session.id, undefined) } }, '×'),
+        ),
+        h('p', { className: 'dsh-tp-attachment-note' }, '原稿将按原始文件冻结并缓存；读取与输出形式由主模型按内容判断。'),
+      ) : null,
+      session.mode === 'normal' && longDraft ? h('div', null,
+        h('div', { className: 'dsh-tp-attachment' },
+          h('button', { type: 'button', className: 'dsh-tp-attachment-name', 'aria-label': '编辑长原稿', title: `${longDraft.totalCodePoints} 个字符 · ${longDraft.bytes} 字节`,
+            onClick: () => sourceInput.current?.focus() }, '长原稿'),
+        ),
+        h('p', { className: 'dsh-tp-attachment-note' }, '发送时将固定为 UTF-8 原稿，正文可继续编辑；超过单次上限时，主模型可按原文范围分段翻译。'),
+      ) : null,
+      h('textarea', { ref: sourceInput, value: session.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(session.id, { input: event.currentTarget.value }) } }),
+      session.mode === 'quick' && Array.from(session.input).length > session.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${session.maxInputChars} 个字符；内容保持完整。`) : null,
+      renderToolbar(session, batchInput, batchButton),
+    )
+  }
   return h('div', { className: 'dsh-tp-workspace' },
     exportFeedback.toast,
     h('aside', { className: 'dsh-tp-session-sidebar', hidden: !sidebar, 'aria-label': '翻译会话侧栏' },
@@ -997,6 +1058,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
           h('div', { className: 'dsh-tp-empty-action' }, button('选择已有主题', () => { setSessionPickerOpen(true) }, action.pending)),
         ) : units.length === 0 && records.length === 0 && current.mode !== 'normal' ? h('div', { className: 'dsh-tp-empty' }, '在下方输入待翻译内容，选择模型后发送。') : null,
       ),
+      current && insertQuote ? h(TranslationQuote, { key: current.id, transcript, insertQuote }) : null,
       storeNotice(store),
       current && status === 'error' ? h('div', { className: 'dsh-tp-actions' },
         button(action.pending ? '正在重试保存…' : '重试保存', () => { void action.run(() => store.saveTranslationHistoryAsync(current.id)) }, action.pending),
@@ -1035,43 +1097,12 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
             h('path', { d: 'M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 17.9 17' }),
           )) : null,
         ) : null,
-        h('div', { className: 'dsh-tp-composer' },
-        current.mode === 'normal' && selectedFile ? h('div', null,
-          h('div', { className: 'dsh-tp-attachment' },
-            h('span', { className: 'dsh-tp-attachment-name', title: selectedFile.name }, selectedFile.name),
-            h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => { materials?.setFileSelected(current.id, undefined) } }, '×'),
-          ),
-          h('p', { className: 'dsh-tp-attachment-note' }, '原稿将按原始文件冻结并缓存；读取与输出形式由主模型按内容判断。'),
-        ) : null,
-        current.mode === 'normal' && longDraft ? h('div', null,
-          h('div', { className: 'dsh-tp-attachment' },
-            h('button', { type: 'button', className: 'dsh-tp-attachment-name', 'aria-label': '编辑长原稿', title: `${longDraft.totalCodePoints} 个字符 · ${longDraft.bytes} 字节`,
-              onClick: () => sourceInput.current?.focus() }, '长原稿'),
-          ),
-          h('p', { className: 'dsh-tp-attachment-note' }, '发送时将固定为 UTF-8 原稿，正文可继续编辑；超过单次上限时，主模型可按原文范围分段翻译。'),
-        ) : null,
-        h('textarea', { ref: sourceInput, value: current.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(current.id, { input: event.currentTarget.value }) } }),
-        current.mode === 'quick' && Array.from(current.input).length > current.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${current.maxInputChars} 个字符；内容保持完整。`) : null,
-        h('div', { className: 'dsh-tp-composer-toolbar' },
-          h('input', { type: 'file', hidden: true, ref: fileInput, key: `file:${current.id}`, 'aria-label': '待译文件', disabled: current.mode === 'quick',
-            onChange: (event: FileEvent) => {
-              const file = event.currentTarget.files?.[0]
-              if (file && current.mode === 'normal') materials?.setFileSelected(current.id, file)
-              event.currentTarget.value = ''
-            },
-          }),
-          h('button', { type: 'button', className: 'dsh-tp-attach', 'aria-label': '选择待译文件', disabled: current.mode === 'quick',
-            title: current.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择原稿（图片最多 50 MiB，其他文件最多 2 MiB）', onClick: () => fileInput.current?.click(),
-          }, h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
-            h('path', { d: 'm8 12 7-7a4 4 0 0 1 6 6L10 22a6 6 0 0 1-8-8L13 3M6 15l9-9a2 2 0 0 1 3 3l-9 9' }),
-          )),
-          h(ModelPicker, { key: current.id, catalog: models, current: current.model, onSelect: (model: LocalSession['model']) => { store.updateSession(current.id, { model }) } }),
-          h('button', { type: 'button', className: 'dsh-tp-send', disabled: current.mode === 'normal' ? busy || !!blocked : !busy && !!blocked, title: current.mode === 'normal' ? blocked ?? '发送待译材料' : busy ? '取消翻译' : blocked ?? '发送快译', 'aria-label': current.mode === 'normal' ? busy ? '正在提交材料' : '发送待译材料' : busy ? '取消翻译' : '发送快译', 'aria-description': busy ? undefined : blocked,
-            onClick: () => { if (current.mode === 'normal') void materials?.send(current.id, ownerId); else if (busy) quick.cancel(current.id); else void quick.send(current.id) },
-            style: { width: 38, height: 38, minWidth: 38, maxWidth: 38, minHeight: 38, maxHeight: 38, padding: 0, borderRadius: '50%', cornerShape: 'round', aspectRatio: '1 / 1', flex: '0 0 38px' },
-          }, busy ? h('span', { 'aria-hidden': true, style: { fontSize: 18, lineHeight: 1 } }, '■') : h(IconSendOutlineMedium, { size: 20 })),
-        ),
-        ),
+        current.mode === 'normal' && current.archivedAt === null && materials && batchRemote && ownerId !== store.getNamespaceId()
+          ? h(BatchProcessingView, { key: current.id, session: current, ownerId, namespaceId: store.getNamespaceId(), materials, remote: batchRemote,
+            libraryReady: topics?.getLibraryStatus().ready ?? false,
+            renderComposer: (batchInput: unknown, batchButton: unknown) => renderComposer(current, batchInput, batchButton),
+            onOpenUnit: (id: string) => Array.from(transcript.current?.querySelectorAll('[data-unit-id]') ?? [])
+              .find(element => element.getAttribute('data-unit-id') === id)?.scrollIntoView({ block: 'start' }) }) : renderComposer(current),
       ) : null,
     ),
     context && target ? h(ContextSubmenus, { onCreate: () => create(target.id) }, h(Menu, { key: context.exportFormat ?? 'actions', open: true, anchor: null, onClose: () => { setContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup dsh-tp-context-popup dsh-tp-session-popup',

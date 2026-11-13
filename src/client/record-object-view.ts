@@ -17,10 +17,11 @@ function RecordObjectFormula({ source }: { readonly source: string }): unknown {
     h('details', null, h('summary', null, '公式源'), h('pre', null, source)),
     h('small', { className: 'dsh-tp-muted' }, '公式源和原件可查看。'))
 }
-export function RecordObjectText({ text, target, objects, objectAssets, references, range, totalCodePoints, hideUnavailable = false, className, renderText }: RecordObjectsProps & {
+export function RecordObjectText({ text, target, objects, objectAssets, references, range, totalCodePoints, hideUnavailable = false, className, renderText, quoteSource }: RecordObjectsProps & {
   readonly text: string; readonly target: RecordObjectTarget; readonly references?: readonly RecordObjectReference[] | undefined
   readonly range?: TranslationSourceRange | undefined; readonly totalCodePoints?: number | undefined; readonly hideUnavailable?: boolean
   readonly className?: string | undefined
+  readonly quoteSource?: string | undefined
   readonly renderText?: ((text: string, offset: number) => unknown) | undefined
 }): unknown {
   const [failures, setFailures] = react.useState<ReadonlyMap<string, string>>(() => new Map())
@@ -41,7 +42,7 @@ export function RecordObjectText({ text, target, objects, objectAssets, referenc
     reference.asset.kind === 'formula' && reference.formulaSource ? h(RecordObjectFormula, { source: reference.formulaSource }) : null)
   }
   let offset = 0
-  return h('div', { className: className ? `dsh-tp-translation-text ${className}` : 'dsh-tp-translation-text' }, ...projected.segments.map(segment => {
+  return h('div', { className: className ? `dsh-tp-translation-text ${className}` : 'dsh-tp-translation-text', 'data-translation-quote': quoteSource }, ...projected.segments.map(segment => {
     if (segment.kind !== 'text') return object(segment.reference)
     const start = offset
     for (const _ of segment.text) offset++

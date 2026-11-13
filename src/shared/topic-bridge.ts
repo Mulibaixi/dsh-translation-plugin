@@ -7,6 +7,8 @@ import { parseReferenceFacts, parseReferenceIndex, type ReferenceFacts, type Ref
 import { decodeTopicTermPut, decodeTopicTermSnapshot, type TopicTermPut, type TopicTermSnapshot, type TopicTerm } from '../memory/topic-terms.js'
 import { decodeTopicArchivePut, decodeTopicArchiveSnapshot, decodeTopicArchiveQuerySnapshot, type TopicArchivePut, type TopicArchiveSnapshot, type TopicArchiveKind } from '../memory/topic-archive.js'
 import { parseNormalTranslationAcceptance, parseNormalTranslationOperation, parseNormalTranslationUpdate, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseNormalTranslationCorrectionReceipt, parseDirectTranslationCommit, parseDirectTranslationReceipt, parseDirectTranslationExport, type NormalTranslationAcceptance, type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationUnitTarget, type NormalTranslationTarget, type NormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt, type DirectTranslationCommit, type DirectTranslationReceipt, type NormalTranslationExport } from './normal-translation.js'
+import { parseDirectResultPatch, parseDirectResultPatchReceipt, type DirectResultPatch, type DirectResultPatchReceipt } from './normal-translation.js'
+import type { TextRevision } from '../memory/translation-history.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { parseNormalTranslationV2Event, type NormalTranslationResolution, type NormalTranslationV2Event } from './normal-translation-v2.js'
 import { parseDocumentAcceptRequest, parseDocumentBlockRegistration, parseDocumentTaskEvent, parseDocumentTaskFinish, parseDocumentTaskScope,
@@ -76,7 +78,7 @@ export interface TopicUnitFact {
   readonly targetLanguage: string
   readonly instruction: string
   readonly revisions: readonly {
-    readonly id: string; readonly order: number; readonly kind: 'machine' | 'manual'
+    readonly id: string; readonly order: number; readonly kind: TextRevision['kind']
     readonly status: 'submitting' | 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'interrupted' | 'context_requested'
     readonly text: string; readonly baseRevisionId: string | null; readonly sourceVersion?: number | undefined
   }[]
@@ -125,6 +127,7 @@ export type TopicBridgeCommand =
   | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
   | ({ readonly kind: 'normal_prepare' } & NormalTranslationAcceptance)
   | ({ readonly kind: 'normal_commit' } & DirectTranslationCommit)
+  | ({ readonly kind: 'normal_patch_result' } & DirectResultPatch)
   | { readonly kind: 'normal_export'; readonly target: DirectTranslationTarget; readonly totalCodePoints?: number }
   | ({ readonly kind: 'normal_update' } & NormalTranslationUpdate)
   | { readonly kind: 'normal_v2_update'; readonly mainSessionId: string; readonly translationSessionId: string; readonly unitId: string; readonly operationId: string; readonly sourceVersion: number; readonly event: NormalTranslationV2Event }
@@ -192,8 +195,9 @@ export type TopicBridgeValue =
   | { readonly kind: 'normal_resolved'; readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }> }
   | { readonly kind: 'normal_source_corrected'; readonly correction: NormalTranslationCorrectionReceipt }
   | { readonly kind: 'normal_operation'; readonly operation: NormalTranslationOperation; readonly termSnapshot: TopicTermSnapshot }
-  | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot; readonly historyContext?: DirectHistoryContext; readonly basis?: DirectTranslationBasis }
+  | { readonly kind: 'normal_prepared'; readonly termSnapshot: TopicTermSnapshot; readonly historyContext?: DirectHistoryContext; readonly basis?: DirectTranslationBasis; readonly targetLanguage?: string }
   | { readonly kind: 'normal_committed'; readonly receipt: DirectTranslationReceipt }
+  | { readonly kind: 'normal_result_patched'; readonly receipt: DirectResultPatchReceipt }
   | { readonly kind: 'normal_exported'; readonly export: NormalTranslationExport }
   | { readonly kind: 'normal_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
   | { readonly kind: 'normal_v2_updated'; readonly operation: NormalTranslationOperation; readonly callId: string | null; readonly sequence: number }
@@ -343,6 +347,11 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
         const { kind, ...commit } = value
         return { kind: 'normal_commit', ...parseDirectTranslationCommit(commit) }
       }
+      case 'normal_patch_result': {
+        if (protocol < 2) throw new TypeError('Command requires topic bridge v2')
+        const { kind: _kind, ...patch } = value
+        return { kind: 'normal_patch_result', ...parseDirectResultPatch(patch) }
+      }
       case 'normal_export': {
         exact(value, ['kind', 'target', ...(value.totalCodePoints === undefined ? [] : ['totalCodePoints'])])
         if (value.totalCodePoints !== undefined) integer(value.totalCodePoints, 1)
@@ -449,7 +458,7 @@ function parseUnit(value: unknown, protocol: 1 | 2 | 3 | 4): TopicUnitFact {
     integer(revision.sourceVersion ?? 1, 1)
     text(revision.id); integer(revision.order, 1); text(revision.text, 2_000_000, true)
     if (revision.baseRevisionId !== null) text(revision.baseRevisionId)
-    if (!['machine', 'manual'].includes(revision.kind as string) || !['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted', ...(protocol >= 2 ? ['context_requested'] : [])].includes(revision.status as string)) throw new TypeError('Invalid topic unit state')
+    if (!['machine', 'manual', 'review_edit'].includes(revision.kind as string) || !['submitting', 'running', 'completed', 'failed', 'cancelled', 'unknown', 'interrupted', ...(protocol >= 2 ? ['context_requested'] : [])].includes(revision.status as string)) throw new TypeError('Invalid topic unit state')
   }
   if (value.final !== null) {
     object(value.final); exact(value.final, ['revisionId', 'selection', 'selectionEventId']); text(value.final.revisionId); text(value.final.selectionEventId)
@@ -553,15 +562,21 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
     case 'normal_source_corrected': exact(value, ['kind', 'correction']); return { kind: 'normal_source_corrected', correction: parseNormalTranslationCorrectionReceipt(value.correction) }
     case 'normal_observed': exact(value, ['kind', 'operation']); return { kind: 'normal_observed', operation: value.operation === null ? null : parseNormalTranslationOperation(value.operation) }
     case 'normal_prepared': {
-      exact(value, ['kind', 'termSnapshot', ...(Object.hasOwn(value, 'historyContext') ? ['historyContext'] : []), ...(Object.hasOwn(value, 'basis') ? ['basis'] : [])])
+      exact(value, ['kind', 'termSnapshot', ...['historyContext', 'basis', 'targetLanguage'].filter(field => Object.hasOwn(value, field))])
       const termSnapshot = decodeTopicTermSnapshot(value.termSnapshot)
       if (!termSnapshot || termSnapshot.entries.some(entry => entry.status !== 'active')) throw new TypeError('Invalid normal translation preparation')
       return { kind: 'normal_prepared', termSnapshot, ...(value.historyContext === undefined ? {} : { historyContext: parseDirectHistoryContext(value.historyContext) }),
+        ...(value.targetLanguage === undefined ? {} : { targetLanguage: parseDirectTargetLanguage(value.targetLanguage) }),
         ...(value.basis === undefined ? {} : { basis: parseDirectTranslationBasis(value.basis) }) }
     }
     case 'normal_committed': {
       exact(value, ['kind', 'receipt'])
       return { kind: 'normal_committed', receipt: parseDirectTranslationReceipt(value.receipt) }
+    }
+    case 'normal_result_patched': {
+      if (protocol < 2) throw new TypeError('Reply requires topic bridge v2')
+      exact(value, ['kind', 'receipt'])
+      return { kind: 'normal_result_patched', receipt: parseDirectResultPatchReceipt(value.receipt) }
     }
     case 'normal_exported': {
       exact(value, ['kind', 'export'])
@@ -675,5 +690,5 @@ export const TOPIC_BRIDGE_REMOTE = { package: packageName, descriptors: [
     invocation: { kind: 'direct' as const }, parameters: [{ name: 'request', wire: 'request', source: 'json' as const, codec: codec('openV3', parseTopicBridgeOpen) }], cancellation: { parameter: 'signal' },
     result: codec('downV3', value => parseTopicBridgeDown(value, 3)), uplink: { codec: codec('replyV3', value => parseTopicBridgeReply(value, 3)) } }
 ] }
-import { parseImageUnitUpdate, parseDirectTranslationTarget, type DirectUnitTarget, type DirectTranslationTarget } from './normal-translation.js'
+import { parseImageUnitUpdate, parseDirectTargetLanguage, parseDirectTranslationTarget, type DirectUnitTarget, type DirectTranslationTarget } from './normal-translation.js'
 import type { ImageUnitUpdate } from './image-translation.js'

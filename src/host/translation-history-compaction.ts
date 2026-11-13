@@ -1,5 +1,5 @@
 import { referenceSegmentationComplete } from '../shared/reference-segmentation.js'
-import { DIRECT_REVIEW_NEXT_STEP, DIRECT_REVISION_GUIDANCE, TRANSLATION_SELF_REVIEW } from '../shared/translation-review.js'
+import { DIRECT_REVIEW_NEXT_STEP, DIRECT_REVISION_GUIDANCE, LEGACY_DIRECT_REVISION_GUIDANCE, TRANSLATION_SELF_REVIEW } from '../shared/translation-review.js'
 import { diagnosticSpan } from './diagnostics.js'
 import type { OtherMemoryService } from './other-memory.js'
 import type { MainAgent, TopicHostContext, TopicToolsService } from './topic-tools.js'
@@ -113,6 +113,7 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
       // Keep the visible body unless an exact saved version can replace it with a shorter reference.
       if (typeof visible?.nextStep === 'string') {
         const nextStep = visible.nextStep.replace(TRANSLATION_SELF_REVIEW + ' ' + DIRECT_REVISION_GUIDANCE, DIRECT_REVIEW_NEXT_STEP)
+          .replace(TRANSLATION_SELF_REVIEW + ' ' + LEGACY_DIRECT_REVISION_GUIDANCE, DIRECT_REVIEW_NEXT_STEP)
         if (nextStep !== visible.nextStep) summary = { ...visible, nextStep }
       }
       if (visible && visible.kind !== 'translation_result_history' && event.data.turn !== latestTranslationTurn && history?.compactionSnapshot &&

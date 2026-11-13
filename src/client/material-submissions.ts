@@ -4,7 +4,7 @@ import { MAX_TOPIC_BRIDGE_REPLY_BYTES } from '../shared/topic-bridge.js'
 import { INLINE_TRANSLATION_SOURCE_CODE_POINTS } from '../shared/translation-source-read.js'
 import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
 import { imageFileFormat, MAX_IMAGE_ORIGINAL_BYTES } from '../shared/image-translation.js'
-import { appendImageUnit } from './translation-history.js'
+import { appendImageUnit, isImageUnit } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
@@ -725,7 +725,7 @@ export class MaterialSubmissionsClient {
     if (signal.aborted || item.finished || item.withdrawn || item.replacementId || this.disposed || item.generation !== this.generation ||
       item.sessionId && (!this.options.store.getSession(item.sessionId) || this.options.store.isSessionDeleted(item.sessionId) || this.fileAccessBlockedReason(item.sessionId, `unit:${item.draft?.materialId}`))) throw new Error('材料准备已取消。')
   }
-  private async materialEnvelope(item: Submission, signal: AbortSignal): Promise<TranslationMaterialEnvelope> {
+  private async materialEnvelope(item: Submission, signal: AbortSignal, registerBatchFile?: () => void): Promise<TranslationMaterialEnvelope> {
     this.active(item, signal)
     if (item.envelope) return item.envelope
     const draft = item.draft, carrier = draft?.carrier, sources = this.options.sources, upload = this.options.upload
@@ -747,12 +747,13 @@ export class MaterialSubmissionsClient {
       try { originalFilePath = bridge?.pathFor(file) || undefined } catch { /* Web and generated files have no native origin. */ }
     }
     const source = await sources.importReceipt({ scope: { namespaceId: this.options.store.getNamespaceId(), ownerId: item.identity.mainSessionId, mainSessionId: item.identity.mainSessionId,
-      topicId: draft.session.topicId, translationSessionId: draft.session.id }, receiptId: value.receiptId, idempotencyKey: draft.materialId,
+      topicId: draft.session.topicId, translationSessionId: draft.session.id }, receiptId: value.receiptId, idempotencyKey: registerBatchFile ? item.identity.requestId : draft.materialId,
       ...(originalFilePath ? { originalFilePath } : {}) }, signal)
     this.active(item, signal)
     if (!source.ok) throw new MaterialRejected(source.error.message, source.error.code)
     item.envelope = this.boundedEnvelope({ ...item.identity, kind: 'material', material: { ...this.config(draft), sourceRef: source.value } })
     if (fileCarrier(carrier)) {
+      registerBatchFile?.()
       this.fileIntakes.setSource(`unit:${draft.materialId}`, source.value)
       this.emit()
       item.reason = '正在缓存原稿…'; this.emit()
@@ -877,6 +878,47 @@ export class MaterialSubmissionsClient {
     }
     try { await this.prepare(item, new AbortController().signal, 'submit') }    catch (error) { item.reason = detail(error) }
     finally { item.finished = true; this.reconcile(); this.emit() }
+  }
+  /** Freeze one explicitly selected batch file without consuming the ordinary attachment or draft. */
+  async prepareBatchImage(sessionId: string, ownerId: string, materialId: string, file: File, signal: AbortSignal): Promise<string> {
+    const session = this.options.store.getSession(sessionId), unitId = `unit:${materialId}`
+    if (this.disposed || !session || session.mode !== 'normal' || !this.live(session) || !this.options.store.isSessionOpen(ownerId, sessionId)) throw new Error('请选择可用的普通翻译会话。')
+    if (!this.options.sourceStorage) throw new Error('原图保存服务尚未就绪。')
+    if (!imageFileFormat(file.name) || file.size > MAX_IMAGE_ORIGINAL_BYTES) throw new Error('请选择 50 MiB 以内的 PNG、JPEG 或静态 WebP 图片。')
+    const release = this.options.topics.retain(ownerId)
+    try {
+      const previous = this.options.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
+      if (previous) {
+        if (!isImageUnit(previous) || previous.deletion || previous.original?.name !== file.name) throw new Error('已登记的图片单元不可用。')
+        await this.fileIntakes.saveSource(unitId, this.options.sourceStorage)
+      } else {
+        const draft: FrozenDraft = { session, materialId, draftVersion: 1, signature: '', carrier: { kind: 'selected_file', selected: { file, version: 0 } } }
+        const identity = { mainSessionId: ownerId, requestId: id(), operationId: id() }
+        const item: Submission = { identity, createdAt: new Date().toISOString(), kind: 'material', draft, generation: this.generation,
+          envelope: undefined, sessionId, direct: true, stage: 'preparing', reason: undefined, finished: false, started: true, settling: false, hostStarted: false }
+        const config = this.config(draft)
+        const register = () => {
+          if (this.fileIntakes.get(unitId)) return
+          this.fileIntakes.put({ schemaVersion: 1, scope: { namespaceId: this.options.store.getNamespaceId(), ownerId, mainSessionId: ownerId,
+            topicId: session.topicId, translationSessionId: sessionId }, unitId, materialId, name: file.name, createdAt: item.createdAt,
+            config, submission: identity, stage: 'accepted', hostStarted: false, documentUnitId: unitId })
+        }
+        const sourceRef = this.fileIntakes.runtimeSource(unitId)
+        if (sourceRef) {
+          await this.fileIntakes.saveSource(unitId, this.options.sourceStorage)
+          this.active(item, signal)
+          const envelope = this.boundedEnvelope({ ...identity, kind: 'material', material: { ...config, sourceRef } })
+          if (envelope.kind !== 'material' || !this.options.store.updateTranslationHistory(sessionId, history => appendImageUnit(history, envelope, item.createdAt))) {
+            throw new Error('图片单元登记失败，原图仍保留。')
+          }
+        } else await this.materialEnvelope(item, signal, register)
+      }
+      signal.throwIfAborted()
+      const storageError = this.fileIntakes.storageState(unitId).storageError
+      if (storageError) throw new Error(storageError)
+      if (!await this.options.store.saveTranslationHistoryAsync(sessionId)) throw new Error('批次图片的会话记录尚未保存，请重试。')
+      return unitId
+    } finally { release() }
   }
   async query(sessionId: string, materialId?: string): Promise<void> {
     const item = [...this.submissions.values()].filter(value => value.sessionId === sessionId && !value.replacementId && (value.stage === 'unknown' || materialId !== undefined && fileCarrier(value.draft?.carrier)) &&

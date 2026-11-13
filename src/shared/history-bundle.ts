@@ -20,7 +20,7 @@ export function encodeLegacySessionSnapshot(session: LocalSession, token: string
 export function readLegacySessionSnapshot(raw: string): { readonly session: LocalSession; readonly translationHistory: TranslationHistory } | undefined {
   try {
     const value = JSON.parse(raw) as Record<string, unknown>
-    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
+    if (!value || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].includes(value.schemaVersion as number) || typeof value.token !== 'string') return undefined
     const hasHistory = (value.schemaVersion as number) >= 4
     referenceExact(value, ['schemaVersion', 'token', 'session', ...(hasHistory ? ['translationHistory'] : [])])
     const historyVersion = (value.translationHistory as { schemaVersion?: unknown })?.schemaVersion

@@ -28,7 +28,12 @@ export const styles = `
 .dsh-tp-session-add { display: flex; align-items: center; justify-content: center; width: 100%; align-self: stretch; text-align: center; margin-top: 2px; }
 .dsh-tp-session-divider { border-top: 1px solid var(--dsw-alias-border-l2, #8883); margin: 4px 0; }
 .dsh-tp-archive-toggle { width: 100%; margin-top: 14px; text-align: left; font-size: 12px !important; color: var(--dsw-alias-label-caption, #888) !important; }
-.dsh-tp-main { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.dsh-tp-main { position: relative; min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.dsh-tp-quote-anchor { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.dsh-tp button.dsh-tp-quote-selection { position: absolute; transform: translateX(-50%); pointer-events: auto; white-space: nowrap;
+  padding: 3px 7px; font-size: 12px; line-height: 16px; border-radius: 999px; corner-shape: round;
+  background: var(--dsw-alias-bg-module-platform, color-mix(in srgb, Canvas 85%, CanvasText)); box-shadow: var(--dsw-elevation-panel, 0 1px 5px #0004); }
+.dsh-tp button.dsh-tp-quote-selection:hover:not(:disabled) { background: var(--dsw-alias-bg-overlay, color-mix(in srgb, Canvas 75%, CanvasText)); }
 .dsh-tp-workspace-header { display: flex; align-items: center; gap: 5px; flex: none; padding: 8px 10px; }
 .dsh-tp-title-select { min-width: 0; flex: 1; }
 .dsh-tp-title-anchor { display: block; min-width: 0; width: 100%; }
@@ -60,6 +65,17 @@ export const styles = `
 .dsh-tp-empty-guide p { margin: 0; }
 .dsh-tp-empty-guide .dsh-tp-empty-action { display: flex; justify-content: center; }
 .dsh-tp-composer-area { flex: none; margin: 8px 12px 12px; }
+.dsh-tp-batch { margin-block: 4px 8px; padding: 4px 6px; border: 1px solid var(--dsw-alias-border-l2, #8883); border-radius: 8px; }
+.dsh-tp-batch-header { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.dsh-tp-batch-header > button, .dsh-tp-batch-action { flex: none; }
+.dsh-tp-batch-action { margin-inline-start: auto; }
+.dsh-tp-batch-notice { margin: 4px 6px; overflow-wrap: anywhere; }
+.dsh-tp-batch[data-expanded=false] .dsh-tp-batch-notice { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-tp-batch-content { display: grid; gap: 8px; margin-top: 8px; max-height: 35vh; overflow-y: auto; }
+.dsh-tp-batch-list { margin: 4px 0; padding-inline-start: 26px; max-height: 150px; overflow-y: auto; }
+.dsh-tp-batch-list > li { padding-block: 3px; overflow-wrap: anywhere; }
+.dsh-tp-batch-list > li > small { margin-inline-start: 6px; }
+.dsh-tp-batch-content textarea { box-sizing: border-box; width: 100%; }
 .dsh-tp-service-status { display: flex; align-items: center; gap: 6px; margin: 0 3px 4px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; line-height: 1.5; }
 .dsh-tp-service-status-text { min-width: 0; flex: 1; }
 .dsh-tp button.dsh-tp-service-recheck { display: flex; align-items: center; justify-content: center; flex: 0 0 24px; width: 24px; height: 24px; padding: 4px; }
@@ -71,7 +87,8 @@ export const styles = `
 .dsh-tp-composer textarea { display: block; resize: none; width: 100%; min-height: 70px; max-height: 180px; overflow-y: auto; padding: 4px; background: transparent; border: 0; }
 .dsh-tp-composer:focus-within, .dsh-tp-composer textarea:focus, .dsh-tp-composer textarea:focus-visible { outline: none !important; box-shadow: none !important; }
 .dsh-tp-composer-toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 6px; min-width: 0; }
-.dsh-tp button.dsh-tp-attach { display: flex; align-items: center; justify-content: center; padding: 5px; margin-right: auto; }
+.dsh-tp-composer-files { display: flex; align-items: center; gap: 6px; margin-inline-end: auto; }
+.dsh-tp button.dsh-tp-attach { display: flex; align-items: center; justify-content: center; padding: 5px; }
 .dsh-tp-attachment { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 12px; }
 .dsh-tp-attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-tp-attachment-note { margin: 2px 0 5px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }

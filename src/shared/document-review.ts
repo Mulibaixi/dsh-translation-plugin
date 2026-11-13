@@ -2,6 +2,7 @@ import { parseTranslationSourceScope, type TranslationSourceScope } from './tran
 import { sourceCodePointLength, type TranslationSourceRange } from './translation-source-read.js'
 import type { VersionReference } from './translation-batch.js'
 import { parseVersionDeletion, type VersionDeletion } from './version-deletion.js'
+import { applyExactTextEdits } from './text-edits.js'
 
 export interface DocumentReviewIssue { readonly code: string; readonly range: TranslationSourceRange; readonly message: string }
 export interface DocumentReviewEntryReference { readonly chunkId: string; readonly revisionId: string }
@@ -181,23 +182,8 @@ export function parseDocumentManualRevisionRequest(value: unknown): DocumentManu
  * Apply precise edits against one immutable base string. Every oldText must match exactly once and all
  * matches are located in the original base, so replacements never chain. Nothing is normalized.
  */
-export function applyDocumentEdits(base: string, edits: readonly DocumentTextEdit[]): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly code: string; readonly message: string } {
-  if (!edits.length) return { ok: false, code: 'edit_empty', message: '至少需要一条精确修改。' }
-  const spans: { start: number; end: number; newText: string }[] = []
-  for (const [index, edit] of edits.entries()) {
-    if (!edit.oldText) return { ok: false, code: 'edit_empty', message: `第 ${index + 1} 条修改的 oldText 为空。` }
-    const first = base.indexOf(edit.oldText)
-    if (first < 0) return { ok: false, code: 'edit_no_match', message: `第 ${index + 1} 条修改的 oldText 在基准正文中不存在；请提供更准确的上下文。` }
-    if (base.indexOf(edit.oldText, first + 1) >= 0) return { ok: false, code: 'edit_ambiguous', message: `第 ${index + 1} 条修改的 oldText 在基准正文中命中多处；请提供足够上下文使其唯一。` }
-    spans.push({ start: first, end: first + edit.oldText.length, newText: edit.newText })
-  }
-  spans.sort((left, right) => left.start - right.start)
-  for (let index = 1; index < spans.length; index++) {
-    if (spans[index]!.start < spans[index - 1]!.end) return { ok: false, code: 'edit_overlap', message: '多条修改的定位范围重叠；请按原文分别给出互不重叠的替换。' }
-  }
-  let text = base
-  for (const span of [...spans].reverse()) text = text.slice(0, span.start) + span.newText + text.slice(span.end)
-  return { ok: true, text }
+export function applyDocumentEdits(base: string, edits: readonly DocumentTextEdit[]): ReturnType<typeof applyExactTextEdits> {
+  return applyExactTextEdits(base, edits.map(({ oldText, newText }) => ({ from: oldText, to: newText })))
 }
 export const parseDocumentFinalRequest = parseDocumentReviewBeginRequest
 export function parseDocumentReviewReceipt(value: unknown): DocumentReviewReceipt {

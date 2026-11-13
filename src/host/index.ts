@@ -12,6 +12,7 @@ import { createTranslationFramework } from './framework.js'
 import { installQuickTranslation, type QuickHostContext } from './quick-translation.js'
 import { installTopicTools, type TopicHostContext } from './topic-tools.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
+import { BatchProcessingService } from './batch-processing.js'
 import { installObjectAssets } from './object-assets.js'
 import { installViewFiles } from './view-files.js'
 import { installTranslationMaterials, type TranslationMaterialHostContext } from './translation-materials.js'
@@ -72,7 +73,7 @@ export type * from '../shared/translation-source-storage.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationCorrection', 'translationReview', 'translationReferences', 'translationOtherMemory', 'translationOtherMemoryFiles', 'translationArchive', 'translationTerms', 'translationEmbedding', 'translationMemorySearch', 'translationHistory', 'translationRecordIndex', 'translationLocalData', 'translationFileJobs'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationBatchProcessing', 'translationCorrection', 'translationReview', 'translationReferences', 'translationOtherMemory', 'translationOtherMemoryFiles', 'translationArchive', 'translationTerms', 'translationEmbedding', 'translationMemorySearch', 'translationHistory', 'translationRecordIndex', 'translationLocalData', 'translationFileJobs'] as const
 
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
@@ -168,6 +169,9 @@ export function apply(ctx: QuickHostContext): void {
   installTranslationMaterials(ctx as TranslationMaterialHostContext, undefined, false)
   installNormalTranslation(ctx as TopicHostContext, undefined, false)
   installTranslationSources(ctx, false)
+  const batches = new BatchProcessingService(ctx as TopicHostContext)
+  ctx.provide('translationBatchProcessing', batches)
+  ctx.effect?.(() => () => batches.dispose(), 'batch processing lifetime')
   installTerminologyAnalysis(ctx as TopicHostContext)
   installTranslationPreparation(ctx as TopicHostContext)
   installDocumentPlanning(ctx as TopicHostContext)

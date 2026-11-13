@@ -121,6 +121,14 @@ export class HistoryService {
       try { this.check(guard); return this.seats.get(key(scope))?.current === bundle } catch { return false }
     } }
   }
+  async batchHistory(scope: HistoryScope, peer: string): Promise<{ readonly current: HistoryBundle; readonly saved: HistoryBundle | null }> {
+    const guard: Guard = { scope, peer, generation: this.generation }
+    this.check(guard); await this.tail
+    const seat = await this.seat(guard); this.check(guard)
+    if (!seat?.current) throw failure('history_unavailable', '批次所属会话已删除或不可用。')
+    return { current: seat.current, saved: seat.saved }
+  }
+
   /** Exact saved-history evidence for compaction; never wait for an in-flight history write. */
   async compactionSnapshot(scope: HistoryScope, peer: string): Promise<{ readonly current: HistoryBundle; readonly saved: HistoryBundle; readonly isCurrent: () => boolean } | undefined> {
     const guard: Guard = { scope, peer, generation: this.generation }
@@ -457,7 +465,7 @@ export class HistoryService {
           else if (bundle === seat.current) return { status: 'blocked', state: this.describe(seat), reason: '此文件译文版本不存在。' }
         }
       }
-      if (['translationFileJobs', 'translationNormal', 'translationBatch', 'translationAnalysis', 'translationCorrection', 'translationPlanning'].some(name => (this.ctx.get?.(name) as { historyUnitBusy?(scope: HistoryScope, unitId: string): boolean } | undefined)?.historyUnitBusy?.(guard.scope, command.unitId))) return { status: 'blocked', state: this.describe(seat), reason: '此单元仍有宿主任务未结算，请先结束或查询。' }
+      if (['translationFileJobs', 'translationNormal', 'translationBatch', 'translationBatchProcessing', 'translationAnalysis', 'translationCorrection', 'translationPlanning'].some(name => (this.ctx.get?.(name) as { historyUnitBusy?(scope: HistoryScope, unitId: string): boolean } | undefined)?.historyUnitBusy?.(guard.scope, command.unitId))) return { status: 'blocked', state: this.describe(seat), reason: '此单元仍有宿主任务未结算，请先结束或查询。' }
       const cleanup: HistoryCleanup | undefined = command.kind === 'delete_unit' ? historyResources([seat.current, ...seat.saved ? [seat.saved] : []], guard.scope, command.unitId)
         : command.kind === 'delete_file_source' ? (() => {
           const bundles = [seat.current, ...seat.saved ? [seat.saved] : []], records = bundles.flatMap(bundle => bundle.fileJobs.filter(record => record.summary.unitId === command.unitId))
@@ -591,10 +599,14 @@ export class HistoryService {
     return this.serial(guard, () => this.writer(async () => {
       const seat = await this.seat(guard)
       if (!seat) throw failure('history_unavailable', '会话尚未存入宿主。')
-      if (seat.current === null) return { status: 'updated', state: this.describe(seat), resourceCleanup: await this.cleanupResourcesLocked(guard.scope) }
+      const batches = this.ctx.get?.('translationBatchProcessing') as import('./batch-processing.js').BatchProcessingService | undefined
+      if (seat.current === null) {
+        await batches?.retireLocked(guard.scope)
+        return { status: 'updated', state: this.describe(seat), resourceCleanup: await this.cleanupResourcesLocked(guard.scope) }
+      }
       if (seat.token !== request.token) return { status: 'stale', state: this.describe(seat) }
       if (historyUnsettled(seat.current) || seat.saved && historyUnsettled(seat.saved)) return { status: 'blocked', state: this.describe(seat), reason: '此会话仍有未结算任务，请先结束或查询。' }
-      if (['translationFileJobs', 'translationNormal', 'translationBatch', 'translationAnalysis', 'translationCorrection', 'translationPlanning', 'translationReview'].some(name => (this.ctx.get?.(name) as { historyUnitBusy?(scope: HistoryScope, unitId: string): boolean } | undefined)?.historyUnitBusy?.(guard.scope, '*'))) return { status: 'blocked', state: this.describe(seat), reason: '此会话仍有宿主任务未结算，请先结束或查询。' }
+      if (['translationFileJobs', 'translationNormal', 'translationBatch', 'translationBatchProcessing', 'translationAnalysis', 'translationCorrection', 'translationPlanning', 'translationReview'].some(name => (this.ctx.get?.(name) as { historyUnitBusy?(scope: HistoryScope, unitId: string): boolean } | undefined)?.historyUnitBusy?.(guard.scope, '*'))) return { status: 'blocked', state: this.describe(seat), reason: '此会话仍有宿主任务未结算，请先结束或查询。' }
       const fence = JSON.stringify([guard.scope.namespaceId, guard.scope.sessionId, '*']); this.deletingUnits.set(fence, { scope: guard.scope, unitId: '*' })
       try {
         const task = await this.sessionCleanupLocked(guard.scope, [seat.current, ...seat.saved ? [seat.saved] : []])
@@ -607,6 +619,7 @@ export class HistoryService {
           for (const unit of seat.current!.history.units) historyIndexSourceIds(guard.scope.sessionId, unit.id).forEach(id => db!.indexRemoveSource(guard.scope.namespaceId, guard.scope.topicId, id))
         })
         this.seats.set(key(guard.scope), next)
+        await batches?.retireLocked(guard.scope)
         return { status: 'updated', state: this.describe(next), resourceCleanup: await this.cleanupResourcesLocked(guard.scope) }
       } finally { this.deletingUnits.delete(fence) }
     }))
@@ -625,6 +638,8 @@ export class HistoryService {
       db!.historyCleanupSave(task)
     } })
     for (const sessionId of ids) this.seats.set(key({ namespaceId, sessionId }), { scope: { namespaceId, topicId, sessionId }, current: null, saved: null, token: token() })
+    const batches = this.ctx.get?.('translationBatchProcessing') as import('./batch-processing.js').BatchProcessingService | undefined
+    for (const sessionId of ids) await batches?.retireLocked({ namespaceId, topicId, sessionId })
     for (const [id, transfer] of this.transfers) if (transfer.guard.scope.namespaceId === namespaceId && transfer.guard.scope.topicId === topicId) this.transfers.delete(id)
   }
   async hasActiveTopicJobs(namespaceId: string, topicId: string): Promise<boolean> {

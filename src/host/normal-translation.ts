@@ -6,13 +6,15 @@ import { historyContextRefs, type DirectHistoryRefs } from '../shared/direct-his
 import { diagnosticSpan } from '../shared/diagnostics.js'
 import { historyTargetMatches } from './history-resources.js'
 import type { HistoryScope } from '../shared/history-bundle.js'
+import { BATCH_OPERATION_PREFIX, batchOperationId } from '../shared/batch-processing.js'
+import type { BatchProcessingService } from './batch-processing.js'
 import { languageMatches } from '../shared/language-tag.js'
 import type { ReferenceFilesService } from './reference-files.js'
 import type { OtherMemoryService } from './other-memory.js'
 import { NORMAL_TRANSLATION_REMOTE, parseNormalTranslationExecute, parseNormalTranslationQuery, type NormalTranslationExecute,
   type NormalTranslationOperation, type NormalTranslationQuery, type NormalTranslationJob, type NormalTranslationResult,
   type NormalTranslationUpdate, type NormalTranslationError, type NormalTranslationCapability,
-  parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt,
+  parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt, parseDirectResultPatch, type DirectResultPatchReceipt,
   parseDirectUnitRequest, type DirectUnitRequest, type NormalTranslationUnitReceipt,
   parseDirectTranslationRequest, type DirectTranslationRequest, type DirectTranslationCommit, type DirectTranslationReceipt, type RawDirectTranslationRequest,
   parseNormalTranslationResultRead, type NormalTranslationTermReference, type DirectTranslationRange, draftTranslationTerms,
@@ -100,6 +102,7 @@ export interface DirectTranslationView {
   readonly mainSessionId: string
   readonly translationSessionId: string
   readonly topicId: string
+  readonly targetLanguage: string
   readonly unitId: string
   readonly revisionId: string
   readonly sourceVersion?: number
@@ -125,6 +128,7 @@ export interface DirectContextQuestionView {
   readonly mainSessionId: string
   readonly translationSessionId: string
   readonly topicId: string
+  readonly targetLanguage: string
   readonly sourceVersion?: number
   readonly target: DirectTranslationTarget
   readonly range?: DirectTranslationRange
@@ -399,6 +403,9 @@ export class NormalTranslationService {
     const update = parseImageUnitUpdate(input)
     this.owned(update.target, exec)
     const { target, operationId } = update, key = identity(target.mainSessionId, operationId)
+    const batchId = operationId.startsWith(BATCH_OPERATION_PREFIX) && operationId.endsWith(':image') ? operationId.slice(0, -6) : undefined
+    const batches = batchId ? this.ctx.get?.('translationBatchProcessing') as BatchProcessingService | undefined : undefined
+    if (batchId && !batches?.allows(batchId, target)) throw rejected('batch_item_inactive', '此图片批次操作已停止。', 'image_update')
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(update)))
     const signature = JSON.stringify({ target, hash: Array.from(new Uint8Array(digest)).join(',') })
     const previous = this.imageUpdates.get(key)
@@ -410,6 +417,7 @@ export class NormalTranslationService {
     if (this.activeSessions.has(target.translationSessionId)) throw rejected('busy', '此会话正在翻译，等本次调用结束后再编辑。', 'image_update')
     const result = this.topics.requestOwned(target.mainSessionId, { kind: 'image_update', ...update }, exec).then(value => {
       if (value.kind !== 'image_updated' || value.unitId !== target.unitId) throw rejected('invalid_reply', '图片单元更新未确认。', 'image_update')
+      if (batchId && update.sourceText === '') batches?.markNoText(batchId)
       for (const entry of this.direct.values()) if (entry.question?.target.kind === 'image_unit' &&
         entry.question.target.translationSessionId === target.translationSessionId && entry.question.target.unitId === target.unitId) delete entry.question
       return { unitId: value.unitId }
@@ -463,10 +471,10 @@ export class NormalTranslationService {
     job.acceptance = Promise.resolve().then(() => this.prepare(job, exec.callId)).finally(() => exec.signal.removeEventListener('abort', abort))
     return job.acceptance.then(() => structuredClone(job.operation!))
   }
-  private validateTerms(termReferences: readonly NormalTranslationTermReference[], envelope: Envelope, snapshot: TopicTermSnapshot): void {
+  private validateTerms(termReferences: readonly NormalTranslationTermReference[], envelope: Envelope, snapshot: TopicTermSnapshot, targetLanguage = envelope.material.targetLanguage): void {
     if (snapshot.topicId !== envelope.material.topicId ||
       snapshot.entries.length !== termReferences.length || termReferences.some(ref => !snapshot.entries.some(entry =>
-        entry.id === ref.id && entry.version === ref.entryVersion && entry.status === 'active' && languageMatches(entry.targetLanguage, envelope.material.targetLanguage)))) throw rejected('invalid_reply', '普通翻译术语回执与指定范围或版本不一致。', 'prepare')
+        entry.id === ref.id && entry.version === ref.entryVersion && entry.status === 'active' && languageMatches(entry.targetLanguage, targetLanguage)))) throw rejected('invalid_reply', '普通翻译术语回执与指定范围或版本不一致。', 'prepare')
   }
   private async prepare(job: Job, mainCallId: string): Promise<NormalTranslationOperation> {
     const { request, envelope } = job, exec: ToolExecution = { agent: job.agent, callId: mainCallId, signal: job.controller.signal }
@@ -585,11 +593,15 @@ export class NormalTranslationService {
       if (JSON.stringify(original.target) !== JSON.stringify(request.target) ||
         request.range !== undefined && JSON.stringify(request.range) !== JSON.stringify(frozenRange) ||
         request.body !== undefined && request.body !== original.body) throw rejected('context_target_changed', '补充回答不能更换原稿、范围或整理正文；请重新组织当前任务。', 'prepare')
+      const targetLanguage = parent.question.targetLanguage
+      if (request.targetLanguage !== undefined && !languageMatches(request.targetLanguage, targetLanguage)) {
+        throw rejected('context_target_changed', '补充回答须沿用原调用的目标语言；若需更换译向，请重新发起翻译。', 'prepare')
+      }
       const oldBackground = original.auxiliaryContext, newBackground = request.auxiliaryContext
       const auxiliaryContext = !newBackground || newBackground === oldBackground ? oldBackground
         : !oldBackground ? newBackground : oldBackground + '\n\n' + newBackground
       if (sourceCodePointLength(auxiliaryContext) > 8000) throw rejected('context_limit', '累计辅助背景超过本次上限，请按当前已确认事实重新组织任务；本次尚未调用翻译模型。', 'prepare')
-      request = this.resolveTermHandles(parseDirectTranslationRequest({ ...request, auxiliaryContext,
+      request = this.resolveTermHandles(parseDirectTranslationRequest({ ...request, auxiliaryContext, targetLanguage,
         ...(frozenRange ? { range: frozenRange } : {}), ...(original.body !== undefined ? { body: original.body } : {}) }))
       const earlier = parent.supplement ? [...(parent.supplement.previous ?? []), { operationId: parent.supplement.operationId,
         questions: parent.supplement.questions, answerText: parent.supplement.answerText }] : []
@@ -601,10 +613,17 @@ export class NormalTranslationService {
         originalUserRequirements,
         ...(earlier.length ? { previous: earlier } : {}) })
     }
+    const batchId = batchOperationId(request.operationId, supplement)
+    const batches = this.ctx.get?.('translationBatchProcessing') as BatchProcessingService | undefined
+    if (batchId) {
+      if (request.target.kind !== 'image_unit' || !batches?.allows(batchId, request.target)) throw rejected('batch_item_inactive', '此图片批次操作已停止。', 'prepare')
+    } else if (request.target.kind === 'image_unit' && batches?.ownsActiveTarget(request.target)) {
+      throw rejected('batch_operation_required', '此图正在批次中处理，请使用本项通知给出的操作 ID。', 'prepare')
+    }
     const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify(request)
     const previous = this.direct.get(key)
     if (previous) {
-      if (previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、要求或术语；该 ID 已用于另一次请求，请修正参数后改用新的 operationId 重试。', 'prepare')
+      if (previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、目标语言、要求或术语；该 ID 已用于另一次请求，请修正参数后改用新的 operationId 重试。', 'prepare')
       return previous.promise.then(view => structuredClone(view))
     }
     if (this.corrections.has(key) || this.imageUpdates.has(key)) throw rejected('idempotency_conflict', '编辑原文与翻译须使用独立的操作 ID。', 'prepare')
@@ -640,6 +659,19 @@ export class NormalTranslationService {
       throw error
     })
   }
+  isSessionExecuting(sessionId: string): boolean { return this.activeSessions.has(sessionId) }
+
+  async batchDirectStatus(ownerId: string, operationId: string): Promise<DirectTranslationResult['status'] | 'running' | undefined> {
+    let entry = this.direct.get(identity(ownerId, operationId))
+    while (entry?.answer) entry = this.direct.get(identity(ownerId, entry.answer.operationId))
+    if (!entry) return undefined
+    if (!entry.settled) return 'running'
+    try {
+      const result = await entry.promise
+      return result.status === 'needs_context' && !entry.question ? 'failed' : result.status
+    } catch { return 'failed' }
+  }
+
   private async runDirect(request: DirectTranslationRequest, exec: ToolExecution, attempt: DispatchAttempt, expectedBasis?: DirectContextBasis,
     supplement?: DirectContextSupplement, expectedImageInput?: string): Promise<DirectTranslationResult> {
     const startedAt = Date.now()
@@ -692,12 +724,18 @@ export class NormalTranslationService {
       exec.signal.throwIfAborted()
       const terms = await this.topics.requestOwned(request.target.mainSessionId, { kind: 'normal_prepare', envelope,
         operationId: request.operationId, organizedRequirements: request.organizedNotes, termReferences: request.termReferences,
+        ...(request.targetLanguage === undefined ? {} : { targetLanguage: request.targetLanguage }),
         ...(request.referenceContextRef ? { referenceContextRef: request.referenceContextRef } : {}),
         ...(range ? { range } : {}), ...(bodyMode ? { body: true } : {}), ...(supplement ? { contextSupplement: supplement } : {}) }, exec)
       if (terms.kind !== 'normal_prepared') throw rejected('invalid_reply', '未取得普通翻译准备回执。', 'prepare')
       if (!terms.basis) throw rejected('invalid_reply', '直接翻译准备缺少准确目标基准，请刷新连接后重试。', 'prepare')
       if (expectedBasis && JSON.stringify(terms.basis) !== JSON.stringify(expectedBasis)) throw rejected('context_target_changed', '等待补充期间原文、有效译文或人工选择已变化，或材料已有结果；请先读取当前单元，再组织修订任务。', 'prepare')
-      this.validateTerms(request.termReferences, envelope, terms.termSnapshot)
+      const targetLanguage = terms.targetLanguage ?? material.targetLanguage
+      if (request.targetLanguage !== undefined && !languageMatches(request.targetLanguage, targetLanguage)) {
+        throw rejected('invalid_reply', '普通翻译准备回执与本次目标语言不一致。', 'prepare')
+      }
+      request = { ...request, targetLanguage }
+      this.validateTerms(request.termReferences, envelope, terms.termSnapshot, targetLanguage)
       const savedRequirements = await this.savedRequirements(envelope.mainSessionId, material.topicId)
       const model: ModelSelection = { providerId: route.provider, modelId: route.model, configVersion: 0,
         ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) }
@@ -728,7 +766,7 @@ export class NormalTranslationService {
         }), ...draftTranslationTerms(request.draftTerms)],
         ...(contextRef ? { referenceContextRef: contextRef } : {}) }
       const packet: NormalExecutionPacket = { operationId: internalId, callId, model, sourceText,
-        targetLanguage: material.targetLanguage, instruction: material.instruction, context, mode: 'direct',
+        targetLanguage, instruction: material.instruction, context, mode: 'direct',
         ...(terms.historyContext ? { historyContext: terms.historyContext } : {}),
         ...(referenceContext ? { referenceContext, referenceContextCurrent: () => (this.ctx.get?.('translationReferences') as ReferenceFilesService).contextCurrent(referenceContext) } : {}) }
       const entry = this.direct.get(identity(request.target.mainSessionId, request.operationId))
@@ -768,14 +806,15 @@ export class NormalTranslationService {
       const streamDone = Date.now()
       if (questions && terminal.provider_state === 'finished' && terminal.reason === 'stop' && !exec.signal.aborted) {
         const view: DirectContextQuestionView = { status: 'needs_context', operationId: request.operationId, callId,
-          mainSessionId: request.target.mainSessionId, translationSessionId: sessionId, topicId: material.topicId, ...(request.target.kind === 'image_unit' ? {} : { sourceVersion: material.sourceVersion }),
+          mainSessionId: request.target.mainSessionId, translationSessionId: sessionId, topicId: material.topicId, targetLanguage,
+          ...(request.target.kind === 'image_unit' ? {} : { sourceVersion: material.sourceVersion }),
           target: request.target, ...(range ? { range } : {}), questions: questions.questions, metadata: translationCallFacts(metadata),
           timing: { prepareMs: prepareDone - startedAt, firstTextMs: firstTextAt ? firstTextAt - startedAt : null, streamMs: streamDone - prepareDone, recordMs: 0, totalMs: streamDone - startedAt },
           nextStep: (request.contextResponse
             ? 'The supplemented call still needs context. Ask the user to resolve these specific questions; do not automatically start a third translation.'
             : 'Translation is not complete. Answer these questions from existing requirements and accessible references when sufficient; otherwise ask the user. At most one automatic supplemented call.') +
             ' Then call translation_translate with the SAME target, a NEW operationId and ' + JSON.stringify({ contextResponse: { operationId: request.operationId, answerText: '...' } }) +
-            '. Frozen range/body and earlier question answers/background are inherited. Keep actual user wording in userRequirements and inferred answers as background. Question ranges are Unicode code points local to this call\'s source; add the outer range.start for a text-file location. Do not review partial output as a translation, poll, or replay this operation to continue.',
+            '. Target language, frozen range/body and earlier question answers/background are inherited. Keep actual user wording in userRequirements and inferred answers as background. Question ranges are Unicode code points local to this call\'s source; add the outer range.start for a text-file location. Do not review partial output as a translation, poll, or replay this operation to continue.',
           log: { tool: 'translation_read_call_log', operationId: request.operationId, callId, start: 0 } }
         if (entry) entry.question = structuredClone(view)
         return view
@@ -823,7 +862,8 @@ export class NormalTranslationService {
     timing: DirectTranslationView['timing'], fallbackUnitId: string, checks: readonly TranslationCheck[] = []): DirectTranslationView {
     const material = envelope.material
     const base = { operationId: request.operationId, mainSessionId: request.target.mainSessionId, translationSessionId: material.translationSessionId,
-      topicId: material.topicId, unitId: receipt?.unitId ?? material.unitReference?.unitId ?? fallbackUnitId,
+      topicId: material.topicId, targetLanguage: receipt?.targetLanguage ?? request.targetLanguage ?? material.targetLanguage,
+      unitId: receipt?.unitId ?? material.unitReference?.unitId ?? fallbackUnitId,
       revisionId: receipt?.revisionId ?? callId, ...(request.target.kind === 'image_unit' ? {} : { sourceVersion: material.sourceVersion }), status, recorded: receipt !== undefined,
       totalCodePoints, metadata: translationCallFacts(metadata), timing, ...(checks.length ? { checks } : {}),
       ...(message ? { message } : {}) }
@@ -832,7 +872,7 @@ export class NormalTranslationService {
       ? { ...scope, kind: 'image_unit' } : { ...scope, kind: 'unit', sourceVersion: receipt.sourceVersion })
     const assetReview = (material.sourceText === undefined || request.target.kind === 'image_unit') && status === 'completed' && receipt && target ? { assetReview: {
       tool: 'translation_submit_proposals' as const, target, revisionId: receipt.revisionId,
-      nextStep: 'Review this result, then submit reusable entity/term/fact/relation proposals consistent with it using exact unique source quotes. draftTerms were only translation input, not saved proposals. Submit [] if no new assets. The translation Session already owns this recorded file result; point the user to its file entry. Do not create a separate delivery copy unless the user explicitly asks for an export.' } } : {}
+      nextStep: 'After review, submit reusable candidates for this revision only if there are any. Use exact unique source quotes. Deliver the recorded result in the translation Session.' } } : {}
     const handoff = target ? { target, nextStep: DIRECT_REVIEW_NEXT_STEP } : {}
     const withText = { ...base, ...assetReview, ...handoff, text, truncated: false }
     if (new TextEncoder().encode(JSON.stringify(withText)).byteLength <= 60_000) return withText
@@ -848,12 +888,14 @@ export class NormalTranslationService {
     const receipt = value.receipt
     if (receipt.operationId !== request.operationId || receipt.mainSessionId !== request.target.mainSessionId ||
       receipt.translationSessionId !== envelope.material.translationSessionId || receipt.revisionId !== callId ||
+      receipt.targetLanguage !== undefined && !languageMatches(receipt.targetLanguage, request.targetLanguage ?? envelope.material.targetLanguage) ||
       receipt.sourceVersion !== (request.target.kind === 'image_unit' ? undefined : envelope.material.sourceVersion)) throw rejected('invalid_reply', '译文提交回执身份不一致。', 'record_result')
     return receipt
   }
   private directCommitPayload(request: DirectTranslationRequest, envelope: Envelope, callId: string, status: DirectTranslationCommit['status'],
     text: string, message: string, metadata: TranslationCallMetadata, sourceText: string, range: DirectTranslationRange | undefined, bodyMode: boolean): DirectTranslationCommit {
     return { envelope, operationId: request.operationId, userRequirements: request.userRequirements,
+      ...(request.targetLanguage === undefined ? {} : { targetLanguage: request.targetLanguage }),
       organizedNotes: request.organizedNotes, auxiliaryContext: request.auxiliaryContext, termReferences: request.termReferences,
       revisionId: callId, status, text, message, callRecord: metadata,
       ...(envelope.material.sourceText === undefined ? { sourceText } : {}), ...(range ? { range } : {}), ...(bodyMode ? { body: true } : {}),
@@ -1013,6 +1055,26 @@ export class NormalTranslationService {
     catch { exec.signal.throwIfAborted(); throw rejected('open_failed', '译件已保存，但未能在系统默认应用中打开。', 'open_artifact') }
     return { opened: true, path }
   }
+  async patchResult(input: unknown, exec: ToolExecution): Promise<DirectResultPatchReceipt> {
+    const request = parseDirectResultPatch(input), { target, operationId } = request
+    this.owned(target, exec)
+    if (exec.agent) this.topics.retainToolsForNextTurn(exec.agent, ['direct'])
+    const key = identity(target.mainSessionId, operationId), sessionId = target.translationSessionId
+    if (this.direct.has(key) || this.jobs.has(key) || this.resolved.has(key) || this.admissions.has(key) || this.corrections.has(key) || this.imageUpdates.has(key)) {
+      throw rejected('idempotency_conflict', '审阅修订需要独立的操作 ID。', 'patch_result')
+    }
+    if (this.activeSessions.has(sessionId)) throw rejected('busy', '此会话仍在翻译，请等待本次调用结束。', 'patch_result')
+    this.activeSessions.add(sessionId)
+    try {
+      const value = await this.topics.requestOwned(target.mainSessionId, { kind: 'normal_patch_result', ...request }, exec)
+      if (value.kind !== 'normal_result_patched') throw rejected('invalid_reply', '未取得审阅修订回执。', 'patch_result')
+      const receipt = value.receipt, actual = receipt.target
+      if (actual.mainSessionId !== target.mainSessionId || actual.translationSessionId !== sessionId || actual.unitId !== target.unitId ||
+        actual.sourceVersion !== target.sourceVersion || receipt.operationId !== operationId || receipt.baseRevisionId !== request.baseRevisionId ||
+        receipt.editCount !== request.edits.length) throw rejected('invalid_reply', '审阅修订回执身份不符。', 'patch_result')
+      return receipt
+    } finally { this.activeSessions.delete(sessionId) }
+  }
   correctSource(input: unknown, exec: ToolExecution): Promise<NormalTranslationCorrectionReceipt> {
     const request = parseNormalTranslationSourceCorrection(input)
     if (this.disposed || !this.topics.ownsAgent(request.target.mainSessionId, exec.agent)) throw rejected('scope_mismatch', '纠错工具不属于此主 Agent。', 'authorize')
@@ -1061,7 +1123,7 @@ export class NormalTranslationService {
         'This is a full user-requested retranslation, not an automatic retry or a request to preserve every old wording. The previous translation is reference data. Read current applicable settings and query the relevant active terms, including disputed expressions. Do not copy earlier model-authored notes or obsolete interpretations as current user requirements. Use organizedNotes for your organization; userRequirements contains only actual current user wording, empty when none.',
         ...(request.target.kind === 'image_unit' ? ['Use the image unit’s current editable text and background. Only revisit the original image if the user asks for a new reading or source correction.'] : []),
         SOURCE_LAYOUT_GUIDANCE,
-        request.fileName ? `Original file: ${request.fileName}. After review, submit reusable candidates with translation_submit_proposals using the returned target/revisionId (or [] if none). Keep delivery in this file unit and its version entry; briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation. Save a file only when the user explicitly requests a separate export.',
+        request.fileName ? `Original file: ${request.fileName}. After review, submit any reusable candidates with translation_submit_proposals using the returned target/revisionId. Keep delivery in this file unit and its version entry; briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation. Save a file only when the user explicitly requests a separate export.',
         STYLE_SETTINGS_GUIDANCE,
         ...(request.fileName ? [FILE_MEMORY_REVIEW_GUIDANCE] : []),
         DIRECT_REVIEW_NEXT_STEP,

@@ -252,9 +252,10 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
           }
           function revisionStatus(revision: TextRevision, kind: 'final' | 'candidate'): string {
             const stale = !revisionMatchesCurrentSource(textUnit, revision)
+            const origin = revision.kind === 'review_edit' ? ' · 审阅修订' : ''
             return kind === 'candidate'
-              ? `候选 · 版本 ${revision.order}${stale ? ` · 已过时（原文版本 ${revision.sourceVersion}）` : ''}`
-              : `版本 ${revision.order} · ${!isFileJobUnit(unit) && unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`
+              ? `候选 · 版本 ${revision.order}${origin}${stale ? ` · 已过时（原文版本 ${revision.sourceVersion}）` : ''}`
+              : `版本 ${revision.order}${origin} · ${!isFileJobUnit(unit) && unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}`
           }
           function revisionView(revision: TextRevision, kind: 'final' | 'candidate', inlineActions: boolean): unknown {
             const isCandidate = kind === 'candidate'

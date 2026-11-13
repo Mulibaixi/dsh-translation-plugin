@@ -22,12 +22,12 @@ async function filesFor(ctx: TopicHostContext): Promise<Files> {
   const fsName='node:fs/promises',pathName='node:path'
   const fs=await import(fsName) as {readdir(path:string,options:object):Promise<{name:string;isFile():boolean;isDirectory():boolean}[]>;stat(path:string):Promise<{size:number}>;lstat(path:string):Promise<{isSymbolicLink():boolean}>;unlink(path:string):Promise<void>;rmdir(path:string):Promise<void>;readFile(path:string,encoding:'utf8'):Promise<string>}
   const path=await import(pathName) as {join(...parts:string[]):string;resolve(path:string):string;dirname(path:string):string}
-  const roots=[['sources','v1','content'],['sources','v1','references'],['references','v1'],['views','v1'],['objects','v1'],['memory','v1']].map(parts=>path.resolve(home.dshHomePath('translation-plugin',...parts)))
-  const directories=[[],['sources'],['sources','v1'],['sources','v1','content'],['sources','v1','references'],['references'],['references','v1'],['views'],['views','v1'],['objects'],['objects','v1'],['memory'],['memory','v1']].map(parts=>home.dshHomePath('translation-plugin',...parts))
+  const roots=[['sources','v1','content'],['sources','v1','references'],['references','v1'],['views','v1'],['objects','v1'],['memory','v1'],['batches','v1']].map(parts=>path.resolve(home.dshHomePath('translation-plugin',...parts)))
+  const directories=[[],['sources'],['sources','v1'],['sources','v1','content'],['sources','v1','references'],['references'],['references','v1'],['views'],['views','v1'],['objects'],['objects','v1'],['memory'],['memory','v1'],['batches'],['batches','v1']].map(parts=>home.dshHomePath('translation-plugin',...parts))
   const allowed=(file:string):boolean=>{
     const name=file.slice(Math.max(file.lastIndexOf('/'),file.lastIndexOf('\\'))+1), root=path.dirname(path.resolve(file))
     if(root===roots[0])return sourceContentDigest(name)!==undefined
-    if(root===roots[1]||root===roots[2])return /^[a-f0-9]{64}\.json$/u.test(name)
+    if(root===roots[1]||root===roots[2]||root===roots[6])return /^[a-f0-9]{64}\.json$/u.test(name)
     if(root===roots[3])return isViewFileStorageName(name)
     if(path.dirname(root)===roots[3]&&isViewFileStorageDirectory(root.slice(Math.max(root.lastIndexOf('/'),root.lastIndexOf('\\'))+1)))return isViewFileStorageName(viewFileStorageName(file))
     if(root===roots[5])return /^assets\.sqlite(?:-journal|-wal|-shm)?$/u.test(name)
@@ -70,11 +70,11 @@ export class LocalDataService {
   private authorize():void{if(!this.ctx.invocation?.peer.id)throw stopped('本地数据操作缺少宿主连接身份。')}
   /** Library-wide cleanup checks every service; topic cleanup uses its own scope. */
   private hasActiveJobs():boolean{
-    const services=['translationFileJobs','translationQuick','translationNormal','translationBatch','translationReview','translationMaterials','translationSources','translationReferences','translationOtherMemoryFiles','translationOtherMemory','translationArchive','translationTerms','translationEmbedding','translationMemorySearch','translationRecordIndex','translationHistory']
+    const services=['translationFileJobs','translationQuick','translationNormal','translationBatch','translationBatchProcessing','translationReview','translationMaterials','translationSources','translationReferences','translationOtherMemoryFiles','translationOtherMemory','translationArchive','translationTerms','translationEmbedding','translationMemorySearch','translationRecordIndex','translationHistory']
     return services.some(name=>(this.ctx.get?.(name) as Service|undefined)?.hasActiveJobs?.())
   }
   private async hasActiveTopicJobs(scope:HistoryScope):Promise<boolean>{
-    const services=['translationFileJobs','translationNormal','translationBatch','translationAnalysis','translationCorrection','translationPlanning','translationReview','translationSources']
+    const services=['translationFileJobs','translationNormal','translationBatch','translationBatchProcessing','translationAnalysis','translationCorrection','translationPlanning','translationReview','translationSources']
     if(services.some(name=>(this.ctx.get?.(name) as {historyUnitBusy?(scope:HistoryScope,unitId:string):boolean}|undefined)?.historyUnitBusy?.(scope,'*')))return true
     return await (this.ctx.get?.('translationHistory') as HistoryService|undefined)?.hasActiveTopicJobs?.(scope.namespaceId,scope.topicId)??false
   }
@@ -273,7 +273,7 @@ export class LocalDataService {
     this.authorize();referenceObject(raw);referenceExact(raw,['operationId']);referenceString(raw.operationId)
     try {
     if(this.complete)return {operationId:raw.operationId,cleared:true}
-    const services=['translationRecordIndex','translationHistory','translationMemorySearch','translationEmbedding','translationFileJobs','translationQuick','translationNormal','translationBatch','translationAnalysis','translationReview','translationCorrection','translationMaterials','translationObjects','translationSources','translationReferences','translationArchive','translationTerms','translationOtherMemoryFiles','translationOtherMemory','translationPreparation','translationPlanning','translationTopics']
+    const services=['translationRecordIndex','translationHistory','translationMemorySearch','translationEmbedding','translationFileJobs','translationQuick','translationNormal','translationBatch','translationBatchProcessing','translationAnalysis','translationReview','translationCorrection','translationMaterials','translationObjects','translationSources','translationReferences','translationArchive','translationTerms','translationOtherMemoryFiles','translationOtherMemory','translationPreparation','translationPlanning','translationTopics']
     if(!this.blocked&&services.some(name=>(this.ctx.get?.(name) as Service|undefined)?.hasActiveJobs?.()))throw Object.assign(new Error('仍有运行中、等待处理或结果未知的翻译任务，请先结束或确认任务。'), {code:'local_data_busy'})
     // Resolve the complete bounded file inventory before interrupting services or deleting bytes.
     const files=await this.files();await files.scan()

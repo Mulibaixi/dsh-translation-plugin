@@ -4,6 +4,7 @@
  * the topic snapshot, so both sides are reduced to one coarse key here.
  */
 const LABELS: Readonly<Record<string, string>> = {
+  english: 'en', chinese: 'zh-hans', 'simplified chinese': 'zh-hans', 'traditional chinese': 'zh-hant',
   '中文': 'zh-hans', '汉语': 'zh-hans', '漢語': 'zh-hans', '简体中文': 'zh-hans', '简体': 'zh-hans',
   '繁体中文': 'zh-hant', '繁體中文': 'zh-hant', '繁体': 'zh-hant', '繁體': 'zh-hant',
   '日语': 'ja', '日文': 'ja', '日本語': 'ja', '英语': 'en', '英文': 'en', '英語': 'en',
@@ -19,14 +20,6 @@ export function languageKey(value: string | null | undefined): string | undefine
   const [base] = tag.split('-')
   if (base === 'zh') return /^zh-(?:hant|tw|hk|mo)/u.test(tag) ? 'zh-hant' : 'zh-hans'
   return base
-}
-/**
- * An unrecognized display name is not proof of a mismatch; the exact term id/version still governs
- * whether the cited term applies, so such pairs are accepted instead of blocking the translation.
- */
-export function sameLanguage(left: string | null | undefined, right: string | null | undefined): boolean {
-  const a = languageKey(left), b = languageKey(right)
-  return a === undefined || b === undefined || a === b
 }
 /** Exact search: equal text, or two recognized names of one language. Unknown names never match. */
 export function languageMatches(left: string | null | undefined, right: string | null | undefined): boolean {
