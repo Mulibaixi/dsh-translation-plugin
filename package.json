@@ -86,6 +86,10 @@
     "mdast-util-gfm": "^3.1.0",
     "mdast-util-math": "^3.0.0",
     "micromark-extension-gfm": "^3.0.0",
-    "micromark-extension-math": "^3.1.0"
+    "micromark-extension-math": "^3.1.0",
+    "unpdf": "1.6.0"
+  },
+  "optionalDependencies": {
+    "@napi-rs/canvas": "0.1.100"
   }
 }

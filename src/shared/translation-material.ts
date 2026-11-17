@@ -1,4 +1,5 @@
 import { parseTranslationSourceAsset, type TranslationSourceAsset } from './translation-sources.js'
+import { isPdfFile, parsePdfOutputOptions, type PdfOutputOptions } from './pdf-source.js'
 
 /** Frozen plugin material for one main-session submission, independent of its transport. */
 export interface TranslationMaterialScope {
@@ -41,6 +42,7 @@ export interface TranslationMaterialConfig {
   readonly maxInputChars: number
   /** Active topic term count observed by the Client; lets the notice skip an empty term round trip. */
   readonly termCount?: number
+  readonly pdfOutput?: PdfOutputOptions
   readonly unitReference?: TranslationMaterialUnitReference
   readonly revises?: TranslationMaterialRevisionReference
 }
@@ -98,7 +100,7 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
 
   const material = value.material
   object(material)
-  fields(material, ['materialId', 'sourceVersion', 'topicId', 'translationSessionId', 'draftVersion', 'targetLanguage', 'instruction', 'model', 'maxInputChars'], ['sourceText', 'sourceRef', 'unitReference', 'revises', 'termCount'])
+  fields(material, ['materialId', 'sourceVersion', 'topicId', 'translationSessionId', 'draftVersion', 'targetLanguage', 'instruction', 'model', 'maxInputChars'], ['sourceText', 'sourceRef', 'unitReference', 'revises', 'termCount', 'pdfOutput'])
   text(material.materialId, 2048); text(material.topicId, 3000); text(material.translationSessionId, 2048)
   integer(material.sourceVersion); integer(material.draftVersion); integer(material.maxInputChars, 1, 200000)
   if (material.termCount !== undefined) integer(material.termCount, 0, 10000)
@@ -110,6 +112,9 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
     if (material.sourceVersion !== 1 || Object.hasOwn(material, 'unitReference') || Object.hasOwn(material, 'revises')) throw new TypeError('Source assets require a new material source version')
     source = { sourceRef: parseTranslationSourceAsset(material.sourceRef) }
   }
+  if (material.pdfOutput !== undefined && (source.sourceRef?.encoding !== 'binary' || !isPdfFile(source.sourceRef.name)))
+    throw new TypeError('PDF output options require a PDF source')
+  const pdfOutput = material.pdfOutput === undefined ? undefined : parsePdfOutputOptions(material.pdfOutput)
   text(material.targetLanguage, 80); text(material.instruction, 4000, true)
   let model: TranslationMaterialRoute | null = null
   if (material.model !== null) {
@@ -147,6 +152,6 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
   return { ...scope, kind: 'material', ...uiLocale, material: { materialId: material.materialId, sourceVersion: material.sourceVersion,
     topicId: material.topicId, translationSessionId: material.translationSessionId, draftVersion: material.draftVersion,
     ...source, targetLanguage: material.targetLanguage, instruction: material.instruction, model, maxInputChars: material.maxInputChars,
-    ...(material.termCount === undefined ? {} : { termCount: material.termCount }),
+    ...(material.termCount === undefined ? {} : { termCount: material.termCount }), ...(pdfOutput ? { pdfOutput } : {}),
     ...(unitReference === undefined ? {} : { unitReference }), ...(revises === undefined ? {} : { revises }) } }
 }

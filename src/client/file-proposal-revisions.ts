@@ -41,7 +41,8 @@ export function reviewFileProposals(record: FileJobRecord, terms: readonly Topic
     if (proposal.kind === 'fact') reviews[proposal.candidateId] = choose(archive.filter(entry => entry.kind === 'fact' &&
       label(entry.title) === label(proposal.title) && idsEqual(entry.entityIds, proposal.entityCandidateIds.map(entity))))
     else if (proposal.kind === 'relation') reviews[proposal.candidateId] = choose(archive.filter(entry => entry.kind === 'relation' &&
-      entry.sourceEntityId === entity(proposal.sourceEntityCandidateId) && entry.targetEntityId === entity(proposal.targetEntityCandidateId) && label(entry.relation) === label(proposal.relation)))
+      idsEqual(entry.sourceEntityIds, [entity(proposal.sourceEntityCandidateId)]) &&
+      idsEqual(entry.targetEntityIds, [entity(proposal.targetEntityCandidateId)]) && label(entry.relation) === label(proposal.relation)))
   }
   return reviews
 }

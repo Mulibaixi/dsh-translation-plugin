@@ -1,4 +1,4 @@
-import { MAX_VIEW_FILE_BYTES, parseViewFileResult, type ViewFileClear, type ViewFileOpen, type ViewFilePort, type ViewFileResult } from '../shared/view-files.js'
+import { MAX_VIEW_FILE_BYTES, parseViewFileResult, type ViewFileClear, type ViewFileOpen, type ViewFileOpened, type ViewFilePort, type ViewFileResult } from '../shared/view-files.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS } from '../shared/translation-source-read.js'
 import { parseTranslationSourceStorageRequest, type TranslationSourceStoredRead, type TranslationSourceStoragePort } from '../shared/translation-source-storage.js'
 import { parseTranslationSourceAsset, parseTranslationSourceResult, parseTranslationSourceScope, toSourceIdentity,
@@ -20,7 +20,8 @@ export function adaptViewFilesRemote(remote: ViewFilesRemotePort | undefined | (
 }
 
 export interface ViewOpenOutcome { readonly ok: boolean; readonly message?: string }
-export type ViewSourceOpenRequest = Omit<ViewFileOpen, 'text' | 'format'>
+export type ViewFileTarget = 'preview' | 'system'
+export type ViewSourceOpenRequest = Omit<ViewFileOpen, 'text' | 'format' | 'preview'>
 export interface ViewSourceSnapshot {
   readonly scope: TranslationSourceScope
   readonly sourceRef?: TranslationSourceAsset
@@ -28,7 +29,12 @@ export interface ViewSourceSnapshot {
   readonly savedSource?: TranslationSourceStoredRead
   readonly file?: Blob
 }
-export interface ViewFilesSourceOptions { readonly library?: import('../shared/library-sources.js').LibrarySourcesPort; readonly sources?: TranslationSourcesPort; readonly sourceStorage?: TranslationSourceStoragePort }
+export interface ViewFilesSourceOptions {
+  readonly library?: import('../shared/library-sources.js').LibrarySourcesPort
+  readonly sources?: TranslationSourcesPort
+  readonly sourceStorage?: TranslationSourceStoragePort
+  readonly getPreview?: () => ((path: string) => void) | undefined
+}
 function same(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right) }
 function textFileFormat(name?: string): 'txt' | 'md' { return name && /\.md$/iu.test(name) ? 'md' : 'txt' }
 /** Host opening files mirror the Client session lifetime: capture the scope before a deletion, clear after it. */
@@ -55,9 +61,10 @@ export class ViewFilesClient {
     }
     return [...groups].map(([namespaceId, sessionIds]) => ({ namespaceId, sessionIds }))
   }
-  async open(request: ViewFileOpen, signal?: AbortSignal): Promise<ViewOpenOutcome> {
+  async open(request: Omit<ViewFileOpen, 'preview'>, signal?: AbortSignal, target: ViewFileTarget = 'system'): Promise<ViewOpenOutcome> {
     request = { ...request, namespaceId: this.sessions.getNamespaceId() }
-    return await this.operation(signal => this.openRequest(request, signal), request, signal)
+    const preview = target === 'preview' && (request.format === 'txt' || request.format === 'md') ? this.sourceOptions.getPreview?.() : undefined
+    return await this.operation(signal => this.openRequest(request, signal, preview), request, signal)
   }
   /** Read the captured UTF-8 file without touching it; decoding retains its BOM and all newline characters. */
   async openCapturedTxt(request: ViewSourceOpenRequest, file: Blob, signal?: AbortSignal): Promise<ViewOpenOutcome> {
@@ -83,7 +90,9 @@ export class ViewFilesClient {
   }
 
   /** Saved non-Markdown opens the original; Markdown uses verified text to resolve images in an opening copy. */
-  async openSource(request: ViewSourceOpenRequest, snapshot: ViewSourceSnapshot, signal?: AbortSignal): Promise<ViewOpenOutcome> {
+  async openSource(request: ViewSourceOpenRequest, snapshot: ViewSourceSnapshot, signal?: AbortSignal, target: ViewFileTarget = 'system'): Promise<ViewOpenOutcome> {
+    const fileName = request.fileName ?? snapshot.sourceRef?.name ?? snapshot.savedSource?.source.name ?? snapshot.librarySource?.stored.source.name
+    const preview = target === 'preview' && fileName && /\.(?:txt|md|pdf)$/iu.test(fileName) ? this.sourceOptions.getPreview?.() : undefined
     return await this.operation(async signal => {
       const scope = parseTranslationSourceScope(snapshot.scope)
       if (request.kind !== 'source' || request.sessionId !== scope.translationSessionId) throw new Error('原稿打开范围与文件单元不一致。')
@@ -95,8 +104,12 @@ export class ViewFilesClient {
         if (!this.sourceOptions.library) throw new Error('资料库原稿打开服务尚未就绪。')
         if (snapshot.librarySource.namespaceId !== this.sessions.getNamespaceId() || snapshot.librarySource.stored.scope.translationSessionId !== request.sessionId) throw new Error('共享原稿范围不一致。')
         if (!markdown) {
-          const result = await this.sourceOptions.library.readLibrarySource({ ...snapshot.librarySource, action: 'open' }, signal)
-          return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+          const result = await this.sourceOptions.library.readLibrarySource({ ...snapshot.librarySource, action: preview ? 'preview' : 'open' }, signal)
+          signal.throwIfAborted()
+          if (!result.ok) return { ok: false, message: result.error.message }
+          if (result.value.kind === 'preview') return this.finishOpen({ path: result.value.path }, preview)
+          if (result.value.kind === 'opened') return this.finishOpen({ opened: true }, preview)
+          return { ok: false, message: '未取得原稿打开回执。' }
         }
       }
       if (snapshot.savedSource && !snapshot.librarySource) {
@@ -104,9 +117,9 @@ export class ViewFilesClient {
         if (!same(stored.scope, scope) || source && !same(stored.source, toSourceIdentity(source))) throw new Error('已保存原稿与此源版本不一致。')
         if (!this.sourceOptions.sourceStorage) throw new Error('原稿存储打开服务未就绪，请重试。')
         if (!markdown) {
-          const result = await this.sourceOptions.sourceStorage.openOriginal(stored, signal)
+          const result = await this.sourceOptions.sourceStorage.openOriginal({ ...stored, ...(preview ? { preview: true } : {}) }, signal)
           signal.throwIfAborted()
-          return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+          return result.ok ? this.finishOpen(result.value, preview) : { ok: false, message: result.error.message }
         }
         if (!snapshot.librarySource) {
           const restored = await this.sourceOptions.sourceStorage.restore(stored)
@@ -141,10 +154,10 @@ export class ViewFilesClient {
         if (hash !== source.sha256) throw new Error('原稿内容与固定源版本校验不一致。')
         return await this.openRequest({ ...request, revisionId: request.revisionId ?? `source:${source.sourceId}:${source.version}`,
           fileName: request.fileName ?? source.name, text, format: textFileFormat(request.fileName ?? source.name),
-          ...(source.originalFilePath ? { originalFilePath: source.originalFilePath } : {}) }, signal)
+          ...(source.originalFilePath ? { originalFilePath: source.originalFilePath } : {}) }, signal, preview)
       }
       if (!snapshot.file) throw new Error('本次原稿文件不可用，请重新选择文件。')
-      return await this.openRequest({ ...request, text: await this.capturedText(snapshot.file, signal, request.fileName), format: textFileFormat(request.fileName ?? (snapshot.file as File).name) }, signal)
+      return await this.openRequest({ ...request, text: await this.capturedText(snapshot.file, signal, request.fileName), format: textFileFormat(fileName ?? (snapshot.file as File).name) }, signal, preview)
     }, request, signal)
   }
   private async capturedText(file: Blob, signal: AbortSignal, fileName?: string): Promise<string> {
@@ -157,12 +170,16 @@ export class ViewFilesClient {
     try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }
     catch { throw new Error('原稿不是有效 UTF-8 文本，未替换或猜测编码。') }
   }
-  private async openRequest(request: ViewFileOpen, signal: AbortSignal): Promise<ViewOpenOutcome> {
-    request = { ...request, namespaceId: this.sessions.getNamespaceId() }
+  private async openRequest(request: Omit<ViewFileOpen, 'preview'>, signal: AbortSignal, preview?: (path: string) => void): Promise<ViewOpenOutcome> {
     signal.throwIfAborted()
-    const result = await this.port.open(request, signal)
+    const result = await this.port.open({ ...request, namespaceId: this.sessions.getNamespaceId(), ...(preview ? { preview: true } : {}) }, signal)
     signal.throwIfAborted()
-    return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+    return result.ok ? this.finishOpen(result.value, preview) : { ok: false, message: result.error.message }
+  }
+  private finishOpen(result: ViewFileOpened, preview?: (path: string) => void): ViewOpenOutcome {
+    if (preview && 'path' in result) { preview(result.path); return { ok: true } }
+    if (!preview && 'opened' in result) return { ok: true }
+    return { ok: false, message: '未取得文件打开回执。' }
   }
   private async operation(action: (signal: AbortSignal) => Promise<ViewOpenOutcome>, scope?: { readonly namespaceId: string; readonly sessionId: string }, signal?: AbortSignal): Promise<ViewOpenOutcome> {
     if (this.disposed) return { ok: false, message: '打开服务已关闭。' }

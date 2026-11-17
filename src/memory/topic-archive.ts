@@ -1,11 +1,12 @@
 import { resolveTermEvidence, fileProposalAcceptance, type FileProposalAcceptance, type TermEvidenceRef, type TermEvidenceResolver, type TermUserAdoption } from './topic-terms.js'
 
 export type TopicArchiveKind = 'entity' | 'fact' | 'relation'
+export const TOPIC_ARCHIVE_LIST_LIMIT = 100
 export type TopicArchiveStatus = 'proposal' | 'active' | 'review_required' | 'disabled'
 export type TopicArchiveOrigin = 'inferred' | 'source_checked' | 'user_explicit'
 export interface TopicEntityContent { readonly kind: 'entity'; readonly name: string; readonly aliases: readonly string[]; readonly description: string }
 export interface TopicFactContent { readonly kind: 'fact'; readonly title: string; readonly body: string; readonly entityIds: readonly string[] }
-export interface TopicRelationContent { readonly kind: 'relation'; readonly sourceEntityId: string; readonly relation: string; readonly targetEntityId: string; readonly description: string }
+export interface TopicRelationContent { readonly kind: 'relation'; readonly sourceEntityIds: readonly string[]; readonly relation: string; readonly targetEntityIds: readonly string[]; readonly description: string }
 export type TopicArchiveSemantic = TopicEntityContent | TopicFactContent | TopicRelationContent
 export type TopicArchiveContent = TopicArchiveSemantic & { readonly evidence: readonly TermEvidenceRef[] }
 export type TopicArchiveEntry = TopicArchiveContent & {
@@ -39,7 +40,14 @@ function text(value: unknown, maximum: number, required = true): value is string
 function integer(value: unknown, minimum = 0): value is number { return Number.isSafeInteger(value) && (value as number) >= minimum }
 function time(value: unknown): value is string { return text(value, 40) && Number.isFinite(Date.parse(value)) }
 function strings(value: unknown, maximum: number): value is readonly string[] {
-  return Array.isArray(value) && value.length <= 100 && value.every(item => text(item, maximum)) && new Set(value).size === value.length
+  return Array.isArray(value) && value.length <= TOPIC_ARCHIVE_LIST_LIMIT && value.every(item => text(item, maximum)) && new Set(value).size === value.length
+}
+function archiveRecord(value: unknown): Data | undefined {
+  if (!record(value)) return undefined
+  if (value.kind !== 'relation' || Object.hasOwn(value, 'sourceEntityIds') || Object.hasOwn(value, 'targetEntityIds') ||
+      !Object.hasOwn(value, 'sourceEntityId') || !Object.hasOwn(value, 'targetEntityId')) return value
+  const { sourceEntityId, targetEntityId, ...rest } = value
+  return { ...rest, sourceEntityIds: [sourceEntityId], targetEntityIds: [targetEntityId] }
 }
 function evidence(value: unknown): value is TermEvidenceRef {
   if (!record(value) || !(exact(value, ['kind', 'sessionId', 'unitId', 'revisionId', 'selectionEventId', 'range', 'role']) ||
@@ -54,10 +62,11 @@ function semantic(value: unknown): value is TopicArchiveSemantic {
   if (!record(value)) return false
   return value.kind === 'entity' ? text(value.name, 500) && strings(value.aliases, 500) && text(value.description, 8000, false) :
     value.kind === 'fact' ? text(value.title, 500) && text(value.body, 16000) && strings(value.entityIds, 2048) :
-    value.kind === 'relation' && text(value.sourceEntityId, 2048) && text(value.relation, 500) && text(value.targetEntityId, 2048) && text(value.description, 8000, false)
+    value.kind === 'relation' && strings(value.sourceEntityIds, 2048) && value.sourceEntityIds.length > 0 &&
+      strings(value.targetEntityIds, 2048) && value.targetEntityIds.length > 0 && text(value.relation, 500) && text(value.description, 8000, false)
 }
 function semanticKeys(kind: unknown): readonly string[] {
-  return kind === 'entity' ? ['kind', 'name', 'aliases', 'description'] : kind === 'fact' ? ['kind', 'title', 'body', 'entityIds'] : ['kind', 'sourceEntityId', 'relation', 'targetEntityId', 'description']
+  return kind === 'entity' ? ['kind', 'name', 'aliases', 'description'] : kind === 'fact' ? ['kind', 'title', 'body', 'entityIds'] : ['kind', 'sourceEntityIds', 'relation', 'targetEntityIds', 'description']
 }
 function content(value: unknown): value is TopicArchiveContent {
   return semantic(value) && record(value) && Array.isArray(value.evidence) && value.evidence.length <= 100 && value.evidence.every(evidence)
@@ -65,7 +74,7 @@ function content(value: unknown): value is TopicArchiveContent {
 function copySemantic(value: TopicArchiveSemantic): TopicArchiveSemantic {
   return value.kind === 'entity' ? { kind: value.kind, name: value.name, aliases: [...value.aliases], description: value.description } :
     value.kind === 'fact' ? { kind: value.kind, title: value.title, body: value.body, entityIds: [...value.entityIds] } :
-      { kind: value.kind, sourceEntityId: value.sourceEntityId, relation: value.relation, targetEntityId: value.targetEntityId, description: value.description }
+      { kind: value.kind, sourceEntityIds: [...value.sourceEntityIds], relation: value.relation, targetEntityIds: [...value.targetEntityIds], description: value.description }
 }
 function copyContent(value: TopicArchiveContent): TopicArchiveContent { return { ...copySemantic(value), evidence: value.evidence.map(ref => ({ ...ref, range: ref.range ? { ...ref.range } : null })) } }
 function sourceBasis(value: TopicArchiveContent): boolean { return value.evidence.some(ref => ref.kind === 'source' && ref.role === 'basis') }
@@ -75,15 +84,17 @@ function adoption(value: unknown): value is TermUserAdoption {
 }
 
 /** Storage/RPC parsing is kept at the boundary; internal mutations use trusted domain values. */
-export function decodeTopicArchivePut(value: unknown): TopicArchivePut | undefined {
-  if (!record(value) || !exact(value, [...semanticKeys(value.kind), 'evidence', 'id', 'expectedEntryVersion', 'origin', 'status']) || !content(value) ||
+export function decodeTopicArchivePut(input: unknown): TopicArchivePut | undefined {
+  const value = archiveRecord(input)
+  if (!value || !exact(value, [...semanticKeys(value.kind), 'evidence', 'id', 'expectedEntryVersion', 'origin', 'status']) || !content(value) ||
     !text(value.id, 2048) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
     !['inferred', 'source_checked'].includes(value.origin as string) || !['proposal', 'active'].includes(value.status as string) ||
     (value.status === 'active' && (!['source_checked'].includes(String(value.origin)) || !sourceBasis(value)))) return undefined
   return { ...copyContent(value), id: value.id, expectedEntryVersion: value.expectedEntryVersion, origin: value.origin as TopicArchivePut['origin'], status: value.status as TopicArchivePut['status'] }
 }
-export function decodeTopicArchiveUserInput(value: unknown): TopicArchiveUserInput | undefined {
-  if (!record(value) || !exact(value, [...semanticKeys(value.kind), 'id', 'expectedEntryVersion']) || !semantic(value) ||
+export function decodeTopicArchiveUserInput(input: unknown): TopicArchiveUserInput | undefined {
+  const value = archiveRecord(input)
+  if (!value || !exact(value, [...semanticKeys(value.kind), 'id', 'expectedEntryVersion']) || !semantic(value) ||
     !(value.id === null || text(value.id, 2048)) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
     (value.id === null && value.expectedEntryVersion !== null)) return undefined
   return { ...copySemantic(value), id: value.id, expectedEntryVersion: value.expectedEntryVersion }
@@ -92,8 +103,9 @@ function decodeSnapshot(value: unknown, projection: boolean): TopicArchiveSnapsh
   if (!record(value) || !exact(value, ['schemaVersion', 'ownerId', 'topicId', 'version', 'activeVersion', 'updatedAt', 'entries']) || ![1, 2, 3].includes(value.schemaVersion as number) ||
     !text(value.ownerId, 2048) || !text(value.topicId, 2048) || !integer(value.version) || !integer(value.activeVersion) || value.activeVersion > value.version || !time(value.updatedAt) || !Array.isArray(value.entries)) return undefined
   const entries: TopicArchiveEntry[] = [], ids = new Set<string>()
-  for (const raw of value.entries) {
-    if (!record(raw) || !exact(raw, [...semanticKeys(raw.kind), 'evidence', 'id', 'version', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt', ...(Object.hasOwn(raw, 'acceptance') ? ['acceptance'] : [])]) ||
+  for (const item of value.entries) {
+    const raw = archiveRecord(item)
+    if (!raw || !exact(raw, [...semanticKeys(raw.kind), 'evidence', 'id', 'version', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt', ...(Object.hasOwn(raw, 'acceptance') ? ['acceptance'] : [])]) ||
       !content(raw) || !text(raw.id, 2048) || ids.has(raw.id) || !integer(raw.version, 1) || raw.version > value.version || !time(raw.createdAt) || !time(raw.updatedAt) ||
       !statuses.includes(raw.status as TopicArchiveStatus) || !['inferred', 'source_checked', 'user_explicit'].includes(raw.origin as string)) return undefined
     if (raw.origin === 'user_explicit' ? (!adoption(raw.confirmation) || raw.confirmation.adoptedEntryVersion >= raw.version || raw.evidence.some(ref => ref.role === 'basis')) : raw.confirmation !== null) return undefined
@@ -113,7 +125,7 @@ export function emptyTopicArchive(ownerId: string, topicId: string, at: string):
   return { schemaVersion: 1, ownerId, topicId, version: 0, activeVersion: 0, updatedAt: at, entries: [] }
 }
 export function referencedEntityIds(value: TopicArchiveSemantic): readonly string[] {
-  return value.kind === 'entity' ? [] : value.kind === 'fact' ? value.entityIds : [...new Set([value.sourceEntityId, value.targetEntityId])]
+  return value.kind === 'entity' ? [] : value.kind === 'fact' ? value.entityIds : [...new Set([...value.sourceEntityIds, ...value.targetEntityIds])]
 }
 function validBasis(snapshot: TopicArchiveSnapshot, entry: TopicArchiveContent, resolver: TermEvidenceResolver, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
   return sourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined || isUnloaded(ref))
@@ -136,16 +148,16 @@ function replace(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, at: s
   return { ...snapshot, schemaVersion: entry.acceptance || snapshot.schemaVersion === 3 ? 3 as const : 2 as const, version: snapshot.version + 1, activeVersion: snapshot.activeVersion + (activeChanged ? 1 : 0), updatedAt: at,
     entries: old ? snapshot.entries.map(item => item.id === entry.id ? entry : item) : [...snapshot.entries, entry] }
 }
-function reviewDependents(snapshot: TopicArchiveSnapshot, entityId: string, at: string): TopicArchiveSnapshot {
+function reviewDependents(snapshot: TopicArchiveSnapshot, entityIds: ReadonlySet<string>, at: string): TopicArchiveSnapshot {
   let next = snapshot
-  for (const entry of snapshot.entries) if (entry.status !== 'disabled' && entry.status !== 'review_required' && referencedEntityIds(entry).includes(entityId)) {
+  for (const entry of snapshot.entries) if (entry.status !== 'disabled' && entry.status !== 'review_required' && referencedEntityIds(entry).some(id => entityIds.has(id))) {
     next = replace(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
   }
   return next
 }
 function replaceAndReview(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, at: string): TopicArchiveSnapshot {
   const old = snapshot.entries.find(item => item.id === entry.id), next = replace(snapshot, entry, at)
-  return old?.kind === 'entity' && (JSON.stringify(copySemantic(old)) !== JSON.stringify(copySemantic(entry)) || (old.status === 'active' && entry.status !== 'active')) ? reviewDependents(next, entry.id, at) : next
+  return old?.kind === 'entity' && (JSON.stringify(copySemantic(old)) !== JSON.stringify(copySemantic(entry)) || (old.status === 'active' && entry.status !== 'active')) ? reviewDependents(next, new Set([entry.id]), at) : next
 }
 function result(snapshot: TopicArchiveSnapshot, status: ArchiveMutationResult['status'], entry: TopicArchiveEntry | null): ArchiveMutationResult { return { status, snapshot, entry } }
 
@@ -218,8 +230,15 @@ export function deleteTopicArchiveEntry(snapshot: TopicArchiveSnapshot, id: stri
   const old = snapshot.entries.find(entry => entry.id === id) ?? null
   if (!old || old.version !== expectedEntryVersion) return result(snapshot, 'stale', old)
   if (!time(at)) return result(snapshot, 'invalid', old)
-  const next: TopicArchiveSnapshot = { ...snapshot, version: snapshot.version + 1, activeVersion: snapshot.activeVersion + (old.status === 'active' ? 1 : 0), updatedAt: at, entries: snapshot.entries.filter(entry => entry.id !== id) }
-  return result(old.kind === 'entity' ? reviewDependents(next, id, at) : next, 'updated', null)
+  return result(removeTopicArchiveEntries(snapshot, new Set([id]), at), 'updated', null)
+}
+export function removeTopicArchiveEntries(snapshot: TopicArchiveSnapshot, ids: ReadonlySet<string>, at: string): TopicArchiveSnapshot {
+  const removed = snapshot.entries.filter(entry => ids.has(entry.id))
+  if (!removed.length) return snapshot
+  const next: TopicArchiveSnapshot = { ...snapshot, version: snapshot.version + 1, activeVersion: snapshot.activeVersion + Number(removed.some(entry => entry.status === 'active')),
+    updatedAt: at, entries: snapshot.entries.filter(entry => !ids.has(entry.id)) }
+  const entityIds = new Set(removed.filter(entry => entry.kind === 'entity').map(entry => entry.id))
+  return entityIds.size ? reviewDependents(next, entityIds, at) : next
 }
 /** A changed final basis never silently revives. User examples do not govern independent adoption. */
 export function reconcileTopicArchive(snapshot: TopicArchiveSnapshot, resolver: TermEvidenceResolver, at: string,

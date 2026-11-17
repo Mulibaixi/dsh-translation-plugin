@@ -29,14 +29,14 @@ interface NativeProvider {
   readonly capabilities: { readonly agentOptions: boolean; readonly outputSchema: boolean; readonly depthLimit: boolean; readonly toolFilter?: boolean; readonly persona?: boolean }
 }
 interface NativeStartRequest {
-  readonly parent: NativeAgent; readonly label: string; readonly prompt: { type: 'text'; text: string }[]; readonly signal: AbortSignal
+  readonly parent: NativeAgent; readonly label: string; readonly prompt: ({ type: 'text'; text: string } | { type: 'image'; attachment: unknown })[]; readonly signal: AbortSignal
   readonly agentOptions?: NativeAgentOptions; readonly outputSchema: Schema; readonly maxDepth: number
   readonly toolFilter: { readonly allow: readonly string[] }; readonly persona: string
 }
 interface NativeService {
   getProvider(name: string): NativeProvider | undefined
   start?(name: string, request: NativeStartRequest): Promise<NativeRun>
-  startActivation?(spec: { readonly provider: string; readonly label: string; readonly childId: string;
+  startActivation?(spec: Omit<NativeStartRequest, 'label' | 'signal' | 'toolFilter' | 'persona'> & { readonly provider: string; readonly label: string; readonly childId: string;
     readonly request: Omit<NativeStartRequest, 'label' | 'signal' | 'toolFilter' | 'persona'>;
     readonly signal: AbortSignal; readonly delivery: 'caller' }): Promise<NativeActivation>
 }
@@ -347,13 +347,13 @@ export class FileWorkerRuntime {
     catch (error) { this.loading = undefined; throw error }
   }
   /** One complete structured task on a fresh native child, using the same routing and teardown as file workers. */
-  structuredTask(jobId: string, mainSessionId: string, task: { readonly label: string; readonly persona: string; readonly prompt: string; readonly schema: Schema }, signal: AbortSignal): Promise<unknown> {
+  structuredTask(jobId: string, mainSessionId: string, task: { readonly label: string; readonly persona: string; readonly prompt: string; readonly schema: Schema; readonly image?: unknown }, signal: AbortSignal): Promise<unknown> {
     const key = `structured:${jobId}`
     if (this.active.has(key)) return Promise.reject(new FileWorkerRuntimeError('native_subagent_already_running', 'worker_start', '同一子任务已在运行。'))
     const controller = new AbortController(), abort = (): void => controller.abort(signal.reason)
     signal.addEventListener('abort', abort, { once: true }); if (signal.aborted) abort()
     const result = (async () => {
-      const report = diagnosticSpan(this.ctx, 'memory.segmentation.worker', { phase: task.label, promptBytes: new TextEncoder().encode(task.prompt).byteLength }, jobId)
+      const report = diagnosticSpan(this.ctx, task.image ? 'pdf.supplement.worker' : 'memory.segmentation.worker', { phase: task.label, promptBytes: new TextEncoder().encode(task.prompt).byteLength }, jobId)
       let run: NativeRun | undefined, error: unknown, value: unknown
       let facts = { modelCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }
       try {
@@ -363,13 +363,15 @@ export class FileWorkerRuntime {
         const parent = this.parent(mainSessionId), sdk = await this.sdk()
         if (!parent || parent.id !== parent.session.id) throw new Error('实际主 Agent 已不可用。')
         controller.signal.throwIfAborted()
-        run = await this.startWorker({ parent, label: task.label, prompt: [{ type: 'text', text: task.prompt }], signal: controller.signal,
+        const prompt: NativeStartRequest['prompt'] = [{ type: 'text', text: task.prompt }]
+        if (task.image) prompt.push({ type: 'image', attachment: task.image })
+        run = await this.startWorker({ parent, label: task.label, prompt, signal: controller.signal,
           outputSchema: task.schema, persona: task.persona, toolFilter: { allow: [] }, maxDepth: sdk.delegationDepthOf(parent) + 1,
           agentOptions: sdk.parentAgentOptionsForDelegation(parent) })
         const outcome = await run.result
         controller.signal.throwIfAborted()
         if (outcome.stopReason !== 'completed' || outcome.structured === undefined) throw new FileWorkerRuntimeError(
-          'native_subagent_invalid_output', 'worker_output', '原生分段子任务未提交完整结构化结果。')
+          'native_subagent_invalid_output', 'worker_output', '原生子任务未提交完整结构化结果。')
         const calls = run.localAgent?.session.snapshotEvents().filter(event => event.type === 'assistant/message') ?? []
         facts = { modelCalls: calls.length, inputTokens: calls.reduce((n, event) => n + (event.data.usage?.inputTokens ?? 0), 0),
           outputTokens: calls.reduce((n, event) => n + (event.data.usage?.outputTokens ?? 0), 0),
@@ -562,7 +564,8 @@ export class FileWorkerRuntime {
     let activation: NativeActivation
     try {
       const { label, signal, toolFilter: _filter, persona: _persona, ...task } = request
-      activation = await service.startActivation({ provider: this.providerName, label, childId, request: task, signal, delivery: 'caller' })
+      // DSH 0.2.2 moved the task from request to the top level during the RC series.
+      activation = await service.startActivation({ ...task, provider: this.providerName, label, childId, request: task, signal, delivery: 'caller' })
     } finally { remove() }
     let disposal: Promise<void> | undefined
     const dispose = () => disposal ??= activation.dispose()

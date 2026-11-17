@@ -1,6 +1,7 @@
 import { h, react } from './react.js'
 import { FileJobsClient, type FileJobRecord } from './file-jobs-client.js'
-import type { ViewFilesClient } from './view-files-client.js'
+import type { ViewFilesClient, ViewFileTarget } from './view-files-client.js'
+import { FileOpenMenu } from './direct-file-view.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import { RecordIndexControl, RecordIndexStatus, supportsRecordIndex, type RecordIndexProps } from './record-index-view.js'
 
@@ -44,8 +45,10 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
   const deletionBlocked = jobs.unitDeletionBlockedReason(job.jobId)
   const resultDeletionBlocked = result && jobs.resultDeletionBlockedReason(job.jobId, result.version)
   const sourceDeletionBlocked = jobs.sourceDeletionBlockedReason(job.jobId, sourceVersion)
-  const openSource = (): void => { if (viewFiles) void jobs.open(job.jobId, 'source', sourceVersion, viewFiles) }
-  const openResult = (): void => { if (viewFiles && resultVersion !== undefined) void jobs.open(job.jobId, 'result', resultVersion, viewFiles) }
+  const sourceOpenBlocked = busy || !viewFiles || !source || !!source.deletion
+  const resultOpenBlocked = busy || !viewFiles || !result || !!result.deletion
+  const openSource = (target: ViewFileTarget): void => { if (viewFiles) void jobs.open(job.jobId, 'source', sourceVersion, viewFiles, target) }
+  const openResult = (target: ViewFileTarget): void => { if (viewFiles && resultVersion !== undefined) void jobs.open(job.jobId, 'result', resultVersion, viewFiles, target) }
   const detailsControl = h('button', { type: 'button', 'aria-expanded': expanded, onClick: () => setExpanded(!expanded) }, expanded ? '收起详情' : '详情')
   const versionsControl = current.results.length > 1 || current.sources.length > 1 ? h('button', { type: 'button', 'aria-expanded': versionsExpanded, onClick: () => setVersionsExpanded(!versionsExpanded) }, `旧版(${Math.max(0, current.results.length - 1)})`) : null
   const assetsControl = onOpenAssets ? h('button', { type: 'button',
@@ -59,8 +62,8 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
         failedWithoutResult ? h('button', { type: 'button', disabled: true, title: '请重新发送原稿，使用当前翻译流程。', onClick: () => { void jobs.retranslate(job.jobId, ownerId) } }, '重新发送') : null,
         h('button', { type: 'button', disabled: busy || deleting || !!deletionBlocked || Boolean(awaitingRetranslation), title: deletionBlocked, onClick: () => setDeletePlan(jobs.captureUnitDeletion(job.jobId)) }, '删除单元'),
         !result ? detailsControl : null, !result ? versionsControl : null,
-        h('button', { type: 'button', disabled: busy || !viewFiles || !source || !!source.deletion, onClick: openSource }, '打开'))),
-    h('div', { className: 'dsh-tp-file-name' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: busy || !viewFiles || !source || !!source.deletion, onClick: openSource }, name)),
+        h(FileOpenMenu, { label: `${name} 操作`, action: { disabled: sourceOpenBlocked, open: () => openSource('system') } }))),
+    h('div', { className: 'dsh-tp-file-name' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: sourceOpenBlocked, onClick: () => openSource('preview') }, name)),
     retranslation ? h('p', { role: 'status', className: 'dsh-tp-muted' }, retranslation.message) : null,
     result ? h('div', { className: 'dsh-tp-version-header' },
       h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${result.version} · 译文 · ${resultLanguage} · ${result.deletion ? '已删除' : current.final?.version === result.version ? '已定稿' : result.semanticStatus === 'passed' ? '待定稿' : '待复核'}`),
@@ -68,8 +71,8 @@ export function FileJobView({ jobs, record, viewFiles, materials, onOpenAssets, 
         h('button', { type: 'button', disabled: busy || !!result.deletion || result.semanticStatus !== 'passed' || result.sourceVersion !== job.sourceVersion || current.final?.version === result.version,
           title: result.sourceVersion !== job.sourceVersion ? '此译文属于其他原稿版本。' : result.semanticStatus !== 'passed' ? '须完成集中语义验收后才能设为最终。' : undefined, onClick: () => jobs.selectFinal(job.jobId, result.version) }, current.final?.version === result.version ? '已定稿' : '设为最终'),
         h('button', { type: 'button', disabled: busy || deleting || !!resultDeletionBlocked, title: resultDeletionBlocked, onClick: () => setResultDeletePlan(jobs.captureResultDeletion(job.jobId, result.version)) }, '删除此译文版本'),
-        assetsControl, detailsControl, versionsControl, h('button', { type: 'button', disabled: busy || !!result.deletion || !viewFiles, onClick: openResult }, '打开'))) : assetsControl,
-    result && !result.deletion ? h('div', { className: 'dsh-tp-file-name' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: busy || !viewFiles, onClick: openResult }, resultName)) : null,
+        assetsControl, detailsControl, versionsControl, h(FileOpenMenu, { label: `${resultName} 操作`, action: { disabled: resultOpenBlocked, open: () => openResult('system') } }))) : assetsControl,
+    result && !result.deletion ? h('div', { className: 'dsh-tp-file-name' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: resultOpenBlocked, onClick: () => openResult('preview') }, resultName)) : null,
     current.final && current.final.version !== result?.version ? h('p', { className: 'dsh-tp-muted', role: 'status' }, `原最终保留：版本 ${current.final.version}。`) : null,
     deletePlan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除文件单元确认' },
       h('p', null, '删除此文件单元及其全部原稿、译文版本和从属任务记录？保留编号和调用统计；其他记录或参考资料仍在使用的原件会保留。'),

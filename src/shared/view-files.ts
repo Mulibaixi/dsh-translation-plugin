@@ -1,5 +1,5 @@
 import { parseOriginalFilePath } from './translation-sources.js'
-/** Browser-safe identities for Host-owned opening artifacts. Output paths stay on Host. */
+/** Browser-safe identities for Host-owned opening artifacts. */
 export type ViewFileKind = 'source' | 'result'
 export type ViewFileFormat = 'html' | 'txt' | 'md'
 export const MAX_VIEW_FILE_BYTES = 16 * 1024 * 1024
@@ -18,6 +18,7 @@ export interface ViewFileOpen {
   /** Omission preserves the existing escaped HTML page behavior. */
   readonly format?: ViewFileFormat
   readonly originalFilePath?: string
+  readonly preview?: true
 }
 export interface ViewFileClear {
   readonly namespaceId: string
@@ -25,8 +26,9 @@ export interface ViewFileClear {
 }
 export type ViewFileErrorCode = 'invalid_input' | 'scope_mismatch' | 'unavailable' | 'storage_failed' | 'open_failed' | 'local_data_stale'
 export type ViewFileResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: { readonly code: ViewFileErrorCode; readonly message: string } }
+export type ViewFileOpened = { readonly opened: true } | { readonly path: string }
 export interface ViewFilePort {
-  open(request: ViewFileOpen, signal: AbortSignal): Promise<ViewFileResult<{ readonly opened: true }>>
+  open(request: ViewFileOpen, signal: AbortSignal): Promise<ViewFileResult<ViewFileOpened>>
   clear(request: ViewFileClear, signal: AbortSignal): Promise<ViewFileResult<{ readonly removed: number }>>
 }
 
@@ -39,12 +41,13 @@ function kind(value: unknown): asserts value is ViewFileKind { if (!VIEW_FILE_KI
 export function parseViewFileRequest(method: 'open' | 'clear', value: unknown): ViewFileOpen | ViewFileClear {
   record(value); text(value.namespaceId)
   if (method === 'open') {
-    exact(value, ['namespaceId', 'sessionId', 'unitId', 'kind', 'title', 'text', 'revisionId', 'fileName', 'format', 'originalFilePath'])
+    exact(value, ['namespaceId', 'sessionId', 'unitId', 'kind', 'title', 'text', 'revisionId', 'fileName', 'format', 'originalFilePath', 'preview'])
     text(value.sessionId); text(value.unitId); kind(value.kind); text(value.title, 300)
     if (value.revisionId !== undefined) text(value.revisionId)
     if (value.fileName !== undefined) text(value.fileName, 255)
     if (value.originalFilePath !== undefined) parseOriginalFilePath(value.originalFilePath)
     if (value.format !== undefined && value.format !== 'txt' && value.format !== 'md' && value.format !== 'html') throw new TypeError('Invalid view format')
+    if (value.preview !== undefined && (value.preview !== true || value.format !== 'txt' && value.format !== 'md')) throw new TypeError('Invalid preview')
     // TXT is raw; Host resolves Markdown image locations and escapes HTML. No newline or BOM normalization.
     if (typeof value.text !== 'string' || value.text.length > MAX_VIEW_FILE_BYTES || new TextEncoder().encode(value.text).byteLength > MAX_VIEW_FILE_BYTES) throw new TypeError('Invalid view text')
   } else {
@@ -63,7 +66,10 @@ export function parseViewFileResult(method: typeof methods[number], value: unkno
   } else {
     if (value.ok !== true) throw new TypeError('Invalid result')
     exact(value, ['ok', 'value']); record(value.value)
-    if (method === 'open') { exact(value.value, ['opened']); if (value.value.opened !== true) throw new TypeError('Invalid opening') }
+    if (method === 'open') {
+      if (Object.hasOwn(value.value, 'path')) { exact(value.value, ['path']); parseOriginalFilePath(value.value.path) }
+      else { exact(value.value, ['opened']); if (value.value.opened !== true) throw new TypeError('Invalid opening') }
+    }
     else { exact(value.value, ['removed']); if (!Number.isSafeInteger(value.value.removed) || (value.value.removed as number) < 0) throw new TypeError('Invalid removal') }
   }
   return structuredClone(value)

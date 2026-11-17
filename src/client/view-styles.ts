@@ -43,9 +43,9 @@ export const styles = `
 .dsh-tp button.dsh-tp-memory-assets-entry { min-height: 36px; padding: 6px 10px; font-size: 14px; line-height: 22px; font-weight: 500; }
 .dsh-tp-session-choice-name { display: block; min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .dsh-tp-session-choice[aria-current=true] { background: transparent; }
-.dsh-tp [data-session-dragging=true] { cursor: grabbing; opacity: .6; user-select: none; }
-.dsh-tp [data-session-drop=before] { box-shadow: inset 0 2px var(--dsw-focus-ring-color, #568bf0); }
-.dsh-tp [data-session-drop=after] { box-shadow: inset 0 -2px var(--dsw-focus-ring-color, #568bf0); }
+.dsh-tp [data-session-dragging=true], .dsh-tp [data-asset-dragging=true] { cursor: grabbing; opacity: .6; user-select: none; }
+.dsh-tp [data-session-drop=before], .dsh-tp [data-asset-drop=before] { box-shadow: inset 0 2px var(--dsw-focus-ring-color, #568bf0); }
+.dsh-tp [data-session-drop=after], .dsh-tp [data-asset-drop=after] { box-shadow: inset 0 -2px var(--dsw-focus-ring-color, #568bf0); }
 .dsh-tp-header-options { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: none; margin-left: auto; }
 .dsh-tp-compact-trigger { display: flex; align-items: center; gap: 4px; font-weight: 400; white-space: nowrap; max-width: 110px; }
 .dsh-tp-compact-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -53,7 +53,8 @@ export const styles = `
 .dsh-tp-chevron-open { transform: rotate(180deg); }
 .dsh-tp-popup { z-index: 1100; min-width: 180px; max-width: min(320px, calc(100vw - 32px)); max-height: min(420px, calc(100vh - 96px)); overflow-y: auto; }
 .dsh-tp-popup.dsh-tp-context-popup { overflow: visible; }
-/* 4px 菜单内边距，加上 2px 接缝偏移。 */
+/* 0.2.1 及更早的原生子菜单渲染在父列表内，需要插件给出右侧接缝位置；
+ * 0.2.2 起子菜单改由原生 portal 到 body，本规则不再命中，保留以兼容旧版。 */
 .dsh-tp-context-popup [role=menu] { top: -4px; bottom: auto; left: calc(100% + 6px); width: ${TOPIC_SUBMENU_WIDTH}px; }
 .dsh-tp-submenu-label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .dsh-tp-submenu-label [data-submenu-arrow] { display: flex; align-items: center; flex: none; padding: 2px 0 2px 8px; }
@@ -92,6 +93,9 @@ export const styles = `
 .dsh-tp-attachment { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 12px; }
 .dsh-tp-attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-tp-attachment-note { margin: 2px 0 5px; color: var(--dsw-alias-label-caption, #888); font-size: 11px; }
+.dsh-tp-pdf-output { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 4px 0; font-size: 12px; }
+.dsh-tp-pdf-output label { display: inline-flex; align-items: center; gap: 4px; }
+.dsh-tp-pdf-output label:has(input:disabled) { opacity: .6; }
 /* DSH 主题全局使用 superellipse；普通圆形必须同时指定 corner-shape。 */
 .dsh-tp .dsh-tp-send { display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; flex: 0 0 38px; border-radius: 50% !important; corner-shape: round !important; background: var(--dsw-alias-interactive-bg-accent, #4d7df3); color: #fff; padding: 0; }
 .dsh-tp button.dsh-tp-send:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-accent, #4d7df3); opacity: .5; }
@@ -108,6 +112,17 @@ export const styles = `
 .dsh-tp-dialog { flex: none; padding: 12px; margin: 6px 12px; border: 1px solid var(--dsw-alias-border-l2, #8884); border-radius: 8px; max-height: 45%; overflow-y: auto; }
 .dsh-tp-dialog p { margin: 6px 0; }
 .dsh-tp-dialog input[type=text] { width: 100%; }
+.dsh-tp .dsh-tp-archive-confirm { width: min(360px, calc(100% - 32px)); max-height: calc(100% - 32px); margin: auto; padding: 18px 20px 16px; overflow: auto;
+  border: 1px solid var(--dsw-alias-border-l2, #8885); border-radius: 12px; background: var(--dsw-alias-bg-overlay, Canvas); color: var(--dsw-alias-label-primary, CanvasText);
+  box-shadow: var(--dsw-elevation-panel, 0 12px 36px #0005); }
+.dsh-tp .dsh-tp-archive-confirm::backdrop { background: #0005; }
+.dsh-tp .dsh-tp-archive-confirm h3 { font-size: 16px; margin: 0 0 6px; }
+.dsh-tp-archive-confirm p { margin: 0; }
+.dsh-tp-archive-confirm p + p { margin-top: 4px; }
+.dsh-tp-archive-confirm-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.dsh-tp .dsh-tp-archive-confirm-actions button { padding: 5px 12px; }
+.dsh-tp .dsh-tp-archive-confirm-actions button.dsh-tp-danger { background: color-mix(in srgb, currentColor 12%, transparent); }
+.dsh-tp .dsh-tp-archive-confirm-actions button.dsh-tp-danger:hover:not(:disabled) { background: color-mix(in srgb, currentColor 20%, transparent); }
 .dsh-tp-legacy { white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 8px; background: var(--dsw-alias-interactive-bg-hover, #8881); }
 /* 单元：整体节奏为「功能行 ↕5px 文本 ↕18px 下一功能行」，单元之间用细横线分隔，线两侧各 18px。 */
 .dsh-tp-translation { margin: 0; }

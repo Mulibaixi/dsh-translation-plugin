@@ -36,6 +36,8 @@ import { parseDocumentReviewPageRequest, parseDocumentReviewPage, parseDocumentR
 import { parseFileHistoryRequest, parseFileHistoryValue, parseFileHistoryUnit, type FileHistoryRequest, type FileHistoryValue, type FileHistoryUnit } from './file-history.js'
 import { parseUnitRequest, parseUnitDirectory, parseUnitContent, type UnitDirectoryRequest, type UnitReadRequest, type UnitDirectory, type UnitContent } from './numbered-units.js'
 import { parseHistoryTextRead, parseHistoryTextPage, type HistoryTextRead, type HistoryTextPage } from './history-text.js'
+import { parsePdfSectionRegistration, parsePdfReadBatch, parsePdfProgress, parsePdfPosition, parsePdfSupplement, parsePdfDelivery,
+  type PdfSectionRegistration, type PdfReadBatch, type PdfPosition, type PdfProgress, type PdfSupplement, type PdfDelivery } from './pdf-source.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
@@ -122,6 +124,10 @@ export type TopicBridgeCommand =
   | { readonly kind: 'preparation_capture'; readonly request: TranslationPreparationQuery; readonly relevantFixedIds: readonly string[]; readonly topicTermsVersion: number }
   | { readonly kind: 'normal_resolve'; readonly target: DirectUnitTarget; readonly operationId: string }
   | ({ readonly kind: 'image_update' } & ImageUnitUpdate)
+  | ({ readonly kind: 'pdf_register'; readonly batch: PdfReadBatch } & PdfSectionRegistration)
+  | { readonly kind: 'pdf_status'; readonly target: import('./normal-translation.js').NormalTranslationMaterialTarget }
+  | { readonly kind: 'pdf_delivery'; readonly target: import('./normal-translation.js').NormalTranslationMaterialTarget }
+  | { readonly kind: 'pdf_supplement'; readonly target: import('./normal-translation.js').NormalTranslationMaterialTarget; readonly supplement: PdfSupplement }
   | { readonly kind: 'normal_call_finished'; readonly operationId: string }
   | ({ readonly kind: 'normal_correct_source' } & NormalTranslationSourceCorrection)
   | ({ readonly kind: 'normal_accept' } & NormalTranslationAcceptance)
@@ -166,6 +172,11 @@ export type TopicWriteReceipt = {
 export type TopicBridgeValue =
   | TopicWriteReceipt
   | { readonly kind: 'image_updated'; readonly unitId: string }
+  | { readonly kind: 'pdf_registered'; readonly targets: readonly NormalTranslationUnitTarget[]; readonly next: PdfPosition | null }
+  | { readonly kind: 'pdf_status'; readonly progress: PdfProgress | null; readonly pending: readonly NormalTranslationUnitTarget[]; readonly targetLanguage: string | null;
+      readonly repairablePages: readonly number[]; readonly maxInputChars?: number }
+  | { readonly kind: 'pdf_delivery'; readonly translationSessionId: string; readonly delivery: PdfDelivery }
+  | { readonly kind: 'pdf_supplemented' }
   | { readonly kind: 'normal_call_finished' }
   | { readonly kind: 'memory_asset_removed'; readonly topicId: string; readonly id: string; readonly version: number }
   | { readonly kind: 'direct_proposals'; readonly receipt: DirectProposalReceipt }
@@ -330,6 +341,19 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
       case 'image_update': {
         const { kind: _kind, ...update } = value
         return { kind: 'image_update', ...parseImageUnitUpdate(update) }
+      }
+      case 'pdf_register': {
+        if (protocol < 2) throw new TypeError('Command requires topic bridge v2')
+        exact(value, ['kind', 'target', 'targetLanguage', 'sections', 'read', 'batch'])
+        return { kind: 'pdf_register', ...parsePdfSectionRegistration(value), batch: parsePdfReadBatch(value.batch) }
+      }
+      case 'pdf_status': case 'pdf_delivery': case 'pdf_supplement': {
+        if (protocol < 2) throw new TypeError('Command requires topic bridge v2')
+        exact(value, ['kind', 'target', ...(value.kind === 'pdf_supplement' ? ['supplement'] : [])])
+        const target = parseNormalTranslationTarget(value.target)
+        if (target.kind !== 'material') throw new TypeError('Invalid PDF target')
+        if (value.kind === 'pdf_supplement') return { kind: 'pdf_supplement', target, supplement: parsePdfSupplement(value.supplement) }
+        return value.kind === 'pdf_status' ? { kind: 'pdf_status', target } : { kind: 'pdf_delivery', target }
       }
       case 'normal_call_finished': {
         exact(value, ['kind', 'operationId']); text(value.operationId)
@@ -558,6 +582,36 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
       return { kind: 'normal_resolved', envelope }
     }
     case 'image_updated': exact(value, ['kind', 'unitId']); text(value.unitId); return { kind: 'image_updated', unitId: value.unitId }
+    case 'pdf_registered': {
+      exact(value, ['kind', 'targets', 'next'])
+      if (protocol < 2 || !Array.isArray(value.targets) || value.targets.length > 32) throw new TypeError('Invalid PDF targets')
+      const targets = value.targets.map(reference => {
+        const target = parseNormalTranslationTarget(reference)
+        if (target.kind !== 'unit') throw new TypeError('Invalid PDF section target')
+        return target
+      })
+      return { kind: 'pdf_registered', targets, next: value.next === null ? null : parsePdfPosition(value.next) }
+    }
+    case 'pdf_status': {
+      // Keep the original V4 reply valid and accept the limit sent by the short-lived newer Client.
+      const limit = Object.hasOwn(value, 'maxInputChars'), maxInputChars = value.maxInputChars
+      exact(value, ['kind', 'progress', 'pending', 'targetLanguage', 'repairablePages', ...(limit ? ['maxInputChars'] : [])])
+      if (protocol < 2 || !Array.isArray(value.pending) || value.pending.length > 32 || value.targetLanguage !== null && typeof value.targetLanguage !== 'string' ||
+        !Array.isArray(value.repairablePages) || value.repairablePages.some(page => !Number.isSafeInteger(page) || page < 1) ||
+        limit && (typeof maxInputChars !== 'number' || !Number.isSafeInteger(maxInputChars) || maxInputChars < 1 || maxInputChars > 200000)) throw new TypeError('Invalid PDF status')
+      const pending = value.pending.map(reference => {
+        const target = parseNormalTranslationTarget(reference)
+        if (target.kind !== 'unit') throw new TypeError('Invalid PDF pending target')
+        return target
+      })
+      return { kind: 'pdf_status', progress: value.progress === null ? null : parsePdfProgress(value.progress), pending,
+        targetLanguage: value.targetLanguage, repairablePages: value.repairablePages, ...(typeof maxInputChars === 'number' ? { maxInputChars } : {}) }
+    }
+    case 'pdf_delivery': {
+      exact(value, ['kind', 'translationSessionId', 'delivery']); text(value.translationSessionId)
+      return { kind: 'pdf_delivery', translationSessionId: value.translationSessionId, delivery: parsePdfDelivery(value.delivery) }
+    }
+    case 'pdf_supplemented': exact(value, ['kind']); return { kind: 'pdf_supplemented' }
     case 'normal_call_finished': exact(value, ['kind']); return { kind: 'normal_call_finished' }
     case 'normal_source_corrected': exact(value, ['kind', 'correction']); return { kind: 'normal_source_corrected', correction: parseNormalTranslationCorrectionReceipt(value.correction) }
     case 'normal_observed': exact(value, ['kind', 'operation']); return { kind: 'normal_observed', operation: value.operation === null ? null : parseNormalTranslationOperation(value.operation) }

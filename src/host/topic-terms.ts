@@ -7,6 +7,9 @@ import { TERM_TRANSFER_POINTS, parseTermRemoteRequest, type TermRemoteScope, typ
 import { newTermId } from '../shared/term-id.js'
 import type { OtherMemoryService } from './other-memory.js'
 import type { LocalDataService } from './local-data.js'
+import type { TopicArchiveService } from './topic-archive.js'
+import { moveTopicAsset } from '../memory/topic-asset-order.js'
+import { isAdoptedAsset } from '../memory/asset-priority.js'
 import type { TopicHostContext, TopicToolsService } from './topic-tools.js'
 
 interface Seat { readonly scope: TermRemoteScope; current: TopicTermSnapshot; saved: TopicTermSnapshot | null; token: string }
@@ -22,8 +25,13 @@ function head(snapshot: TopicTermSnapshot | null): TermHead | null { if (!snapsh
 function deleteTopicTermEntry(snapshot: TopicTermSnapshot, id: string, expectedEntryVersion: number, at: string): TermMutationResult {
   const entry = snapshot.entries.find(item => item.id === id) ?? null
   if (!entry || entry.version !== expectedEntryVersion) return { status: 'stale', snapshot, entry }
-  return { status: 'updated', snapshot: { ...snapshot, entries: snapshot.entries.filter(item => item.id !== id), version: snapshot.version + 1,
-    activeVersion: snapshot.activeVersion + (entry.status === 'active' ? 1 : 0), updatedAt: at }, entry: null }
+  return { status: 'updated', snapshot: removeTopicTermEntries(snapshot, new Set([id]), at), entry: null }
+}
+function removeTopicTermEntries(snapshot: TopicTermSnapshot, ids: ReadonlySet<string>, at: string): TopicTermSnapshot {
+  const entries = snapshot.entries.filter(entry => !ids.has(entry.id))
+  if (entries.length === snapshot.entries.length) return snapshot
+  return { ...snapshot, entries, version: snapshot.version + 1,
+    activeVersion: snapshot.activeVersion + Number(snapshot.entries.some(entry => ids.has(entry.id) && entry.status === 'active')), updatedAt: at }
 }
 
 /** Commands are executed here; Client transports legacy input once and thereafter caches reads only. */
@@ -184,7 +192,19 @@ export class TopicTermsService implements TermsRemotePort {
       // Gateway intentionally hides exception codes; a CAS conflict is a typed business result.
       if (seat.token !== request.token) return { status: 'stale', token: seat.token, entryId: null }
       const command = request.command, at = stamp(), resolver = this.evidence(seat.current, command, request.evidence)
+      if ('input' in command && command.input.entityIds?.length) {
+        const old = seat.current.entries.find(entry => entry.id === command.input.id)
+        if ((old?.version ?? null) !== command.input.expectedEntryVersion)
+          return { status: 'stale', token: seat.token, entryId: old?.id ?? null }
+        const added = command.input.entityIds.filter(id => !old?.entityIds?.includes(id))
+        const archive = this.ctx.get?.('translationArchive') as TopicArchiveService | undefined
+        if (added.length && !await archive?.hasEntities(seat.scope, added))
+          return { status: 'invalid', token: seat.token, entryId: null }
+        this.check(guard)
+      }
       const action = { eventId: `terms-user:${crypto.randomUUID()}`, at }
+      const deletedIds = command.kind === 'delete' ? new Set([command.id]) : command.kind === 'clear_unadopted'
+        ? new Set(seat.current.entries.filter(entry => !isAdoptedAsset(entry)).map(entry => entry.id)) : undefined
       let result: TermMutationResult
       if (command.kind === 'put') result = putTopicTerm(seat.current, command.input, resolver, at, newTermId)
       else if (command.kind === 'user_put') result = putUserTopicTerm(seat.current, command.input, action)
@@ -192,6 +212,11 @@ export class TopicTermsService implements TermsRemotePort {
       else if (command.kind === 'adopt') result = adoptTopicTerm(seat.current, command.id, command.expectedEntryVersion, action)
       else if (command.kind === 'disable') result = disableTopicTerm(seat.current, command.id, command.expectedEntryVersion, at)
       else if (command.kind === 'delete') result = deleteTopicTermEntry(seat.current, command.id, command.expectedEntryVersion, at)
+      else if (command.kind === 'clear_unadopted') {
+        const snapshot = removeTopicTermEntries(seat.current, deletedIds!, at)
+        result = { status: snapshot === seat.current ? 'unchanged' : 'updated', snapshot, entry: null }
+      }
+      else if (command.kind === 'move') result = moveTopicAsset(seat.current, command, at)
       else if (command.kind === 'reconcile') { const next = reconcileTopicTerms(seat.current, resolver, at, ref => resolver.isUnloaded?.(seat.current, ref) === true); result = { status: next === seat.current ? 'unchanged' : 'updated', snapshot: next, entry: null } }
       else {
         const snapshot = { ...emptyTopicTerms(request.ownerId, request.topicId, at), version: Math.max(seat.current.version, seat.saved?.version ?? 0) + 1,
@@ -201,16 +226,22 @@ export class TopicTermsService implements TermsRemotePort {
       if (!['updated', 'unchanged'].includes(result.status)) return { status: result.status, token: seat.token, entryId: result.entry?.id ?? null }
       let saved = seat.saved
       if (command.kind === 'clear') saved = result.snapshot
-      else if (command.kind === 'delete') { const old = saved?.entries.find(entry => entry.id === command.id); if (saved && old) saved = deleteTopicTermEntry(saved, command.id, old.version, at).snapshot }
+      else if (deletedIds) { if (saved) saved = removeTopicTermEntries(saved, deletedIds, at) }
+      else if (command.kind === 'move') {
+        const stored = saved && moveTopicAsset(saved, command, at)
+        if (result.status === 'updated' && (!stored || stored.status === 'stale' || stored.status === 'invalid'))
+          return { status: 'requires_user_action', token: seat.token, entryId: null }
+        if (result.status === 'updated' && stored) saved = stored.snapshot
+      }
       else if (command.kind !== 'reconcile') saved = result.snapshot
-      if (!same(saved, seat.saved) || command.kind === 'clear' || command.kind === 'delete') {
+      if (!same(saved, seat.saved) || command.kind === 'clear' || deletedIds?.size) {
         try {
           const db = await this.memory.databaseForArchives(true); await this.requireOpen(guard)
           db!.transaction(() => db!.termsSave(request.namespaceId, request.ownerId, request.topicId, saved))
         } catch (error) {
           this.check(guard)
           if (this.retired.has(key(request))) throw error
-          if (command.kind === 'clear' || command.kind === 'delete') throw error
+          if (command.kind === 'clear' || deletedIds || command.kind === 'move') throw error
           // A failed save keeps the accepted edit in the Host runtime overlay, never a Client fallback.
           if (seat.current !== result.snapshot) { seat.current = result.snapshot; seat.token = token() }
           return { status: 'save_failed', token: seat.token, entryId: result.entry?.id ?? null }

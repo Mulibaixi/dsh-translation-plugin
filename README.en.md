@@ -30,7 +30,7 @@ For example, say “this sentence is too literal” or “make this character's 
 | Discussion and refinement | In Normal mode, state requirements and discuss wording and style with the main model, then use that feedback for a first translation or further revision. |
 | Source editing and final selection | Edit the current source in a Normal translation unit, retranslate it, or select a final. Existing translation revisions remain available after source edits. |
 | Quick translation | Translate independent plain text directly for short passages and occasional lookups. |
-| File delivery | Work primarily with TXT/Markdown sources, process ranges when needed, and open results through the session or save a translation version to a chosen location with **操作 → 另存为…… (Actions → Save as…)**. |
+| File delivery | Translate TXT, Markdown, and PDFs with a usable text layer. Click a filename to preview it in the DSH sidebar, use **操作 → 打开 (Actions → Open)** to open it in the system default app, or use **操作 → 另存为…… (Actions → Save as…)** to save a specific translation version. |
 | Single-image translation | The main model reads one PNG, JPEG, or static WebP. Edit the extracted source, copy the lettering prompt, or export a text PNG, the prompt, or a ZIP with the original and the prompt. When available, the prompt includes the original pixel dimensions. The generated image may differ in size. |
 | Batch processing | In a Normal session, click the icon to the right of the file button to select multiple images. Confirm their order and translate them one at a time. Each image keeps its own unit. The batch bar above the input shows progress and lets you pause, resume, or retry a failed item. |
 | Topic memory | Share terms, entities, facts, relations, settings, and references across topic sessions, with optional semantic retrieval. |
@@ -50,9 +50,9 @@ Confirmed terminology, settings, and style requirements can also become topic me
 - DSH `>=0.2.0-rc.2 <0.2.3-0`, with local plugin support, the required interfaces, and a configured model. Compatibility within this range follows interface capabilities.
 - **Quick mode** needs no Composer extension. **Normal mode** requires a companion `dsh-composer-extension` and submissions protocol 1. When the host lacks this interface, the extension matches patches by target-module fingerprints; unrelated DSH updates do not require adaptation.
 - Source builds require Node.js 22 or newer, pnpm, and the Composer extension source directory alongside this repository. The DSH Host must load built-in `node:sqlite`.
-- Current TXT/Markdown text files must use UTF-8 and can be up to 2 MiB each. Support boundaries for other formats are described below.
+- TXT and Markdown files must use UTF-8 and can be up to 2 MiB each. Text-layer PDFs can be read by page and have a 20 MiB plugin limit, subject to the DSH upload limit. The PDF card shows progress and the pages and reasons for any known gaps. Resume work, fill whole previously unregistered pages, and export combined Markdown in original page order.
 
-DSH `0.2.2-rc.1` is supported. Normal mode on this host requires Composer `0.4.7` with its matching host patches. Building this DSH version and its host patches requires Node.js 24.9 or later.
+DSH `0.2.2-rc.1` is supported. Normal mode on this host requires Composer `0.4.7` with its matching host patches. Normal mode on DSH `0.2.2-rc.3` requires a Composer build containing the patch for that host. Building these DSH versions and their host patches requires Node.js 24.9 or later.
 
 ## Installation and updates
 
@@ -105,7 +105,17 @@ When reading long text, the current source or translation heading and its contro
 
 Organize terminology, style requirements, and references as [memory assets (简体中文)](docs/user-guide.zh-CN.md#记忆资产) to support later discussion and translation. See the guide for entry adoption, reference-file segmentation, source indexing, and saving rules.
 
+Link a term to entities in the same topic to give its preferred wording context, such as people, places, or organizations.
+
+Press and hold a structured archive entry, then drag it to a new position within its category.
+In a relation entry, you can add multiple source and target entities. Right-click an additional selector to remove it.
+In a relation entry, you can add multiple source and target entities. Right-click an additional selector to remove it.
+
 You can explicitly ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
+
+In Structured Archives, clear unadopted entries in the current category, or use the Export menu to download all archives for the current topic as JSON or Markdown.
+
+In Structured Archives, clear unadopted entries in the current category, or use the Export menu to download all archives for the current topic as JSON or Markdown.
 
 For Normal text and file translation, you can specify the target language for the current submission or set up Chinese–English mutual translation in the session's Translation Requirements. Each submission follows the direction implied by its main source language and records the actual target language. Wording specified for the current task applies directly. Reusable candidates can be submitted for adoption after review.
 
@@ -116,7 +126,7 @@ Names of people, places, and organizations go into entities with their rendering
 ## Current limitations and data
 
 - **Context questions**: Translation models with tool support can ask focused questions during Normal translation. The main model answers from available context or asks you, then starts a new translation call. Each call has its own usage; question references remain valid only during the current host run. The selected provider and model must support tool calls; a rejected tool declaration is reported without silently retrying as a translation.
-- **Limited file support**: the current focus is UTF-8 TXT and Markdown. Complete parsing, recognition, and delivery in the original format are not yet supported for PDF, images, DOCX, and similar formats.
+- **PDF and other formats**. Text-layer PDFs default to full-document translation, with an optional page range. The main model asks before splitting the text into sections, and your choice carries over when you resume the same PDF. **译稿整合输出 (Combine translations)** is on by default and saves the effective translations in one Markdown file, preferably beside the original PDF. **译稿保留图表 (Keep figures and tables)** is off by default and embeds original figures and tables when their boundaries can be identified. Other objects retain their original page references. Verifiable equations use Markdown LaTeX. Translating a specified figure or table requires an image-capable model and native DSH subagent support. Scanned-page recognition and complex layouts remain future work. For formats such as DOCX, the main model works with the tools available to it.
 - **Translation efficiency**: some optimizations have been made, but final completion time is affected by the models and material.
 - **Semantic indexing**: enabling it sends relevant text to the configured embedding service.
 - Restart does not automatically resume model tasks; check the original task when its outcome is unknown. Exports do not replace a complete backup and cannot currently be imported for restoration.

@@ -3,6 +3,7 @@ import { parseTranslationSourceReference } from './translation-source-storage.js
 import type { DocumentSourceHistoryCommit as TranslationSourceHistoryCommit } from './translation-batch.js'
 import type { TranslationMaterialScope } from './translation-material.js'
 import { decodeRoute, type ModelRoute } from './sessions.js'
+import { isPdfFile, parsePdfOutputOptions, parsePdfProgress, parsePdfSupplement, type PdfOutputOptions, type PdfProgress, type PdfSupplement } from './pdf-source.js'
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b)
 export interface FileIntakeConfig {
   readonly targetLanguage: string
@@ -29,6 +30,9 @@ export interface FileIntakeRecord {
   readonly source?: SourceIdentity
   readonly historyCommit?: TranslationSourceHistoryCommit
   readonly documentUnitId?: string
+  readonly pdfOutput?: PdfOutputOptions
+  readonly pdfProgress?: PdfProgress
+  readonly pdfSupplements?: readonly PdfSupplement[]
 }
 export function parseFileIntakeRecord(value: unknown): FileIntakeRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('文件记录格式无法读取。')
@@ -42,6 +46,11 @@ export function parseFileIntakeRecord(value: unknown): FileIntakeRecord {
     typeof item.submission.requestId !== 'string' || !item.submission.requestId.trim() || typeof item.submission.operationId !== 'string' || !item.submission.operationId.trim() ||
     item.message !== undefined && typeof item.message !== 'string' || item.documentUnitId !== undefined && item.documentUnitId !== item.unitId) throw new Error('文件记录身份或配置无效。')
   const source = item.source ? parseSourceIdentity(item.source) : undefined
+  if (item.pdfOutput !== undefined && !isPdfFile(item.name)) throw new Error('PDF 输出选项与原件不一致。')
+  const pdfOutput = item.pdfOutput === undefined ? undefined : parsePdfOutputOptions(item.pdfOutput)
+  if ((item.pdfProgress || item.pdfSupplements) && (source?.encoding !== 'binary' || !isPdfFile(source.name))) throw new Error('PDF 进度与原件不一致。')
+  const pdfProgress = item.pdfProgress === undefined ? undefined : parsePdfProgress(item.pdfProgress)
+  const pdfSupplements = item.pdfSupplements?.map(parsePdfSupplement)
   let historyCommit: TranslationSourceHistoryCommit | undefined
   if (item.historyCommit) {
     const reference = parseTranslationSourceReference(item.historyCommit.reference)
@@ -54,5 +63,6 @@ export function parseFileIntakeRecord(value: unknown): FileIntakeRecord {
     config: { targetLanguage: config.targetLanguage, instruction: config.instruction, model: config.model, maxInputChars: config.maxInputChars, draftVersion: config.draftVersion },
     submission: {  mainSessionId: item.submission.mainSessionId, requestId: item.submission.requestId, operationId: item.submission.operationId },
     stage: item.stage, hostStarted: item.hostStarted, ...(item.message ? { message: item.message } : {}), ...(source ? { source } : {}),
-    ...(historyCommit ? { historyCommit } : {}), ...(item.documentUnitId ? { documentUnitId: item.documentUnitId } : {}) }
+    ...(historyCommit ? { historyCommit } : {}), ...(item.documentUnitId ? { documentUnitId: item.documentUnitId } : {}),
+    ...(pdfOutput ? { pdfOutput } : {}), ...(pdfProgress ? { pdfProgress } : {}), ...(pdfSupplements?.length ? { pdfSupplements } : {}) }
 }

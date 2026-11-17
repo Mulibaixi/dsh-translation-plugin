@@ -13,8 +13,8 @@ function name(snapshot: DocumentReadSnapshot): string {
   return raw.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '') || 'document.txt'
 }
 /** Saved assets use the Host's opaque original opener; runtime/inline sources produce a bounded-read TXT projection. */
-export async function openDocumentOriginal(snapshot: DocumentReadSnapshot, signal: AbortSignal = new AbortController().signal): Promise<DocumentTextFile | { readonly status: 'opened' } | EvidenceUnavailableResult> {
-  if (snapshot.source.body.kind === 'asset' && snapshot.source.historyCommit) return snapshot.openOriginal(signal)
+export async function openDocumentOriginal(snapshot: DocumentReadSnapshot, signal: AbortSignal = new AbortController().signal, preview = false): Promise<DocumentTextFile | { readonly status: 'opened' } | EvidenceUnavailableResult> {
+  if (!preview && snapshot.source.body.kind === 'asset' && snapshot.source.historyCommit) return snapshot.openOriginal(signal)
   const loaded = await readDocumentText(range => snapshot.readSource(range), { start: 0, end: snapshot.totalSourceCodePoints })
   if (!('text' in loaded)) return loaded
   const after = snapshot.check()

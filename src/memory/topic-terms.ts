@@ -39,6 +39,7 @@ export interface TopicTermContent {
   readonly preferred: string
   readonly forbidden: readonly string[]
   readonly evidence: readonly TermEvidenceRef[]
+  readonly entityIds?: readonly string[] | undefined
 }
 export interface TopicTerm extends TopicTermContent {
   readonly id: string
@@ -130,7 +131,8 @@ function evidence(value: unknown): value is TermEvidenceRef {
 function content(value: TopicTermContent): boolean {
   return (value.sourceLanguage === null || text(value.sourceLanguage, 80)) && text(value.targetLanguage, 80) &&
     strings(value.sourceForms, 500, true) && strings(value.aliases, 500) && text(value.sense, 4000, false) && text(value.preferred, 4000) &&
-    strings(value.forbidden, 4000) && !value.forbidden.includes(value.preferred) && Array.isArray(value.evidence) && value.evidence.length <= 100 && value.evidence.every(evidence)
+    strings(value.forbidden, 4000) && !value.forbidden.includes(value.preferred) && Array.isArray(value.evidence) && value.evidence.length <= 100 && value.evidence.every(evidence) &&
+    (!Object.hasOwn(value, 'entityIds') || strings(value.entityIds, 2048))
 }
 function hasSourceBasis(entry: TopicTermContent): boolean { return entry.evidence.some(ref => ref.kind === 'source' && ref.role === 'basis') }
 function adoption(value: unknown): value is TermUserAdoption {
@@ -143,18 +145,20 @@ export function fileProposalAcceptance(value: unknown): value is FileProposalAcc
 }
 
 export function decodeTopicTermPut(value: unknown): TopicTermPut | undefined {
-  if (!record(value) || !exact(value, ['id', 'expectedEntryVersion', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', 'evidence', 'origin', 'status']) ||
+  if (!record(value) || !exact(value, ['id', 'expectedEntryVersion', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', 'evidence', 'origin', 'status', ...(Object.hasOwn(value, 'entityIds') ? ['entityIds'] : [])]) ||
     !(value.id === null || text(value.id, 2048)) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
     (value.id === null && value.expectedEntryVersion !== null) || !content(value as unknown as TopicTermContent) ||
     !['inferred', 'source_checked'].includes(value.origin as string) || !['proposal', 'active'].includes(value.status as string) ||
     (value.status === 'active' && (!['source_checked'].includes(String(value.origin)) || !hasSourceBasis(value as unknown as TopicTermContent)))) return undefined
-  return { ...copyContent(value as unknown as TopicTermContent), id: value.id as string | null, expectedEntryVersion: value.expectedEntryVersion,
+  return { ...copyContent(value as unknown as TopicTermContent),
+    ...(Array.isArray(value.entityIds) && value.entityIds.length === 0 ? { entityIds: [] } : {}),
+    id: value.id as string | null, expectedEntryVersion: value.expectedEntryVersion,
     origin: value.origin as TopicTermPut['origin'], status: value.status as TopicTermPut['status'] }
 }
 
 /** Local form boundary. The model RPC continues to accept only TopicTermPut. */
 export function decodeTopicTermUserInput(value: unknown): TopicTermUserInput | undefined {
-  if (!record(value) || !exact(value, ['id', 'expectedEntryVersion', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden']) ||
+  if (!record(value) || !exact(value, ['id', 'expectedEntryVersion', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', ...(Object.hasOwn(value, 'entityIds') ? ['entityIds'] : [])]) ||
     !(value.id === null || text(value.id, 2048)) || !(value.expectedEntryVersion === null || integer(value.expectedEntryVersion, 1)) ||
     (value.id === null && value.expectedEntryVersion !== null) || !content({ ...value, evidence: [] } as unknown as TopicTermContent)) return undefined
   return structuredClone(value) as unknown as TopicTermUserInput
@@ -166,7 +170,7 @@ export function decodeTopicTermSnapshot(value: unknown): TopicTermSnapshot | und
     !text(value.ownerId, 2048) || !text(value.topicId, 2048) || !integer(value.version) || !integer(value.activeVersion) || value.activeVersion > value.version || !time(value.updatedAt) || !Array.isArray(value.entries)) return undefined
   const entries: TopicTerm[] = [], ids = new Set<string>()
   for (const raw of value.entries) {
-    if (!record(raw) || !exact(raw, ['id', 'version', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', 'evidence', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt', ...(Object.hasOwn(raw, 'acceptance') ? ['acceptance'] : [])]) ||
+    if (!record(raw) || !exact(raw, ['id', 'version', 'sourceLanguage', 'targetLanguage', 'sourceForms', 'aliases', 'sense', 'preferred', 'forbidden', 'evidence', 'status', 'origin', 'confirmation', 'createdAt', 'updatedAt', ...(Object.hasOwn(raw, 'acceptance') ? ['acceptance'] : []), ...(Object.hasOwn(raw, 'entityIds') ? ['entityIds'] : [])]) ||
       !text(raw.id, 2048) || ids.has(raw.id) || !integer(raw.version, 1) || raw.version > value.version || !time(raw.createdAt) || !time(raw.updatedAt) ||
       !statuses.includes(raw.status as TopicTermStatus) || !['inferred', 'source_checked', 'user_explicit'].includes(raw.origin as string) || !content(raw as unknown as TopicTermContent)) return undefined
     if (raw.origin === 'user_explicit' ? (!adoption(raw.confirmation) || raw.confirmation.adoptedEntryVersion >= raw.version || (raw.evidence as TermEvidenceRef[]).some(ref => ref.role === 'basis')) : raw.confirmation !== null) return undefined
@@ -226,11 +230,11 @@ function hasConflict(snapshot: TopicTermSnapshot, entry: TopicTermContent & { re
 function activeProjection(entry: TopicTerm): unknown {
   if (entry.status !== 'active') return null
   return { id: entry.id, sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sourceForms: entry.sourceForms, aliases: entry.aliases,
-    sense: entry.sense, preferred: entry.preferred, forbidden: entry.forbidden, origin: entry.origin, basis: entry.evidence.filter(ref => ref.role === 'basis') }
+    sense: entry.sense, preferred: entry.preferred, forbidden: entry.forbidden, origin: entry.origin, entityIds: entry.entityIds, basis: entry.evidence.filter(ref => ref.role === 'basis') }
 }
 function copyContent(entry: TopicTermContent): TopicTermContent {
   return { sourceLanguage: entry.sourceLanguage, targetLanguage: entry.targetLanguage, sourceForms: [...entry.sourceForms], aliases: [...entry.aliases],
-    sense: entry.sense, preferred: entry.preferred, forbidden: [...entry.forbidden], evidence: entry.evidence.map(ref => ({ kind: ref.kind, sessionId: ref.sessionId, unitId: ref.unitId,
+    sense: entry.sense, preferred: entry.preferred, forbidden: [...entry.forbidden], ...(entry.entityIds?.length ? { entityIds: [...entry.entityIds] } : {}), evidence: entry.evidence.map(ref => ({ kind: ref.kind, sessionId: ref.sessionId, unitId: ref.unitId,
       ...(ref.kind === 'source' && ref.sourceVersion !== undefined ? { sourceVersion: ref.sourceVersion } : {}),
       revisionId: ref.revisionId, selectionEventId: ref.selectionEventId, range: ref.range ? { ...ref.range } : null, role: ref.role })) }
 }
@@ -264,6 +268,7 @@ export function putTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermPut, r
   if (id === null) return result(snapshot, 'invalid', null)
   const old = snapshot.entries.find(entry => entry.id === id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
+  if (input.entityIds === undefined && old?.entityIds) input = { ...input, entityIds: old.entityIds }
   if (old && time(at) && content(input) && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
   if (old) input = { ...input, status: 'proposal' }
   if (!text(id, 2048) || !time(at) || !content(input) || !['inferred', 'source_checked'].includes(input.origin) ||
@@ -281,6 +286,7 @@ export function putUserTopicTerm(snapshot: TopicTermSnapshot, input: TopicTermUs
   input = { ...input, ...alignTopicTermLanguages(snapshot, input) }
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
+  if (input.entityIds === undefined && old?.entityIds) input = { ...input, entityIds: old.entityIds }
   const submitted = { ...input, evidence: old?.evidence ?? [] }
   if (!text(input.id, 2048) || !text(action.eventId, 2048) || !time(action.at) || !content(submitted)) return result(snapshot, 'invalid', old)
   const fields = copyContent(submitted)
@@ -313,21 +319,23 @@ export function adoptTopicTerm(snapshot: TopicTermSnapshot, id: string, expected
 
 /** One browser action saves the confirmed card directly; model RPC inputs have no acceptance field. */
 export function acceptTopicTermProposal(snapshot: TopicTermSnapshot, input: TopicTermPut, resolver: TermEvidenceResolver, action: FileProposalAcceptance, revision = false): TermMutationResult {
-  if (input.id === null) return result(snapshot, 'invalid', null)
-  const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
+  const id = input.id
+  if (id === null) return result(snapshot, 'invalid', null)
+  const old = snapshot.entries.find(entry => entry.id === id) ?? null
+  if (input.entityIds === undefined && old?.entityIds) input = { ...input, entityIds: old.entityIds }
   if (old?.acceptance?.candidateId === action.candidateId && old.acceptance.batchId === action.batchId &&
     old.status === 'active' && old.origin === input.origin && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(input))) return result(snapshot, 'unchanged', old)
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
   if (revision ? !old : old?.origin === 'user_explicit' || old?.acceptance) return result(snapshot, 'requires_user_action', old)
   if (!decodeTopicTermPut({ ...input, status: 'proposal' }) || !fileProposalAcceptance(action) || !validBasis(snapshot, input, resolver)) return result(snapshot, 'invalid', old)
-  if (hasConflict(snapshot, { ...input, id: input.id }, resolver)) return result(snapshot, 'conflict', old)
+  if (hasConflict(snapshot, { ...input, id }, resolver)) return result(snapshot, 'conflict', old)
   if (old?.origin === 'user_explicit') {
     const entry: TopicTerm = { ...copyContent(input), evidence: input.evidence.map(ref => ({ ...ref, role: 'example' })), id: old.id,
       origin: 'user_explicit', status: 'active', confirmation: { eventId: action.eventId, at: action.at, adoptedEntryVersion: old.version, edited: old.confirmation?.edited !== false || action.edited },
       version: old.version + 1, createdAt: old.createdAt, updatedAt: action.at }
     return result(replace(snapshot, entry, action.at), 'updated', entry)
   }
-  const entry: TopicTerm = { ...copyContent(input), id: input.id, origin: input.origin, status: 'active', confirmation: null,
+  const entry: TopicTerm = { ...copyContent(input), id, origin: input.origin, status: 'active', confirmation: null,
     acceptance: { ...action, edited: action.edited || !!old?.acceptance?.edited }, version: (old?.version ?? 0) + 1, createdAt: old?.createdAt ?? action.at, updatedAt: action.at }
   return result(replace(snapshot, entry, action.at), 'updated', entry)
 }

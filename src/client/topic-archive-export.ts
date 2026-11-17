@@ -38,13 +38,17 @@ function entityLabel(snapshot: TopicArchiveSnapshot, id: string): string {
   const entry = snapshot.entries.find(entry => entry.id === id)
   return entry?.kind === 'entity' ? `${md(entry.name)}（ID：${md(id)}；${statusLabels[entry.status]}）` : `实体不可用（ID：${md(id)}）`
 }
+function entityLabels(snapshot: TopicArchiveSnapshot, ids: readonly string[]): string {
+  return ids.map(id => entityLabel(snapshot, id)).join('、')
+}
 function entryTitle(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry): string {
-  return entry.kind === 'entity' ? md(entry.name) : entry.kind === 'fact' ? md(entry.title) : `${entityLabel(snapshot, entry.sourceEntityId)} → ${md(entry.relation)} → ${entityLabel(snapshot, entry.targetEntityId)}`
+  return entry.kind === 'entity' ? md(entry.name) : entry.kind === 'fact' ? md(entry.title) :
+    `${entityLabels(snapshot, entry.sourceEntityIds)} → ${md(entry.relation)} → ${entityLabels(snapshot, entry.targetEntityIds)}`
 }
 function semanticLines(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry): readonly string[] {
   return entry.kind === 'entity' ? [`- 名称：${md(entry.name)}`, `- 别名：${entry.aliases.map(md).join('、') || '无'}`, `- 描述：${md(entry.description) || '未提供'}`] :
-    entry.kind === 'fact' ? [`- 标题：${md(entry.title)}`, `- 正文：${md(entry.body)}`, `- 关联实体：${entry.entityIds.map(id => entityLabel(snapshot, id)).join('、') || '无'}`] :
-      [`- 源实体：${entityLabel(snapshot, entry.sourceEntityId)}`, `- 关系：${md(entry.relation)}`, `- 目标实体：${entityLabel(snapshot, entry.targetEntityId)}`, `- 描述：${md(entry.description) || '未提供'}`]
+    entry.kind === 'fact' ? [`- 标题：${md(entry.title)}`, `- 正文：${md(entry.body)}`, `- 关联实体：${entityLabels(snapshot, entry.entityIds) || '无'}`] :
+      [`- 源实体：${entityLabels(snapshot, entry.sourceEntityIds)}`, `- 关系：${md(entry.relation)}`, `- 目标实体：${entityLabels(snapshot, entry.targetEntityIds)}`, `- 描述：${md(entry.description) || '未提供'}`]
 }
 function referenceLines(ref: TermEvidenceRef): readonly string[] {
   return [`- 类型：${ref.kind === 'source' ? '原文' : '最终译文'}；用途：${ref.role === 'basis' ? '依据' : '示例'}`,
@@ -61,7 +65,7 @@ export function buildTopicArchiveMarkdownExport(input: TopicArchiveExportSnapsho
     `- 术语实际保存状态：${storageLabels[input.termsStorageStatus]}`, `- 档案实际保存状态：${storageLabels[input.archiveStorageStatus]}`,
     '- 本文件记录冻结时的内存快照，不提供导入。', '',
     buildTopicTermsMarkdownExport({ topicName: input.topicName, snapshot: input.terms, exportedAt: input.exportedAt,
-      storageStatus: input.termsStorageStatus, evidenceAvailability: input.termEvidenceAvailability }).content.replace(/^(#{1,4}) /gm, '$1# '), '',
+      storageStatus: input.termsStorageStatus, evidenceAvailability: input.termEvidenceAvailability }, archive).content.replace(/^(#{1,4}) /gm, '$1# '), '',
     '## 实体、事实和关系', '', `- 档案版本：${archive.version}；生效集版本：${archive.activeVersion}`, `- 档案更新时间：${md(archive.updatedAt)}`, '']
   if (!archive.entries.length) lines.push('暂无实体、事实或关系。', '')
   for (const entry of archive.entries) {

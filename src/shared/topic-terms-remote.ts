@@ -1,6 +1,7 @@
 import { decodeTopicTermPut, decodeTopicTermUserInput, type TopicTermSnapshot, type TopicTermPut, type TopicTermUserPut, type TermMutationResult } from '../memory/topic-terms.js'
 import { termEvidenceKey, type TermEvidenceRef, type FileProposalAcceptance } from '../memory/topic-terms.js'
 import { referenceBytes, referenceExact, referenceInteger, referenceObject, referenceString } from './reference-memory.js'
+import { validateTopicAssetMove, type TopicAssetMove } from './topic-asset-move.js'
 
 export const TERM_TRANSFER_POINTS = 4000
 export const TERM_TRANSFER_BYTES = 196608
@@ -11,7 +12,9 @@ export type TermCommand = { readonly kind: 'put'; readonly input: TopicTermPut }
   | { readonly kind: 'accept_file_proposal' | 'revise_file_proposal'; readonly input: TopicTermPut; readonly acceptance: FileProposalAcceptance }
   | { readonly kind: 'user_put'; readonly input: TopicTermUserPut }
   | { readonly kind: 'adopt' | 'disable' | 'delete'; readonly id: string; readonly expectedEntryVersion: number }
+  | { readonly kind: 'clear_unadopted' }
   | { readonly kind: 'clear' | 'reconcile' }
+  | TopicAssetMove
 export interface TermEvidenceState { readonly ref: TermEvidenceRef; readonly status: 'ready' | 'unloaded' | 'missing' }
 export interface TermReadRequest extends TermRemoteScope { readonly token: string; readonly layer: 'current' | 'saved'; readonly offset: number }
 export interface TermReadPage { readonly text: string; readonly nextOffset: number | null }
@@ -46,7 +49,8 @@ export function parseTermCommand(value: unknown): TermCommand {
     }
   } else if (value.kind === 'user_put') { referenceExact(value, ['kind', 'input']); referenceObject(value.input); if (!decodeTopicTermUserInput(value.input) || value.input.id === null) throw new TypeError('Invalid user term input') }
   else if (value.kind === 'adopt' || value.kind === 'disable' || value.kind === 'delete') { referenceExact(value, ['kind', 'id', 'expectedEntryVersion']); referenceString(value.id); referenceInteger(value.expectedEntryVersion, 1) }
-  else if (value.kind === 'clear' || value.kind === 'reconcile') referenceExact(value, ['kind'])
+  else if (value.kind === 'clear' || value.kind === 'reconcile' || value.kind === 'clear_unadopted') referenceExact(value, ['kind'])
+  else if (value.kind === 'move') validateTopicAssetMove(value)
   else throw new TypeError('Invalid term command')
   return structuredClone(value) as unknown as TermCommand
 }

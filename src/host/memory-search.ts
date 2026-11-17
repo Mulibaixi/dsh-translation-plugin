@@ -47,7 +47,7 @@ function failure(message: string): Error { return new MemoryIndexFailure(message
 function projection(entry: TopicArchiveEntry, snapshot: TopicArchiveSnapshot): string {
   const entity = (id: string): string => { const item = snapshot.entries.find(item => item.id === id); return item?.kind === 'entity' ? item.name : id }
   return entry.kind === 'entity' ? [entry.name, ...entry.aliases, entry.description].join('\n') : entry.kind === 'fact' ? [entry.title, entry.body].join('\n')
-    : [entity(entry.sourceEntityId), entry.relation, entity(entry.targetEntityId), entry.description].join('\n')
+    : [...entry.sourceEntityIds.map(entity), entry.relation, ...entry.targetEntityIds.map(entity), entry.description].join('\n')
 }
 async function segments(text: string): Promise<readonly { readonly text: string; readonly hash: string; readonly start: number; readonly end: number }[]> {
   const points = Array.from(text), result = []

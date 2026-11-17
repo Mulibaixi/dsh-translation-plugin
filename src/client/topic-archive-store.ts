@@ -17,6 +17,7 @@ export interface TopicArchiveVersion {
   readonly version: number; readonly currentCount: number; readonly storedCount: number
 }
 export type TopicArchiveCommand = { readonly kind: 'put'; readonly input: TopicArchivePut }
+  | Extract<ArchiveCommand, { kind: 'move' | 'clear_unadopted' }>
   | { readonly kind: 'delete'; readonly id: string; readonly expectedEntryVersion: number }
   | { readonly kind: 'accept_file_proposal' | 'revise_file_proposal'; readonly input: TopicArchivePut; readonly acceptance: FileProposalAcceptance }
   | { readonly kind: 'user_put'; readonly input: TopicArchiveUserPut }
@@ -213,7 +214,7 @@ export class TopicArchiveStore {
     return { ...snapshot, entries: queryTopicArchive(snapshot, { ...fixed, ownerId: snapshot.ownerId, topicId }, prepared.resolver) }
   }
   private commandRefs(snapshot: TopicArchiveSnapshot, command: ArchiveCommand): readonly TermEvidenceRef[] {
-    if (command.kind === 'clear' || command.kind === 'delete' || command.kind === 'disable') return []
+    if (command.kind === 'clear' || command.kind === 'delete' || command.kind === 'disable' || command.kind === 'move') return []
     if (command.kind === 'reconcile') return snapshot.entries.filter(entry => entry.origin !== 'user_explicit' && entry.status !== 'disabled' && entry.status !== 'review_required').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))
     const content = 'input' in command ? command.input : 'id' in command ? snapshot.entries.find(entry => entry.id === command.id) : undefined
     const ids = new Set(content ? referencedEntityIds(content) : [])
@@ -273,12 +274,16 @@ export class TopicArchiveStore {
     const latest = await this.refresh(ownerId, topicId)
     if (seat.storage?.token !== result.token) return failure('stale')
     if (result.status === 'save_failed') { seat.saveFailed = true; this.notice = '主题档案修改已保留在本次运行，但尚未保存；可重试保存。'; this.emit() }
-    else if (fixed.kind !== 'reconcile') { delete seat.saveFailed; if (!seat.legacyCleanupPending) this.notice = undefined; this.emit() }
+    else if (fixed.kind !== 'reconcile' && fixed.kind !== 'move' && fixed.kind !== 'clear_unadopted') { delete seat.saveFailed; if (!seat.legacyCleanupPending) this.notice = undefined; this.emit() }
     return { status: result.status, snapshot: latest, entry: result.entryId ? latest.entries.find(entry => entry.id === result.entryId) ?? null : null }
   }
   async apply(ownerId: string, topicId: string, expectedVersion: number, command: TopicArchiveCommand): Promise<ArchiveMutationResult> {
     const snapshot = await this.ensureLoaded(ownerId, topicId)
-    if ((command.kind === 'put' || command.kind === 'accept_file_proposal' || command.kind === 'revise_file_proposal') && !decodeTopicArchivePut(command.input)) return { status: 'invalid', snapshot, entry: null }
+    if (command.kind === 'put' || command.kind === 'accept_file_proposal' || command.kind === 'revise_file_proposal') {
+      const input = decodeTopicArchivePut(command.input)
+      if (!input) return { status: 'invalid', snapshot, entry: null }
+      return this.mutate(ownerId, topicId, { ...command, input }, expectedVersion)
+    }
     return this.mutate(ownerId, topicId, command, expectedVersion)
   }
   async saveUserEntry(ownerId: string, topicId: string, expectedVersion: number, input: TopicArchiveUserInput): Promise<ArchiveMutationResult> {

@@ -3,8 +3,10 @@ const MOVE_TOLERANCE = 6
 export interface SessionDrop { readonly id: string; readonly targetId: string; readonly after: boolean }
 export type SessionPointerEvent = Pick<PointerEvent, 'button' | 'isPrimary' | 'pointerId' | 'clientX' | 'clientY'> & { readonly currentTarget: HTMLElement }
 
-/** Native button Pointer Events; capture starts only after the hold, preserving ordinary scrolling. */
-export function createSessionReorder(onPreview: (drop: SessionDrop | undefined) => void, onCommit: (drop: SessionDrop) => void): {
+/** Pointer capture starts only after the hold, preserving ordinary scrolling. */
+export function createSessionReorder(onPreview: (drop: SessionDrop | undefined) => void, onCommit: (drop: SessionDrop) => void,
+  listKind: 'session' | 'asset' = 'session',
+): {
   down(id: string, event: SessionPointerEvent): void
   consumeClick(id: string): boolean
   cancel(): void
@@ -25,12 +27,16 @@ export function createSessionReorder(onPreview: (drop: SessionDrop | undefined) 
 
   function preview(y: number): void {
     if (!pending?.active) return
-    const rows = [...pending.list.querySelectorAll<HTMLElement>('[data-session-sort-id]')].filter(row => row !== pending!.source)
+    const all = [...pending.list.querySelectorAll<HTMLElement>(`[data-${listKind}-sort-id]`)]
+    const from = all.indexOf(pending.source)
+    const rows = all.filter(row => row !== pending!.source)
     const before = rows.find(row => { const rect = row.getBoundingClientRect(); return y < rect.top + rect.height / 2 })
     const target = before ?? rows.at(-1)
-    const drop = target ? { id: pending.id, targetId: target.dataset.sessionSortId!, after: !before } : undefined
+    const targetId = listKind === 'session' ? target?.dataset.sessionSortId : target?.dataset.assetSortId
+    const to = before ? rows.indexOf(before) : rows.length
+    const drop = targetId && from >= 0 && from !== to ? { id: pending.id, targetId, after: !before } : undefined
     if (drop?.targetId === pending.drop?.targetId && drop?.after === pending.drop?.after) return
-    pending.drop = drop; onPreview(drop)
+    pending.drop = drop; onPreview(drop ?? { id: pending.id, targetId: pending.id, after: false })
   }
   function finish(commit = false, notify = true): void {
     const drag = pending
@@ -65,6 +71,7 @@ export function createSessionReorder(onPreview: (drop: SessionDrop | undefined) 
     }
     pending.y = event.clientY
     event.preventDefault(); event.stopPropagation(); preview(event.clientY)
+    pending.frame ??= pending.source.ownerDocument.defaultView?.requestAnimationFrame(scrollFrame)
   }
   function up(event: PointerEvent): void {
     if (!pending || event.pointerId !== pending.pointerId) return
@@ -75,16 +82,16 @@ export function createSessionReorder(onPreview: (drop: SessionDrop | undefined) 
     down(id, event) {
       finish()
       if (event.button !== 0 || !event.isPrimary) return
-      const source = event.currentTarget, pointerId = event.pointerId, list = source.closest<HTMLElement>('[data-session-sort-list]')
+      const source = event.currentTarget, pointerId = event.pointerId, list = source.closest<HTMLElement>(`[data-${listKind}-sort-list]`)
       if (!list) return
       const timer = setTimeout(() => {
         if (!pending) return
         try { source.setPointerCapture(pointerId) } catch { finish(); return }
         pending.active = true; onPreview({ id, targetId: id, after: false })
         preview(pending.y)
-        pending.frame = source.ownerDocument.defaultView?.requestAnimationFrame(scrollFrame)
       }, SESSION_REORDER_HOLD_MS)
-      pending = { id, source, list, scroll: list.closest<HTMLElement>('.dsh-tp-popup, .dsh-tp-session-sidebar') ?? list, pointerId, x: event.clientX, y: event.clientY, timer, frame: undefined, active: false, drop: undefined }
+      const scroll = listKind === 'session' ? list.closest<HTMLElement>('.dsh-tp-popup, .dsh-tp-session-sidebar') ?? list : list
+      pending = { id, source, list, scroll, pointerId, x: event.clientX, y: event.clientY, timer, frame: undefined, active: false, drop: undefined }
       const doc = source.ownerDocument
       doc.addEventListener('pointermove', move, { capture: true, passive: false })
       doc.addEventListener('pointerup', up, true)

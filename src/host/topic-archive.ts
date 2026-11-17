@@ -1,11 +1,13 @@
 import { decodeTopicArchiveSnapshot, emptyTopicArchive, putTopicArchive, putUserTopicArchive, adoptTopicArchive, acceptTopicArchiveProposal, disableTopicArchive,
-  deleteTopicArchiveEntry, reconcileTopicArchive, referencedEntityIds, type TopicArchiveSnapshot, type ArchiveMutationResult } from '../memory/topic-archive.js'
+  deleteTopicArchiveEntry, removeTopicArchiveEntries, reconcileTopicArchive, referencedEntityIds, type TopicArchiveSnapshot, type ArchiveMutationResult } from '../memory/topic-archive.js'
+import { isAdoptedAsset } from '../memory/asset-priority.js'
 import { termEvidenceKey, type TermEvidenceRef, type TermEvidenceResolver } from '../memory/topic-terms.js'
 import { ARCHIVE_TRANSFER_POINTS, parseArchiveRemoteRequest, type ArchiveRemoteScope, type ArchiveStorageStatus, type ArchiveHead, type ArchiveReadRequest,
   type ArchiveReadPage, type ArchiveMigrateBegin, type ArchiveMigratePart, type ArchiveMigrateCommit, type ArchiveMutationRequest, type ArchiveMutationReceipt,
   type ArchiveRemotePort, type ArchiveEvidenceState, type ArchiveCommand } from '../shared/topic-archive-remote.js'
 import type { OtherMemoryService } from './other-memory.js'
 import type { LocalDataService } from './local-data.js'
+import { moveTopicAsset } from '../memory/topic-asset-order.js'
 import type { TopicHostContext, TopicToolsService } from './topic-tools.js'
 
 interface Seat { readonly scope: ArchiveRemoteScope; current: TopicArchiveSnapshot; saved: TopicArchiveSnapshot | null; token: string }
@@ -74,6 +76,11 @@ export class TopicArchiveService implements ArchiveRemotePort {
   private writer<T>(run: () => Promise<T>): Promise<T> { return ((this.ctx.get?.('translationLocalData') as LocalDataService | undefined)?.storageWriter() ?? (async <R>(f: () => Promise<R>): Promise<R> => f()))(run).then(value => {
     (this.ctx.get?.('translationMemorySearch') as { contentChanged(): void } | undefined)?.contentChanged(); return value
   }) }
+  /** Called by the terms writer inside the shared storage write queue. */
+  async hasEntities(scope: ArchiveRemoteScope, ids: readonly string[]): Promise<boolean> {
+    const entries = (await this.seat(scope))?.current.entries
+    return ids.every(id => entries?.some(entry => entry.kind === 'entity' && entry.id === id))
+  }
   /** Current Host overlays and saved projections; never imports a Client body for indexing. */
   async retrievalSnapshots(namespaceId: string, peer: string, topicId?: string): Promise<readonly { readonly current: TopicArchiveSnapshot; readonly saved: TopicArchiveSnapshot | null }[]> {
     const guard: Guard = { scope: { namespaceId, ownerId: namespaceId, topicId: '*' }, peer, generation: this.generation }; this.check(guard)
@@ -164,7 +171,7 @@ export class TopicArchiveService implements ArchiveRemotePort {
     const target = 'input' in command ? command.input : 'id' in command ? snapshot.entries.find(entry => entry.id === command.id) : undefined
     const dependencies = new Set(target ? referencedEntityIds(target) : [])
     const refs: TermEvidenceRef[] = command.kind === 'reconcile' ? snapshot.entries.filter(entry => entry.origin !== 'user_explicit' && !['disabled', 'review_required'].includes(entry.status)).flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))
-      : command.kind === 'clear' || command.kind === 'delete' || command.kind === 'disable' ? []
+      : command.kind === 'clear' || command.kind === 'delete' || command.kind === 'disable' || command.kind === 'move' ? []
       : [...('input' in command && 'evidence' in command.input ? command.input.evidence.filter(ref => ref.role === 'basis') : []), ...snapshot.entries.filter(entry => dependencies.has(entry.id) && entry.origin !== 'user_explicit').flatMap(entry => entry.evidence.filter(ref => ref.role === 'basis'))]
     const facts = new Map(values.map(value => [termEvidenceKey(snapshot, value.ref), value.status]))
     if (refs.some(ref => !facts.has(termEvidenceKey(snapshot, ref)))) throw failure('archive_evidence_incomplete', '档案依据状态尚未完整取得，请重新读取实际依据。')
@@ -188,6 +195,8 @@ export class TopicArchiveService implements ArchiveRemotePort {
       if (seat.token !== request.token) return { status: 'stale', token: seat.token, entryId: null }
       const command = request.command, at = stamp(), resolver = this.evidence(seat.current, command, request.evidence)
       const action = { eventId: `archive-user:${crypto.randomUUID()}`, at }
+      const deletedIds = command.kind === 'delete' ? new Set([command.id]) : command.kind === 'clear_unadopted'
+        ? new Set(seat.current.entries.filter(entry => entry.kind === command.category && !isAdoptedAsset(entry)).map(entry => entry.id)) : undefined
       let result: ArchiveMutationResult
       if (command.kind === 'put') result = putTopicArchive(seat.current, command.input, resolver, at)
       else if (command.kind === 'user_put') result = putUserTopicArchive(seat.current, command.input, resolver, action)
@@ -195,6 +204,11 @@ export class TopicArchiveService implements ArchiveRemotePort {
       else if (command.kind === 'adopt') result = adoptTopicArchive(seat.current, command.id, command.expectedEntryVersion, resolver, action)
       else if (command.kind === 'disable') result = disableTopicArchive(seat.current, command.id, command.expectedEntryVersion, at)
       else if (command.kind === 'delete') result = deleteTopicArchiveEntry(seat.current, command.id, command.expectedEntryVersion, at)
+      else if (command.kind === 'clear_unadopted') {
+        const snapshot = removeTopicArchiveEntries(seat.current, deletedIds!, at)
+        result = { status: snapshot === seat.current ? 'unchanged' : 'updated', snapshot, entry: null }
+      }
+      else if (command.kind === 'move') result = moveTopicAsset(seat.current, command, at)
       else if (command.kind === 'reconcile') { const next = reconcileTopicArchive(seat.current, resolver, at, ref => resolver.isUnloaded?.(seat.current, ref) === true); result = { status: next === seat.current ? 'unchanged' : 'updated', snapshot: next, entry: null } }
       else {
         const snapshot = { ...emptyTopicArchive(request.ownerId, request.topicId, at), version: Math.max(seat.current.version, seat.saved?.version ?? 0) + 1,
@@ -204,20 +218,26 @@ export class TopicArchiveService implements ArchiveRemotePort {
       if (!['updated', 'unchanged'].includes(result.status)) return { status: result.status, token: seat.token, entryId: result.entry?.id ?? null }
       let saved = seat.saved
       if (command.kind === 'clear') saved = result.snapshot
-      else if (command.kind === 'delete') { const old = saved?.entries.find(entry => entry.id === command.id); if (saved && old) saved = deleteTopicArchiveEntry(saved, command.id, old.version, at).snapshot }
+      else if (deletedIds) { if (saved) saved = removeTopicArchiveEntries(saved, deletedIds, at) }
+      else if (command.kind === 'move') {
+        const stored = saved && moveTopicAsset(saved, command, at)
+        if (result.status === 'updated' && (!stored || stored.status === 'stale' || stored.status === 'invalid'))
+          return { status: 'requires_user_action', token: seat.token, entryId: null }
+        if (result.status === 'updated' && stored) saved = stored.snapshot
+      }
       else if (command.kind !== 'reconcile') saved = result.snapshot
-      if (!same(saved, seat.saved) || command.kind === 'clear' || command.kind === 'delete') {
+      if (!same(saved, seat.saved) || command.kind === 'clear' || deletedIds?.size) {
         try {
           const db = await this.memory.databaseForArchives(true); await this.requireOpen(guard)
           db!.transaction(() => {
             db!.archiveSave(request.namespaceId, request.ownerId, request.topicId, saved)
-            if (command.kind === 'delete') db!.indexRemoveSource(request.namespaceId, request.topicId, `archive:${command.id}`)
+            if (deletedIds) for (const id of deletedIds) db!.indexRemoveSource(request.namespaceId, request.topicId, `archive:${id}`)
             if (command.kind === 'clear') for (const entry of [...seat.current.entries, ...(seat.saved?.entries ?? [])]) db!.indexRemoveSource(request.namespaceId, request.topicId, `archive:${entry.id}`)
           })
         } catch (error) {
           this.check(guard)
           if (this.retired.has(key(request))) throw error
-          if (command.kind === 'clear' || command.kind === 'delete') throw error
+          if (command.kind === 'clear' || deletedIds || command.kind === 'move') throw error
           // A failed save keeps the accepted edit in the Host runtime overlay, never a Client fallback.
           if (seat.current !== result.snapshot) { seat.current = result.snapshot; seat.token = token() }
           return { status: 'save_failed', token: seat.token, entryId: result.entry?.id ?? null }

@@ -1,5 +1,7 @@
 import { isDocumentUnit, isFileJobUnit, isImageUnit } from './translation-history.js'
-import { DirectFileLink, type DirectFile } from './direct-file-view.js'
+import { FileOpenMenu, useDirectFileOpen, type DirectFile, type FileOpenAction } from './direct-file-view.js'
+import { isPdfFile, pdfDeliveryComplete, pdfPageLabel, pdfPageNumbers, pdfRepairablePages } from '../shared/pdf-source.js'
+import { buildPdfExport, capturePdfDelivery } from './pdf-delivery.js'
 import { ImageBackground, ImageExportMenu, ImageOriginalButton } from './image-unit-view.js'
 import { BatchProcessingView, type BatchRemoteCall } from './batch-processing-view.js'
 import { SourceTextEditor } from './source-text-editor.js'
@@ -24,14 +26,14 @@ import type { RecordObjectReference } from '../shared/record-objects.js'
 import { RecordObjectText, type RecordObjectsProps } from './record-object-view.js'
 import { type HistoryVersion, type SessionStore, type TextRevisionDeletionPlan, type TextUnitDeletionPlan } from './session-store.js'
 import { DEFAULT_SESSION_SETTINGS, sessionName, validateSessionSettings, type LocalSession, type SessionSettings } from './sessions.js'
-import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconChevronRightOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium } from './native-ui.js'
+import { Menu, MenuGroup, MenuItemButton, IconChevronDownOutlineRegular, IconChevronRightOutlineRegular, IconPanelLeftOutlineRegular, IconSendOutlineMedium, nativeSubmenuArrow } from './native-ui.js'
 import { type TopicTermsViewPort } from './topic-terms-view.js'
 import { downloadExport, saveExport } from './browser-download.js'
 import { buildRevisionExport } from './revision-export.js'
 import { useExportDownloadFeedback } from './export-download-feedback.js'
 import { StorageUsageView } from './storage-usage-view.js'
 import type { TopicBridgeClient } from './topic-bridge.js'
-import type { ViewFilesClient } from './view-files-client.js'
+import type { ViewFilesClient, ViewFileTarget } from './view-files-client.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import type { NormalTranslationClient } from './normal-translation.js'
 import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
@@ -102,8 +104,9 @@ function modeSelect(value: LocalSession['mode'], action: (mode: LocalSession['mo
 function storeNotice(store: SessionStore): unknown { return store.getNotice() ? h('div', { role: 'alert', className: 'dsh-tp-message' }, store.getNotice()) : null }
 
 function submenuLabel(action: 'new' | 'open', text: string): unknown {
+  // DSH 0.2.2 起原生行自绘子菜单箭头，插件只在旧版原生菜单上补箭头。
   return h('span', { className: 'dsh-tp-submenu-label', 'data-session-submenu': action }, h('span', null, text),
-    h('span', { 'data-submenu-arrow': true, 'aria-hidden': true }, h(IconChevronRightOutlineRegular, { size: 16 })))
+    nativeSubmenuArrow ? null : h('span', { 'data-submenu-arrow': true, 'aria-hidden': true }, h(IconChevronRightOutlineRegular, { size: 16 })))
 }
 const newSessionChoices = [
   { id: 'new-quick', label: '新建快译会话' },
@@ -114,10 +117,16 @@ function ContextSubmenus({ onCreate, children }: { readonly onCreate: () => void
   return h('div', {
     onClickCapture: (event: MouseEvent) => {
       const target = event.target as Element, button = target.closest<HTMLButtonElement>('button[role="menuitem"]')
-      if (!button || button.disabled || !button.querySelector('[data-session-submenu="new"]') || target.closest('[data-submenu-arrow]')) return
+      // 新版原生菜单用 click() 打开子菜单（ArrowRight／Tab 都会走这条路，detail 为 0），
+      // 这种点击必须交还原生，否则会被当成默认新建。旧版没有这套键盘接管，保持原有行为。
+      if (nativeSubmenuArrow && event.detail === 0) return
+      // 命中箭头图形时交给原生菜单展开子菜单，其余点击仍是默认新建。
+      // 旧版箭头由插件绘制并带 data-submenu-arrow；新版由原生行自绘，只能按 svg 识别。
+      const arrow = target.closest('[data-submenu-arrow]') ?? (nativeSubmenuArrow ? target.closest('svg') : null)
+      if (!button || button.disabled || !button.querySelector('[data-session-submenu="new"]') || arrow) return
       event.preventDefault(); event.stopPropagation(); onCreate()
     },
-    onKeyDownCapture: (event: KeyboardEvent) => {
+    onKeyDownCapture: nativeSubmenuArrow ? undefined : (event: KeyboardEvent) => {
       const button = (event.target as Element).closest<HTMLButtonElement>('button[role="menuitem"]')
       if (!button || button.disabled) return
       if (event.key === 'ArrowRight' && button.getAttribute('aria-haspopup') === 'menu') {
@@ -131,10 +140,54 @@ function ContextSubmenus({ onCreate, children }: { readonly onCreate: () => void
     },
   }, children)
 }
+/**
+ * 右键菜单锚点。0.2.2 起原生 Menu 改读 anchorRef／anchorPoint，不再读 getAnchorRect；
+ * 0.2.0／0.2.1 只读 getAnchorRect。所以两边的参数都提供，各版本只读自己认识的那个。
+ *
+ * 新版把 anchorPoint 写进一个 `position: fixed` 的 0×0 锚点，只要祖先带布局包含，
+ * 该坐标就相对那个祖先而不是视口——本面板的 container-type: inline-size 正是这种情况，
+ * 于是面板内的标题按钮会一直偏移，而 portal 到 body 的下拉行却正常。
+ * 解决方式是给新版一个自己挂在 body 上的定位元素，锚点参照系只剩视口，
+ * 不再随触发器位于哪个容器而变化。
+ */
+interface MenuAnchor {
+  readonly ref: { current: HTMLElement | null }
+  place(x: number, y: number): void
+  dispose(): void
+}
+function createMenuAnchor(): MenuAnchor {
+  const ref: { current: HTMLElement | null } = { current: null }
+  return {
+    ref,
+    place(x, y) {
+      const body = typeof document === 'undefined' ? undefined : document.body
+      if (!body || typeof document.createElement !== 'function') return
+      let element = ref.current
+      if (!element) {
+        element = document.createElement('div')
+        element.setAttribute('aria-hidden', 'true')
+        element.style.cssText = 'position:fixed;width:0;height:0;pointer-events:none'
+        body.append(element)
+        ref.current = element
+      }
+      element.style.left = `${x}px`
+      element.style.top = `${y}px`
+    },
+    dispose() { ref.current?.remove(); ref.current = null },
+  }
+}
 function contextMenuAnchor(x: number, y: number, menuClass: string): { left: number; right: number; top: number; bottom: number; width: number; height: number } {
   const width = document.querySelector<HTMLElement>(menuClass)?.offsetWidth ?? 180
   const left = Math.max(12, Math.min(x, window.innerWidth - width - TOPIC_SUBMENU_WIDTH - 2 - 12))
   return { left, right: left, top: y, bottom: y, width: 0, height: 0 }
+}
+function contextMenuAnchorProps(x: number, y: number, menuClass: string, anchor: MenuAnchor): Readonly<Record<string, unknown>> {
+  // 只有 0.2.2 起的原生菜单会用 anchorRef／anchorPoint；旧版按 getAnchorRect 定位，
+  // 不必往 body 里加元素。探测失败时退回旧版写法，代价只是新版位置可能略微偏移。
+  if (!nativeSubmenuArrow) return { getAnchorRect: () => contextMenuAnchor(x, y, menuClass) }
+  anchor.place(x, y)
+  // 新版拿不到可用定位元素时，宁可只给坐标，也不让菜单因此不显示。
+  return { ...(anchor.ref.current ? { anchorRef: anchor.ref } : {}), anchorPoint: { x, y }, contextual: true, getAnchorRect: () => contextMenuAnchor(x, y, menuClass) }
 }
 
 interface RevisionEdit { readonly sessionId: string; readonly unitId: string; readonly baseRevisionId: string; readonly text: string; readonly failure: string | null }
@@ -369,8 +422,8 @@ function TranslationRecord({ record, quick, canRestore }: { readonly record: Qui
   )
 }
 
-function TextRevisionActions({ store, session, unit, revision, quick, normal, materials, topics, editor, objects, file }: StoreProps & TopicUiProps & {
-  readonly session: LocalSession; readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly file?: DirectFile | undefined
+function TextRevisionActions({ store, session, unit, revision, quick, normal, materials, topics, editor, objects, file, openFile }: StoreProps & TopicUiProps & {
+  readonly session: LocalSession; readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly file?: DirectFile | undefined; readonly openFile?: FileOpenAction | undefined
 }): unknown {
   const [open, setOpen] = react.useState(false)
   const [exportBusy, setExportBusy] = react.useState(false)
@@ -430,6 +483,7 @@ function TextRevisionActions({ store, session, unit, revision, quick, normal, ma
       open, onClose: () => setOpen(false), portal: true, align: 'end', compact: true, listClassName: 'dsh-tp-popup',
       anchor: h('button', { type: 'button', 'aria-label': `${label}操作`, 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => setOpen(value => !value) }, '操作'),
     },
+    openFile ? h(MenuItemButton, { disabled: openFile.disabled, onSelect: () => { setOpen(false); openFile.open() } }, '打开') : null,
     h(MenuItemButton, { disabled: !eligible || fixed, onSelect: () => { setOpen(false); quick.selectFinal(session.id, unit.id, revision.id) } }, fixed ? '已固定' : '设为最终'),
     session.mode === 'normal' && normal && revision.kind === 'machine' && !revision.deletion ? h(MenuItemButton, { disabled: exportBusy || ['running', 'submitting'].includes(revision.status), onSelect: () => { void exportLog() } }, h('span', { title: '包含本次调用的原文、提示词和模型输出；仅在原宿主运行期间可导出。' }, '导出调用日志')) : null,
     unit.revisions.at(-1)?.id !== revision.id ? h(MenuItemButton, { danger: true, disabled: pending || !!blocked, title: blocked, onSelect: () => {
@@ -448,8 +502,8 @@ function TextRevisionActions({ store, session, unit, revision, quick, normal, ma
     message ? h('p', { className: 'dsh-tp-muted', role: 'status' }, message) : null)
 }
 
-function TextUnitDeletionControl({ store, session, unit, quick, normal, materials, topics, editor }: StoreProps & TopicUiProps & {
-  readonly session: LocalSession; readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor
+function TextUnitDeletionControl({ store, session, unit, quick, normal, materials, topics, editor, openFile }: StoreProps & TopicUiProps & {
+  readonly session: LocalSession; readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly editor: RevisionEditor; readonly openFile?: FileOpenAction | undefined
 }): unknown {
   const [open, setOpen] = react.useState(false)
   const [plan, setPlan] = react.useState<TextUnitDeletionPlan | undefined>(undefined)
@@ -482,7 +536,8 @@ function TextUnitDeletionControl({ store, session, unit, quick, normal, material
     h(Menu, {
       open, onClose: () => setOpen(false), portal: true, align: 'end', compact: true, listClassName: 'dsh-tp-popup',
       anchor: h('button', { type: 'button', 'aria-label': `文本 ${unit.order}单元操作`, 'aria-haspopup': 'menu', 'aria-expanded': open, onClick: () => setOpen(value => !value) }, '操作'),
-    }, h(MenuItemButton, { danger: true, disabled: pending || !!blocked, title: blocked, onSelect: () => {
+    }, openFile ? h(MenuItemButton, { disabled: openFile.disabled, onSelect: () => { setOpen(false); openFile.open() } }, '打开') : null,
+    h(MenuItemButton, { danger: true, disabled: pending || !!blocked, title: blocked, onSelect: () => {
       setOpen(false); setMessage(undefined); setPlan(store.captureTextUnitDeletion(session.id, unit.id))
     } }, '删除此单元')),
     plan ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除文本单元确认', 'aria-busy': pending },
@@ -497,6 +552,7 @@ function TextUnitDeletionControl({ store, session, unit, quick, normal, material
 }
 
 function TranslationRevision({ store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, resultOpen, versionsToggle, executionOwner, file, viewFiles }: StoreProps & TopicUiProps & { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly resultOpen?: unknown; readonly versionsToggle?: unknown; readonly file?: DirectFile | undefined }): unknown {
+  const fileOpen = useDirectFileOpen({ file: revision.text ? file : undefined, unit, revision, session, materials, viewFiles })
   const [details, setDetails] = react.useState(false)
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断', context_requested: '等待补充背景', deleted: '已删除' }[revision.status]
@@ -526,7 +582,7 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
         h('button', { type: 'button', 'aria-label': `${label}详情`, 'aria-expanded': details, onClick: () => setDetails(value => !value) }, '详情'),
         versionsToggle ?? null,
         isImageUnit(unit) ? h(ImageExportMenu, { unit, session, revision, materials, viewFiles }) : null,
-        h(TextRevisionActions, { store, session, unit, revision, quick, normal, materials, topics, editor, objects, file }),
+        h(TextRevisionActions, { store, session, unit, revision, quick, normal, materials, topics, editor, objects, file, openFile: fileOpen?.system }),
         resultOpen ?? null,
       ),
     ),
@@ -550,7 +606,7 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
         h('button', { type: 'button', 'aria-label': `取消${label}编辑`, onClick: () => editor.cancel(key) }, '取消'),
       ),
       draft.failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, draft.failure) : null,
-    ) : revision.text ? file ? h(DirectFileLink, { file, unit, revision, session, materials, viewFiles }) : h(RecordObjectText, {
+    ) : revision.text ? fileOpen ? fileOpen.link : h(RecordObjectText, {
       text: revision.text, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id }, objects, objectAssets,
       quoteSource: revision.status === 'completed'
         ? quoteSource(session, unit, `译文 v${revision.order} · 译文版本 ID ${revision.id}${revision.sourceVersion === undefined ? '' : ` · 原文版本 ${revision.sourceVersion}`}`) : undefined,
@@ -593,6 +649,8 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const latest = unit.revisions.at(-1)
   const image = isImageUnit(unit) ? unit : undefined
   const intake = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
+  const file = image ? undefined : intake
+  const fileOpen = useDirectFileOpen({ file, unit, session, materials, viewFiles })
   const sourceQuote = image ? quoteSource(session, unit, '图片原文')
     : intake ? undefined : quoteSource(session, unit, `原文 v${unit.sourceVersion ?? 1}`)
   const sourceEditable = session.mode === 'normal' && session.archivedAt === null
@@ -657,7 +715,6 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const final = currentFinalRevision(unit), pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
   const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : pointed ? !revisionMatchesCurrentSource(unit, pointed) ? `原最终版本 ${pointed.order}已过时，待新原文定稿` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中` : '待定稿'
   const blocked = session.mode === 'normal' ? !executionOwner ? '请选择本次任务使用的主会话。' : normal?.retranslateBlockedReason(session.id, unit.id) ?? (normal ? undefined : '普通重译入口未就绪。') : quick.retranslateBlockedReason(session, unit.id)
-  const file = image ? undefined : intake
   const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
   return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `${image ? '图片' : file ? '文件' : '文本'} ${unit.order}` },
     imageHeader,
@@ -670,10 +727,10 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
           sourceEditButton,
           h('button', { type: 'button', 'aria-label': `重译${image ? '图片' : '文本'} ${unit.order}`, disabled: !!blocked || !!image && !unit.source.trim(), title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
           h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, disabled: !final || session.archivedAt !== null }),
-          h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
+          h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor, openFile: fileOpen?.system }),
           file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
       ),
-      sourceEditor ?? (image && !unit.source ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '等待提取文字。') : file ? h(DirectFileLink, { file, unit, session, materials, viewFiles }) : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote })),
+      sourceEditor ?? (image && !unit.source ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '等待提取文字。') : fileOpen ? fileOpen.link : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote })),
       imageBackground,
       imageIntakeStatus,
       sourceHistory,
@@ -690,15 +747,35 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   )
 }
 
-function FileUnitView({ file, session, materials, viewFiles }: {
+function FileUnitView({ file, session, store, materials, viewFiles, ownerId, translating }: {
   readonly file: ReturnType<MaterialSubmissionsClient['getFileUnits']>[number]
   readonly session: LocalSession; readonly materials: MaterialSubmissionsClient; readonly viewFiles?: ViewFilesClient | undefined
+  readonly store: SessionStore; readonly ownerId: string; readonly translating: boolean
 }): unknown {
   const [opening, setOpening] = react.useState(false), [notice, setNotice] = react.useState<string | undefined>(undefined)
   const lifetime = react.useRef({ mounted: true, opening: false, controller: null as AbortController | null })
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false; lifetime.current.controller?.abort() } }, [])
   const status = { freezing: file.sourceFrozen ? '原稿已冻结 · 正在交付' : '正在准备 · 原稿尚未冻结', frozen: '原稿已冻结 · 已交付，等待处理', failed: '处理失败', unknown: '提交状态未知', accepted: '原稿已冻结 · 已交付，等待处理' }[file.status]
-  async function open(): Promise<void> {
+  const pdf = isPdfFile(file.name), history = pdf ? store.getTranslationHistory(session.id) : undefined
+  const delivery = history ? capturePdfDelivery(file, history) : undefined
+  const progress = file.pdfProgress
+  const gaps = [...(progress?.gaps ?? [])].sort((a, b) => a.page - b.page)
+  const canRepair = !!delivery && pdfRepairablePages(progress, [...delivery.sections, ...delivery.unfinished]).length > 0
+  const canResume = !!ownerId && (progress ? progress.next !== null || !!delivery?.unfinished.length || canRepair : !delivery?.totalSections) && file.sourceFrozen
+  const pdfStatus = progress ? [pdfPageLabel(progress.requested), progress.next ? `待读第 ${progress.next.page} 页${progress.next.offset ? '剩余正文' : ''}` : '读取结束',
+    `已完成 ${delivery?.sections.length ?? 0}/${delivery?.totalSections ?? 0} 个区段`].join(' · ') : undefined
+  async function savePdf(): Promise<void> {
+    try {
+      const current = materials.getFileUnits(session.id).find(item => item.materialId === file.materialId)
+      const snapshot = store.getTranslationHistory(session.id)
+      if (!current || !snapshot) throw new Error('PDF 记录已变化。')
+      const selected = capturePdfDelivery(current, snapshot)
+      if (!selected.sections.length && !selected.supplements.length) throw new Error('暂无可保存的 PDF 译文。')
+      const result = buildPdfExport(selected), saved = await saveExport(result)
+      if (lifetime.current.mounted && saved !== 'cancelled') setNotice(saved === 'saved' ? 'Markdown 译稿已保存。' : `已发起下载：${result.fileName}`)
+    } catch { if (lifetime.current.mounted) setNotice('Markdown 译稿保存未完成，可重试。') }
+  }
+  async function open(target: ViewFileTarget): Promise<void> {
     if (lifetime.current.opening) return
     const controller = new AbortController()
     lifetime.current.opening = true; lifetime.current.controller = controller; setOpening(true); setNotice(undefined)
@@ -706,21 +783,26 @@ function FileUnitView({ file, session, materials, viewFiles }: {
       const snapshot = await materials.resolveFileSource(session.id, file.unitId)
       if (!lifetime.current.mounted) return
       if (!snapshot || !viewFiles) { setNotice('原稿暂不可打开，可稍后重试。'); return }
-      const result = await viewFiles.openSource({ namespaceId: viewFiles.getNamespaceId(), sessionId: session.id, unitId: file.unitId, kind: 'source', title: `${file.name} · 原稿`, revisionId: 'source:1', fileName: file.name }, snapshot, controller.signal)
+      const result = await viewFiles.openSource({ namespaceId: viewFiles.getNamespaceId(), sessionId: session.id, unitId: file.unitId, kind: 'source', title: `${file.name} · 原稿`, revisionId: 'source:1', fileName: file.name }, snapshot, controller.signal, target)
       if (lifetime.current.mounted && !result.ok) setNotice(result.message ?? '原稿打开未完成，可重试。')
     } catch { if (lifetime.current.mounted) setNotice('原稿打开未完成，可重试。') }
     finally { lifetime.current.opening = false; lifetime.current.controller = null; if (lifetime.current.mounted) setOpening(false) }
   }
   return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit dsh-tp-source', 'data-unit-id': file.unitId, 'data-material-id': file.materialId, 'aria-label': `文件：${file.name}` },
-    h('div', { className: 'dsh-tp-unit-header' }, h('span', { role: file.status === 'failed' || file.unknown ? 'alert' : 'status', className: 'dsh-tp-muted' }, `原文 · ${status}`),
+    h('div', { className: 'dsh-tp-unit-header' }, h('span', { role: file.status === 'failed' || file.unknown ? 'alert' : 'status', className: 'dsh-tp-muted' }, pdfStatus ?? `原文 · ${status}`),
       h('div', { className: 'dsh-tp-actions' },
-        ['failed', 'frozen'].includes(file.status) ? button('重新发送', () => { void materials.recoverFile(session.id, file.unitId, 'retry') }, file.busy || file.unknown) : null,
-        ['failed', 'frozen'].includes(file.status) ? button('移除', () => { void materials.recoverFile(session.id, file.unitId, 'remove') }, file.busy || file.unknown) : null,
+        pdf && canResume && file.status !== 'freezing' ? button(canRepair && progress?.next === null ? '补译缺页' : '继续翻译',
+          () => { void materials.resumePdf(session.id, file.materialId, ownerId) }, file.busy || file.querying || translating) : null,
+        !progress && ['failed', 'frozen'].includes(file.status) ? button('重新发送', () => { void materials.recoverFile(session.id, file.unitId, 'retry') }, file.busy || file.unknown) : null,
+        !progress && ['failed', 'frozen'].includes(file.status) ? button('移除', () => { void materials.recoverFile(session.id, file.unitId, 'remove') }, file.busy || file.unknown) : null,
+        delivery && (delivery.sections.length || delivery.supplements.length) ? button(pdfDeliveryComplete(delivery) ? '另存 Markdown' : '另存 Markdown 节选', () => { void savePdf() }) : null,
         file.unknown || file.status === 'frozen' ? button('检查状态', () => { void materials.queryFile(session.id, file.unitId) }, file.querying || file.status === 'freezing') : null,
-        button(opening ? '正在打开…' : '打开', () => { void open() }, opening))),
-    h('div', { className: 'dsh-tp-file-name' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: opening, 'aria-label': `打开原稿：${file.name}`, onClick: () => { void open() } }, file.name)),
+        h(FileOpenMenu, { label: `${file.name} 操作`, action: { disabled: opening, open: () => { void open('system') } } }))),
+    h('div', { className: 'dsh-tp-file-name' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: opening, 'aria-label': `打开原稿：${file.name}`, onClick: () => { void open('preview') } }, file.name)),
+    gaps.length ? h('details', { className: 'dsh-tp-muted' },
+      h('summary', null, `原 PDF 第 ${pdfPageNumbers(gaps.map(gap => gap.page))} 页待核对`),
+      ...gaps.map(gap => h('p', { key: gap.page }, `第 ${gap.page} 页 · ${gap.message}`))) : null,
     file.message ? h('p', { role: 'status', className: 'dsh-tp-muted' }, file.message) : null,
-    file.storagePending ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '原稿保存状态待核对，可打开原稿或检查状态。') : null,
     file.storage === 'runtime_only' && file.sourceFrozen && !file.storagePending ? h('p', { role: 'status', className: 'dsh-tp-muted' }, '此原稿仅保留在本次运行。') : null,
     file.storageError ? h('p', { role: 'status', className: 'dsh-tp-muted' }, file.storageError) : null,
     notice ? h('p', { role: 'status', className: 'dsh-tp-muted' }, notice) : null)
@@ -761,6 +843,9 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const [archives, setArchives] = react.useState(false)
   const [context, setContext] = react.useState<ContextRequest | undefined>(undefined)
   const [topicContext, setTopicContext] = react.useState<TopicContextRequest | undefined>(undefined)
+  const menuAnchor = react.useRef<MenuAnchor | undefined>(undefined)
+  menuAnchor.current ??= createMenuAnchor()
+  react.useEffect(() => () => { menuAnchor.current?.dispose(); menuAnchor.current = undefined }, [])
   const [dialog, setDialog] = react.useState<WorkspaceDialog | undefined>(undefined)
   const [deletion, setDeletion] = react.useState<DeleteRequest | undefined>(undefined)
   const [topicDeletionPreview, setTopicDeletionPreview] = react.useState<TopicDeletionPreview | undefined>(undefined)
@@ -830,7 +915,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       active: !['completed', 'failed', 'cancelled'].includes(record.summary.phase), createdAt: fileUnits.find(file => file.materialId === record.summary.materialId || file.unitId === record.summary.unitId)?.createdAt ?? record.summary.createdAt,
       view: h(FileJobView, { key: record.summary.unitId, unitNumber: units.find(unit => unit.id === record.summary.unitId)?.order, jobs: fileJobs, record, viewFiles, materials, recordIndex, onOpenAssets, ownerId }) })),
     ...fileUnits.filter(file => !fileJobs?.isUnitRemoved(current.id, file.unitId) && !fileJobRecords.some(record => record.summary.materialId === file.materialId || record.summary.unitId === file.unitId) && !units.some(unit => unit.id === file.unitId || unit.id === file.documentUnitId)).map(file => ({ id: `u:${file.unitId}`, events: [], active: false, createdAt: file.createdAt,
-      view: h(FileUnitView, { key: file.unitId, file, session: current, materials, viewFiles }) })),
+      view: h(FileUnitView, { key: file.unitId, file, session: current, store, materials, viewFiles, ownerId, translating: normal?.isBusy(current.id) ?? false }) })),
     ...transient.map(record => ({ id: `o:${record.id}`, events: record.text ? ['result'] : [], active: ['submitting', 'running', 'unknown'].includes(record.status), createdAt: record.createdAt, view: h(TranslationRecord, { key: record.id, record, quick, canRestore: !current.input }) })),
     ...sentTexts.map(material => ({ id: `m:${material.materialId}`, events: [], active: false, createdAt: material.createdAt, view: h('article', { key: material.materialId, className: 'dsh-tp-translation dsh-tp-source', 'data-material-id': material.materialId, 'aria-label': '已发送文本' },
       h('div', { className: 'dsh-tp-unit-header' },
@@ -982,13 +1067,19 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
     )
   }
   function renderComposer(session: LocalSession, batchInput?: unknown, batchButton?: unknown): unknown {
+    const pdfOutput = session.mode === 'normal' ? materials?.getPdfOutput(session.id) : undefined
     return h('div', { className: 'dsh-tp-composer' },
       session.mode === 'normal' && selectedFile ? h('div', null,
         h('div', { className: 'dsh-tp-attachment' },
           h('span', { className: 'dsh-tp-attachment-name', title: selectedFile.name }, selectedFile.name),
           h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => { materials?.setFileSelected(session.id, undefined) } }, '×'),
         ),
-        h('p', { className: 'dsh-tp-attachment-note' }, '原稿将按原始文件冻结并缓存；读取与输出形式由主模型按内容判断。'),
+        pdfOutput ? h('div', { className: 'dsh-tp-pdf-output', role: 'group', 'aria-label': 'PDF 译稿输出选项' },
+          h('label', null, h('input', { type: 'checkbox', checked: pdfOutput.combine,
+            onChange: (event: CheckEvent) => materials?.setPdfOutput(session.id, selectedFile, { combine: event.currentTarget.checked }) }), '译稿整合输出'),
+          h('label', null, h('input', { type: 'checkbox', checked: pdfOutput.combine && pdfOutput.keepFigures, disabled: !pdfOutput.combine,
+            onChange: (event: CheckEvent) => materials?.setPdfOutput(session.id, selectedFile, { keepFigures: event.currentTarget.checked }) }), '译稿保留图表'),
+        ) : null,
       ) : null,
       session.mode === 'normal' && longDraft ? h('div', null,
         h('div', { className: 'dsh-tp-attachment' },
@@ -1106,7 +1197,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       ) : null,
     ),
     context && target ? h(ContextSubmenus, { onCreate: () => create(target.id) }, h(Menu, { key: context.exportFormat ?? 'actions', open: true, anchor: null, onClose: () => { setContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup dsh-tp-context-popup dsh-tp-session-popup',
-      getAnchorRect: () => context.exportFormat ? { left: context.x, right: context.x, top: context.y, bottom: context.y, width: 0, height: 0 } : contextMenuAnchor(context.x, context.y, '.dsh-tp-session-popup'),
+      ...contextMenuAnchorProps(context.x, context.y, '.dsh-tp-session-popup', menuAnchor.current),
       items: context.exportFormat ? [] : [{ id: 'new', label: submenuLabel('new', '新建'), disabled: action.pending,
         submenu: newSessionChoices.map(item => ({ ...item, disabled: action.pending })) }],
       onSelect: (id: string) => { if (id === 'new-quick' || id === 'new-normal') create(target.id, id === 'new-quick' ? 'quick' : 'normal') },
@@ -1133,7 +1224,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       } }, '删除'),
     )))) : null,
     topicContext && topicTarget ? h(ContextSubmenus, { onCreate: () => createForTopic(topicTarget.id) }, h(Menu, { key: topicTarget.id, open: true, anchor: null, onClose: () => { setTopicContext(undefined); setSessionPickerOpen(false) }, portal: true, autoFocus: true, compact: true, listClassName: 'dsh-tp-popup dsh-tp-context-popup dsh-tp-topic-popup',
-      getAnchorRect: () => contextMenuAnchor(topicContext.x, topicContext.y, '.dsh-tp-topic-popup'),
+      ...contextMenuAnchorProps(topicContext.x, topicContext.y, '.dsh-tp-topic-popup', menuAnchor.current),
       items: [{ id: 'open', label: submenuLabel('open', '打开'), submenu: topicOpenable.length
         ? topicOpenable.map(session => ({ id: session.id, label: `${sessionDisplayName(session)}${session.id === current?.id ? '（当前）' : ''}` }))
         : [{ id: 'empty', label: '该主题暂无可打开的会话。', disabled: true }] },

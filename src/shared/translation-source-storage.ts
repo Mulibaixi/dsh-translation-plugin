@@ -1,4 +1,4 @@
-import { MAX_TRANSLATION_SOURCE_BYTES, parseSourceIdentity, parseTranslationSourceAsset, parseTranslationSourceScope,
+import { MAX_TRANSLATION_SOURCE_BYTES, parseOriginalFilePath, parseSourceIdentity, parseTranslationSourceAsset, parseTranslationSourceScope,
   type SourceIdentity, type TranslationSourceAsset, type TranslationSourceScope } from './translation-sources.js'
 import { sourceCodePointLength } from './translation-source-read.js'
 
@@ -30,6 +30,7 @@ export interface TranslationSourceStoredRead extends TranslationSourceQueryRefer
   readonly source: SourceIdentity
   readonly historyToken: string
 }
+export interface TranslationSourceOpenOriginal extends TranslationSourceStoredRead { readonly preview?: true }
 export interface TranslationSourceReleaseReference extends TranslationSourceQueryReference {
   readonly expectedVersion: number
   readonly operationId: string
@@ -60,13 +61,13 @@ export interface TranslationSourceStoragePort {
   confirmReference(request: TranslationSourceConfirmReference): Promise<TranslationSourceStorageResult<TranslationSourceReference>>
   queryReference(request: TranslationSourceQueryReference): Promise<TranslationSourceStorageResult<TranslationSourceReference>>
   restore(request: TranslationSourceStoredRead): Promise<TranslationSourceStorageResult<TranslationSourceRestored>>
-  openOriginal(request: TranslationSourceStoredRead, signal: AbortSignal): Promise<TranslationSourceStorageResult<{ readonly opened: true }>>
+  openOriginal(request: TranslationSourceOpenOriginal, signal: AbortSignal): Promise<TranslationSourceStorageResult<import('./view-files.js').ViewFileOpened>>
   releaseReference(request: TranslationSourceReleaseReference): Promise<TranslationSourceStorageResult<TranslationSourceReference>>
 }
 export const TRANSLATION_SOURCE_STORAGE_METHODS = ['storageCapabilities', 'prepareSave', 'confirmReference', 'queryReference', 'restore', 'openOriginal', 'releaseReference'] as const
 export type TranslationSourceStorageMethod = typeof TRANSLATION_SOURCE_STORAGE_METHODS[number]
 export type TranslationSourceStorageRequest = TranslationSourcePrepareSave | TranslationSourceConfirmReference | TranslationSourceQueryReference
-  | TranslationSourceStoredRead | TranslationSourceReleaseReference
+  | TranslationSourceOpenOriginal | TranslationSourceReleaseReference
 type Data = Record<string, unknown>
 function exact(value: unknown, required: readonly string[], optional: readonly string[] = []): asserts value is Data {
   if (!value || typeof value !== 'object' || Array.isArray(value) || required.some(key => !Object.hasOwn(value, key)) ||
@@ -84,7 +85,7 @@ function token(value: unknown): asserts value is string {
 export function parseTranslationSourceStorageRequest(method: Exclude<TranslationSourceStorageMethod, 'storageCapabilities'>, value: unknown): TranslationSourceStorageRequest {
   const extra = method === 'prepareSave' ? ['sourceRef', 'operationId'] : method === 'confirmReference' ? ['prepareToken', 'historyToken', 'operationId']
     : method === 'restore' || method === 'openOriginal' ? ['source', 'historyToken'] : method === 'releaseReference' ? ['expectedVersion', 'operationId'] : []
-  exact(value, ['scope', 'referenceKey', ...extra], ['namespaceId'])
+  exact(value, ['scope', 'referenceKey', ...extra], method === 'openOriginal' ? ['namespaceId', 'preview'] : ['namespaceId'])
   if (value.namespaceId !== undefined) text(value.namespaceId)
   const scope = parseTranslationSourceScope(value.scope); text(value.referenceKey)
   const base = { scope, referenceKey: value.referenceKey, ...(value.namespaceId === undefined ? {} : { namespaceId: value.namespaceId as string }) }
@@ -93,7 +94,11 @@ export function parseTranslationSourceStorageRequest(method: Exclude<Translation
     token(value.prepareToken); text(value.historyToken); text(value.operationId)
     return { ...base, prepareToken: value.prepareToken, historyToken: value.historyToken, operationId: value.operationId }
   }
-  if (method === 'restore' || method === 'openOriginal') { text(value.historyToken); return { ...base, source: parseSourceIdentity(value.source), historyToken: value.historyToken } }
+  if (method === 'restore' || method === 'openOriginal') {
+    text(value.historyToken)
+    if (value.preview !== undefined && value.preview !== true) throw new TypeError('Invalid source preview')
+    return { ...base, source: parseSourceIdentity(value.source), historyToken: value.historyToken, ...(value.preview === true ? { preview: true } : {}) }
+  }
   if (method === 'releaseReference') { version(value.expectedVersion); text(value.operationId); return { ...base, expectedVersion: value.expectedVersion, operationId: value.operationId } }
   return base
 }
@@ -129,7 +134,8 @@ export function parseTranslationSourceStorageResult(method: TranslationSourceSto
       parseTranslationSourceScope(value.value.scope); parseTranslationSourceAsset(value.value.source); text(value.value.referenceKey)
       if (value.value.referenceVersion !== 1 || value.value.storage !== 'saved' || value.value.state !== 'confirmed') throw new TypeError('Invalid restored source')
     } else if (method === 'openOriginal') {
-      exact(value.value, ['opened']); if (value.value.opened !== true) throw new TypeError('Invalid source open result')
+      if (value.value && typeof value.value === 'object' && Object.hasOwn(value.value, 'path')) { exact(value.value, ['path']); parseOriginalFilePath(value.value.path) }
+      else { exact(value.value, ['opened']); if (value.value.opened !== true) throw new TypeError('Invalid source open result') }
     } else {
       const reference = parseTranslationSourceReference(value.value)
       if (method === 'confirmReference' && reference.state !== 'confirmed' || method === 'releaseReference' && reference.state !== 'released') throw new TypeError('Invalid reference result state')

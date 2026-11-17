@@ -2,17 +2,18 @@ import { parseTranslationSourceStorageRequest, parseTranslationSourceStorageResu
   type TranslationSourceStorageResult } from './translation-source-storage.js'
 import { imageFileFormat, MAX_IMAGE_ORIGINAL_BYTES } from './image-translation.js'
 import { sourceCodePointLength } from './translation-source-read.js'
+import { parseOriginalFilePath } from './translation-sources.js'
 
 /** Saved-history proof grants read access only; it cannot admit material or mutate its source. */
 export interface LibrarySourceRequest {
   readonly stored: TranslationSourceStoredRead
   readonly namespaceId: string
   readonly prepareToken: string
-  readonly action: 'page' | 'verify' | 'open' | 'image'
+  readonly action: 'page' | 'verify' | 'open' | 'preview' | 'image'
   readonly range?: { readonly start: number; readonly end: number }
   readonly sha256?: string
 }
-export type LibrarySourceValue = { readonly kind: 'page'; readonly text: string } | { readonly kind: 'verified' } | { readonly kind: 'opened' } | { readonly kind: 'image'; readonly base64: string }
+export type LibrarySourceValue = { readonly kind: 'page'; readonly text: string } | { readonly kind: 'verified' } | { readonly kind: 'opened' } | { readonly kind: 'preview'; readonly path: string } | { readonly kind: 'image'; readonly base64: string }
 export interface LibrarySourcesPort {
   readLibrarySource(request: LibrarySourceRequest, signal?: AbortSignal): Promise<TranslationSourceStorageResult<LibrarySourceValue>>
 }
@@ -20,7 +21,7 @@ export function parseLibrarySourceRequest(raw: unknown): LibrarySourceRequest {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new TypeError('Invalid library source request')
   const value = raw as Record<string, unknown>, action = value.action
   const fields = ['stored', 'namespaceId', 'prepareToken', 'action', ...(action === 'page' || action === 'verify' ? ['range'] : []), ...(action === 'verify' ? ['sha256'] : [])]
-  if (!['page', 'verify', 'open', 'image'].includes(String(action)) || fields.length !== Object.keys(value).length || fields.some(key => !Object.hasOwn(value, key)) ||
+  if (!['page', 'verify', 'open', 'preview', 'image'].includes(String(action)) || fields.length !== Object.keys(value).length || fields.some(key => !Object.hasOwn(value, key)) ||
     typeof value.namespaceId !== 'string' || !value.namespaceId.trim() || value.namespaceId.length > 2048 || /[\u0000-\u001f\u007f]/u.test(value.namespaceId) ||
     typeof value.prepareToken !== 'string' || !/^source-prepare-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(value.prepareToken)) throw new TypeError('Invalid library source proof')
   const stored = parseTranslationSourceStorageRequest('restore', value.stored) as TranslationSourceStoredRead
@@ -40,6 +41,9 @@ export function parseLibrarySourceResult(raw: unknown): TranslationSourceStorage
   const result = value.value
   if (result.kind === 'page') {
     if (Object.keys(result).length !== 2 || typeof result.text !== 'string' || sourceCodePointLength(result.text) > 4000 || new TextEncoder().encode(result.text).byteLength > 32000) throw new TypeError('Invalid library source page')
+  } else if (result.kind === 'preview') {
+    if (Object.keys(result).length !== 2) throw new TypeError('Invalid library preview result')
+    parseOriginalFilePath(result.path)
   } else if (result.kind === 'image') {
     if (Object.keys(result).length !== 2 || typeof result.base64 !== 'string' || result.base64.length > Math.ceil(MAX_IMAGE_ORIGINAL_BYTES / 3) * 4) throw new TypeError('Invalid library image result')
   } else if (!['verified', 'opened'].includes(result.kind) || Object.keys(result).length !== 1) throw new TypeError('Invalid library source acknowledgment')

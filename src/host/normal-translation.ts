@@ -1,5 +1,6 @@
 import { parseTranslationLogRead, parseDirectTranslationLogRead, type TranslationLogRead, type TranslationLogPage } from '../shared/translation-log.js'
 import { SOURCE_LAYOUT_GUIDANCE } from '../shared/translation-call.js'
+import { isPdfFile, PDF_OBJECT_REFERENCE_GUIDANCE, pdfDeliveryComplete, pdfDeliveryName, pdfTranslationMarkdown, pdfUnitPages } from '../shared/pdf-source.js'
 import { translationTaskBoundary } from '../shared/translation-task.js'
 import { STYLE_SETTINGS_GUIDANCE } from '../shared/style-settings.js'
 import { historyContextRefs, type DirectHistoryRefs } from '../shared/direct-history-context.js'
@@ -43,6 +44,7 @@ import { artifactExtension, parseArtifactOpen, parseArtifactSave, type Translati
 import { DIRECT_REVIEW_NEXT_STEP, FILE_MEMORY_REVIEW_GUIDANCE, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
 import { resolveMarkdownImages } from './markdown-files.js'
 import { loadArtifactStorage, type ArtifactStorage } from './translation-delivery.js'
+import { writePdfExport } from './pdf-export.js'
 import { assetPriority } from '../memory/asset-priority.js'
 import type { ModelSelection } from '../shared/contracts.js'
 
@@ -118,6 +120,7 @@ export interface DirectTranslationView {
   /** Local stage durations for latency diagnosis; no user text is included. */
   readonly timing: { readonly prepareMs: number; readonly firstTextMs: number | null; readonly streamMs: number; readonly recordMs: number; readonly totalMs: number }
   readonly message?: string
+  readonly pdfOutput?: PdfOutputResult
   readonly resultRef?: { readonly operationId: string; readonly totalCodePoints: number; readonly tool: 'translation_read_result' }
   readonly contextUsage?: { readonly terms: number; readonly nearbyUnits: number; readonly revisionBaseId: string | null; readonly referenceStatus: string; readonly referenceFiles: number }
 }
@@ -139,6 +142,18 @@ export interface DirectContextQuestionView {
   readonly log: { readonly tool: 'translation_read_call_log'; readonly operationId: string; readonly callId: string; readonly start: 0 }
 }
 type DirectTranslationResult = DirectTranslationView | DirectContextQuestionView
+type PdfOutputResult = {
+  readonly path: string
+  readonly fileName: string
+  readonly format: 'md'
+  readonly complete: boolean
+  readonly sections: number
+  readonly supplements: number
+  readonly besideOriginal: boolean
+  readonly figures: number
+  readonly skippedFigures: number
+  readonly figuresUnavailable: boolean
+} | { readonly error: string }
 interface DirectEntry {
   readonly signature: string
   readonly promise: Promise<DirectTranslationResult>
@@ -689,6 +704,9 @@ export class NormalTranslationService {
       if (!delivered.ok) throw rejected(delivered.error.code, delivered.error.message, delivered.error.stage)
       if (delivered.value.material.unitReference || delivered.value.material.revises) throw rejected('unsupported_target', '已有单元的重译和原文修改尚未接入。', 'resolve_material')
       envelope = delivered.value
+      if (envelope.material.sourceRef && isPdfFile(envelope.material.sourceRef.name)) {
+        throw rejected('unsupported_input', '请先读取 PDF 并登记区段，再使用返回的单元目标翻译。', 'prepare')
+      }
       if (envelope.material.sourceText !== undefined) {
         if (request.range || request.body !== undefined) throw rejected('unsupported_input', '内联短文不接受原文范围或替换正文。', 'prepare')
         sourceText = envelope.material.sourceText
@@ -765,8 +783,12 @@ export class NormalTranslationService {
             preferred: entry.preferred, forbidden: entry.forbidden, userFixed: priority === 2, priority }
         }), ...draftTranslationTerms(request.draftTerms)],
         ...(contextRef ? { referenceContextRef: contextRef } : {}) }
+      const pdfUnit = request.target.kind === 'unit' && pdfUnitPages(request.target.unitId, material.materialId)
+      const instruction = pdfUnit ? [material.instruction,
+        'Preserve the registered Markdown math and equation numbers in place. Copy inline $...$ and display $$ blocks with their LaTeX unchanged, and retain original-page references for uncertain formulas. Translate the surrounding prose.',
+        PDF_OBJECT_REFERENCE_GUIDANCE].filter(Boolean).join('\n') : material.instruction
       const packet: NormalExecutionPacket = { operationId: internalId, callId, model, sourceText,
-        targetLanguage, instruction: material.instruction, context, mode: 'direct',
+        targetLanguage, instruction, context, mode: 'direct',
         ...(terms.historyContext ? { historyContext: terms.historyContext } : {}),
         ...(referenceContext ? { referenceContext, referenceContextCurrent: () => (this.ctx.get?.('translationReferences') as ReferenceFilesService).contextCurrent(referenceContext) } : {}) }
       const entry = this.direct.get(identity(request.target.mainSessionId, request.operationId))
@@ -838,6 +860,10 @@ export class NormalTranslationService {
         catch (error) { recordError = `译文已生成，但结果记录未确认：${error instanceof Error ? error.message : '请重新读取当前单元。'}` }
       }
       const recordDone = Date.now()
+      const pdfTarget = pdfUnit && status === 'completed' && receipt && exec.agent
+        ? this.materials?.pdfOutputTarget(material.materialId, sessionId, exec.agent)
+        : undefined
+      const pdfOutput = pdfTarget && await this.finishPdfOutput(pdfTarget, exec)
       return { ...this.directView(request, envelope, callId, status, text, points, metadata, receipt,
         [reason, recordError].filter(item => item !== undefined).join(' ') || undefined,
         { prepareMs: prepareDone - startedAt, firstTextMs: firstTextAt ? firstTextAt - startedAt : null,
@@ -847,7 +873,7 @@ export class NormalTranslationService {
             : range!.start === 0 && range!.end === material.sourceRef?.totalCodePoints ? `unit:${material.materialId}`
             : `unit:${material.materialId}:${range!.start}-${range!.end}`
           : `unit:${material.materialId}`,
-        status === 'completed' ? sourceAnnotationChecks(text, context.terms, sourceText) : []), contextUsage }
+        status === 'completed' ? sourceAnnotationChecks(text, context.terms, sourceText) : []), contextUsage, ...(pdfOutput ? { pdfOutput } : {}) }
     } catch (error) {
       const code = (error as { code?: unknown }).code
       if (typeof code === 'string' && code !== 'ABORT_ERR') throw error
@@ -1021,7 +1047,10 @@ export class NormalTranslationService {
       const overlapping = exported.overlapping.map(range => `[${range.start},${range.end})`).join('、')
       throw rejected('incomplete_result', `译文尚未覆盖完整原文，未保存产物。缺少：${missing}${overlapping ? `；重叠：${overlapping}` : ''}。`, 'export_result')
     }
-    const recorded = exported.segments.map(segment => segment.text).join('')
+    const recorded = exported.segments.map(segment => {
+      const pages = request.format === 'md' ? pdfUnitPages(segment.unitId) : undefined
+      return pages ? pdfTranslationMarkdown(segment.text, pages) : segment.text
+    }).join('')
     if (!recorded.trim()) throw rejected('empty_result', '当前译文为空，未保存产物。', 'export_result')
     const fileName = this.artifactName(request, target)
     let path: string, body: string
@@ -1039,6 +1068,57 @@ export class NormalTranslationService {
     return { path, fileName, format: request.format, bytes: new TextEncoder().encode(body).byteLength,
       codePoints: Array.from(body).length, revisionIds: exported.segments.map(segment => segment.revisionId),
       segments: exported.segments.length, checks }
+  }
+  async finishPdfOutput(target: NormalTranslationMaterialTarget, exec: ToolExecution): Promise<PdfOutputResult | undefined> {
+    try { return await this.savePdfArtifact(target, exec, true) }
+    catch (error) {
+      diagnosticSpan(this.ctx, 'translation.pdf_output', {}, target.requestId)('failed', {}, error)
+      return { error: '译文已保存在会话，整合译稿写入失败。可从 PDF 卡片另存。' }
+    }
+  }
+  async savePdfArtifact(target: NormalTranslationMaterialTarget, exec: ToolExecution, automatic = false) {
+    if (this.disposed || !this.topics?.ownsAgent(target.mainSessionId, exec.agent)) throw rejected('scope_mismatch', 'PDF 保存工具不属于此实际主 Agent。', 'authorize')
+    const original = this.materials?.deliveredForAgent(target, exec.agent!, { historical: true })
+    const material = original?.ok ? original.value.material : undefined
+    const source = material?.sourceRef
+    if (!source || source.encoding !== 'binary' || !isPdfFile(source.name)) throw rejected('source_unavailable', '无法取得此 PDF 原稿。', 'export_result')
+    if (automatic && !material.pdfOutput?.combine) return undefined
+    const plan = await this.topics.requestOwned(target.mainSessionId, { kind: 'pdf_delivery', target }, exec)
+    if (plan.kind !== 'pdf_delivery') throw rejected('invalid_reply', '无法读取 PDF 交付范围。', 'export_result')
+    const { delivery, translationSessionId } = plan
+    if (automatic && (!delivery.sections.length || !delivery.progress || delivery.progress.next || delivery.unfinished.length)) return undefined
+    if (!delivery.sections.length && !delivery.supplements.length) throw rejected('empty_result', 'PDF 暂无可保存的译文。', 'export_result')
+    const bodies: string[] = []
+    for (const section of delivery.sections) {
+      const pages = pdfUnitPages(section.unitId, target.materialId)
+      if (!pages || pages.firstPage !== section.firstPage || pages.lastPage !== section.lastPage) throw rejected('invalid_reply', '区段与 PDF 原件不一致。', 'export_result')
+      const pieces: string[] = []
+      let start: number | null = 0, total: number | undefined
+      while (start !== null) {
+        exec.signal.throwIfAborted()
+        const value = await this.topics.requestOwned(target.mainSessionId, { kind: 'read_history', translationSessionId, unitId: section.unitId,
+          side: 'translation', revisionId: section.revisionId, start }, exec)
+        if (value.kind !== 'history_text' || value.page.translationSessionId !== translationSessionId || value.page.unitId !== section.unitId ||
+          value.page.revisionId !== section.revisionId || value.page.side !== 'translation' || value.page.start !== start ||
+          total !== undefined && value.page.totalCodePoints !== total) throw rejected('invalid_reply', 'PDF 区段译文在读取期间变化。', 'export_result')
+        pieces.push(value.page.text)
+        total = value.page.totalCodePoints
+        start = value.page.nextStart
+      }
+      bodies.push(pieces.join(''))
+    }
+    const fileName = pdfDeliveryName(delivery), keepFigures = !!material.pdfOutput?.combine && material.pdfOutput.keepFigures
+    const graphics = keepFigures ? this.materials?.pdfBytes(target, exec.agent!) : undefined
+    let saved: Awaited<ReturnType<typeof writePdfExport>>
+    try {
+      exec.signal.throwIfAborted()
+      saved = await writePdfExport(await this.artifactStorage(), fileName, source, delivery, bodies, exec.signal, graphics?.ok ? graphics.value : undefined)
+    }
+    catch { exec.signal.throwIfAborted(); throw rejected('storage_failed', 'PDF 译稿写入失败。', 'save_artifact') }
+    this.savedArtifacts.set(`${target.mainSessionId}\u0000${saved.path}`, saved.path)
+    return { ...saved, fileName: saved.path.split(/[\\/]/u).at(-1) ?? fileName, format: 'md' as const,
+      complete: pdfDeliveryComplete(delivery), sections: delivery.sections.length, supplements: delivery.supplements.length,
+      figuresUnavailable: saved.figuresUnavailable || keepFigures && !graphics?.ok }
   }
   /** Open one artifact saved in this runtime; an arbitrary path is never accepted. */
   async openArtifact(input: unknown, exec: ToolExecution): Promise<{ readonly opened: true; readonly path: string }> {

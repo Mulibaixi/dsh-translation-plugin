@@ -27,6 +27,7 @@ import type { DocumentReviewClient } from './document-review-client.js'
 import { planDocumentTermSedimentation } from './document-term-sedimentation.js'
 import { NumberedUnits } from './numbered-units.js'
 import { HISTORY_TEXT_REPLY_BYTES } from '../shared/history-text.js'
+import { diagnosticSpan } from '../shared/diagnostics.js'
 
 const TOPIC_BRIDGE_RECONNECT_MS = 250
 
@@ -86,6 +87,10 @@ export interface DocumentTermSedimentResult {
 }
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
 interface NormalPort {
+  registerPdfSections: import('./normal-translation.js').NormalTranslationClient['registerPdfSections']
+  pdfStatus: import('./normal-translation.js').NormalTranslationClient['pdfStatus']
+  pdfDelivery: import('./normal-translation.js').NormalTranslationClient['pdfDelivery']
+  savePdfSupplement: import('./normal-translation.js').NormalTranslationClient['savePdfSupplement']
   updateImage(ownerId: string, request: import('../shared/image-translation.js').ImageUnitUpdate): boolean
   finishUnitCall(ownerId: string, operationId: string): void
   releaseUnitCalls(ownerId: string): void
@@ -268,14 +273,21 @@ export class TopicBridgeClient {
         if (!current()) return
         if (new TextEncoder().encode(JSON.stringify(reply)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) reply = error(frame.requestId, 'reply_too_large', '此资料超过桥接读取上限，未截断或发送。')
 
-        handle.send(parseTopicBridgeReply(reply, protocol))
+        try { reply = parseTopicBridgeReply(reply, protocol) }
+        catch (failure) {
+          diagnosticSpan({}, 'topic.bridge.client_reply', { protocol, command: frame.command.kind }, frame.callId)('failed', {}, failure)
+          reply = error(frame.requestId, 'invalid_reply', '主题管理回执未通过客户端校验。请先查询操作状态。')
+        }
+        handle.send(reply)
       }
       if (current()) throw new Error('主题管理连接已结束。')
     } catch (failure) {
       if (current()) {
         const code = failure && typeof failure === 'object' && 'code' in failure ? failure.code : undefined
         connection.ready = false
-        connection.reason = code === 'connection_occupied' ? '此主会话已由另一窗口连接；请在该窗口继续，或关闭该窗口后重试。' : '主题管理桥暂不可用；本地术语仍可查看。'
+        connection.reason = code === 'connection_occupied' ? '此主会话已由另一窗口连接；请在该窗口继续，或关闭该窗口后重试。'
+          : code === 'gateway/input-invalid' ? '主题管理回执未通过宿主校验。请完全退出 DSH 后重开，使 Host 和 Client 加载同一构建。'
+          : '主题管理桥暂不可用；本地术语仍可查看。'
         this.emit()
       }
     } finally {
@@ -473,6 +485,24 @@ export class TopicBridgeClient {
         : { kind: 'preparation_receipt', receipt: result.value as PreparationReceipt }
       if (new TextEncoder().encode(JSON.stringify(success(value))).byteLength > MAX_ANALYSIS_PAGE_BYTES) return error(request.requestId, 'reply_too_large', '完整准备回执超过 32768 字节，未截断字段。')
       return success(value)
+    }
+    if (command.kind === 'pdf_register') {
+      const receipt = this.normal?.registerPdfSections(ownerId, command, command.batch)
+      if (!receipt) return error(request.requestId, 'pdf_register_failed', '无法准备 PDF 译文。请核对当前原稿及会话进度。')
+      if ('oversized' in receipt) return error(request.requestId, 'pdf_source_too_large', `整理后的正文有 ${receipt.oversized} 码点，当前会话单次上限为 ${receipt.maxInputChars}。`)
+      return success({ kind: 'pdf_registered', ...receipt })
+    }
+    if (command.kind === 'pdf_status') {
+      const state = this.normal?.pdfStatus(ownerId, command.target)
+      return state ? success({ kind: 'pdf_status', ...state }) : error(request.requestId, 'out_of_scope', 'PDF 不在当前翻译会话。')
+    }
+    if (command.kind === 'pdf_delivery') {
+      const plan = this.normal?.pdfDelivery(ownerId, command.target)
+      return plan ? success({ kind: 'pdf_delivery', ...plan }) : error(request.requestId, 'out_of_scope', 'PDF 译文记录不在当前翻译会话。')
+    }
+    if (command.kind === 'pdf_supplement') {
+      return this.normal?.savePdfSupplement(ownerId, command.target, command.supplement) ? success({ kind: 'pdf_supplemented' })
+        : error(request.requestId, 'out_of_scope', 'PDF 补译无法保存到当前材料。')
     }
     if (command.kind === 'image_update') {
       const { kind: _kind, ...update } = command

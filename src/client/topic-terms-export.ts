@@ -1,4 +1,5 @@
 import type { TopicTermSnapshot, TermEvidenceRef } from '../memory/topic-terms.js'
+import type { TopicArchiveSnapshot } from '../memory/topic-archive.js'
 import type { HistoryStatus } from './session-store.js'
 
 export interface TopicTermsExport {
@@ -66,8 +67,9 @@ function referenceLines(ref: TermEvidenceRef): string[] {
   ]
 }
 
-export function buildTopicTermsMarkdownExport(input: TopicTermsExportSnapshot): TopicTermsExport {
+export function buildTopicTermsMarkdownExport(input: TopicTermsExportSnapshot, archive?: TopicArchiveSnapshot): TopicTermsExport {
   const { snapshot } = input
+  const entities = new Map(archive?.entries.flatMap(entry => entry.kind === 'entity' ? [[entry.id, entry.name] as const] : []))
   const lines = [
     `# ${md(input.topicName)} · 主题术语快照`, '',
     '仅导出现有术语档案，未触发自动提炼或整理。包含所有状态的条目及证据引用，不包含来源正文、主聊天或完整主题备份。', '',
@@ -90,6 +92,7 @@ export function buildTopicTermsMarkdownExport(input: TopicTermsExportSnapshot): 
       `- 义项：${md(entry.sense) || '未提供'}`,
       `- 别名：${entry.aliases.map(md).join('、') || '无'}`,
       `- 避免译法：${entry.forbidden.map(md).join('、') || '无'}`,
+      ...(entry.entityIds?.length ? [`- 关联实体：${entry.entityIds.map(id => md(entities.get(id) ?? id)).join('、')}`] : []),
       `- 创建：${md(entry.createdAt)}；更新：${md(entry.updatedAt)}`,
       entry.confirmation ? `- 用户确认：事件 ${md(entry.confirmation.eventId)}；时间 ${md(entry.confirmation.at)}；采用前条目版本 ${entry.confirmation.adoptedEntryVersion}` : '- 用户确认：无', '',
       '### 证据引用', '')

@@ -1,4 +1,4 @@
-import { assetPriority } from '../memory/asset-priority.js'
+import { isAdoptedAsset } from '../memory/asset-priority.js'
 import type { TopicTerm } from '../memory/topic-terms.js'
 
 export const assetStatusLabels = {
@@ -8,7 +8,7 @@ type AssetEntry = Pick<TopicTerm, 'status' | 'origin' | 'confirmation' | 'accept
 
 /** An entry can be effective before a user adopts it. */
 export function assetStatus(entry: AssetEntry): keyof typeof assetStatusLabels {
-  return entry.status === 'active' ? (assetPriority(entry) > 0 ? 'adopted' : 'proposal') : entry.status
+  return entry.status === 'active' ? (isAdoptedAsset(entry) ? 'adopted' : 'proposal') : entry.status
 }
 
 export function assetStatusText(entry: AssetEntry, status = assetStatus(entry)): string {

@@ -8,6 +8,7 @@ import { advanceDocumentFinal, createDocumentUnit, currentDocumentFinal, parseDo
 import type { DocumentRevision, DocumentUnit, DocumentTaskStatus } from '../shared/translation-batch.js'
 import { parseSourceIdentity, toSourceIdentity, type SourceIdentity } from '../shared/translation-sources.js'
 import { IMAGE_BACKGROUND_LIMIT, imageFileFormat } from '../shared/image-translation.js'
+import { isPdfFile, pdfUnitPages } from '../shared/pdf-source.js'
 export type { DocumentRevision, DocumentSourceVersion, DocumentSourceHistoryCommit, DocumentUnit } from '../shared/translation-batch.js'
 export type { DocumentMutation, NewDocumentUnit } from '../memory/document-task.js'
 
@@ -883,6 +884,22 @@ export function appendAdmittedFileUnit(history: TranslationHistory, envelope: Tr
   } else if (body ? length === 0 : length !== snapshot.sourceRef.totalCodePoints) throw new Error('File body length does not match the frozen original')
   if (!identity(operationId) || !time(at) || !text(sourceText, 2_000_000) || history.units.some(unit => unit.id === unitId) ||
     history.events.some(event => event.operationId === operationId)) throw new Error('Invalid or duplicate admitted file material')
+  const next = appendFileTextUnit(history, envelope, unitId, sourceText, at)
+  return appendTranslationEvent(next, { id: `text-event:${next.events.length + 1}`,
+    type: 'operation.accepted', mainSessionId: envelope.mainSessionId, at, unitId, revisionId: null, operationId, status: 'submitting', reason: null, sourceVersion: snapshot.sourceVersion })
+}
+
+export function appendPdfSectionUnit(history: TranslationHistory, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>,
+  unitId: string, source: string, at: string): TranslationHistory {
+  const original = envelope.material.sourceRef
+  if (original?.encoding !== 'binary' || !isPdfFile(original.name) || !pdfUnitPages(unitId, envelope.material.materialId) ||
+    !text(source, 2_000_000) || !time(at) || history.units.some(unit => unit.id === unitId)) throw new Error('Invalid or duplicate PDF section')
+  return appendFileTextUnit(history, envelope, unitId, source, at)
+}
+
+function appendFileTextUnit(history: TranslationHistory, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>,
+  unitId: string, sourceText: string, at: string): TranslationHistory {
+  const snapshot = envelope.material
   const unit: TextUnit = { kind: 'text', id: unitId, order: history.units.length + 1, source: sourceText, targetLanguage: snapshot.targetLanguage,
     instruction: snapshot.instruction, sourceVersion: snapshot.sourceVersion,
     sourceVersions: [{ version: snapshot.sourceVersion, text: sourceText, createdAt: at, operationId: envelope.operationId }],
@@ -890,8 +907,7 @@ export function appendAdmittedFileUnit(history: TranslationHistory, envelope: Tr
       model: snapshot.model, maxInputChars: snapshot.maxInputChars }, createdAt: at, revisions: [], final: null, deletion: null }
   const previous = history.units.at(-1)
   const next = previous ? advanceUnitFinal(history, previous, at) : history
-  return appendTranslationEvent({ ...next, schemaVersion: next.schemaVersion === 11 ? 12 : next.schemaVersion, units: [...next.units, unit] }, { id: `text-event:${next.events.length + 1}`,
-    type: 'operation.accepted', mainSessionId: envelope.mainSessionId, at, unitId, revisionId: null, operationId, status: 'submitting', reason: null, sourceVersion: snapshot.sourceVersion })
+  return { ...next, schemaVersion: next.schemaVersion === 11 ? 12 : next.schemaVersion, units: [...next.units, unit] }
 }
 /** Replace the unit's source while preserving its revision IDs and final selection. */
 export function appendSourceCorrection(history: TranslationHistory, unitId: string, data: { readonly operationId: string; readonly expectedVersion: number; readonly text: string; readonly reason: string; readonly at: string }): TranslationHistory {

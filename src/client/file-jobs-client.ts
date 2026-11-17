@@ -8,7 +8,7 @@ import type { SessionStore } from './session-store.js'
 import type { TranslationEvidenceReader } from './source-reader.js'
 import type { TopicMemoryStore } from './topic-memory-store.js'
 import type { TopicArchiveStore } from './topic-archive-store.js'
-import type { ViewFilesClient } from './view-files-client.js'
+import type { ViewFilesClient, ViewFileTarget } from './view-files-client.js'
 import type { MaterialSubmissionsClient } from './material-submissions.js'
 import { FileJobsStore, type FileJobCardState, type FileJobRecord, type FileJobTextVersion } from './file-jobs-store.js'
 import type { FileJobExportUnit } from './translation-export.js'
@@ -545,7 +545,8 @@ export class FileJobsClient implements TranslationEvidenceReader {
           try {
             const semantic = proposal.kind === 'entity' ? { kind: 'entity' as const, name: proposal.name, aliases: proposal.aliases, description: proposal.description }
               : proposal.kind === 'fact' ? { kind: 'fact' as const, title: proposal.title, body: proposal.body, entityIds: proposal.entityCandidateIds.map(resolve) }
-                : { kind: 'relation' as const, sourceEntityId: resolve(proposal.sourceEntityCandidateId), relation: proposal.relation, targetEntityId: resolve(proposal.targetEntityCandidateId), description: proposal.description }
+                : { kind: 'relation' as const, sourceEntityIds: [resolve(proposal.sourceEntityCandidateId)], relation: proposal.relation,
+                  targetEntityIds: [resolve(proposal.targetEntityCandidateId)], description: proposal.description }
             const existing = snapshot.entries.find(entry => entry.id === assetId)
             if (semantic.kind === 'entity' && existing?.kind === 'entity') semantic.aliases = [...new Set([...existing.aliases, ...(existing.name === semantic.name ? [] : [existing.name]), ...semantic.aliases])].filter(name => name !== semantic.name)
             const input: TopicArchivePut = { ...semantic, id: assetId, expectedEntryVersion: review.kind === 'update' ? review.entry.version : null, evidence, origin: proposal.origin, status: 'proposal' }
@@ -588,13 +589,13 @@ export class FileJobsClient implements TranslationEvidenceReader {
     const origin = this.all(record.summary.translationSessionId).find(item => item.summary.unitId === record.summary.unitId && item.summary.sourceVersion === result.sourceVersion && item.results.some(value => value.version === version && value.text === result.text))
     if (origin) this.records.put({ ...origin, final: { version, selection: 'user_fixed', selectedAt: new Date().toISOString() } })
   }
-  async open(jobId: string, side: 'source' | 'result', version: number, views: ViewFilesClient): Promise<void> {
+  async open(jobId: string, side: 'source' | 'result', version: number, views: ViewFilesClient, target: ViewFileTarget = 'system'): Promise<void> {
     await this.action(jobId, async raw => {
       const record = this.unitRecord(raw.summary.jobId) ?? raw
       const value = (side === 'source' ? record.sources : record.results).find(value => value.version === version)
       if (!value || value.deletion) throw new Error('所选固定版本尚未取得或已删除。')
       const outcome = await views.open({ namespaceId: this.sessions.getNamespaceId(), sessionId: record.summary.translationSessionId, unitId: record.summary.unitId,
-        kind: side, title: `${side === 'source' ? '原稿' : '译文'} · 版本 ${version}`, revisionId: `${side}:${record.summary.unitId}:${version}`, fileName: `${side === 'source' ? '原稿' : '译文'}-v${version}.txt`, format: 'txt', text: value.text })
+        kind: side, title: `${side === 'source' ? '原稿' : '译文'} · 版本 ${version}`, revisionId: `${side}:${record.summary.unitId}:${version}`, fileName: `${side === 'source' ? '原稿' : '译文'}-v${version}.txt`, format: 'txt', text: value.text }, undefined, target)
       if (!outcome.ok) throw new Error(outcome.message)
     })
   }

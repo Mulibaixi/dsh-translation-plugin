@@ -11,13 +11,16 @@ import { sourceCodePointLength } from '../shared/translation-source-read.js'
 import { isDirectPromptVersion, type NormalTranslationTerm } from '../shared/translation-call.js'
 import { assetPriority } from '../memory/asset-priority.js'
 import { languageMatches } from '../shared/language-tag.js'
+import { isPdfFile, isPdfRepairRange, pdfRepairablePages, pdfSectionId, pdfUnitPages, type PdfReadBatch, type PdfSectionRegistration, type PdfSupplement } from '../shared/pdf-source.js'
+import { appendPdfSectionUnit } from '../memory/translation-history.js'
+import { capturePdfDelivery } from './pdf-delivery.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import { emptyTopicTerms, type TopicTermSnapshot } from '../memory/topic-terms.js'
 import { isNormalExchangePromptVersion, isNormalTranslationPromptVersion, type TranslationCallMetadata } from '../shared/translation-call.js'
 import { parseRequestContextInput } from '../shared/request-context.js'
 import { parseNormalTranslationV2Event, parseNormalTranslationV2Job, type NormalTranslationResolution, type NormalTranslationV2Event, type NormalTranslationV2Job, type NormalTranslationV2Status } from '../shared/normal-translation-v2.js'
-import { appendAdmittedTextUnit, appendAdmittedFileUnit, appendTextRevision, appendReviewRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation,
+import { appendAdmittedTextUnit, appendAdmittedFileUnit, appendTextRevision, appendReviewRevision, updateTextRevision, appendTranslationEvent, appendSourceCorrection, acceptUnitRetranslation, currentFinalRevision,
   registerTranslationExchange, registerTranslationResolution, registerTranslationResume, recordTranslationExchangeStatus, bindTranslationExchangeId,
   recordTranslationResumeStarted, finishTranslationExchange, isTextUnit, revisionMatchesCurrentSource, currentResultRevision, finalizeCompletedUnit, finalizeExportedUnit } from './translation-history.js'
 import type { TranslationExchangeResolution } from './translation-history.js'
@@ -115,6 +118,84 @@ export class NormalTranslationClient {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private key(ownerId: string, operationId: string): string { return JSON.stringify([ownerId, operationId]) }
+
+  private pdfContext(ownerId: string, target: PdfSectionRegistration['target']) {
+    if (this.disposed || target.mainSessionId !== ownerId) return undefined
+    const envelope = this.materials.resolveSubmittedTarget(target), material = envelope?.material, session = material && this.store.getSession(material.translationSessionId)
+    if (!envelope || material?.sourceRef?.encoding !== 'binary' || !isPdfFile(material.sourceRef.name) || !session ||
+      !this.store.isSessionOpen(ownerId, session.id) || this.store.isSessionDeleted(session.id) || session.topicId !== material.topicId || this.store.getStatus(session.id) === 'conflict') return undefined
+    const record = this.materials.pdfRecord(session.id, target.materialId), history = this.store.getTranslationHistory(session.id)
+    if (!record || !history) return undefined
+    const units = history.units.filter(unit => isTextUnit(unit) && unit.material?.materialId === target.materialId && pdfUnitPages(unit.id, target.materialId))
+    const pageRanges = units.map(unit => pdfUnitPages(unit.id, target.materialId)!)
+    return { envelope, material, session, record, units, repairablePages: pdfRepairablePages(record.pdfProgress, pageRanges) }
+  }
+
+  pdfStatus(ownerId: string, target: PdfSectionRegistration['target']) {
+    const context = this.pdfContext(ownerId, target)
+    if (!context) return undefined
+    const { record, session, units, repairablePages } = context
+    const pending: NormalTranslationUnitTarget[] = units.flatMap(unit => isTextUnit(unit) && unit.sourceVersion && !unit.deletion && !currentFinalRevision(unit)
+      ? [{ kind: 'unit', mainSessionId: ownerId, translationSessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion }]
+      : [])
+    const first = units[0]
+    return { progress: record.pdfProgress ?? null, pending: pending.slice(0, 32), targetLanguage: first && isTextUnit(first) ? first.targetLanguage : null, repairablePages }
+  }
+
+  pdfDelivery(ownerId: string, target: PdfSectionRegistration['target']) {
+    const context = this.pdfContext(ownerId, target)
+    if (!context) return undefined
+    const file = this.materials.getFileUnits(context.session.id).find(item => item.materialId === target.materialId)
+    const history = this.store.getTranslationHistory(context.session.id)
+    if (!file || !history) return undefined
+    const { bodies: _bodies, totalSections: _total, ...delivery } = capturePdfDelivery(file, history)
+    return { translationSessionId: context.session.id, delivery }
+  }
+
+  savePdfSupplement(ownerId: string, target: PdfSectionRegistration['target'], supplement: PdfSupplement): boolean {
+    const context = this.pdfContext(ownerId, target)
+    if (!context || context.session.archivedAt !== null) return false
+    this.materials.savePdfSupplement(context.record, supplement)
+    return true
+  }
+
+  registerPdfSections(ownerId: string, registration: PdfSectionRegistration, batch: PdfReadBatch) {
+    const { target, targetLanguage, sections, read } = registration
+    const context = this.pdfContext(ownerId, target)
+    if (!context) return undefined
+    const { envelope, material, session, record, units, repairablePages } = context
+    const prior = record.pdfProgress
+    if (session.mode !== 'normal' || session.archivedAt !== null ||
+      batch.start.page !== read.start.page || batch.start.offset !== read.start.offset || prior && batch.totalPages !== prior.totalPages ||
+      sections.some(section => section.firstPage < batch.start.page || section.lastPage > batch.lastReadPage) ||
+      units.some(unit => isTextUnit(unit) && !languageMatches(unit.targetLanguage, targetLanguage))) return undefined
+    if (read.repair) {
+      if (!prior || batch.requested.firstPage !== batch.start.page || batch.lastReadPage !== read.endPage || batch.next !== null ||
+        !isPdfRepairRange(repairablePages, batch.start.page, batch.lastReadPage)) return undefined
+    } else {
+      const position = prior ? prior.next : { page: batch.requested.firstPage, offset: 0 }
+      if (!position || batch.start.page !== position.page || batch.start.offset !== position.offset ||
+        prior && (batch.requested.firstPage !== prior.requested.firstPage || batch.requested.lastPage !== prior.requested.lastPage) ||
+        !prior && units.length > 0) return undefined
+    }
+    const maxInputChars = Math.min(material.maxInputChars, session.maxInputChars)
+    const oversized = sections.map(section => sourceCodePointLength(section.text)).find(length => length > maxInputChars)
+    if (oversized !== undefined) return { oversized, maxInputChars }
+    const ids = sections.map((section, index) => pdfSectionId(material.materialId, section, units.length + index + 1))
+    const at = new Date().toISOString(), admission = { ...envelope, material: { ...material, targetLanguage } }
+    if (sections.length && !this.store.updateTranslationHistory(session.id, current => sections.reduce((next, section, index) =>
+      appendPdfSectionUnit(next, admission, ids[index]!, section.text, at), current))) return undefined
+    const gaps = new Map((prior?.gaps ?? []).map(gap => [gap.page, gap]))
+    if (read.repair) for (const page of gaps.keys()) if (batch.start.page <= page && page <= batch.lastReadPage) gaps.delete(page)
+    for (const gap of batch.gaps) gaps.set(gap.page, gap)
+    const latest = this.materials.pdfRecord(session.id, target.materialId) ?? record
+    const next = read.repair ? prior!.next : batch.next
+    this.materials.savePdfProgress(latest, { totalPages: batch.totalPages, requested: prior?.requested ?? batch.requested, next, gaps: [...gaps.values()] })
+    this.materials.consumeSubmittedMaterial(envelope)
+    this.emit()
+    const targets: NormalTranslationUnitTarget[] = ids.map(unitId => ({ kind: 'unit', mainSessionId: ownerId, translationSessionId: session.id, unitId, sourceVersion: 1 }))
+    return { targets, next }
+  }
 
   resolve(ownerId: string, input: { readonly target: DirectUnitTarget; readonly operationId: string }): NormalTranslationReply {
     const target = parseDirectTranslationTarget(input.target)
@@ -555,6 +636,7 @@ export class NormalTranslationClient {
     const history = this.store.getTranslationHistory(session.id)
     if (!history) return failure('history_unavailable', '当前会话没有可导出的译文历史。')
     const scoped = history.units.filter(isTextUnit).filter(unit => owns(unit.id))
+    if (target.kind === 'material' && scoped.some(unit => pdfUnitPages(unit.id, target.materialId))) return failure('unsupported_target', '请按 PDF 区段保存译文。')
     // A completed whole-file unit is the exact result; segments only matter when it is absent.
     const whole = scoped.filter(unit => unit.id === base)
     const units = target.kind === 'material' && whole.some(unit => currentResultRevision(unit)?.status === 'completed') ? whole : scoped
@@ -591,7 +673,8 @@ export class NormalTranslationClient {
       if (cursor < totalCodePoints) missing.push({ start: cursor, end: totalCodePoints })
       complete = missing.length === 0 && overlapping.length === 0
     } else complete = segments.some(segment => segment.range === null)
-    const originalFilePath = this.materials.getFileUnits(session.id).find(file => file.unitId === base || units.some(unit => unit.material?.materialId === file.materialId))?.sourceRef?.originalFilePath
+    const originalFilePath = units.some(unit => pdfUnitPages(unit.id, unit.material?.materialId)) ? undefined
+      : this.materials.getFileUnits(session.id).find(file => file.unitId === base || units.some(unit => unit.material?.materialId === file.materialId))?.sourceRef?.originalFilePath
     const value: TopicBridgeValue = { kind: 'normal_exported', export: { mainSessionId: ownerId, translationSessionId: session.id,
       topicId: session.topicId, materialId: target.kind === 'material' ? target.materialId : null,
       ...(target.sourceVersion === undefined ? {} : { sourceVersion: target.sourceVersion }),

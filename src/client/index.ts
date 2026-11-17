@@ -125,7 +125,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   }
   on(event: string, listener: () => void): Disposer
   readonly sidebarRightTabs: { register(definition: SidebarRightTabDefinition): Disposer }
-  readonly sidebarRight: MemoryAssetsSidebar
+  readonly sidebarRight: MemoryAssetsSidebar & { openResource?(address: string): void }
   readonly slots: {
     register(
       target: { readonly name: string; readonly key?: string; readonly id?: string; readonly order?: number; readonly label?: string },
@@ -318,7 +318,18 @@ export function apply(ctx: ClientPluginContext): void {
     const viewFiles = new ViewFilesClient(adaptViewFilesRemote(ctx.remote.$mount ? async () => {
       const unmountRemote = await mountedRemote
       return remoteDisposed || !unmountRemote ? undefined : ctx.get('remote.translationViews')
-    } : ctx.remote.translationViews), store, { sources, sourceStorage: storage, library: adaptLibrarySourcesRemote(sourcesRemote) })
+    } : ctx.remote.translationViews), store, { sources, sourceStorage: storage, library: adaptLibrarySourcesRemote(sourcesRemote),
+      getPreview: () => {
+        const sidebar = ctx.sidebarRight
+        const sessionId = sidebar.mounted?.getSnapshot()
+        if (!sessionId || !sidebar.openResource) return undefined
+        return path => {
+          if (sidebar.mounted.getSnapshot() !== sessionId) throw new Error('主会话已切换，请返回后重试。')
+          const encodedPath = path.replace(/\\/gu, '/').split('/').map(segment => encodeURIComponent(segment).replace(/%3A/giu, ':')).join('/')
+          sidebar.openResource!(`dsh-resource://file/session/${encodeURIComponent(sessionId)}/${encodedPath}`)
+        }
+      },
+    })
     const normal = new NormalTranslationClient(store, materials, terms, ownerId => topics.retain(ownerId), {
       isSessionBusy: sessionId => quick.isBusy(sessionId), subscribeBridge: listener => topics.subscribe(listener), bridgeReady: ownerId => topics.getStatus(ownerId).ready,
       uiLocale: () => activeUiLocale(ctx),

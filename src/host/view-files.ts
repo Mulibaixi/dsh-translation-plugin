@@ -1,4 +1,4 @@
-import { VIEW_FILES_REMOTE, parseViewFileRequest, type ViewFileClear, type ViewFileErrorCode, type ViewFileOpen, type ViewFileResult } from '../shared/view-files.js'
+import { VIEW_FILES_REMOTE, parseViewFileRequest, type ViewFileClear, type ViewFileErrorCode, type ViewFileOpen, type ViewFileOpened, type ViewFileResult } from '../shared/view-files.js'
 import type { QuickHostContext } from './quick-translation.js'
 import { sourceSha256 } from './source-storage.js'
 import { resolveMarkdownImages } from './markdown-files.js'
@@ -146,7 +146,7 @@ export class ViewFilesService {
     this.clearedSessions.add(JSON.stringify([scope.namespaceId, scope.sessionId]))
     return ![...this.writes.values()].some(value => value.namespaceId === scope.namespaceId && value.sessionId === scope.sessionId)
   }
-  async open(input: ViewFileOpen, signal: AbortSignal): Promise<ViewFileResult<{ readonly opened: true }>> {
+  async open(input: ViewFileOpen, signal: AbortSignal): Promise<ViewFileResult<ViewFileOpened>> {
     let request: ViewFileOpen
     try { request = parseViewFileRequest('open', input) as ViewFileOpen } catch { return bad('invalid_input', '打开文件参数无效或正文超过 16 MiB。') }
     if (!this.owns(request.namespaceId)) return bad('scope_mismatch', '打开文件不属于此主会话连接。')
@@ -157,7 +157,7 @@ export class ViewFilesService {
     if (sourceVersion !== undefined && Number.isSafeInteger(sourceVersion) && await history?.isFileSourceDeleted?.(request.namespaceId, request.sessionId, request.unitId, sourceVersion)) return bad('scope_mismatch', '此文件原稿已删除。')
     if (this.cleared(request.namespaceId, request.sessionId, request.unitId, request.revisionId) || await history?.isUnitDeleted(request.namespaceId, request.sessionId, request.unitId) || version !== undefined && Number.isSafeInteger(version) && await history?.isFileResultDeleted?.(request.namespaceId, request.sessionId, request.unitId, version)) return bad('scope_mismatch', '此单元或版本的打开文件已经清理。')
     const controller = this.ctx.get?.('sessionController') as Controller | undefined
-    if (typeof controller?.canOpenWorkspacePath !== 'function' || !controller.canOpenWorkspacePath() || typeof controller.openWorkspacePath !== 'function') return bad('unavailable', '当前宿主不支持打开本地文件。')
+    if (!request.preview && (typeof controller?.canOpenWorkspacePath !== 'function' || !controller.canOpenWorkspacePath() || typeof controller.openWorkspacePath !== 'function')) return bad('unavailable', '当前宿主不支持打开本地文件。')
     signal.throwIfAborted()
     let destination: string
     const writing = (async () => (await this.disk()).write(request, request.format === 'txt' || request.format === 'md'
@@ -170,7 +170,8 @@ export class ViewFilesService {
     } finally { this.writes.delete(writing) }
     signal.throwIfAborted()
     if (!this.owns(request.namespaceId) || this.cleared(request.namespaceId, request.sessionId, request.unitId, request.revisionId)) return bad('scope_mismatch', '打开文件时所属连接或会话已失效。')
-    try { await controller.openWorkspacePath({ path: destination }, signal) }
+    if (request.preview) return ok({ path: destination })
+    try { await controller!.openWorkspacePath({ path: destination }, signal) }
     catch { signal.throwIfAborted(); return bad('open_failed', '文件未能在系统默认应用中打开，请重试。') }
     signal.throwIfAborted()
     return ok({ opened: true })

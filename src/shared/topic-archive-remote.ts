@@ -1,6 +1,7 @@
-import { decodeTopicArchivePut, decodeTopicArchiveUserInput, type TopicArchiveSnapshot, type TopicArchivePut, type TopicArchiveUserPut, type ArchiveMutationResult } from '../memory/topic-archive.js'
+import { decodeTopicArchivePut, decodeTopicArchiveUserInput, type TopicArchiveKind, type TopicArchiveSnapshot, type TopicArchivePut, type TopicArchiveUserPut, type ArchiveMutationResult } from '../memory/topic-archive.js'
 import { termEvidenceKey, type TermEvidenceRef, type FileProposalAcceptance } from '../memory/topic-terms.js'
 import { referenceBytes, referenceExact, referenceInteger, referenceObject, referenceString } from './reference-memory.js'
+import { validateTopicAssetMove, type TopicAssetMove } from './topic-asset-move.js'
 
 export const ARCHIVE_TRANSFER_POINTS = 4000
 export const ARCHIVE_TRANSFER_BYTES = 196608
@@ -11,7 +12,9 @@ export type ArchiveCommand = { readonly kind: 'put'; readonly input: TopicArchiv
   | { readonly kind: 'accept_file_proposal' | 'revise_file_proposal'; readonly input: TopicArchivePut; readonly acceptance: FileProposalAcceptance }
   | { readonly kind: 'user_put'; readonly input: TopicArchiveUserPut }
   | { readonly kind: 'adopt' | 'disable' | 'delete'; readonly id: string; readonly expectedEntryVersion: number }
+  | { readonly kind: 'clear_unadopted'; readonly category: TopicArchiveKind }
   | { readonly kind: 'clear' | 'reconcile' }
+  | TopicAssetMove
 export interface ArchiveEvidenceState { readonly ref: TermEvidenceRef; readonly status: 'ready' | 'unloaded' | 'missing' }
 export interface ArchiveReadRequest extends ArchiveRemoteScope { readonly token: string; readonly layer: 'current' | 'saved'; readonly offset: number }
 export interface ArchiveReadPage { readonly text: string; readonly nextOffset: number | null }
@@ -37,24 +40,36 @@ export function parseArchiveScope(value: unknown): ArchiveRemoteScope {
 export function parseArchiveCommand(value: unknown): ArchiveCommand {
   referenceObject(value)
   if (value.kind === 'put' || value.kind === 'accept_file_proposal' || value.kind === 'revise_file_proposal') {
-    referenceExact(value, ['kind', 'input'], value.kind === 'put' ? [] : ['acceptance'])
-    if (!decodeTopicArchivePut(value.input)) throw new TypeError('Invalid archive input')
-    if (value.kind !== 'put') {
-      referenceObject(value.acceptance); referenceExact(value.acceptance, ['eventId', 'at', 'batchId', 'candidateId', 'edited'])
-      for (const field of ['eventId', 'at', 'batchId', 'candidateId']) referenceString(value.acceptance[field])
-      if (typeof value.acceptance.edited !== 'boolean' || !Number.isFinite(Date.parse(value.acceptance.at as string))) throw new TypeError('Invalid archive acceptance')
-    }
-  } else if (value.kind === 'user_put') { referenceExact(value, ['kind', 'input']); referenceObject(value.input); if (!decodeTopicArchiveUserInput(value.input) || value.input.id === null) throw new TypeError('Invalid user archive input') }
-  else if (value.kind === 'adopt' || value.kind === 'disable' || value.kind === 'delete') { referenceExact(value, ['kind', 'id', 'expectedEntryVersion']); referenceString(value.id); referenceInteger(value.expectedEntryVersion, 1) }
+    const kind = value.kind
+    referenceExact(value, ['kind', 'input'], kind === 'put' ? [] : ['acceptance'])
+    const input = decodeTopicArchivePut(value.input)
+    if (!input) throw new TypeError('Invalid archive input')
+    if (kind === 'put') return { kind, input }
+    referenceObject(value.acceptance); referenceExact(value.acceptance, ['eventId', 'at', 'batchId', 'candidateId', 'edited'])
+    for (const field of ['eventId', 'at', 'batchId', 'candidateId']) referenceString(value.acceptance[field])
+    if (typeof value.acceptance.edited !== 'boolean' || !Number.isFinite(Date.parse(value.acceptance.at as string))) throw new TypeError('Invalid archive acceptance')
+    return { kind, input, acceptance: structuredClone(value.acceptance) as unknown as FileProposalAcceptance }
+  } else if (value.kind === 'user_put') {
+    referenceExact(value, ['kind', 'input'])
+    const input = decodeTopicArchiveUserInput(value.input)
+    if (!input || input.id === null) throw new TypeError('Invalid user archive input')
+    return { kind: 'user_put', input: { ...input, id: input.id } }
+  } else if (value.kind === 'adopt' || value.kind === 'disable' || value.kind === 'delete') { referenceExact(value, ['kind', 'id', 'expectedEntryVersion']); referenceString(value.id); referenceInteger(value.expectedEntryVersion, 1) }
   else if (value.kind === 'clear' || value.kind === 'reconcile') referenceExact(value, ['kind'])
+  else if (value.kind === 'clear_unadopted') {
+    referenceExact(value, ['kind', 'category'])
+    if (value.category !== 'entity' && value.category !== 'fact' && value.category !== 'relation') throw new TypeError('Invalid archive category')
+  }
+  else if (value.kind === 'move') validateTopicAssetMove(value)
   else throw new TypeError('Invalid archive command')
   return structuredClone(value) as unknown as ArchiveCommand
 }
 type Method = keyof ArchiveRemotePort
 export function parseArchiveRemoteRequest(method: Method, value: unknown): unknown {
   referenceObject(value)
-  parseArchiveScope(value)
+  const archiveScope = parseArchiveScope(value)
   const scope = ['namespaceId', 'ownerId', 'topicId']
+  let parsed = value
   if (method === 'status') referenceExact(value, scope)
   else if (method === 'read') { referenceExact(value, [...scope, 'token', 'layer', 'offset']); referenceString(value.token); referenceInteger(value.offset); if (value.layer !== 'current' && value.layer !== 'saved') throw new TypeError('Invalid archive layer') }
   else if (method === 'persist') { referenceExact(value, [...scope, 'token']); referenceString(value.token) }
@@ -63,20 +78,22 @@ export function parseArchiveRemoteRequest(method: Method, value: unknown): unkno
     referenceExact(value, [...scope, 'transferId', ...(method === 'migratePart' ? ['layer', 'offset', 'text'] : [])]); referenceString(value.transferId)
     if (method === 'migratePart') { referenceInteger(value.offset); referenceString(value.text, ARCHIVE_TRANSFER_POINTS, true); if (!value.text.length || value.layer !== 'current' && value.layer !== 'saved') throw new TypeError('Invalid archive layer') }
   } else {
-    referenceExact(value, [...scope, 'token', 'command', 'evidence']); referenceString(value.token); parseArchiveCommand(value.command)
+    referenceExact(value, [...scope, 'token', 'command', 'evidence']); referenceString(value.token)
+    const command = parseArchiveCommand(value.command)
     if (!Array.isArray(value.evidence)) throw new TypeError('Invalid archive mutation')
     const keys = new Set<string>()
     for (const item of value.evidence) {
       referenceObject(item); referenceExact(item, ['ref', 'status'])
       // The domain decoder is the existing evidence boundary, including legacy source refs.
       if (!decodeTopicArchivePut({ kind: 'fact', id: 'validation', expectedEntryVersion: null, title: 'validation', body: 'validation', entityIds: [], evidence: [item.ref], origin: 'inferred', status: 'proposal' })) throw new TypeError('Invalid archive evidence')
-      const key = termEvidenceKey(parseArchiveScope(value), item.ref as TermEvidenceRef)
+      const key = termEvidenceKey(archiveScope, item.ref as TermEvidenceRef)
       if (keys.has(key) || !['ready', 'unloaded', 'missing'].includes(String(item.status))) throw new TypeError('Invalid archive evidence state')
       keys.add(key)
     }
+    parsed = { ...value, command }
   }
-  if (referenceBytes({ request: value }) > ARCHIVE_TRANSFER_BYTES) throw new RangeError('档案请求超过完整传输预算，未截断。')
-  return structuredClone(value)
+  if (referenceBytes({ request: parsed }) > ARCHIVE_TRANSFER_BYTES) throw new RangeError('档案请求超过完整传输预算，未截断。')
+  return structuredClone(parsed)
 }
 function head(value: unknown): void {
   if (value === null) return

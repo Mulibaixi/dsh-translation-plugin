@@ -16,7 +16,8 @@ import { buildTopicArchiveJsonExport, buildTopicArchiveMarkdownExport, type Topi
 import type { TopicArchiveStore } from './topic-archive-store.js'
 import { TopicArchiveView } from './topic-archive-view.js'
 import { resolveMemoryAssetsSelection } from './memory-assets-window.js'
-import { Menu, IconChevronDownOutlineRegular } from './native-ui.js'
+import { Menu, MenuItemButton, IconChevronDownOutlineRegular } from './native-ui.js'
+import { isAdoptedAsset } from '../memory/asset-priority.js'
 import type { RecordObjectsProps } from './record-object-view.js'
 
 /** One row of peer choices: the archive kind is picked directly instead of through a dropdown. */
@@ -99,36 +100,86 @@ export function MemoryAssetsView({ store, terms, archive, otherMemory, memoryInd
   )
 }
 
-function AssetAdoptionControl({ terms, archive, ownerId, topicId, kind, active, memoryIndex, adopting, onAdoptingChange }: {
+type AssetBatchAction = 'adopt' | 'clear'
+const batchLabels = { adopt: '正在采用…', clear: '正在清除…' } as const
+
+function AssetBatchControls({ terms, archive, ownerId, topicId, kind, active, memoryIndex, batch, onBatchChange }: {
   readonly terms: TopicTermsViewPort; readonly archive: TopicArchiveStore; readonly ownerId: string; readonly topicId: string
   readonly kind: TopicAssetKind; readonly active: boolean; readonly memoryIndex?: MemoryIndexClient | undefined
-  readonly adopting: boolean; readonly onAdoptingChange: (adopting: boolean) => void
+  readonly batch: AssetBatchAction | undefined; readonly onBatchChange: (action: AssetBatchAction | undefined) => void
 }): unknown {
   const assets = kind === 'terms' ? terms : archive
   const [, refresh] = react.useState(0), [notice, setNotice] = react.useState<string | undefined>(undefined)
+  const [clearPlan, setClearPlan] = react.useState<{ version: number; count: number } | undefined>(undefined)
+  const clearDialog = react.useRef<HTMLDialogElement | null>(null)
+  const showingClearDialog = active && clearPlan !== undefined
   const busy = react.useRef(false), alive = react.useRef(true)
   react.useEffect(() => assets.subscribe(() => refresh(value => value + 1)), [assets])
   react.useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
-  const state = assets.getReadState(ownerId, topicId), ready = state.status === 'ready' && !state.retired
-  const count = ready ? state.snapshot!.entries.filter(e => ['proposal', 'review_required'].includes(e.status) && (kind === 'terms' || ('kind' in e && e.kind === kind))).length : 0
-  async function adopt(): Promise<void> {
-    if (busy.current || !active || !ready || !count) return
-    busy.current = true; onAdoptingChange(true); setNotice(undefined)
+  react.useEffect(() => { if (!active) setClearPlan(undefined) }, [active])
+  react.useEffect(() => {
+    const dialog = clearDialog.current
+    if (!showingClearDialog || !dialog) return
+    dialog.showModal()
+    return () => dialog.close()
+  }, [showingClearDialog])
+  const state = assets.getReadState(ownerId, topicId), snapshot = state.status === 'ready' && !state.retired ? state.snapshot : undefined
+  const entries = snapshot?.entries.filter(e => kind === 'terms' || ('kind' in e && e.kind === kind)) ?? []
+  const count = entries.filter(e => e.status === 'proposal' || e.status === 'review_required').length
+  const clearCount = entries.filter(e => !isAdoptedAsset(e)).length
+  const categoryLabel = archiveKinds.find(option => option.value === kind)!.label
+  async function run(action: AssetBatchAction, execute: () => Promise<string>): Promise<void> {
+    if (busy.current || !active) return
+    busy.current = true; onBatchChange(action); setNotice(undefined)
     // A page switch may release its view, but must not evict a batch still being saved.
     const release = assets.retain(ownerId, topicId)
     try {
-      const result = await adoptTopicAssets(terms, archive, ownerId, topicId, kind)
-      if (alive.current) setNotice(`已采用 ${result.adopted} 条${result.remaining ? `，${result.remaining} 条仍待处理${kind === 'fact' || kind === 'relation' ? '，请核对条目及关联实体状态' : ''}` : ''}。`)
+      const message = await execute()
+      if (alive.current) setNotice(message)
       void memoryIndex?.refresh(topicId)
-    } catch (error) { if (alive.current) setNotice((error as Error).message) }
-    finally { release(); busy.current = false; if (alive.current) onAdoptingChange(false) }
+    } catch (error) { if (alive.current) setNotice(error instanceof Error ? error.message : '操作未完成，请重试。') }
+    finally { release(); busy.current = false; if (alive.current) onBatchChange(undefined) }
+  }
+  async function adopt(): Promise<string> {
+    const result = await adoptTopicAssets(terms, archive, ownerId, topicId, kind)
+    return `已采用 ${result.adopted} 条${result.remaining ? `，${result.remaining} 条仍待处理${kind === 'fact' || kind === 'relation' ? '，请核对条目及关联实体状态' : ''}` : ''}。`
+  }
+  function closeClearDialog(): void {
+    clearDialog.current?.close()
+    setClearPlan(undefined)
+  }
+  function confirmClear(): void {
+    if (!clearPlan) return
+    const { version, count } = clearPlan
+    closeClearDialog()
+    void run('clear', async () => {
+      const result = kind === 'terms' ? await terms.apply(ownerId, topicId, version, { kind: 'clear_unadopted' }) :
+        await archive.apply(ownerId, topicId, version, { kind: 'clear_unadopted', category: kind })
+      if (result.status === 'updated') return `已清除 ${count} 条未采用${categoryLabel}。`
+      if (result.status === 'stale') return '档案已变化，请核对后重新确认清除。'
+      return result.status === 'unchanged' ? '当前没有未采用的条目。' : '清除未完成，请核对档案后重试。'
+    })
   }
   if (!active) return null
-  return h('div', { className: 'dsh-tp-actions' },
-    h('button', { type: 'button', disabled: adopting || !ready || !count,
+  return h('div', null, h('div', { className: 'dsh-tp-actions' },
+    h('button', { type: 'button', disabled: !!batch || !count,
       title: '仅采用当前主题本类别的全部待确认和待复核条目，不受页内筛选影响；其他类别不变。事实和关系的关联实体须先采用。已停用和冲突条目保留。',
-      onClick: () => { void adopt() } }, adopting ? '正在采用…' : `一键采用${count ? `（${count}）` : ''}`),
-    notice ? h('span', { role: 'status', className: 'dsh-tp-message' }, notice) : null)
+      onClick: () => { void run('adopt', adopt) } }, batch === 'adopt' ? batchLabels.adopt : `一键采用${count ? `（${count}）` : ''}`),
+    h('button', { type: 'button', disabled: !!batch || !clearCount, 'aria-haspopup': 'dialog',
+      title: '清除当前主题本类别中所有尚未正常采用的条目，不受页内筛选影响。',
+      onClick: () => { if (snapshot) { setNotice(undefined); setClearPlan({ version: snapshot.version, count: clearCount }) } } },
+    batch === 'clear' ? batchLabels.clear : '清除未采用'),
+    notice ? h('span', { role: 'status', className: 'dsh-tp-message' }, notice) : null),
+    clearPlan ? h('dialog', { ref: clearDialog, className: 'dsh-tp-archive-confirm', role: 'alertdialog', 'aria-label': '清除未采用确认',
+      'aria-describedby': 'dsh-tp-archive-clear-description',
+      onCancel: (event: Event) => { event.preventDefault(); closeClearDialog() } },
+      h('h3', null, '清除未采用条目？'),
+      h('div', { id: 'dsh-tp-archive-clear-description' },
+        h('p', null, `将永久删除本主题 ${clearPlan.count} 条未采用${categoryLabel}。`),
+        kind === 'entity' ? h('p', { className: 'dsh-tp-muted' }, '引用这些实体的事实和关系可能转为待复核。') : null),
+      h('div', { className: 'dsh-tp-archive-confirm-actions' },
+        h('button', { type: 'button', onClick: closeClearDialog }, '取消'),
+        h('button', { type: 'button', className: 'dsh-tp-danger', 'aria-label': '确认清除未采用', disabled: !snapshot, onClick: confirmClear }, '确认清除'))) : null)
 }
 
 function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex, recordIndex, materials, normal, mainSessionId, quick, topics, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, memoryClearing, ownerId, topicId, topicName, onDeleteTerm, active, associatedSessionId, jobId, navigationRevision }: MemoryAssetsProps & {
@@ -143,8 +194,8 @@ function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex
   react.useEffect(() => fileJobs?.subscribe(() => refreshJobs(value => value + 1)), [fileJobs])
   react.useEffect(() => { if (jobId) setCategory('terms') }, [jobId, navigationRevision])
   const [kind, setKind] = react.useState<'terms' | 'entity' | 'fact' | 'relation'>('terms')
-  const [adopting, setAdopting] = react.useState<Partial<Record<TopicAssetKind, boolean>>>({})
-  const archiveAdopting = !!(adopting.entity || adopting.fact || adopting.relation)
+  const [batches, setBatches] = react.useState<Partial<Record<TopicAssetKind, AssetBatchAction | undefined>>>({})
+  const archiveBatch = batches.entity ?? batches.fact ?? batches.relation
   react.useEffect(() => {
     if (!active) return
     // The four pages share this topic window's lifetime, rather than evicting each other on tab changes.
@@ -152,10 +203,13 @@ function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex
     return () => { releaseTerms(); releaseArchive() }
   }, [terms, archive, ownerId, topicId, active])
   const [exportNotice, setExportNotice] = react.useState<{ message: string; failure: boolean } | undefined>(undefined)
+  const [exportOpen, setExportOpen] = react.useState(false)
+  react.useEffect(() => { if (!active || category !== 'terms') setExportOpen(false) }, [active, category])
   const exportFeedback = useExportDownloadFeedback(active && category === 'terms')
   const memoryClear = useThemeMemoryClearing({ clearing: memoryClearing, ownerId, topicId, visible: active && category === 'terms' })
   const evidenceContextKey = JSON.stringify([ownerId, topicId, associatedSessionId, navigationRevision])
   async function exportArchive(format: 'json' | 'markdown'): Promise<void> {
+    setExportOpen(false)
     exportFeedback.clear(); setExportNotice(undefined)
     try {
       const termState = terms.getReadState(ownerId, topicId)
@@ -201,23 +255,26 @@ function MemoryAssetsTopicView({ store, terms, archive, otherMemory, memoryIndex
                 h('div', { className: 'dsh-tp-segmented', role: 'radiogroup', 'aria-label': '档案类型' },
                   ...archiveKinds.map(option => h('button', { key: option.value, type: 'button', role: 'radio', 'aria-label': option.label,
                     'aria-checked': kind === option.value, onClick: () => setKind(option.value) }, option.label))),
-                h('div', { className: 'dsh-tp-actions' }, ...archiveKinds.map(option => h(AssetAdoptionControl, { key: option.value, terms, archive, ownerId, topicId, kind: option.value, active: active && category === 'terms' && kind === option.value, memoryIndex,
-                  adopting: !!adopting[option.value], onAdoptingChange: (value: boolean) => setAdopting(current => ({ ...current, [option.value]: value })) })),
+                h('div', { className: 'dsh-tp-actions' }, ...archiveKinds.map(option => h(AssetBatchControls, { key: option.value, terms, archive, ownerId, topicId, kind: option.value, active: active && category === 'terms' && kind === option.value, memoryIndex,
+                  batch: batches[option.value], onBatchChange: (action: AssetBatchAction | undefined) => setBatches(current => ({ ...current, [option.value]: action })) })),
                   memoryIndex ? h('button', { type: 'button', 'aria-expanded': indexOpen, onClick: () => setIndexOpen(value => !value) }, '语义索引') : null,
-                  h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('json') }, '导出 JSON'),
-                  h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', onClick: () => exportArchive('markdown') }, '导出 Markdown'), memoryClear.menu)),
+                  h(Menu, { open: active && category === 'terms' && exportOpen, onClose: () => setExportOpen(false), portal: true, align: 'end', compact: true, listClassName: 'dsh-tp-popup',
+                    anchor: h('button', { type: 'button', title: '导出当前主题全部档案，不受筛选影响。', 'aria-haspopup': 'menu', 'aria-expanded': exportOpen,
+                      onClick: () => setExportOpen(value => !value) }, '导出', h(IconChevronDownOutlineRegular, { size: 12 })) },
+                    h(MenuItemButton, { onSelect: () => { void exportArchive('json') } }, 'JSON'),
+                    h(MenuItemButton, { onSelect: () => { void exportArchive('markdown') } }, 'Markdown')), memoryClear.menu)),
               exportNotice ? h('p', { className: 'dsh-tp-message', role: exportNotice.failure ? 'alert' : 'status' }, exportNotice.message) : null,
               active && memoryIndex && indexOpen ? h(MemoryIndexView, { client: memoryIndex, topicId }) : null,
               memoryClear.feedback, memoryClear.dialog),
             h('div', { className: 'dsh-tp-assets-module', hidden: kind !== 'terms' },
-              h(TopicTermsView, { sessions: store, terms, ownerId, topicId, topicName, hideExport: true,
-                active: active && category === 'terms' && kind === 'terms', evidenceContextKey, adoptionPending: !!adopting.terms,
+              h(TopicTermsView, { sessions: store, terms, archive, ownerId, topicId, topicName, hideExport: true,
+                active: active && category === 'terms' && kind === 'terms', evidenceContextKey, batchStatus: batches.terms && batchLabels[batches.terms],
                 targetLanguage: associatedSessionId && store.getSession(associatedSessionId)?.topicId === topicId ? store.getSession(associatedSessionId)?.targetLanguage : undefined,
                 onDelete: onDeleteTerm, onExport: () => {}, bridgeReason: topics?.getStatus(ownerId).reason,
                 onReconnect: topics ? () => { void topics.reset(ownerId) } : undefined })),
             ...(['entity', 'fact', 'relation'] as const).map(type => h('div', { key: type, className: 'dsh-tp-assets-module', hidden: kind !== type },
               h(TopicArchiveView, { sessions: store, terms, archive, ownerId, topicId, kind: type,
-                active: active && category === 'terms' && kind === type, evidenceContextKey, adoptionPending: archiveAdopting }))))),
+                active: active && category === 'terms' && kind === type, evidenceContextKey, batchStatus: archiveBatch && batchLabels[archiveBatch] }))))),
         otherVisited ? h('div', { className: 'dsh-tp-assets-module dsh-tp-other-memory-module', hidden: category !== 'other' },
           otherMemory ? h(OtherMemoryView, { client: otherMemory, store, topicId, mainSessionId, active: active && category === 'other' }) : h('p', { className: 'dsh-tp-message', role: 'status' }, '其他记忆服务暂不可用。')) : null,
         h('div', { className: 'dsh-tp-assets-module', hidden: category !== 'translations' },

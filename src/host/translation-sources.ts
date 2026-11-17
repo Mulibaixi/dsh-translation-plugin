@@ -9,7 +9,7 @@ import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POI
 import type { QuickHostContext } from './quick-translation.js'
 import { uploadedFile, type NativeUpload } from './native-upload.js'
 import { TRANSLATION_SOURCE_STORAGE_REMOTE, parseTranslationSourceStorageRequest, type TranslationSourceConfirmReference,
-  type TranslationSourcePrepareSave, type TranslationSourceQueryReference, type TranslationSourceReference, type TranslationSourceReleaseReference,
+  type TranslationSourceOpenOriginal, type TranslationSourcePrepareSave, type TranslationSourceQueryReference, type TranslationSourceReference, type TranslationSourceReleaseReference,
   type TranslationSourceRestored, type TranslationSourceStorageCapability, type TranslationSourceStorageErrorCode,
   type TranslationSourceStorageResult, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
 import { loadTranslationSourceStorage, sourceSha256, type StoredSourceReference, type TranslationSourceHostOptions,
@@ -19,6 +19,8 @@ import { TRANSLATION_SOURCE_INTEGRITY_REMOTE, parseTranslationSourceRangeHash,
 
 interface Agent { readonly id: string; readonly session: { readonly id: string }; readonly ctx: unknown }
 import { imageFileFormat, matchesImageOriginal, MAX_IMAGE_ORIGINAL_BYTES } from '../shared/image-translation.js'
+import { isPdfFile, MAX_PDF_SOURCE_BYTES } from '../shared/pdf-source.js'
+import type { ViewFileOpened } from '../shared/view-files.js'
 
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
 interface Attachments {
@@ -196,10 +198,10 @@ export class TranslationSourcesService {
     if (typeof file.name !== 'string' || !file.name.trim() || file.name === '.' || file.name === '..' ||
       sourceCodePointLength(file.name) > 255 || /[\\/<>:"|?*\u0000-\u001f\u007f]/u.test(file.name)) return bad('invalid_input', '宿主返回的原件名称无效。', 'resolve_upload')
     if (!Number.isSafeInteger(file.bytes) || file.bytes < 0) return bad('integrity_failed', '上传原件字节元信息无效。', 'read_original')
-    const format = imageFileFormat(file.name)
+    const format = imageFileFormat(file.name), pdf = isPdfFile(file.name)
     const maxBytes = format ? Math.min(MAX_IMAGE_ORIGINAL_BYTES, attachments.imageLimits?.maxImageBytes ?? Infinity,
-      attachments.imageLimits?.maxMessageImageBytes ?? Infinity) : MAX_TRANSLATION_SOURCE_BYTES
-    const sizeError = format ? '原图超过宿主支持的图片字节上限，未导入。' : '原件超过 2 MiB 上限，未导入。'
+      attachments.imageLimits?.maxMessageImageBytes ?? Infinity) : pdf ? MAX_PDF_SOURCE_BYTES : MAX_TRANSLATION_SOURCE_BYTES
+    const sizeError = format ? '原图超过宿主支持的图片字节上限，未导入。' : pdf ? 'PDF 超过 20 MiB 上限，未导入。' : '原件超过 2 MiB 上限，未导入。'
     if (file.bytes > maxBytes) return bad('source_too_large', sizeError, 'read_original')
     const chunks: Uint8Array[] = []
     let count = 0
@@ -218,8 +220,8 @@ export class TranslationSourcesService {
     let offset = 0
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
     if (format && !matchesImageOriginal(format, bytes)) return bad('invalid_input', '原图内容与文件格式不一致，或使用了动态 WebP。', 'read_original')
-    let text = '', binary = !!format
-    if (!format) try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { binary = true }
+    let text = '', binary = !!format || pdf
+    if (!binary) try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) } catch { binary = true }
     if (!binary && !text) return bad('empty_source', '原件没有可读取的正文。', 'decode_text')
     const totalCodePoints = binary ? 0 : sourceCodePointLength(text)
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes.buffer))
@@ -278,6 +280,18 @@ export class TranslationSourcesService {
    */
   cachedOriginalPath(source: TranslationSourceAsset): string | undefined {
     try { return this.storageInstance?.originalPath(toSourceIdentity(source)) } catch { return undefined }
+  }
+  /** Give the parser a copy, because PDF.js may take ownership of its backing buffer. */
+  readPdfForAgent(scope: TranslationSourceScope, source: TranslationSourceAsset, peerId: string,
+    agent: Pick<Agent, 'id' | 'session'>): TranslationSourceResult<Uint8Array> {
+    if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', 'PDF 原稿不属于此实际主 Agent。', 'read_pdf')
+    const stored = this.sources.get(source.sourceId)?.scope
+    // A restored library reference is bound to the owner and peer, without retaining the old Agent object.
+    const namespaceId = stored?.mainSessionId === scope.mainSessionId && stored.ownerId === scope.ownerId ? stored.namespaceId : undefined
+    const found = this.referenceRecord(namespaceId ? { ...scope, namespaceId } : scope, source, peerId, agent)
+    if (!found.ok) return found
+    if (source.encoding !== 'binary' || !isPdfFile(source.name)) return bad('unsupported_file', '请选择 PDF 原稿。', 'read_pdf')
+    return { ok: true, value: found.value.bytes.slice() }
   }
   /** Batch targets are taken from authorized history and may outlive an imported runtime source. */
   async batchImagePath(scope: HistoryScope, source: import('../shared/translation-sources.js').SourceIdentity, peer: string): Promise<string> {
@@ -437,6 +451,7 @@ export class TranslationSourcesService {
       const history = this.ctx.get?.('translationHistory') as { sourceReferenceAvailable(reference: TranslationSourceStoredRead): Promise<boolean> } | undefined
       if (history && !await history.sourceReferenceAvailable({ ...request.stored, namespaceId: request.namespaceId })) return storageBad('reference_released', '原稿所属历史已删除。', 'read_library_source')
       if (!current() || JSON.stringify(latest?.reference) !== JSON.stringify(prior?.reference)) return storageBad('scope_mismatch', '共享原稿引用或连接已变化。', 'read_library_source')
+      if (request.action === 'preview') return ok({ kind: 'preview', path: storage.originalPath(request.stored.source) })
       if (request.action === 'open') {
         const controller = this.ctx.get?.('sessionController') as Controller | undefined
         if (!controller?.canOpenWorkspacePath?.()) return storageBad('unavailable', '宿主不支持在系统应用中打开原稿。', 'read_library_source')
@@ -486,24 +501,26 @@ export class TranslationSourcesService {
       return ok({ scope: request.scope, source, referenceKey: request.referenceKey, referenceVersion: reference.value.referenceVersion, storage: 'saved', state: 'confirmed' })
     })
   }
-  async openOriginal(input: TranslationSourceStoredRead, signal: AbortSignal): Promise<TranslationSourceStorageResult<{ readonly opened: true }>> {
-    let request: TranslationSourceStoredRead
-    try { request = parseTranslationSourceStorageRequest('openOriginal', input) as TranslationSourceStoredRead } catch { return storageBad('invalid_input', '原稿打开参数无效。', 'open_source_original') }
+  async openOriginal(input: TranslationSourceOpenOriginal, signal: AbortSignal): Promise<TranslationSourceStorageResult<ViewFileOpened>> {
+    let request: TranslationSourceOpenOriginal
+    try { request = parseTranslationSourceStorageRequest('openOriginal', input) as TranslationSourceOpenOriginal } catch { return storageBad('invalid_input', '原稿打开参数无效。', 'open_source_original') }
     signal.throwIfAborted()
     const peerId = this.ctx.invocation?.peer.id, authorized = await this.currentAgent(request.scope, peerId, request.namespaceId)
     signal.throwIfAborted()
     if (!authorized.ok) return authorized
     const { agent, generation } = authorized.value
-    return this.referenceTransaction(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, generation, async (storage, prior) => {
+    return this.referenceTransaction<ViewFileOpened>(request.scope, request.referenceKey, peerId!, agent, request.namespaceId, generation, async (storage, prior) => {
       const reference = this.confirmed(prior, request)
       if (!reference.ok) return reference
       const controller = this.ctx.get?.('sessionController') as Controller | undefined
-      if (!controller?.canOpenWorkspacePath?.() || typeof controller.openWorkspacePath !== 'function') return storageBad('unavailable', '当前宿主不支持在系统应用中打开原稿。', 'open_source_original')
+      if (!request.preview && (!controller?.canOpenWorkspacePath?.() || typeof controller.openWorkspacePath !== 'function')) return storageBad('unavailable', '当前宿主不支持在系统应用中打开原稿。', 'open_source_original')
       const content = await this.verifiedContent(storage, request, peerId!, agent, () => this.storageOwns(request.scope, peerId, agent, request.namespaceId))
       signal.throwIfAborted()
       if (!content.ok) return content
       if (!this.storageOwns(request.scope, peerId, agent, request.namespaceId)) return storageBad('scope_mismatch', '打开原稿时所属连接或 Agent 已失效。', 'open_source_original')
-      try { await controller.openWorkspacePath({ path: storage.originalPath(request.source) }, signal) }
+      const path = storage.originalPath(request.source)
+      if (request.preview) return ok({ path })
+      try { await controller!.openWorkspacePath({ path }, signal) }
       catch { signal.throwIfAborted(); return storageBad('open_failed', '原稿未能在系统应用中打开。', 'open_source_original') }
       signal.throwIfAborted()
       return ok({ opened: true })
