@@ -88,41 +88,27 @@ See the user guide for [backup and restoration](docs/user-guide.zh-CN.md#资料�
 
 ## Usage
 
-The [detailed user guide (简体中文)](docs/user-guide.zh-CN.md) covers topics and sessions, material submission, refinement and finals, file delivery, memory management, storage cleanup, and issue reports.
+For detailed instructions on topics and sessions, material submission, refinement and finalization, file delivery, memory management, storage cleanup, and issue reporting, see the [user guide (Simplified Chinese)](docs/user-guide.zh-CN.md).
 
-**Put sources in the translation input, and requirements or revision feedback in the main chat.** Use Normal mode to hand the source and current requirements to the main model for coordination.
+### Submitting sources and instructions
 
-**Discuss first, then decide what to change.** For example, ask “what other renderings would fit this word? Let's discuss first, without translating yet.” Once you choose a direction, say “use the second option and refine this unit in the tone we agreed on.” The main model passes the explicit feedback to the translation model, with the existing translation as the revision basis.
+In Normal mode, **put the source in the translation input and your current instructions or revision feedback in the main chat**. When you submit, the main model uses both to coordinate the translation.
 
-Before discussing an older translation, open its translation session in the current main chat so the main model can read the source and existing translation by exact unit and version.
+The **翻译要求 (Translation Requirements)** field in **翻译设置 (Translation Preferences)** is optional. It provides default requirements for each translation in a new session, so use it for broadly applicable instructions. Use **翻译设定 (Translation Settings)** to manage rules at the topic or user level.
 
-Select source text or a completed translation in the translation session and choose **引用文本 (Quote text)** to insert the excerpt and its version details into the main chat draft.
+### Discussing and quoting translations
 
-Session history saves automatically in the background. If saving fails, the workspace keeps the current content and offers **重试保存 (Retry saving)** without calling the translation model again.
+You can ask “What are some other ways to translate this word? Let's discuss it before translating,” then follow up with “Use the second option and refine this unit in the tone we agreed on.” The main model sends your explicit feedback to the translation model, which revises the existing translation.
 
-For withdrawn text, choose **清除 (Clear)** at the top right of its entry to remove the placeholder.
+Before discussing an existing translation, open its translation session in the current main chat so the main model can find the relevant unit and version. Select source text or a completed translation and choose **引用文本 (Quote text)** to add the excerpt and its version details to the main chat draft.
 
-When reading long text, the current source or translation heading and its controls stay at the top of the translation pane and follow the block being read. Collapsing the source positions the current translation heading at the top only when the source heading is already pinned there.
+### Managing memory assets
 
-Organize terminology, style requirements, and references as [memory assets (简体中文)](docs/user-guide.zh-CN.md#记忆资产) to support later discussion and translation. See the guide for entry adoption, reference-file segmentation, source indexing, and saving rules.
+Save terminology, style requirements, and references for later discussion and translation. For entry adoption, reference-file segmentation, source indexing, and saving rules, see [Memory assets (Simplified Chinese)](docs/user-guide.zh-CN.md#记忆资产).
 
-Link a term to entities in the same topic to give its preferred wording context, such as people, places, or organizations.
+When organizing candidates, file the names of people, places, and organizations under entities along with their translations. File established translations of specialized concepts under terminology. Keep each referent in one category. You can edit the entities linked to terms, facts, and relations to provide context.
 
-Press and hold a structured archive entry, then drag it to a new position within its category.
-In a relation entry, you can add multiple source and target entities. Right-click an additional selector to remove it.
-In a relation entry, you can add multiple source and target entities. Right-click an additional selector to remove it.
-
-You can explicitly ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
-
-In Structured Archives, clear unadopted entries in the current category, or use the Export menu to download all archives for the current topic as JSON or Markdown.
-
-In Structured Archives, clear unadopted entries in the current category, or use the Export menu to download all archives for the current topic as JSON or Markdown.
-
-For Normal text and file translation, you can specify the target language for the current submission or set up Chinese–English mutual translation in the session's Translation Requirements. Each submission follows the direction implied by its main source language and records the actual target language. Wording specified for the current task applies directly. Reusable candidates can be submitted for adoption after review.
-
-After reviewing a Normal plain-text translation, the main model can replace exact passages and save a Review Edit in the same unit. This step uses no translation model and preserves user-fixed finals.
-
-Names of people, places, and organizations go into entities with their renderings. Established renderings of specialized concepts go into terminology. Each referent belongs in one category.
+In **结构化档案 (Structured Archives)**, you can clear unadopted entries in the current category or use **导出 (Export)** to save all archives for the current topic as JSON or Markdown. You can also ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
 
 ## Current limitations and data
 

@@ -67,10 +67,10 @@
 
 将两个仓库并排放置，先按 Composer 扩展的说明完成其构建，再在本插件目录执行：
 
-   ```powershell
+```powershell
    pnpm install --frozen-lockfile
    pnpm build
-   ```
+```
 
 构建完成后，可在 DSH 插件管理器中安装本目录，或执行 `pnpm pack` 生成分发包。
 
@@ -88,37 +88,27 @@ Composer 只有实际需要替换宿主补丁时，才必须正常完全退出�
 
 ## 使用说明
 
-详细操作见[中文使用指南](docs/user-guide.zh-CN.md)，涵盖主题与会话、材料提交、润色定稿、文件交付、记忆管理、存储清理及问题反馈。
+主题与会话、材料提交、润色定稿、文件交付、记忆管理、存储清理和问题反馈的详细操作见[中文使用指南](docs/user-guide.zh-CN.md)。
 
-**翻译输入框放原稿，主聊天输入框放要求和修改意见。** 使用普通模式，将原稿与本次要求一起交给主模型组织处理。
+### 提交原稿与要求
 
-**可以先讨论，再决定怎样改。** 例如先说“这个词还有哪些译法？先讨论，暂不翻译”，确定方向后再说“采用第二种说法，按刚才商定的语气润色这一单元”。主模型将明确的修改要求递交给翻译模型，已有译文作为修订依据。
+普通模式下，**翻译输入框放原稿，主聊天输入框放本次要求和修改意见**。提交后，主模型结合原稿与要求组织翻译。
 
-讨论旧译文前，先在当前主聊天中打开对应翻译会话，让主模型按准确单元和版本查看原稿及已有译文。
+「翻译设置」中的「翻译要求」可以留空。填写后，它会成为新会话的默认要求，用于每轮翻译，适合记录普遍适用的规则。需要按主题或用户范围管理的规则，可记录为「翻译设定」。
 
-在翻译会话内划选原文或已完成译文，点击「引用文本」，即可将片段和版本出处插入主聊天草稿。
+### 讨论与引用
 
-会话历史由程序在后台自动保存。保存失败时，工作区保留当前内容并提供**重试保存**，无需重新调用翻译模型。
+可以先问“这个词还有哪些译法？先讨论，暂不翻译”，确定后再说“采用第二种说法，按刚才商定的语气润色这一单元”。主模型将明确的修改要求交给翻译模型，结合已有译文进行修订。
 
-已撤回文本可在单元右上角选择**清除**，移除该占位。
+讨论已有译文前，先在当前主聊天中打开对应的翻译会话，方便主模型按单元和版本查阅原稿与译文。划选原文或已完成的译文，点击「引用文本」，即可将片段与版本出处插入主聊天草稿。
 
-阅读长文本时，当前原文或译文的标题与操作行保持在翻译会话顶部，随阅读区块切换。仅当原文行已吸顶时，收起原文会自动定位到当前译文行。
+### 管理记忆资产
 
-术语、风格要求和参考资料可以整理为[记忆资产](docs/user-guide.zh-CN.md#记忆资产)，支持后续讨论与翻译。条目采用、参考文件分段、原文索引及具体保存规则见使用指南。
+术语、风格要求和参考资料可整理为记忆资产，供后续讨论与翻译使用。条目采用、参考文件分段、原文索引和保存规则见[记忆资产](docs/user-guide.zh-CN.md#记忆资产)。
 
-可在术语、事实和关系条目中编辑关联实体，为译法补充人物、地点或组织等语境。
+整理候选条目时，人物、地点、组织等专名及其译名归入实体，专业概念的固定译法归入术语，同一指代只归入一类。可在术语、事实和关系条目中编辑关联实体，补充人物、地点或组织等语境。
 
-在结构化档案中可批量清除当前类别的未采用条目，或通过「导出」菜单将当前主题的全部档案导出为 JSON 或 Markdown。
-
-在结构化档案中可批量清除当前类别的未采用条目，或通过「导出」菜单将当前主题的全部档案导出为 JSON 或 Markdown。
-
-你可以明确要求主模型删除指定的待确认或已停用术语、实体、事实和关系。
-
-普通文本和文件翻译可在当次指定目标语，也可在会话「翻译要求」中约定中英互译，按每份原文的主要语言确定方向。每个单元记录实际目标语。当次指定的译法可随本轮要求直接使用，需要长期保留的候选可在审阅后提交待确认。
-
-普通纯文本译文审阅后，主模型可精确替换需要改动的片段，保存为同一单元的「审阅修订」。这个步骤无需调用翻译模型，并保留用户固定的定稿。
-
-整理候选时，人物、地点、组织等专名及其译名归入实体，专业概念的固定译法归入术语。同一指代只归一类。
+在「结构化档案」中，可批量清除当前类别的未采用条目，或通过「导出」将当前主题的全部档案保存为 JSON 或 Markdown。也可以明确要求主模型删除指定的待确认或已停用术语、实体、事实和关系。
 
 ## 当前限制与数据
 
@@ -131,16 +121,16 @@ Composer 只有实际需要替换宿主补丁时，才必须正常完全退出�
 
 ## 项目与文档
 
-| 入口 | 链接 |
-| --- | --- |
-| 翻译插件 | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin) |
-| Composer 扩展 | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension) |
-| 分发包 | [翻译插件发行页](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer 发行页](https://github.com/Mulibaixi/dsh-composer-extension/releases) |
-| 插件市场 | [Awesome DSH Plugin](https://awesome-dsh-plugin.com/?q=Mulibaixi%2Fdsh-translation-plugin) · [dsh-plugin.org](https://dsh-plugin.org/plugins/mulibaixi/dsh-translation-plugin) |
-| 问题反馈 | [翻译插件 Issues](https://github.com/Mulibaixi/dsh-translation-plugin/issues) |
-| 中文使用指南 | [详细操作与问题反馈](docs/user-guide.zh-CN.md) |
-| 更新记录 | [CHANGELOG](CHANGELOG.md) |
-| 贡献指南 | [CONTRIBUTING](CONTRIBUTING.md) |
+| 入口          | 链接                                                                                                                                                                          |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 翻译插件      | [Mulibaixi/dsh-translation-plugin](https://github.com/Mulibaixi/dsh-translation-plugin)                                                                                        |
+| Composer 扩展 | [Mulibaixi/dsh-composer-extension](https://github.com/Mulibaixi/dsh-composer-extension)                                                                                        |
+| 分发包        | [翻译插件发行页](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer 发行页](https://github.com/Mulibaixi/dsh-composer-extension/releases)               |
+| 插件市场      | [Awesome DSH Plugin](https://awesome-dsh-plugin.com/?q=Mulibaixi%2Fdsh-translation-plugin) · [dsh-plugin.org](https://dsh-plugin.org/plugins/mulibaixi/dsh-translation-plugin) |
+| 问题反馈      | [翻译插件 Issues](https://github.com/Mulibaixi/dsh-translation-plugin/issues)                                                                                                  |
+| 中文使用指南  | [详细操作与问题反馈](docs/user-guide.zh-CN.md)                                                                                                                                 |
+| 更新记录      | [CHANGELOG](CHANGELOG.md)                                                                                                                                                      |
+| 贡献指南      | [CONTRIBUTING](CONTRIBUTING.md)                                                                                                                                                |
 
 ## 贡献与许可证
 
