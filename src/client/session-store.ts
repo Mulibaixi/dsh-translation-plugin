@@ -839,7 +839,7 @@ export class SessionStore {
     const id = reserved?.id ?? this.freshId()
     const sequence = reserved?.sequence ?? topic?.identity.nextSequence ?? 0
     if (!Number.isSafeInteger(sequence + 1)) throw new Error('sequence exhausted')
-    const settings = parent ? { ...this.settings, defaultMode: parent.mode, targetLanguage: parent.targetLanguage, defaultInstruction: parent.instruction, maxInputChars: parent.maxInputChars } : this.settings
+    const settings = parent ? { defaultMode: parent.mode, targetLanguage: parent.targetLanguage } : this.settings
     const initial = newSession(initialMode ? { ...settings, defaultMode: initialMode } : settings, ownerId, id, topic?.name ?? '新翻译会话', parent?.id ?? null, topic?.identity.id, topic?.identity.sequenceNamespaceId, sequence)
     const model = parent ? parent.model : this.lastModels.has(this.namespaceId) ? this.lastModels.get(this.namespaceId)! : this.readModelPreference(ownerModelKey(this.namespaceId)) ?? null
     const session = { ...initial, model: model ? { ...model } : null }
@@ -1190,7 +1190,7 @@ export class SessionStore {
       return this.finishManagedSession(seat)
     })
   }
-  updateSession(id: string, patch: Partial<Pick<LocalSession, 'mode' | 'targetLanguage' | 'input' | 'instruction' | 'model' | 'maxInputChars' | 'remark'>>): boolean {
+  updateSession(id: string, patch: Partial<Pick<LocalSession, 'mode' | 'targetLanguage' | 'input' | 'model' | 'remark'>>): boolean {
     const seat = this.seats.get(id)
     if (!seat) return false
     if (this.unloadedHistory.has(id) && Object.keys(patch).some(field => field !== 'remark')) { void this.ensureSessionHistory(id); return false }

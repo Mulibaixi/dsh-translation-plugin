@@ -177,7 +177,7 @@ export class DocumentPlanner {
     if (item.mode === 'copy') return { budget: { chunkId: item.chunkId, mode: 'copy', outputCodePoints: item.outputRange.end - item.outputRange.start,
       inputTokens: 0, countKind: 'estimated', outputReservationTokens: 0, contextWindow: capacity.contextWindow, maxOutputTokens: capacity.maxOutputTokens, contextRef }, prompt: null }
     const outputCodePoints = item.outputRange.end - item.outputRange.start
-    if (outputCodePoints > maximum) throw reject('single_input_limit', `块 ${item.chunkId} 的待译正文 ${outputCodePoints} 码点超过会话单次上限 ${maximum}；上下文不计入正文上限。`)
+    if (outputCodePoints > maximum) throw reject('single_input_limit', `块 ${item.chunkId} 的待译正文 ${outputCodePoints} 码点超过单次上限 ${maximum}；上下文不计入正文上限。`)
     const contexts = contextRanges(preparation, item), relevance = [item.outputRange, ...contexts]
     const termRefs = preparation.terms.filter(term => term.ranges.some(range => relevance.some(part => overlap(range, part)))).map(term => term.ref)
     if (termRefs.length > 100) throw reject('term_range_budget', `块 ${item.chunkId} 的实际相关术语超过 100 项，请细分需译范围或调整准备适用范围。`)

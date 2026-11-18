@@ -59,7 +59,7 @@ DSH `0.2.2-rc.1` is supported. Normal mode on this host requires Composer `0.4.7
 
 ### Install
 
-1. For Normal mode, install Composer **0.4.7** first from its [Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases/latest). Quick mode does not require Composer.
+1. For Normal mode, first install a Composer build containing the patch for your DSH host. For Quick mode, install the translation plugin directly. [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases/latest)
 2. Download `dsh-translation-plugin-<version>.tgz` from this plugin's [Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases/latest). Enter its full local path or the asset's download URL in DSH's plugin manager, then install and enable it. Choose the `.tgz` asset; distribution packages include the build output and need no local build.
 3. Open **翻译 (Translation)** in the main chat's right sidebar and create a topic and session. Restart when requested by the plugin manager. If Composer reports a prepared patch, exit DSH completely and reopen it before using Normal mode.
 
@@ -94,7 +94,7 @@ For detailed instructions on topics and sessions, material submission, refinemen
 
 In Normal mode, **put the source in the translation input and your current instructions or revision feedback in the main chat**. When you submit, the main model uses both to coordinate the translation.
 
-The **翻译要求 (Translation Requirements)** field in **翻译设置 (Translation Preferences)** is optional. It provides default requirements for each translation in a new session, so use it for broadly applicable instructions. Use **翻译设定 (Translation Settings)** to manage rules at the topic or user level.
+Use **翻译设置 (Translation Preferences)** to set the default mode and target language for new sessions. **翻译要求 (Translation Requirements)** and **单次上限 (Per-translation limit)** are global and apply to future translations and retranslations in all sessions. The requirements field is optional. Use **翻译设定 (Translation Settings)** to manage rules at the topic or user level.
 
 ### Discussing and quoting translations
 
@@ -113,7 +113,8 @@ In **结构化档案 (Structured Archives)**, you can clear unadopted entries in
 ## Current limitations and data
 
 - **Context questions**: Translation models with tool support can ask focused questions during Normal translation. The main model answers from available context or asks you, then starts a new translation call. Each call has its own usage; question references remain valid only during the current host run. The selected provider and model must support tool calls; a rejected tool declaration is reported without silently retrying as a translation.
-- **PDF and other formats**. Text-layer PDFs default to full-document translation, with an optional page range. When the text exceeds the translation budget, the main model asks before splitting it. Your choice carries over when you resume the same PDF. **译稿整合输出 (Combine translations)** is on by default and saves one Markdown file in original page order, preferably beside the original PDF. **译稿保留图表 (Keep figures and tables)** is off by default and embeds originals when their boundaries can be identified. Other figures and tables retain original page references. Verifiable equations use Markdown LaTeX. Translating a specified figure or table requires an image-capable model and native DSH subagent support. Mixed PDFs also offer **翻译扫描页 (Translate scanned pages)**, off by default. Image-only PDFs deliver page-level translations in the Session. Combined delivery for these files is planned. For formats such as DOCX, the main model works with the tools available to it.
+- **PDF**. Text-layer PDFs default to full-document translation, with an optional page range. When the text exceeds the translation budget, the main model asks before splitting it. Your choice carries over when you resume the same PDF. **译稿整合输出 (Combine translations)** is on by default and saves one Markdown file in original page order, preferably beside the original PDF. **译稿保留图表 (Keep figures and tables)** is off by default and embeds originals when their boundaries can be identified. Other figures and tables retain original page references. Verifiable equations use Markdown LaTeX. Translating a specified figure or table requires an image-capable model and native DSH subagent support. Mixed PDFs also offer **翻译扫描页 (Translate scanned pages)**, off by default. Image-only PDFs deliver page-level translations in the Session. Combined delivery for these files is planned.
+- **Other source formats**. The main model extracts the text with available tools and delivers the result in the Normal translation Session. Markdown is the default when you request a standalone export without specifying a format. If the main model cannot read the requested scope in full, it explains what is missing and asks how to proceed. It needs your approval to install or enable a dedicated parser.
 - **Translation efficiency**: some optimizations have been made, but final completion time is affected by the models and material.
 - **Semantic indexing**: enabling it sends relevant text to the configured embedding service.
 - Restart does not automatically resume model tasks; check the original task when its outcome is unknown. Exports do not replace a complete backup and cannot currently be imported for restoration.

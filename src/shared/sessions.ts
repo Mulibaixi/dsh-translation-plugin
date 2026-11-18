@@ -6,6 +6,7 @@ export interface SessionSettings {
   readonly schemaVersion: 2
   readonly defaultMode: Mode
   readonly targetLanguage: string
+  /** Stored under this name for compatibility with existing plugin settings. */
   readonly defaultInstruction: string
   readonly maxInputChars: number
 }
@@ -15,7 +16,7 @@ export interface ModelRoute {
   readonly reasoningEffort?: string
 }
 export interface LocalSession {
-  readonly schemaVersion: 4
+  readonly schemaVersion: 5
   readonly id: string
   readonly topicId: string
   readonly sequenceNamespaceId: string
@@ -31,8 +32,6 @@ export interface LocalSession {
   readonly archivedAt: string | null
   readonly mode: Mode
   readonly targetLanguage: string
-  readonly instruction: string
-  readonly maxInputChars: number
   readonly model: ModelRoute | null
   readonly input: string
   readonly legacyManualText: string
@@ -103,29 +102,30 @@ export function decodeRoute(value: unknown): ModelRoute | null | undefined {
 }
 
 export function decodeSession(value: unknown): LocalSession | undefined {
-  const keys = ['schemaVersion', 'id', 'name', 'parentId', 'childSequence', 'createdAt', 'updatedAt', 'mode', 'targetLanguage', 'instruction', 'maxInputChars', 'model', 'input', 'legacyManualText', 'legacyKey']
-  if (!record(value) || ![2, 3, 4].includes(value.schemaVersion as number)) return undefined
-  const base = value.schemaVersion === 4 ? keys : [...keys, 'ownerId']
+  const keys = ['schemaVersion', 'id', 'name', 'parentId', 'childSequence', 'createdAt', 'updatedAt', 'mode', 'targetLanguage', 'model', 'input', 'legacyManualText', 'legacyKey']
+  if (!record(value) || ![2, 3, 4, 5].includes(value.schemaVersion as number)) return undefined
+  const hasLegacyOwner = value.schemaVersion === 2 || value.schemaVersion === 3
+  const base = [...keys, ...(value.schemaVersion === 5 ? [] : ['instruction', 'maxInputChars']), ...(hasLegacyOwner ? ['ownerId'] : [])]
   const expected = value.schemaVersion !== 2 ? [...base, 'archivedAt', 'topicId', 'sequenceNamespaceId', 'topicName', 'sequence', 'remark', 'legacyName'] : Object.hasOwn(value, 'archivedAt') ? [...base, 'archivedAt'] : base
   if (!exact(value, expected)) return undefined
-  if (!text(value.id, 2048, true) || (value.schemaVersion !== 4 && !text(value.ownerId, 1000, true)) || !text(value.name, value.schemaVersion !== 2 ? 150 : 120, true)) return undefined
+  if (!text(value.id, 2048, true) || hasLegacyOwner && !text(value.ownerId, 1000, true) || !text(value.name, value.schemaVersion !== 2 ? 150 : 120, true)) return undefined
   if (!(value.parentId === null || text(value.parentId, 2048, true)) || !Number.isSafeInteger(value.childSequence) || (value.childSequence as number) < 0) return undefined
   if (!text(value.createdAt, 40, true) || !Number.isFinite(Date.parse(value.createdAt)) || !text(value.updatedAt, 40, true) || !Number.isFinite(Date.parse(value.updatedAt))) return undefined
   if (!(value.archivedAt === undefined || value.archivedAt === null || (text(value.archivedAt, 40, true) && Number.isFinite(Date.parse(value.archivedAt))))) return undefined
-  if (!mode(value.mode) || !text(value.targetLanguage, 80) || !text(value.instruction, 4000) || !limit(value.maxInputChars)) return undefined
+  if (!mode(value.mode) || !text(value.targetLanguage, 80)) return undefined
   const route = decodeRoute(value.model)
   if (route === undefined || !text(value.input, value.mode === 'normal' ? MAX_TRANSLATION_SOURCE_BYTES : 200000) || !text(value.legacyManualText, 200000)) return undefined
   if (!(value.legacyKey === null || (text(value.legacyKey, 2000) && value.legacyKey.startsWith(LEGACY_DRAFT_PREFIX)))) return undefined
-  const { ownerId: _legacyOwner, ...content } = value
+  const { ownerId: _legacyOwner, instruction: _legacyInstruction, maxInputChars: _legacyLimit, ...content } = value
   if (value.schemaVersion !== 2) {
     if (!text(value.topicId, 3000, true) || !text(value.sequenceNamespaceId, 3000, true) || !text(value.topicName, 120, true) ||
       !Number.isSafeInteger(value.sequence) || (value.sequence as number) < 0 || (value.sequence as number) >= Number.MAX_SAFE_INTEGER || !text(value.remark, 1000) || !(value.legacyName === null || text(value.legacyName, 120, true))) return undefined
     if (value.name !== sessionName(value.topicName, value.sequence as number)) return undefined
-    return { ...content, schemaVersion: 4, model: route } as unknown as LocalSession
+    return { ...content, schemaVersion: 5, model: route } as unknown as LocalSession
   }
   // ID 及父边的归并由 SessionStore 在读完全部记录后完成，不依据旧名称。
   return {
-    ...content, schemaVersion: 4, archivedAt: value.archivedAt ?? null, model: route,
+    ...content, schemaVersion: 5, archivedAt: value.archivedAt ?? null, model: route,
     topicId: `legacy-pending:${value.id}`, sequenceNamespaceId: `legacy-pending:${value.id}`,
     topicName: value.name, sequence: 0, remark: '', legacyName: value.name,
   } as unknown as LocalSession
@@ -133,13 +133,13 @@ export function decodeSession(value: unknown): LocalSession | undefined {
 
 export function sessionName(topicName: string, sequence: number): string { return sequence === 0 ? topicName : `${topicName}-${String(sequence).padStart(2, '0')}` }
 
-export function newSession(settings: SessionSettings, _entryId: string, id: string, name = '新翻译会话', parentId: string | null = null, topicId = `topic:${id}`, sequenceNamespaceId = `sequence:${id}`, sequence = 0): LocalSession {
+export function newSession(settings: Pick<SessionSettings, 'defaultMode' | 'targetLanguage'>, _entryId: string, id: string, name = '新翻译会话', parentId: string | null = null, topicId = `topic:${id}`, sequenceNamespaceId = `sequence:${id}`, sequence = 0): LocalSession {
   const time = new Date().toISOString()
   return {
-    schemaVersion: 4, id, topicId, sequenceNamespaceId, topicName: name, sequence, name: sessionName(name, sequence), remark: '', legacyName: null,
+    schemaVersion: 5, id, topicId, sequenceNamespaceId, topicName: name, sequence, name: sessionName(name, sequence), remark: '', legacyName: null,
     parentId, childSequence: 0, createdAt: time, updatedAt: time, archivedAt: null,
-    mode: settings.defaultMode, targetLanguage: settings.targetLanguage, instruction: settings.defaultInstruction,
-    maxInputChars: settings.maxInputChars, model: null, input: '', legacyManualText: '', legacyKey: null,
+    mode: settings.defaultMode, targetLanguage: settings.targetLanguage,
+    model: null, input: '', legacyManualText: '', legacyKey: null,
   }
 }
 
@@ -159,7 +159,7 @@ export function legacySession(key: string, raw: string): LocalSession | undefine
       ...newSession(DEFAULT_SESSION_SETTINGS, ownerId, `legacy:${key}`, draft.mode === 'quick' ? '旧版快译会话' : '旧版翻译会话'),
       topicId: `legacy-pending:legacy:${key}`, sequenceNamespaceId: `legacy-pending:legacy:${key}`,
       legacyName: draft.mode === 'quick' ? '旧版快译会话' : '旧版翻译会话',
-      mode: draft.mode, targetLanguage: draft.targetLanguage, instruction: draft.instruction, input: draft.sourceText,
+      mode: draft.mode, targetLanguage: draft.targetLanguage, input: draft.sourceText,
       model: draft.providerId && draft.modelId ? { provider: draft.providerId, model: draft.modelId } : null,
       legacyManualText: draft.manualTranslation, legacyKey: key,
     }

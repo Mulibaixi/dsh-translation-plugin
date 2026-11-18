@@ -662,7 +662,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
     h(ImageOriginalButton, { unit: image, session, materials, viewFiles })) : null
   const sourceEditButton = sourceEditable && normal ? h('button', { type: 'button', 'aria-label': '编辑原文',
     disabled: sourceEditing || !!sourceBlocked, title: sourceBlocked, onClick: () => setSourceEditing(true) }, '编辑') : null
-  const sourceEditor = sourceEditable && normal && sourceEditing ? h(SourceTextEditor, { unit, session, normal, executionOwner, close: () => setSourceEditing(false) }) : null
+  const sourceEditor = sourceEditable && normal && sourceEditing ? h(SourceTextEditor, { unit, session, normal, maxInputChars: store.getSettings().maxInputChars, executionOwner, close: () => setSourceEditing(false) }) : null
   const imageBackground = image ? h(ImageBackground, { unit: image, session, normal }) : null
   const imageIntakeStatus = image && intake && materials && (!unit.source.trim() || intake.storageError) ? h('div', { className: 'dsh-tp-muted' },
     intake.storageError ? h('p', { role: 'status' }, intake.storageError) : null,
@@ -731,7 +731,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
           collapsibleSource && !file ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文${sourceCollapsed ? '展开' : '收起'}`, 'aria-expanded': !sourceCollapsed,
             title: sourceCollapsed ? '展开原文' : '收起原文，只显示前三行', onClick: toggleSource }, sourceCollapsed ? '展开' : '收起') : null,
           sourceEditButton,
-          h('button', { type: 'button', 'aria-label': `重译${image ? '图片' : '文本'} ${unit.order}`, disabled: !!blocked || !!originalScanPage || !!image && !unit.source.trim(), title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
+          h('button', { type: 'button', 'aria-label': `重译${image ? '图片' : '文本'} ${unit.order}`, disabled: !!blocked || !!originalScanPage || !!image && !unit.source.trim(), title: blocked ?? '沿用此段原文和目标语言，使用当前模型与全局翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
           h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, disabled: !final || session.archivedAt !== null }),
           h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor, openFile: fileOpen?.system }),
           file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
@@ -1107,7 +1107,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
         h('p', { className: 'dsh-tp-attachment-note' }, '发送时将固定为 UTF-8 原稿，正文可继续编辑；超过单次上限时，主模型可按原文范围分段翻译。'),
       ) : null,
       h('textarea', { ref: sourceInput, value: session.input, 'aria-label': '待翻译内容', rows: 3, placeholder: '输入待翻译内容…', style: { outline: 'none', boxShadow: 'none' }, onChange: (event: TextEvent) => { store.updateSession(session.id, { input: event.currentTarget.value }) } }),
-      session.mode === 'quick' && Array.from(session.input).length > session.maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${session.maxInputChars} 个字符；内容保持完整。`) : null,
+      session.mode === 'quick' && Array.from(session.input).length > store.getSettings().maxInputChars ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, `已超过单次上限 ${store.getSettings().maxInputChars} 个字符；内容保持完整。`) : null,
       renderToolbar(session, batchInput, batchButton),
     )
   }
@@ -1406,8 +1406,11 @@ export function SettingsView({ store, onClose, terms, localData, embedding, memo
       h('h3', null, '新会话默认值'),
       field('翻译模式', modeSelect(form.defaultMode, defaultMode => change({ defaultMode }))),
       field('目标语言', h('input', { value: form.targetLanguage, onChange: (event: TextEvent) => change({ targetLanguage: event.currentTarget.value }) })),
+    ),
+    h('div', { className: 'dsh-tp-settings-section' },
+      h('h3', null, '全局翻译设置'),
       field('翻译要求', h('textarea', { value: form.defaultInstruction, rows: 3, placeholder: '可留空', onChange: (event: TextEvent) => change({ defaultInstruction: event.currentTarget.value }) })),
-      field('单次上限', h('input', { type: 'number', value: form.maxInputChars, min: 1, max: 200000, step: 1, onChange: (event: TextEvent) => change({ maxInputChars: Number(event.currentTarget.value) }) }), '原文字符数：1–200000。降低默认值不会裁剪已有输入。'),
+      field('单次上限', h('input', { type: 'number', value: form.maxInputChars, min: 1, max: 200000, step: 1, onChange: (event: TextEvent) => change({ maxInputChars: Number(event.currentTarget.value) }) }), '原文字符数为 1–200000。修改后适用于所有会话接下来提交的任务。'),
     ),
     embedding ? h(EmbeddingSettingsView, { client: embedding, index: memoryIndex }) : null,
     localData ? h(LocalDataClearView, {data:localData}) : null,

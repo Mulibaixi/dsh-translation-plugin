@@ -1,9 +1,11 @@
 import { splitHistoryBundle, joinHistoryBundle, type HistoryBundle, type HistoryPart, type HistoryScope } from './history-bundle.js'
-import type { LocalSession } from './sessions.js'
+import { decodeSession, type LocalSession } from './sessions.js'
 
 /** The directory contains labels and settings, never draft or translation bodies. */
 export function historySessionMetadata(session: LocalSession): LocalSession {
-  return { ...session, input: '', legacyManualText: '', instruction: '' }
+  const metadata = decodeSession({ ...session, input: '', legacyManualText: '' })
+  if (!metadata) throw new TypeError('Invalid history directory metadata')
+  return metadata
 }
 const identity = (part: Pick<HistoryPart, 'kind' | 'parent' | 'id'>): string => JSON.stringify([part.kind, part.parent, part.id])
 export interface HistoryPatch { readonly header: string | null; readonly upsert: readonly HistoryPart[]; readonly remove: readonly string[] }

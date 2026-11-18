@@ -398,7 +398,7 @@ export function DocumentUnitView({ unit, session, store, documents, documentTask
           : h(FileOpenMenu, { label: '原稿操作', action: sourceOpen.system }),
         store ? h(DocumentSourceDeletionControl, { store, unit, session, busy: pending || !!draft }) : null,
         store ? h(DocumentChunkCleanupControl, { store, unit, session, busy: pending || !!draft }) : null,
-        h('button', { type: 'button', disabled: Boolean(retranslationBlocked) || Boolean(draft) || pending, title: retranslationBlocked ?? '沿用此原稿、目标语言与翻译要求，交由主模型准备新的整篇任务。', onClick: () => { void documentTasks?.requestRetranslation(session.id, unit.id, executionOwner) } }, '重译'),
+        h('button', { type: 'button', disabled: Boolean(retranslationBlocked) || Boolean(draft) || pending, title: retranslationBlocked ?? '沿用此原稿和目标语言，交由主模型按全局翻译要求准备新的整篇任务。', onClick: () => { void documentTasks?.requestRetranslation(session.id, unit.id, executionOwner) } }, '重译'),
         h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, visible, disabled: !final || !!draft || pending || session.archivedAt !== null }),
         retranslation?.unknown ? h('button', { type: 'button', disabled: retranslation.pending, onClick: () => { void documentTasks?.queryRetranslation(session.id, unit.id) } }, '检查重译状态') : null,
         task && controls && ['failed', 'cancelled', 'interrupted', 'unknown'].includes(actualStatus ?? '') ?

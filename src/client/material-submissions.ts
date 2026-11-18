@@ -60,7 +60,7 @@ interface PdfPreflight {
 interface SelectedFile { readonly file: File; readonly version: number; readonly pdfOutput?: PdfOutputOptions; readonly pdfPreflight?: PdfPreflight }
 interface PastedTextCarrier { readonly kind: 'pasted_text'; readonly text: string; readonly name: string; readonly bytes: number; readonly totalCodePoints: number }
 type SourceCarrier = { readonly kind: 'selected_file'; readonly selected: SelectedFile } | { readonly kind: 'frozen_file'; readonly unitId: string; readonly name: string } | PastedTextCarrier
-interface FrozenDraft { readonly session: LocalSession; readonly draftVersion: number; readonly materialId: string; readonly signature: string; readonly carrier?: SourceCarrier; readonly pdfOutput?: PdfOutputOptions }
+interface FrozenDraft { readonly session: LocalSession; readonly instruction: string; readonly maxInputChars: number; readonly draftVersion: number; readonly materialId: string; readonly signature: string; readonly carrier?: SourceCarrier; readonly pdfOutput?: PdfOutputOptions }
 interface Submission {
   readonly createdAt: string
   readonly identity: TranslationMaterialScope
@@ -126,7 +126,7 @@ function sameScope(a: TranslationMaterialScope, b: TranslationMaterialScope): bo
   return a.mainSessionId === b.mainSessionId && a.requestId === b.requestId && a.operationId === b.operationId
 }
 function signature(session: LocalSession, fileVersion: number): string {
-  return JSON.stringify([session.input, session.targetLanguage, session.instruction, session.model, session.maxInputChars, fileVersion])
+  return JSON.stringify([session.input, session.targetLanguage, session.model, fileVersion])
 }
 function detail(error: unknown): string { return error instanceof Error ? error.message : '材料提交未完成，草稿保留。' }
 /** Reject lone UTF-16 surrogates before any UTF-8 encoder can replace them. */
@@ -210,7 +210,8 @@ export class MaterialSubmissionsClient {
       if (this.submissions.has(JSON.stringify([record.submission.mainSessionId, record.submission.requestId]))) continue
       const session = this.options.store.getSession(record.scope.translationSessionId)
       if (!session) continue
-      const draft: FrozenDraft = { session: { ...session, ...record.config, input: '' }, materialId: record.materialId,
+      const draft: FrozenDraft = { session: { ...session, targetLanguage: record.config.targetLanguage, model: record.config.model, input: '' },
+        materialId: record.materialId, instruction: record.config.instruction, maxInputChars: record.config.maxInputChars,
         draftVersion: record.config.draftVersion, signature: '', carrier: { kind: 'frozen_file', unitId: record.unitId, name: record.name },
         ...(record.pdfOutput ? { pdfOutput: record.pdfOutput } : {}) }
       const item: Submission = { identity: record.submission, createdAt: record.createdAt, kind: 'material', draft, generation: this.generation,
@@ -235,7 +236,7 @@ export class MaterialSubmissionsClient {
       const pdfOutput = item.envelope?.kind === 'material' ? item.envelope.material.pdfOutput : draft.pdfOutput
       const record: FileIntakeRecord = { schemaVersion: 1, scope: old?.scope ?? { namespaceId: this.options.store.getNamespaceId(), ownerId: item.identity.mainSessionId, mainSessionId: item.identity.mainSessionId, topicId: session.topicId, translationSessionId: session.id },
         unitId, materialId: draft.materialId, name: carrier!.kind === 'selected_file' ? carrier!.selected.file.name : carrier!.name, createdAt: item.createdAt,
-        config: { targetLanguage: session.targetLanguage, instruction: session.instruction, model: session.model, maxInputChars: session.maxInputChars, draftVersion: draft.draftVersion },
+        config: { targetLanguage: session.targetLanguage, instruction: draft.instruction, model: session.model, maxInputChars: draft.maxInputChars, draftVersion: draft.draftVersion },
         submission: item.identity, stage, hostStarted: item.hostStarted, ...(item.reason ? { message: item.reason } : {}),
         ...(old?.source ? { source: old.source } : {}), ...(old?.historyCommit ? { historyCommit: old.historyCommit } : {}),
         ...(item.consumed ? { documentUnitId: unitId } : old?.documentUnitId ? { documentUnitId: old.documentUnitId } : {}),
@@ -436,7 +437,8 @@ export class MaterialSubmissionsClient {
       if (!source) throw new Error('无法恢复已保存的 PDF 原稿。')
       if (old?.hostStarted && !old.withdrawn) await this.releaseFileAuthority(old)
       const identity = { mainSessionId: ownerId, requestId: id(), operationId: id() }
-      const draft: FrozenDraft = { session: { ...session, ...record.config, model: session.model, maxInputChars: session.maxInputChars, input: '' },
+      const { defaultInstruction, maxInputChars } = this.options.store.getSettings()
+      const draft: FrozenDraft = { session: { ...session, targetLanguage: record.config.targetLanguage, input: '' }, instruction: defaultInstruction, maxInputChars,
         draftVersion: record.config.draftVersion, materialId, signature: '', carrier: { kind: 'frozen_file', unitId: record.unitId, name: record.name },
         ...(record.pdfOutput ? { pdfOutput: record.pdfOutput } : {}) }
       const envelope = this.boundedEnvelope({ ...identity, kind: 'material', material: { ...this.config(draft), sourceRef: source } })
@@ -527,7 +529,7 @@ export class MaterialSubmissionsClient {
         const first = document.sourceVersions[0], old = this.fileIntakes.get(unitId)
         const record: FileIntakeRecord = old ?? { schemaVersion: 1, scope: { namespaceId: this.options.store.getNamespaceId(), ownerId: item?.identity.mainSessionId ?? this.options.store.getNamespaceId(), mainSessionId: item?.identity.mainSessionId ?? this.options.store.getNamespaceId(), topicId: session.topicId, translationSessionId: sessionId },
           unitId, materialId: unitId.startsWith('unit:') ? unitId.slice(5) : unitId, name: first?.body.kind === 'asset' ? first.body.reference.name : '原稿.txt', createdAt: document.createdAt,
-          config: { targetLanguage: document.targetLanguage, instruction: document.instruction, model: session.model, maxInputChars: session.maxInputChars, draftVersion: 1 },
+          config: { targetLanguage: document.targetLanguage, instruction: document.instruction, model: session.model, maxInputChars: this.options.store.getSettings().maxInputChars, draftVersion: 1 },
           submission: item?.identity ?? {  mainSessionId: item?.identity.mainSessionId ?? this.options.store.getNamespaceId(), requestId: id(), operationId: id() }, stage: 'accepted', hostStarted: false,
           ...(first?.body.kind === 'asset' ? { source: first.body.reference, ...(first.historyCommit ? { historyCommit: first.historyCommit } : {}) } : {}) }
         // When history is entirely runtime-only, the barrier must stay runtime-only too.
@@ -686,8 +688,8 @@ export class MaterialSubmissionsClient {
   private config(draft: FrozenDraft) {
     const session = draft.session, termCount = this.options.topics.termCount?.(this.options.store.getTopicStorageScope(session.topicId)!, session.topicId)
     return { materialId: draft.materialId, sourceVersion: 1, topicId: session.topicId, translationSessionId: session.id,
-      draftVersion: draft.draftVersion, targetLanguage: session.targetLanguage, instruction: session.instruction,
-      model: session.model, maxInputChars: session.maxInputChars, ...(termCount === undefined ? {} : { termCount }),
+      draftVersion: draft.draftVersion, targetLanguage: session.targetLanguage, instruction: draft.instruction,
+      model: session.model, maxInputChars: draft.maxInputChars, ...(termCount === undefined ? {} : { termCount }),
       ...(draft.pdfOutput ? { pdfOutput: draft.pdfOutput } : {}) }
   }
   getStatus(sessionId: string, executionOwner?: string): MaterialSubmissionStatus {
@@ -723,7 +725,7 @@ export class MaterialSubmissionsClient {
   private pastedCarrier(draft: FrozenDraft, identity: TranslationMaterialScope): PastedTextCarrier | undefined {
     const text = draft.session.input, size = pastedTextSize(text)
     const inline = { ...identity, kind: 'material', material: { ...this.config(draft), sourceText: text } }
-    if (size.totalCodePoints > INLINE_TRANSLATION_SOURCE_CODE_POINTS || size.totalCodePoints > draft.session.maxInputChars ||
+    if (size.totalCodePoints > INLINE_TRANSLATION_SOURCE_CODE_POINTS || size.totalCodePoints > draft.maxInputChars ||
       new TextEncoder().encode(JSON.stringify(inline)).byteLength > MAX_TOPIC_BRIDGE_REPLY_BYTES) {
       // Check the frozen config and scope before starting any upload; only the source transport changes.
       this.boundedEnvelope({ ...inline, material: { ...this.config(draft), sourceText: 'x' } })
@@ -734,7 +736,8 @@ export class MaterialSubmissionsClient {
   }
   private previewPastedCarrier(session: LocalSession): PastedTextCarrier | undefined {
     const previewId = '00000000-0000-0000-0000-000000000000'
-    return this.pastedCarrier({ session, materialId: previewId, draftVersion: this.draftVersion(session), signature: '' },
+    const { defaultInstruction, maxInputChars } = this.options.store.getSettings()
+    return this.pastedCarrier({ session, instruction: defaultInstruction, maxInputChars, materialId: previewId, draftVersion: this.draftVersion(session), signature: '' },
       {  mainSessionId: this.options.store.getNamespaceId(), requestId: previewId, operationId: previewId })
   }
   /** Editable draft projection; actual capture uses the exact submission identity in record(). */
@@ -749,7 +752,9 @@ export class MaterialSubmissionsClient {
   private record(session: LocalSession | undefined, ownerId: string, requestId: string, kind: TranslationMaterialEnvelope['kind'], direct: boolean, sourceText?: string): Submission {
     const identity = {  mainSessionId: ownerId, requestId, operationId: id() }
     const selected = sourceText === undefined && session ? this.files.get(session.id) : undefined
-    const captured: FrozenDraft | undefined = kind === 'material' && session ? { session: { ...structuredClone(session), ...(sourceText === undefined ? {} : { input: sourceText }) }, draftVersion: this.draftVersion(session),
+    const { defaultInstruction, maxInputChars } = this.options.store.getSettings()
+    const captured: FrozenDraft | undefined = kind === 'material' && session ? { session: { ...structuredClone(session), ...(sourceText === undefined ? {} : { input: sourceText }) },
+      instruction: defaultInstruction, maxInputChars, draftVersion: this.draftVersion(session),
       materialId: id(), signature: signature(session, this.fileVersions.get(session.id) ?? 0) } : undefined
     const carrier = captured ? selected ? { kind: 'selected_file' as const, selected } : this.pastedCarrier(captured, identity) : undefined
     const pdfOutput = selected && session ? this.getPdfOutput(session.id) : undefined
@@ -1008,7 +1013,8 @@ export class MaterialSubmissionsClient {
         if (!isImageUnit(previous) || previous.deletion || previous.original?.name !== file.name) throw new Error('已登记的图片单元不可用。')
         await this.fileIntakes.saveSource(unitId, this.options.sourceStorage)
       } else {
-        const draft: FrozenDraft = { session, materialId, draftVersion: 1, signature: '', carrier: { kind: 'selected_file', selected: { file, version: 0 } } }
+        const { defaultInstruction, maxInputChars } = this.options.store.getSettings()
+        const draft: FrozenDraft = { session, instruction: defaultInstruction, maxInputChars, materialId, draftVersion: 1, signature: '', carrier: { kind: 'selected_file', selected: { file, version: 0 } } }
         const identity = { mainSessionId: ownerId, requestId: id(), operationId: id() }
         const item: Submission = { identity, createdAt: new Date().toISOString(), kind: 'material', draft, generation: this.generation,
           envelope: undefined, sessionId, direct: true, stage: 'preparing', reason: undefined, finished: false, started: true, settling: false, hostStarted: false }

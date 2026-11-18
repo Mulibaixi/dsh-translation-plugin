@@ -65,7 +65,7 @@ export class QuickTranslationClient {
   private emit(): void { if (!this.disposed) for (const listener of this.listeners) listener() }
   private draftStamp(session: LocalSession): number {
     const signature = JSON.stringify([this.store.getNamespaceId(), session.topicId, session.mode, session.input, session.targetLanguage,
-      session.instruction, session.model?.provider ?? null, session.model?.model ?? null, session.model?.reasoningEffort ?? null, session.maxInputChars])
+      session.model?.provider ?? null, session.model?.model ?? null, session.model?.reasoningEffort ?? null])
     const prior = this.drafts.get(session.id)
     if (prior?.signature === signature) return prior.stamp
     const next = { signature, stamp: (prior?.stamp ?? 0) + 1 }
@@ -81,7 +81,8 @@ export class QuickTranslationClient {
     if (this.store.hasDocumentLease(session.id) || this.isBusy(session.id)) return '当前会话仍有未结束或结果未知的翻译，请先查询或取消。'
     if (this.readiness !== 'ready') return this.reason
     if (!session.input.trim()) return '请输入待翻译内容。'
-    if (Array.from(session.input).length > session.maxInputChars) return `原文超过单次上限 ${session.maxInputChars} 个字符。`
+    const { maxInputChars } = this.store.getSettings()
+    if (Array.from(session.input).length > maxInputChars) return `原文超过单次上限 ${maxInputChars} 个字符。`
     if (!session.targetLanguage.trim()) return '请设置目标语言。'
     if (!catalogAllowsRoute(this.models.getSnapshot(), session.model)) return '请选择当前目录中的模型与可用推理等级。'
     return undefined
@@ -91,7 +92,7 @@ export class QuickTranslationClient {
     if (!unit) return '该处理单元已不存在。'
     if (!isTextUnit(unit)) return '整篇文档重译尚未接通。'
     if (unit.deletion) return '此单元已删除。'
-    return this.blockedReason({ ...session, input: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction })
+    return this.blockedReason({ ...session, input: unit.source, targetLanguage: unit.targetLanguage })
   }
   selectFinal(id: string, unitId: string, revisionId: string): boolean {
     const session = this.store.getSession(id)
@@ -170,24 +171,25 @@ export class QuickTranslationClient {
   }
   private async start(draft: LocalSession, unit?: TextUnit): Promise<void> {
     if (!this.port || !draft.model) return
+    const { defaultInstruction, maxInputChars } = this.store.getSettings()
     const id = draft.id
     const choice = this.models.getSnapshot().groups.find(group => group.id === draft.model?.provider)?.models.find(model => model.id === draft.model?.model)
     const effort = draft.model.reasoningEffort ?? choice?.reasoning?.defaultEffort
     const model = { ...draft.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
     const operationId = this.options.makeId?.() ?? `quick:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}:${++this.sequence}:${Math.random().toString(36).slice(2)}`}`
     const record: QuickRecord = { id: operationId, localSessionId: id, unitId: unit?.id ?? `unit:${operationId}`, kind: unit ? 'revision' : 'new_unit', createdAt: new Date().toISOString(),
-      source: unit?.source ?? draft.input, targetLanguage: unit?.targetLanguage ?? draft.targetLanguage, instruction: unit?.instruction ?? draft.instruction, model,
+      source: unit?.source ?? draft.input, targetLanguage: unit?.targetLanguage ?? draft.targetLanguage, instruction: defaultInstruction, model,
       draftVersion: ++this.sequence, status: 'submitting', text: '', message: undefined, accepted: false, callRecord: null }
     const pending: Pending = { record, draftStamp: this.draftStamp(draft), sessionKey: undefined, consumedStamp: undefined, stopped: false, suspended: false, dispatched: false, cancelRequested: false, timer: undefined, historyAttached: !!unit }
     if (unit && !this.store.updateTranslationHistory(id, history => appendTextRevision(history, unit.id, this.revision(record)))) return
     this.records.set(id, [...this.getRecords(id), record]); this.pending.set(operationId, pending); this.emit()
     try {
       let binding = this.bindings.get(id)
-      if (!binding || binding.ownerId !== this.store.getNamespaceId() || binding.topicId !== draft.topicId || binding.max !== draft.maxInputChars) {
-        const opened = await this.request(this.port.open({ localSessionId: id, maxSourceCodePoints: draft.maxInputChars }))
+      if (!binding || binding.ownerId !== this.store.getNamespaceId() || binding.topicId !== draft.topicId || binding.max !== maxInputChars) {
+        const opened = await this.request(this.port.open({ localSessionId: id, maxSourceCodePoints: maxInputChars }))
         if (!opened.ok) { this.fail(pending, opened.error.message); return }
-        if (typeof opened.value?.sessionKey !== 'string' || !opened.value.sessionKey || opened.value.localSessionId !== id || opened.value.maxSourceCodePoints !== draft.maxInputChars) { this.fail(pending, '快译会话身份无效。'); return }
-        binding = { ownerId: this.store.getNamespaceId(), topicId: draft.topicId, max: draft.maxInputChars, sessionKey: opened.value.sessionKey }
+        if (typeof opened.value?.sessionKey !== 'string' || !opened.value.sessionKey || opened.value.localSessionId !== id || opened.value.maxSourceCodePoints !== maxInputChars) { this.fail(pending, '快译会话身份无效。'); return }
+        binding = { ownerId: this.store.getNamespaceId(), topicId: draft.topicId, max: maxInputChars, sessionKey: opened.value.sessionKey }
         if (!this.store.getSession(id) || pending.stopped || pending.suspended) return
         this.bindings.set(id, binding)
       }

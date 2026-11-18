@@ -85,7 +85,11 @@ export function parseHistoryResult(method: keyof HistoryRemotePort, value: unkno
     referenceExact(value, ['sessions', 'next']); if (!Array.isArray(value.sessions) || value.sessions.length > 20) throw new TypeError('Invalid history list')
     for (const entry of value.sessions) {
       referenceObject(entry); referenceExact(entry, ['sessionId', 'topicId', 'state'], ['session']); referenceString(entry.sessionId, 3000); referenceString(entry.topicId, 3000); parseHistoryResult('status', entry.state)
-      if (entry.session !== undefined && (!decodeSession(entry.session) || (entry.session as LocalSession).id !== entry.sessionId || (entry.session as LocalSession).topicId !== entry.topicId || ['input', 'instruction', 'legacyManualText'].some(field => (entry.session as any)[field] !== ''))) throw new TypeError('Invalid history directory metadata')
+      if (entry.session !== undefined) {
+        const session = decodeSession(entry.session)
+        if (!session || session.id !== entry.sessionId || session.topicId !== entry.topicId || session.input || session.legacyManualText ||
+          Object.hasOwn(entry.session as object, 'instruction') && (entry.session as { instruction: unknown }).instruction !== '') throw new TypeError('Invalid history directory metadata')
+      }
       if (!(entry.state as HistoryStatus).retired && !entry.session) throw new TypeError('Missing history directory metadata')
     }
     if (value.next !== null) referenceString(value.next, 3000)

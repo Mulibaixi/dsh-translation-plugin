@@ -711,7 +711,7 @@ export class NormalTranslationService {
         if (request.range || request.body !== undefined) throw rejected('unsupported_input', '内联短文不接受原文范围或替换正文。', 'prepare')
         sourceText = envelope.material.sourceText
       } else if (request.body !== undefined) {
-        // A non-text original: the main model supplies the body it actually extracted and organized.
+        // The main model supplies the body it extracted and organized from a file without a dedicated workflow.
         sourceText = request.body; bodyMode = true
       } else {
         const read = this.materials!.materialText(request.target, request.range, exec.agent!)
@@ -732,7 +732,7 @@ export class NormalTranslationService {
     }
     if (!route) throw rejected('model_required', '此提交材料未选择翻译模型，请选择后重新提交；草稿保留。', 'prepare')
     const length = sourceCodePointLength(sourceText), limit = material.maxInputChars
-    if (length > limit) throw rejected('source_too_large', `本次正文 ${length} 码点，超过此会话单次上限 ${limit}；请用范围分段翻译或缩小正文。`, 'prepare')
+    if (length > limit) throw rejected('source_too_large', `本次正文 ${length} 码点，超过单次上限 ${limit}；请用范围分段翻译或缩小正文。`, 'prepare')
     const sessionId = material.translationSessionId
     if (this.activeSessions.has(sessionId)) throw rejected('busy', '此普通翻译会话仍有未结算操作。', 'prepare')
     const internalId = `normal-direct:${crypto.randomUUID()}`, callId = `normal-direct-call:${crypto.randomUUID()}`
@@ -987,7 +987,7 @@ export class NormalTranslationService {
       text = read.value.text; totalCodePoints = read.value.totalCodePoints; base = read.value.range.start
     }
     const length = sourceCodePointLength(text)
-    if (length > material.maxInputChars) throw rejected('source_too_large', `本次提取正文 ${length} 码点，超过此会话单次上限 ${material.maxInputChars}；请按范围分段提取。`, 'prepare')
+    if (length > material.maxInputChars) throw rejected('source_too_large', `本次提取正文 ${length} 码点，超过单次上限 ${material.maxInputChars}；请按范围分段提取。`, 'prepare')
     const snapshot = await this.topics.requestOwned(target.mainSessionId, { kind: 'list_terms', translationSessionId: material.translationSessionId }, exec)
     if (snapshot.kind !== 'terms') throw rejected('invalid_reply', '未取得提取所需的术语快照。', 'prepare')
     const existingAssets = snapshot.snapshot.entries.filter(entry => entry.status === 'active' && languageMatches(entry.targetLanguage, material.targetLanguage))

@@ -178,7 +178,7 @@ export class NormalTranslationClient {
         prior && (batch.requested.firstPage !== prior.requested.firstPage || batch.requested.lastPage !== prior.requested.lastPage) ||
         !prior && units.length > 0) return undefined
     }
-    const maxInputChars = Math.min(material.maxInputChars, session.maxInputChars)
+    const { maxInputChars } = material
     const oversized = sections.map(section => sourceCodePointLength(section.text)).find(length => length > maxInputChars)
     if (oversized !== undefined) return { oversized, maxInputChars }
     const ids = sections.map((section, index) => pdfSectionId(material.materialId, section, units.length + index + 1))
@@ -210,7 +210,7 @@ export class NormalTranslationClient {
       if (!material.pdfOutput?.translateScanPages || !pdf.scanPages?.includes(page) || prior?.next !== null ||
         !prior.gaps.some(gap => gap.page === page && gap.message === PDF_SCAN_PENDING)) return undefined
     } else if (pdf.kind !== 'image' || page !== (prior ? prior.next?.page : requested.firstPage)) return undefined
-    const maxInputChars = Math.min(material.maxInputChars, session.maxInputChars), length = sourceCodePointLength(text)
+    const { maxInputChars } = material, length = sourceCodePointLength(text)
     if (length > maxInputChars) return { oversized: length, maxInputChars }
     const unitId = pdfScanUnitId(target.materialId, page)
     const existing = units.find(unit => unit.id === unitId)
@@ -245,13 +245,18 @@ export class NormalTranslationClient {
       ? { ok: true, value: { kind: 'normal_resolved', envelope: structuredClone(cached) } } : failure('idempotency_conflict', '此业务操作已冻结其他历史单元。')
     if (this.store.getAllSessions().some(candidate => this.store.getTranslationHistory(candidate.id)?.events.some(event => event.operationId === input.operationId))) return failure('idempotency_conflict', '此操作已有历史事实，请查询原操作。')
     if (!session.model) return failure('invalid_input', '请为此翻译会话选择模型。')
-    if (Array.from(unit.source).length > session.maxInputChars) return failure('input_too_large', '当前原文超过此会话单次上限，未截断。')
+    const settings = this.store.getSettings()
+    // Registered PDF and image units keep the submitted settings through their first translation.
+    const submitted = !unit.revisions.length ? unit.material : undefined
+    const maxInputChars = submitted?.maxInputChars ?? settings.maxInputChars
+    const instruction = submitted ? unit.instruction : settings.defaultInstruction
+    if (sourceCodePointLength(unit.source) > maxInputChars) return failure('input_too_large', '当前原文超过单次上限，未截断。')
     const imageInputId = image ? this.imageInputs.get(unit.id) ?? crypto.randomUUID() : undefined
     if (imageInputId) this.imageInputs.set(unit.id, imageInputId)
     const envelope = parseTranslationMaterialEnvelope({  mainSessionId: ownerId, requestId: `unit-request:${input.operationId}`, operationId: input.operationId, kind: 'material', material: {
       materialId: unit.material?.materialId ?? unit.id, sourceVersion: image?.original?.version ?? target.sourceVersion, topicId: session.topicId, translationSessionId: session.id,
-      draftVersion: unit.material?.draftVersion ?? 1, sourceText: unit.source, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-      model: session.model, maxInputChars: session.maxInputChars, unitReference: image
+      draftVersion: unit.material?.draftVersion ?? 1, sourceText: unit.source, targetLanguage: unit.targetLanguage, instruction,
+      model: session.model, maxInputChars, unitReference: image
         ? { unitId: unit.id, backgroundDescription: image.backgroundDescription, imageInputId }
         : { unitId: unit.id, sourceVersion: target.sourceVersion },
     } }) as Extract<TranslationMaterialEnvelope, { kind: 'material' }>
@@ -288,8 +293,9 @@ export class NormalTranslationClient {
     const session = this.store.getSession(target.translationSessionId)
     if (target.mainSessionId !== ownerId || !session || session.mode !== 'normal' || session.archivedAt !== null ||
       !this.store.canAccessUnit(ownerId, session.id, target.unitId)) return false
-    const updated = this.editImage(session.id, target.unitId, { sourceText, backgroundDescription })
     const unit = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === target.unitId)
+    const submitted = unit && isImageUnit(unit) && !unit.revisions.length ? unit.material : undefined
+    const updated = this.editImage(session.id, target.unitId, { sourceText, backgroundDescription }, submitted?.maxInputChars)
     if (updated && sourceText !== undefined && unit && isImageUnit(unit) && unit.material && unit.original) {
       const submission = this.materials.resolveSubmittedTarget({ kind: 'material', mainSessionId: ownerId,
         requestId: unit.material.requestId, materialId: unit.material.materialId, sourceVersion: unit.original.version })
@@ -298,10 +304,10 @@ export class NormalTranslationClient {
     return updated
   }
 
-  editImage(sessionId: string, unitId: string, edits: { sourceText?: string | undefined; backgroundDescription?: string | undefined }): boolean {
+  editImage(sessionId: string, unitId: string, edits: { sourceText?: string | undefined; backgroundDescription?: string | undefined }, maxInputChars = this.store.getSettings().maxInputChars): boolean {
     const session = this.store.getSession(sessionId)
     if (!session || session.archivedAt !== null || this.store.getStatus(sessionId) === 'conflict' || this.sourceEditBlockedReason(sessionId, unitId) ||
-      edits.sourceText !== undefined && Array.from(edits.sourceText).length > session.maxInputChars) return false
+      edits.sourceText !== undefined && sourceCodePointLength(edits.sourceText) > maxInputChars) return false
     const previousInput = this.imageInputs.get(unitId)
     if (previousInput) this.imageInputs.set(unitId, crypto.randomUUID())
     const updated = this.store.updateTranslationHistory(sessionId, history => updateImageUnit(history, unitId,
@@ -343,7 +349,7 @@ export class NormalTranslationClient {
     const blocked = this.sourceEditBlockedReason(session.id, unit.id)
     if (blocked) return failure('source_edit_blocked', blocked)
     if (request.sourceText === unit.source) return failure('unchanged_source', '原文内容未变化。')
-    if (Array.from(request.sourceText).length > session.maxInputChars) return failure('input_too_large', '更正原文超过此会话上限，未截断。')
+    if (sourceCodePointLength(request.sourceText) > this.store.getSettings().maxInputChars) return failure('input_too_large', '更正原文超过单次上限，未截断。')
     if (!this.saveTextSource(session.id, unit.id, { operationId: request.operationId,
       expectedVersion: target.sourceVersion, text: request.sourceText, reason: request.reason, at: new Date().toISOString() })) return failure('history_update_failed', '原文纠错记录未完成，请读取当前版本。')
     return { ok: true, value: { kind: 'normal_source_corrected', correction: { operationId: request.operationId, mainSessionId: ownerId,

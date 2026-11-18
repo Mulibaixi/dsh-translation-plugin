@@ -491,7 +491,7 @@ export class TopicBridgeClient {
       const receipt = command.kind === 'pdf_register' ? this.normal?.registerPdfSections(ownerId, command, command.batch)
         : this.normal?.registerPdfScanPage(ownerId, command)
       if (!receipt) return error(request.requestId, 'pdf_register_failed', '无法准备 PDF 译文。请核对当前原稿及会话进度。')
-      if ('oversized' in receipt) return error(request.requestId, 'pdf_source_too_large', `整理后的正文有 ${receipt.oversized} 码点，当前会话单次上限为 ${receipt.maxInputChars}。`)
+      if ('oversized' in receipt) return error(request.requestId, 'pdf_source_too_large', `整理后的正文有 ${receipt.oversized} 码点，本次翻译的单次上限为 ${receipt.maxInputChars}。`)
       return success({ kind: 'pdf_registered', ...receipt })
     }
     if (command.kind === 'pdf_status') {
@@ -510,7 +510,7 @@ export class TopicBridgeClient {
       const { kind: _kind, ...update } = command
       return this.normal?.updateImage(ownerId, update)
         ? success({ kind: 'image_updated', unitId: command.target.unitId })
-        : error(request.requestId, 'image_update_failed', '图片单元不可编辑，或当前内容超过会话上限。')
+        : error(request.requestId, 'image_update_failed', '图片单元不可编辑，或当前内容超过单次上限。')
     }
     if (command.kind === 'normal_call_finished') {
       this.normal?.finishUnitCall(ownerId, command.operationId)

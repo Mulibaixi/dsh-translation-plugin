@@ -85,7 +85,7 @@ export function draftTranslationTerms(draft: readonly DirectTranslationDraftTerm
  * One direct short-text call: the translation model runs once and the main model must review the
  * returned body. Requirements, the model's own notes and auxiliary context stay distinct.
  * `range` asks the Host to read that exact frozen source interval of a text file; `body` supplies
- * a main-model-organized body for a non-text original (for example extracted PDF or image text).
+ * a main-model-organized body for a file without a dedicated translation workflow.
  */
 export interface DirectTranslationRequest {
   readonly target: DirectTranslationTarget

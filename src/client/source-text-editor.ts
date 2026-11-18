@@ -6,10 +6,11 @@ import { isImageUnit, type TextUnit } from './translation-history.js'
 
 type TextEvent = { currentTarget: { value: string } }
 
-export function SourceTextEditor({ unit, session, normal, executionOwner, field = 'source', close }: {
+export function SourceTextEditor({ unit, session, normal, maxInputChars, executionOwner, field = 'source', close }: {
   readonly unit: TextUnit
   readonly session: LocalSession
   readonly normal: NormalTranslationClient
+  readonly maxInputChars: number
   readonly executionOwner?: string | undefined
   readonly field?: 'source' | 'background'
   readonly close: () => void
@@ -22,7 +23,7 @@ export function SourceTextEditor({ unit, session, normal, executionOwner, field 
   const changed = current !== atOpen.current.text || unit.sourceVersion !== atOpen.current.version
   const blocked = changed ? '内容已更新，请重新打开编辑。' : normal.sourceEditBlockedReason(session.id, unit.id)
   const retranslateBlocked = !background && (normal.retranslateBlockedReason(session.id, unit.id) ??
-    (Array.from(draft).length > session.maxInputChars ? '原文超过本会话的单次翻译上限。' : undefined))
+    (Array.from(draft).length > maxInputChars ? '原文超过单次翻译上限。' : undefined))
   const canSave = !blocked && (image || !!draft.trim())
 
   function save(retranslate: boolean): void {

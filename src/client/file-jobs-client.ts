@@ -396,12 +396,13 @@ export class FileJobsClient implements TranslationEvidenceReader {
       if (!sourceRef) throw new Error('已保存原稿未能恢复，且运行期引用不可用；请打开原稿后重新选择文件。')
       if (this.disposed || this.sessions.isSessionDeleted(session.id) || this.unitDeleted(session.id, config.unitId) || this.sourceDeleted(session.id, config.unitId, config.sourceVersion)) throw new Error('此文件或原稿已删除，未恢复旧稿任务。')
       const locale = this.uiLocale?.()?.trim().slice(0, 64)
+      const { defaultInstruction, maxInputChars } = this.sessions.getSettings()
       return { operationId, previousResultVersion: this.unitRecord(jobId)?.results.at(-1)?.version ?? 0,
         organizedRequirements: organizedRequirements.trim() ? organizedRequirements : config.organizedRequirements ?? '',
         envelope: {  mainSessionId: ownerId, requestId: `file-restart:${operationId}`, operationId,
           ...(locale ? { uiLocale: locale } : {}),
           kind: 'material', material: { materialId: config.materialId, sourceVersion: config.sourceVersion, topicId: config.topicId, translationSessionId: config.translationSessionId,
-            draftVersion: 1, targetLanguage: config.targetLanguage, instruction: config.instruction, model: session.model, maxInputChars: session.maxInputChars, sourceRef } },
+            draftVersion: 1, targetLanguage: config.targetLanguage, instruction: defaultInstruction, model: session.model, maxInputChars, sourceRef } },
         ...(librarySource ? { librarySource } : {}) }
   }
   async reviseSaved(request: FileJobRevision, actingOwner = request.ownerId): Promise<FileJobSummary> {

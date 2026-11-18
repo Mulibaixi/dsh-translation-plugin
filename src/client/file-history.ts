@@ -210,10 +210,11 @@ export class FileHistoryClient {
     await this.jobs.preserveDocument({ schemaVersion: 1, summary, sources, results, proposals: [], proposalVersion: null, workers: [], cards: [],
       final: selected ? { version: selected.version, selection: unit.final?.selection ?? 'automatic', selectedAt: timestamp } : null })
     const locale = this.uiLocale()?.trim().slice(0, 64)
+    const { defaultInstruction, maxInputChars } = this.sessions.getSettings()
     return { operationId, organizedRequirements, previousResultVersion: Math.max(0, ...results.map(result => result.version)), ...(librarySource ? { librarySource } : {}), envelope: {
        mainSessionId: target.mainSessionId, requestId: `file-restart:${operationId}`, operationId,
       ...(locale ? { uiLocale: locale } : {}), kind: 'material', material: { materialId: unit.id.replace(/^unit:/u, ''), sourceVersion: target.sourceVersion,
-        topicId: session.topicId, translationSessionId: session.id, draftVersion: 1, targetLanguage: unit.targetLanguage, instruction: unit.instruction,
-        model: session.model, maxInputChars: session.maxInputChars, sourceRef: current } } }
+        topicId: session.topicId, translationSessionId: session.id, draftVersion: 1, targetLanguage: unit.targetLanguage, instruction: defaultInstruction,
+        model: session.model, maxInputChars, sourceRef: current } } }
   }
 }

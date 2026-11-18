@@ -26,7 +26,9 @@
 - 文件候选资产提取使用 DSH 原生子代理，适配受支持版本的 run／Activation 接口；能力缺失会提示原因，主模型仍可直接读取文本原稿并翻译。
 - 宿主需能加载内置 `node:sqlite`；从源码构建插件需要 Node.js 22 或更高版本、pnpm，以及并排放置的 Composer 扩展源码目录。构建 DSH `0.2.2-rc.1` 及其宿主补丁需要 Node.js 24.9 或更高版本。
 
-文本文件支持 UTF-8 编码的 TXT／Markdown，每份最多 2 MiB，可按原格式交付。PDF 每份最多 20 MiB，实际上传受宿主限制。普通会话也支持单张 PNG、JPEG 或静态 WebP，原图最多 50 MiB，实际可用大小取决于宿主和当前主模型。其他格式由主模型按可用工具整理正文，JSON／HTML 结果可按约定形式保存。
+文本文件支持 UTF-8 编码的 TXT／Markdown，每份最多 2 MiB，可按原格式交付。PDF 每份最多 20 MiB，实际上传受宿主限制。普通会话也支持单张 PNG、JPEG 或静态 WebP，原图最多 50 MiB，实际可用大小取决于宿主和当前主模型。
+
+DOCX、XLSX、CSV 等其他格式由主模型使用现有工具提取正文，保留章节、工作表或单元格等可核对的位置，再通过普通翻译会话交付。明确要求单独导出且未指定格式时，默认用 Markdown。指定原格式时，主模型先核对工具能否生成该格式。如果无法处理完整的指定范围，主模型会指出缺口，并询问是否提供可读版本或先翻译已读部分。需要安装或启用专用解析工具时，须先获得用户同意。
 
 记忆资产窗口位于 DSH 应用内，可浮动或停靠。
 
@@ -216,7 +218,7 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 
 ## 保存存储与清理
 
-在 **DSH 设置 → 翻译** 配置新会话默认模式、目标语言、要求和单次上限。有效设置即时保存；恢复默认不会清除历史或改写已有会话。
+在 **DSH 设置 → 翻译** 的「新会话默认值」中配置翻译模式和目标语言。「全局翻译设置」中的翻译要求和单次上限适用于所有会话后续提交的翻译与重译，已提交的任务继续使用提交时的值。有效设置即时保存，恢复默认会重置这四项设置，历史记录和已有会话的模式、语言保持原样。
 
 ### 嵌入服务与语义索引
 
@@ -254,13 +256,13 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 
 ### 发行包更新
 
-安装包入口：[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)。选择 `.tgz` 附件，按对应发行说明核对配套版本；当前版本配套 Composer `0.4.7`，也可使用本地构建的包。
+选择 `.tgz` 附件，并按 DSH 宿主版本选择带有匹配补丁的 Composer。也可使用本地构建的包。[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)
 
-使用 DSH CLI 时，以下命令固定安装翻译插件 `0.27.1` 与 Composer `0.4.7`，先安装 Composer。需要其他版本时，从对应 Release 复制 `.tgz` 附件链接替换；也可使用下载后的包的完整路径。
+使用 DSH CLI 时，以下命令先安装 Composer `0.4.8`，再安装翻译插件 `0.27.2`。需要其他版本时，可替换为该版本的 `.tgz` 附件链接或下载后的完整路径。
 
 ```powershell
-dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.7/dsh-composer-extension-0.4.7.tgz
-dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.27.1/dsh-translation-plugin-0.27.1.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.8/dsh-composer-extension-0.4.8.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.27.2/dsh-translation-plugin-0.27.2.tgz
 ```
 
 上述命令使用桌面 `desktop` profile；Web 环境使用自身实际 profile，联动组件支持范围仍以 Composer 说明为准。使用桌面插件管理器安装时无需另装 CLI。

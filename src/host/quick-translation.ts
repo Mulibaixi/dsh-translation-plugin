@@ -114,7 +114,7 @@ export class QuickTranslationService {
     if (existing && (existing.source !== request.sourceText || existing.targetLanguage !== request.targetLanguage || existing.instruction !== request.instruction)) {
       return bad('invalid_input', '同一处理单元的原文、目标语言和要求已冻结。')
     }
-    if (Array.from(request.sourceText).length > context.binding.maxSourceCodePoints) return bad('invalid_input', '原文超过当前会话的单次上限。')
+    if (Array.from(request.sourceText).length > context.binding.maxSourceCodePoints) return bad('invalid_input', '原文超过单次上限。')
     if (context.jobs.size >= 500) return bad('busy', '运行期请求已达到上限，请重新加载插件后继续。')
     const job: JobRecord = {
       query: { sessionKey: request.sessionKey, operationId: request.operationId }, draftVersion: request.draftVersion,
