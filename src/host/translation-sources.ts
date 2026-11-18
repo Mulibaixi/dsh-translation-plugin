@@ -20,6 +20,7 @@ import { TRANSLATION_SOURCE_INTEGRITY_REMOTE, parseTranslationSourceRangeHash,
 interface Agent { readonly id: string; readonly session: { readonly id: string }; readonly ctx: unknown }
 import { imageFileFormat, matchesImageOriginal, MAX_IMAGE_ORIGINAL_BYTES } from '../shared/image-translation.js'
 import { isPdfFile, MAX_PDF_SOURCE_BYTES } from '../shared/pdf-source.js'
+import { inspectPdf } from './pdf-text.js'
 import type { ViewFileOpened } from '../shared/view-files.js'
 
 interface FileRef { readonly attachmentId: string; readonly name: string; readonly bytes: number }
@@ -94,6 +95,7 @@ export class TranslationSourcesService {
     if (source.version !== record.source.version) return bad('stale_version', '引用的固定源资产版本不一致。', 'resolve_source')
     if (source.name !== record.source.name || source.bytes !== record.source.bytes || source.totalCodePoints !== record.source.totalCodePoints ||
       source.encoding !== record.source.encoding || source.bom !== record.source.bom || source.sha256 !== record.source.sha256 ||
+      JSON.stringify(source.pdf) !== JSON.stringify(record.source.pdf) ||
       source.persistence !== record.source.persistence) return bad('integrity_failed', '固定源引用的元数据与原资产不一致。', 'resolve_source')
     return { ok: true, value: record }
   }
@@ -225,12 +227,13 @@ export class TranslationSourcesService {
     if (!binary && !text) return bad('empty_source', '原件没有可读取的正文。', 'decode_text')
     const totalCodePoints = binary ? 0 : sourceCodePointLength(text)
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes.buffer))
+    const pdfInfo = pdf ? await inspectPdf(bytes.slice(), signal).catch(() => { signal.throwIfAborted(); return undefined }) : undefined
     signal.throwIfAborted()
     if (!this.owns(scope, peerId, agent)) return bad('scope_mismatch', '原件准备完成前所属连接或 Agent 已失效。', 'decode_text')
     const source = parseTranslationSourceAsset({ sourceId: `source-${crypto.randomUUID()}`, version: 1, name: file.name, bytes: count,
       totalCodePoints, encoding: binary ? 'binary' : 'utf-8', bom: binary ? false : bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf,
       sha256: [...digest].map(byte => byte.toString(16).padStart(2, '0')).join(''), persistence: 'runtime_only',
-      ...(originalFilePath ? { originalFilePath } : {}) })
+      ...(originalFilePath ? { originalFilePath } : {}), ...(pdfInfo ? { pdf: pdfInfo } : {}) })
     this.sources.set(source.sourceId, { scope, peerId, agent, source, text, bytes, codePointOffsets: indexText(text) }); this.receipts.set(signature, source.sourceId)
     return ok(source)
   }

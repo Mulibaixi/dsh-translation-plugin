@@ -1,5 +1,5 @@
 import { parseTranslationSourceAsset, type TranslationSourceAsset } from './translation-sources.js'
-import { isPdfFile, parsePdfOutputOptions, type PdfOutputOptions } from './pdf-source.js'
+import { IMAGE_PDF_OUTPUT, isPdfFile, parsePdfOutputOptions, type PdfOutputOptions } from './pdf-source.js'
 
 /** Frozen plugin material for one main-session submission, independent of its transport. */
 export interface TranslationMaterialScope {
@@ -114,7 +114,8 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
   }
   if (material.pdfOutput !== undefined && (source.sourceRef?.encoding !== 'binary' || !isPdfFile(source.sourceRef.name)))
     throw new TypeError('PDF output options require a PDF source')
-  const pdfOutput = material.pdfOutput === undefined ? undefined : parsePdfOutputOptions(material.pdfOutput)
+  const options = material.pdfOutput === undefined ? undefined : parsePdfOutputOptions(material.pdfOutput)
+  const pdfOutput = source.sourceRef?.pdf?.kind === 'image' ? IMAGE_PDF_OUTPUT : options
   text(material.targetLanguage, 80); text(material.instruction, 4000, true)
   let model: TranslationMaterialRoute | null = null
   if (material.model !== null) {

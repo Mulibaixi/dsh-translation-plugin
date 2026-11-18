@@ -39,7 +39,7 @@ export async function writePdfExport(storage: ArtifactStorage, fileName: string,
           }
           references.add(object.reference)
           figures++
-        })
+        }, source.pdf?.scanPages)
       } catch (error) {
         if (!(error instanceof PdfReadError)) throw error
         figuresUnavailable = true

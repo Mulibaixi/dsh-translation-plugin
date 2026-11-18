@@ -1,16 +1,17 @@
 import { parseLibraryConnection, type LibraryConnectionIdentity } from '../shared/topic-bridge.js'
-import { isPdfRepairRange, parsePdfPages, parsePdfReadRange, parsePdfSections, parsePdfSupplement, pdfPageNumbers,
+import { PDF_SCAN_PENDING, PDF_SCAN_SKIPPED, isPdfRepairRange, parsePdfPages, parsePdfReadRange, parsePdfSections, parsePdfSupplement, parsePdfScanPage, pdfPageNumbers, pdfScanUnitPage, pendingPdfScanPages,
   type PdfReadBatch, type PdfSectionRegistration } from '../shared/pdf-source.js'
 import { parseNormalTranslationTarget, parseDirectTargetLanguage } from '../shared/normal-translation.js'
-import { PdfReadError, readPdfCoverage, readPdfText, renderPdfSelection, type PdfCrop } from './pdf-text.js'
+import { PdfReadError, readPdfCoverage, readPdfText, renderPdfSelection, withPdfRenderer, type PdfCrop } from './pdf-text.js'
 import { hasPdfUserDecision, PDF_SPLIT_QUESTION_GUIDANCE } from './pdf-user-decision.js'
 import { diagnosticSpan } from './diagnostics.js'
 import { FileWorkerRuntime, FileWorkerRuntimeError } from './file-worker-runtime.js'
 import { registerReferenceTools, type ReferenceFilesService } from './reference-files.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
-import { DIRECT_REQUIREMENTS_CODE_POINTS, DIRECT_AUXILIARY_CONTEXT_CODE_POINTS, MAX_DIRECT_RESULT_EDITS, parseNormalTranslationExecute, parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt } from '../shared/normal-translation.js'
+import { DIRECT_REQUIREMENTS_CODE_POINTS, DIRECT_AUXILIARY_CONTEXT_CODE_POINTS, MAX_DIRECT_RESULT_EDITS, parseNormalTranslationExecute, parseNormalTranslationSourceCorrection, type NormalTranslationCorrectionReceipt, type NormalTranslationUnitTarget } from '../shared/normal-translation.js'
 import { SOURCE_LAYOUT_GUIDANCE } from '../shared/translation-call.js'
+import { languageMatches } from '../shared/language-tag.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TerminologyAnalysisService } from './terminology-analysis.js'
 import type { TranslationPreparationService } from './translation-preparation.js'
@@ -184,7 +185,7 @@ class ManagementConnection {
     const pending = this.pending
     if (!pending || reply.requestId !== pending.frame.requestId) throw bridgeError('invalid_reply', '主题管理回执与请求不一致。')
     if (reply.ok) {
-      const expected = { pdf_register: 'pdf_registered', pdf_status: 'pdf_status', pdf_delivery: 'pdf_delivery', pdf_supplement: 'pdf_supplemented', image_update: 'image_updated', normal_call_finished: 'normal_call_finished', normal_patch_result: 'normal_result_patched', direct_proposals: 'direct_proposals', settings_scope: 'settings_scope', list_units: 'unit_directory', read_units: 'unit_contents', read_history: 'history_text', reference_assets: 'reference_facts', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
+      const expected = { pdf_register: 'pdf_registered', pdf_scan_page: 'pdf_registered', pdf_status: 'pdf_status', pdf_delivery: 'pdf_delivery', pdf_supplement: 'pdf_supplemented', image_update: 'image_updated', normal_call_finished: 'normal_call_finished', normal_patch_result: 'normal_result_patched', direct_proposals: 'direct_proposals', settings_scope: 'settings_scope', list_units: 'unit_directory', read_units: 'unit_contents', read_history: 'history_text', reference_assets: 'reference_facts', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         file_history: 'file_history', document_review_page: 'document_review_page', document_review_read: 'document_review_text', document_review_begin: 'document_review_receipt', document_review_submit: 'document_review_receipt', document_review_manual: 'document_review_receipt', document_review_observe: 'document_review_observed', document_task_terms: 'document_task_terms',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'term_write', remove_memory_asset: 'memory_asset_removed',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive_write', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_commit: 'normal_committed', normal_export: 'normal_exported', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
@@ -594,6 +595,12 @@ export class TopicToolsService {
         },
       })))
       if (materials) {
+        const deliveredPdf = (target: PdfSectionRegistration['target'], exec: ToolExecution) => {
+          if (exec.agent !== agent) throw bridgeError('scope_mismatch', 'PDF 工具需要当前主模型已收到的原件引用。')
+          const delivered = materials.deliveredForAgent(target, agent, { historical: true })
+          if (!delivered.ok) throw bridgeError(delivered.error.code, delivered.error.message)
+          return delivered.value.material
+        }
         const pdfBytes = (target: ReturnType<typeof parseNormalTranslationTarget>, exec: ToolExecution): Uint8Array => {
           if (target.kind !== 'material' || exec.agent !== agent) throw bridgeError('scope_mismatch', 'PDF 工具需要当前主模型已收到的原件引用。')
           const result = materials.pdfBytes(target, exec.agent)
@@ -610,23 +617,24 @@ export class TopicToolsService {
             throw Object.assign(bridgeError('pdf_bridge_unavailable', `PDF 进度未能核对。${detail} 请停止提交，待连接恢复后先重新查询进度。`), { cause: failure })
           }
           if (result.kind !== 'pdf_status') throw bridgeError('invalid_reply', '无法核对 PDF 进度。')
-          const delivered = materials.deliveredForAgent(target, agent, { historical: true })
-          if (!delivered.ok) throw bridgeError(delivered.error.code, delivered.error.message)
-          const frozenLimit = delivered.value.material.maxInputChars
+          const material = deliveredPdf(target, exec)
+          const frozenLimit = material.maxInputChars
           directory.retainNextTurn(['pdf'])
-          return { ...result, maxInputChars: Math.min(result.maxInputChars ?? frozenLimit, frozenLimit) }
+          return { ...result, pdf: material.sourceRef?.pdf, translateScanPages: material.pdfOutput?.translateScanPages === true,
+            defaultLanguage: material.targetLanguage, maxInputChars: Math.min(result.maxInputChars ?? frozenLimit, frozenLimit) }
         }
         const output = { schema: { type: 'json' as const }, render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }] }
         const pdfPosition = { type: 'object' as const, additionalProperties: false,
           properties: { page: { type: 'integer' as const, required: true }, offset: { type: 'integer' as const, required: true } } }
         disposers.push(register(define({
-          name: 'translation_pdf_status', description: 'Check the PDF workflow connection, submitted source length limit, and recorded coverage and pending translations. When resuming, use saved progress, language and repairablePages. If the bridge is unavailable, stop writes and report the lack of a saved result. Recheck status once when the connection is restored before continuing.',
+          name: 'translation_pdf_status', description: 'Check PDF type, scan pages, source length limit and saved progress. Mixed PDFs use text-layer tools first and, when opted in, translation_translate_scanned_pdf after text sections finish. Image PDFs use translation_translate_scanned_pdf directly. If the bridge is unavailable, stop writes and recheck once the connection is restored.',
           parameters: { target: { ...materialTargetParameter, required: true } }, output,
           execute: async (args: { target: unknown }, exec: ToolExecution) => {
             const target = parseNormalTranslationTarget(args.target)
             if (exec.agent !== agent || target.kind !== 'material') throw bridgeError('scope_mismatch', '需要当前主模型的 PDF 材料引用。')
             const result = await pdfStatus(target, exec)
-            return { progress: result.progress, pending: result.pending, targetLanguage: result.targetLanguage, repairablePages: result.repairablePages,
+            return { ...(result.pdf ? { pdf: result.pdf } : {}), ...(result.pdf?.kind === 'mixed' ? { translateScanPages: result.translateScanPages } : {}),
+              progress: result.progress, pending: result.pending, targetLanguage: result.targetLanguage, repairablePages: result.repairablePages,
               maxInputChars: result.maxInputChars }
           },
         })))
@@ -637,16 +645,118 @@ export class TopicToolsService {
           output,
           execute: async (args: { target: unknown; startPage?: number; endPage?: number; offset?: number }, exec: ToolExecution) => {
             const target = parseNormalTranslationTarget(args.target), page = args.startPage ?? 1, offset = args.offset ?? 0, end = args.endPage
+            const pdf = target.kind === 'material' ? deliveredPdf(target, exec).sourceRef?.pdf : undefined
+            if (pdf?.kind === 'image')
+              throw bridgeError('pdf_scan_required', '图片型 PDF 请使用 translation_translate_scanned_pdf。')
             if (!Number.isSafeInteger(page) || page < 1 || !Number.isSafeInteger(offset) || offset < 0 || end !== undefined && (!Number.isSafeInteger(end) || end < page)) throw bridgeError('invalid_pdf_range', 'PDF 页码或续读位置无效。')
             try {
-              const result = await readPdfText(pdfBytes(target, exec), { page, offset }, end, exec.signal)
+              const result = await readPdfText(pdfBytes(target, exec), { page, offset }, end, exec.signal, pdf?.scanPages)
               directory.retainNextTurn(['pdf'])
               return result
             }
             catch (error) { if (error instanceof PdfReadError) throw bridgeError(error.code, error.message); throw error }
           },
         })))
-        const pdfNormal = this.ctx.get?.('translationNormal') as Pick<import('./normal-translation.js').NormalTranslationService, 'savePdfArtifact' | 'finishPdfOutput'> | undefined
+        const pdfNormal = this.ctx.get?.('translationNormal') as Pick<import('./normal-translation.js').NormalTranslationService, 'savePdfArtifact' | 'finishPdfOutput' | 'translate'> | undefined
+        const scanning = new Set<string>()
+        if (pdfNormal) disposers.push(register(define({
+          name: 'translation_translate_scanned_pdf',
+          description: 'Translate an image PDF, or finish the opted-in scan pages of a mixed PDF after its text-layer units have translations. The Host completes pending scan translations first, then processes the remaining images. Use the saved page range. On needs_context, answer via translation_translate for the returned unit, then resume this tool.',
+          parameters: { target: { ...materialTargetParameter, required: true },
+            targetLanguage: { type: 'string', description: 'Resolved target language. Omit to use the saved language or Session default.' },
+            userRequirements: { type: 'string', description: 'Current user translation requirements verbatim.' },
+            requestedPages: { type: 'object', additionalProperties: false, properties: {
+              firstPage: { type: 'integer', required: true }, lastPage: { type: 'integer', required: true },
+            } } }, output,
+          execute: async (args: { target: unknown; targetLanguage?: unknown; requestedPages?: unknown; userRequirements?: string }, exec: ToolExecution) => {
+            const target = parseNormalTranslationTarget(args.target), requirements = args.userRequirements ?? ''
+            if (target.kind !== 'material' || exec.agent !== agent) throw bridgeError('scope_mismatch', '需要当前主模型已收到的 PDF。')
+            if (typeof requirements !== 'string' || sourceCodePointLength(requirements) > DIRECT_REQUIREMENTS_CODE_POINTS)
+              throw bridgeError('invalid_input', '翻译要求超出单次上限。')
+            if (scanning.has(target.materialId)) throw bridgeError('pdf_scan_busy', '此 PDF 正在识读，请等当前页结束。')
+            scanning.add(target.materialId)
+            let page: number | undefined
+            try {
+              const status = await pdfStatus(target, exec)
+              const mixed = status.pdf?.kind === 'mixed'
+              if (!status.pdf || !(status.pdf.kind === 'image' || mixed && status.translateScanPages))
+                throw bridgeError('pdf_scan_unavailable', '逐页识读适用于图片型 PDF 和已启用扫描页翻译的混合型 PDF。')
+              if (mixed && (status.progress?.next !== null || status.pending.some(unit => !pdfScanUnitPage(unit.unitId, target.materialId))))
+                throw bridgeError('pdf_text_pending', '请先处理请求范围内的文字页并完成已有正文译文。')
+              const selected = args.requestedPages === undefined ? undefined : parsePdfPages(args.requestedPages)
+              const requested = status.progress?.requested ?? selected ?? { firstPage: 1, lastPage: status.pdf.totalPages }
+              if (requested.lastPage > status.pdf.totalPages || selected &&
+                (selected.firstPage !== requested.firstPage || selected.lastPage !== requested.lastPage)) {
+                throw bridgeError('pdf_position_changed', 'PDF 页码或范围与当前进度不一致。请先核对 PDF 状态。')
+              }
+              const targetLanguage = parseDirectTargetLanguage(args.targetLanguage ?? status.targetLanguage ?? status.defaultLanguage)
+              if (status.targetLanguage && !languageMatches(targetLanguage, status.targetLanguage))
+                throw bridgeError('invalid_input', '续作请沿用此 PDF 已保存的目标语言。')
+              const translatePage = async (unit: NormalTranslationUnitTarget) => {
+                page = pdfScanUnitPage(unit.unitId, target.materialId)
+                if (!page) throw bridgeError('invalid_reply', '扫描页单元与 PDF 原稿不一致。')
+                const result = await pdfNormal.translate({ target: unit, targetLanguage,
+                  operationId: crypto.randomUUID(), ...(requirements ? { userRequirements: requirements } : {}) }, exec)
+                if (result.status === 'needs_context') return { status: result.status, page, question: result }
+                if (result.status !== 'completed' || !result.recorded) return { status: result.status === 'completed' ? 'unknown' : result.status, page,
+                  ...(result.message ? { message: result.message } : {}) }
+                return undefined
+              }
+              const finish = async () => {
+                const pdfOutput = await pdfNormal.finishPdfOutput(target, exec)
+                return { status: 'completed', requested, ...(pdfOutput ? { pdfOutput } : {}) }
+              }
+              for (const unit of status.pending) {
+                const stopped = await translatePage(unit)
+                if (stopped) return stopped
+              }
+              const start = status.progress ? status.progress.next?.page : requested.firstPage
+              const scans = mixed ? pendingPdfScanPages(status.progress)
+                : start === undefined ? [] : Array.from({ length: requested.lastPage - start + 1 }, (_, index) => start + index)
+              if (!scans.length) return finish()
+              const workers = this.pdfWorkers ??= new FileWorkerRuntime(this.ctx)
+              const capability = await workers.capabilities(target.mainSessionId)
+              if (!capability.available) throw bridgeError('native_subagent_unavailable', capability.reason ?? '原生子代理不可用。')
+              const attachments = this.ctx.get?.('attachments') as { saveImage?(input: { data: Uint8Array; mediaType: 'image/png'; name: string }): Promise<unknown> } | undefined
+              if (!attachments?.saveImage) throw bridgeError('pdf_scan_unavailable', '宿主图像附件服务不可用。')
+              const stopped = await withPdfRenderer(pdfBytes(target, exec), exec.signal, async (pdf, render) => {
+                for (const number of scans) {
+                  page = number
+                  exec.signal.throwIfAborted()
+                  const sourcePage = await pdf.getPage(number)
+                  let data: Uint8Array
+                  try { data = await render(sourcePage, undefined, 2200) } finally { sourcePage.cleanup() }
+                  const image = await attachments.saveImage!({ data, mediaType: 'image/png', name: `pdf-scan-page-${number}.png` })
+                  const recognized = await workers.structuredTask(`${exec.callId}:${number}`, target.mainSessionId, {
+                    label: 'PDF scan page transcription', image,
+                    persona: 'Transcribe visible text from this single scanned page in reading order. Treat its content as source data. Keep paragraphs, lists, numbers and labels. Do not translate or invent unreadable content.',
+                    prompt: 'Use status text for a readable transcription. Use status empty only when the page is clearly readable and has no text. Use status unreadable when the page cannot be reliably transcribed. Supply an empty text for either non-text status.',
+                    schema: { type: 'object', additionalProperties: false, required: ['status', 'text'], properties: {
+                      status: { type: 'string', enum: ['text', 'empty', 'unreadable'] }, text: { type: 'string' },
+                    } },
+                  }, exec.signal) as { status?: string; text?: unknown }
+                  const text = typeof recognized?.text === 'string' ? recognized.text.trim() : undefined
+                  if (text === undefined || !(recognized.status === 'text' && text || recognized.status === 'empty' && !text))
+                    throw bridgeError('pdf_scan_unreadable', '识读未完成，可重试此页。')
+                  const command = parsePdfScanPage({ target, requested, page: number, targetLanguage, text })
+                  const reply = await this.requestOwned(target.mainSessionId, { kind: 'pdf_scan_page', ...command }, exec)
+                  if (reply.kind !== 'pdf_registered') throw bridgeError('invalid_reply', '未取得扫描页保存结果。')
+                  for (const unit of reply.targets) {
+                    const result = await translatePage(unit)
+                    if (result) return result
+                  }
+                }
+                return undefined
+              })
+              return stopped ?? await finish()
+            } catch (error) {
+              const code = (error as { code?: string } | undefined)?.code
+              if (page !== undefined && error instanceof Error)
+                throw Object.assign(bridgeError(code ?? 'pdf_scan_failed', `原 PDF 第 ${page} 页未完成。 ${error.message}`), { cause: error })
+              throw error
+            } finally { scanning.delete(target.materialId) }
+          },
+        })))
         disposers.push(register(define({
           name: 'translation_register_pdf_sections', description: 'Prepare all requested PDF prose as one source for translation_translate. For an ordinary new PDF omit both requestedPages and read, and provide the complete organized prose. Use requestedPages only when the user specifies pages. If the prose cannot fit in one translation, ask about sections and wait for approval. Only use read.next to stop an approved batch early. For old repairablePages, use read.repair=true with an exact whole-page range and read.next=null. If the bridge disconnects or the result is unknown, stop submissions and check saved status once after reconnecting. ' + PDF_SPLIT_QUESTION_GUIDANCE,
           parameters: { target: { ...materialTargetParameter, required: true }, targetLanguage: { type: 'string', required: true },
@@ -675,6 +785,7 @@ export class TopicToolsService {
             let batch: PdfReadBatch
             try {
               const status = await pdfStatus(target, exec)
+              if (status.pdf?.kind === 'image') throw bridgeError('pdf_scan_required', '图片型 PDF 请使用 translation_translate_scanned_pdf。')
               const current = status.progress, requested = current?.requested ?? selected
               const repair = hint?.repair === true
               const start = repair ? hint.start : current ? current.next : { page: requested?.firstPage ?? 1, offset: 0 }
@@ -700,7 +811,8 @@ export class TopicToolsService {
                 throw bridgeError('pdf_source_too_large', `整理后的正文有 ${oversized} 码点，单次上限为 ${status.maxInputChars}。${confirmed ? '请缩小本段正文，保持整篇请求范围。' : splitQuestion}`)
               }
               read = { start, ...(end === undefined ? {} : { endPage: end }), next, ...(repair ? { repair: true } : {}) }
-              const result = await readPdfCoverage(pdfBytes(target, exec), start, end, next, exec.signal)
+              const scanPages = status.pdf?.scanPages ?? []
+              const result = await readPdfCoverage(pdfBytes(target, exec), start, end, next, exec.signal, scanPages)
               const lastReadPage = result.pages.at(-1)?.page
               if (!lastReadPage) throw bridgeError('pdf_position_changed', '此次没有可登记的 PDF 页。')
               if (sections.some(section => section.firstPage < read.start.page || section.lastPage > lastReadPage)) {
@@ -711,13 +823,19 @@ export class TopicToolsService {
               if (missing.length) {
                 throw bridgeError('pdf_sections_incomplete', `原 PDF 第 ${pdfPageNumbers(missing)} 页有可读正文尚未纳入区段。请补齐这些页后重新提交同一范围。`)
               }
-              if (!repair && (next || sections.length > 1) && !confirmed) {
+              if (status.translateScanPages &&
+                sections.some(section => scanPages.some(page => page >= section.firstPage && page <= section.lastPage)))
+                throw bridgeError('pdf_section_contains_scan', '文字区段须在扫描页前后分开，扫描页由识读流程补入。')
+              const splitTextRun = sections.some((section, index) => index > 0 &&
+                !(status.translateScanPages && scanPages.some(page => page > sections[index - 1]!.lastPage && page < section.firstPage)))
+              if (!repair && (next || splitTextRun) && !confirmed) {
                 const length = lengths.reduce((sum, size) => sum + size, 0)
                 if (!next && length <= status.maxInputChars) throw bridgeError('pdf_use_single_section', '正文可一次送译。请合并各章节正文，作为一个区段提交。')
                 directory.retainNextTurn(['pdf'])
                 throw bridgeError('pdf_split_confirmation_required', `请优先处理完整范围。确实超出单次翻译预算时，${splitQuestion}`)
               }
-              const gaps = result.pages.flatMap(page => page.issue ? [{ page: page.page, message: page.issue }] : [])
+              const gaps = result.pages.flatMap(page => page.issue ? [{ page: page.page,
+                message: status.translateScanPages && page.issue === PDF_SCAN_SKIPPED ? PDF_SCAN_PENDING : page.issue }] : [])
               batch = { totalPages: result.totalPages, requested: { firstPage: read.repair ? read.start.page : requested?.firstPage ?? 1,
                 lastPage: end ?? result.totalPages }, start: read.start, lastReadPage, next: result.next, gaps }
             } catch (error) { if (error instanceof PdfReadError) throw bridgeError(error.code, error.message); throw error }
@@ -741,7 +859,7 @@ export class TopicToolsService {
           },
         })))
         if (pdfNormal) disposers.push(register(define({
-          name: 'translation_save_pdf', description: 'On an explicit save or export request, combine the effective finals of this PDF into Markdown in original order. Current gaps and unfinished ranges are labeled as an excerpt. Includes saved supplements. Individual versions belong in the translation Session.',
+          name: 'translation_save_pdf', description: 'On an explicit export request, save the effective finals of a text or mixed PDF as Markdown in original page order. Incomplete ranges are marked as excerpts.',
           parameters: { target: { ...materialTargetParameter, required: true } }, output,
           execute: (args: { target: unknown }, exec: ToolExecution) => {
             const target = parseNormalTranslationTarget(args.target)

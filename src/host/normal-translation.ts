@@ -1,6 +1,6 @@
 import { parseTranslationLogRead, parseDirectTranslationLogRead, type TranslationLogRead, type TranslationLogPage } from '../shared/translation-log.js'
 import { SOURCE_LAYOUT_GUIDANCE } from '../shared/translation-call.js'
-import { isPdfFile, PDF_OBJECT_REFERENCE_GUIDANCE, pdfDeliveryComplete, pdfDeliveryName, pdfTranslationMarkdown, pdfUnitPages } from '../shared/pdf-source.js'
+import { isPdfFile, PDF_OBJECT_REFERENCE_GUIDANCE, pdfDeliveryComplete, pdfDeliveryName, pdfScanUnitPage, pdfTranslationMarkdown, pdfUnitPages, pendingPdfScanPages } from '../shared/pdf-source.js'
 import { translationTaskBoundary } from '../shared/translation-task.js'
 import { STYLE_SETTINGS_GUIDANCE } from '../shared/style-settings.js'
 import { historyContextRefs, type DirectHistoryRefs } from '../shared/direct-history-context.js'
@@ -150,9 +150,9 @@ type PdfOutputResult = {
   readonly sections: number
   readonly supplements: number
   readonly besideOriginal: boolean
-  readonly figures: number
-  readonly skippedFigures: number
-  readonly figuresUnavailable: boolean
+  readonly figures?: number
+  readonly skippedFigures?: number
+  readonly figuresUnavailable?: boolean
 } | { readonly error: string }
 interface DirectEntry {
   readonly signature: string
@@ -784,7 +784,10 @@ export class NormalTranslationService {
         }), ...draftTranslationTerms(request.draftTerms)],
         ...(contextRef ? { referenceContextRef: contextRef } : {}) }
       const pdfUnit = request.target.kind === 'unit' && pdfUnitPages(request.target.unitId, material.materialId)
-      const instruction = pdfUnit ? [material.instruction,
+      const scanned = request.target.kind === 'unit' && pdfScanUnitPage(request.target.unitId, material.materialId)
+      const instruction = scanned ? [material.instruction,
+        'Translate the transcribed text of one scanned page. Keep its headings, lists, numbers and reading order. Use plain text and separate paragraphs with a blank line.'].filter(Boolean).join('\n')
+        : pdfUnit ? [material.instruction,
         'Preserve the registered Markdown math and equation numbers in place. Copy inline $...$ and display $$ blocks with their LaTeX unchanged, and retain original-page references for uncertain formulas. Translate the surrounding prose.',
         PDF_OBJECT_REFERENCE_GUIDANCE].filter(Boolean).join('\n') : material.instruction
       const packet: NormalExecutionPacket = { operationId: internalId, callId, model, sourceText,
@@ -860,7 +863,7 @@ export class NormalTranslationService {
         catch (error) { recordError = `译文已生成，但结果记录未确认：${error instanceof Error ? error.message : '请重新读取当前单元。'}` }
       }
       const recordDone = Date.now()
-      const pdfTarget = pdfUnit && status === 'completed' && receipt && exec.agent
+      const pdfTarget = pdfUnit && !scanned && status === 'completed' && receipt && exec.agent
         ? this.materials?.pdfOutputTarget(material.materialId, sessionId, exec.agent)
         : undefined
       const pdfOutput = pdfTarget && await this.finishPdfOutput(pdfTarget, exec)
@@ -1073,7 +1076,7 @@ export class NormalTranslationService {
     try { return await this.savePdfArtifact(target, exec, true) }
     catch (error) {
       diagnosticSpan(this.ctx, 'translation.pdf_output', {}, target.requestId)('failed', {}, error)
-      return { error: '译文已保存在会话，整合译稿写入失败。可从 PDF 卡片另存。' }
+      return { error: '页结果已保存在会话，整合译稿写入失败。可请求重新导出。' }
     }
   }
   async savePdfArtifact(target: NormalTranslationMaterialTarget, exec: ToolExecution, automatic = false) {
@@ -1082,12 +1085,18 @@ export class NormalTranslationService {
     const material = original?.ok ? original.value.material : undefined
     const source = material?.sourceRef
     if (!source || source.encoding !== 'binary' || !isPdfFile(source.name)) throw rejected('source_unavailable', '无法取得此 PDF 原稿。', 'export_result')
+    if (source.pdf?.kind === 'image') {
+      if (automatic) return undefined
+      throw rejected('unsupported_output', '图片型 PDF 的整合交付待支持。可在会话查看或另存各页译文。', 'export_result')
+    }
     if (automatic && !material.pdfOutput?.combine) return undefined
     const plan = await this.topics.requestOwned(target.mainSessionId, { kind: 'pdf_delivery', target }, exec)
     if (plan.kind !== 'pdf_delivery') throw rejected('invalid_reply', '无法读取 PDF 交付范围。', 'export_result')
     const { delivery, translationSessionId } = plan
-    if (automatic && (!delivery.sections.length || !delivery.progress || delivery.progress.next || delivery.unfinished.length)) return undefined
-    if (!delivery.sections.length && !delivery.supplements.length) throw rejected('empty_result', 'PDF 暂无可保存的译文。', 'export_result')
+    const complete = pdfDeliveryComplete(delivery)
+    if (automatic && (!delivery.sections.length && !delivery.originalPages?.length || !delivery.progress || delivery.progress.next ||
+      delivery.unfinished.length || pendingPdfScanPages(delivery.progress).length)) return undefined
+    if (!delivery.sections.length && !delivery.supplements.length && !delivery.originalPages?.length) throw rejected('empty_result', 'PDF 暂无可保存的译文。', 'export_result')
     const bodies: string[] = []
     for (const section of delivery.sections) {
       const pages = pdfUnitPages(section.unitId, target.materialId)
@@ -1107,7 +1116,8 @@ export class NormalTranslationService {
       }
       bodies.push(pieces.join(''))
     }
-    const fileName = pdfDeliveryName(delivery), keepFigures = !!material.pdfOutput?.combine && material.pdfOutput.keepFigures
+    const fileName = pdfDeliveryName(delivery)
+    const keepFigures = !!material.pdfOutput?.combine && material.pdfOutput.keepFigures
     const graphics = keepFigures ? this.materials?.pdfBytes(target, exec.agent!) : undefined
     let saved: Awaited<ReturnType<typeof writePdfExport>>
     try {
@@ -1117,7 +1127,7 @@ export class NormalTranslationService {
     catch { exec.signal.throwIfAborted(); throw rejected('storage_failed', 'PDF 译稿写入失败。', 'save_artifact') }
     this.savedArtifacts.set(`${target.mainSessionId}\u0000${saved.path}`, saved.path)
     return { ...saved, fileName: saved.path.split(/[\\/]/u).at(-1) ?? fileName, format: 'md' as const,
-      complete: pdfDeliveryComplete(delivery), sections: delivery.sections.length, supplements: delivery.supplements.length,
+      complete, sections: delivery.sections.length, supplements: delivery.supplements.length,
       figuresUnavailable: saved.figuresUnavailable || keepFigures && !graphics?.ok }
   }
   /** Open one artifact saved in this runtime; an arbitrary path is never accepted. */

@@ -36,8 +36,8 @@ import { parseDocumentReviewPageRequest, parseDocumentReviewPage, parseDocumentR
 import { parseFileHistoryRequest, parseFileHistoryValue, parseFileHistoryUnit, type FileHistoryRequest, type FileHistoryValue, type FileHistoryUnit } from './file-history.js'
 import { parseUnitRequest, parseUnitDirectory, parseUnitContent, type UnitDirectoryRequest, type UnitReadRequest, type UnitDirectory, type UnitContent } from './numbered-units.js'
 import { parseHistoryTextRead, parseHistoryTextPage, type HistoryTextRead, type HistoryTextPage } from './history-text.js'
-import { parsePdfSectionRegistration, parsePdfReadBatch, parsePdfProgress, parsePdfPosition, parsePdfSupplement, parsePdfDelivery,
-  type PdfSectionRegistration, type PdfReadBatch, type PdfPosition, type PdfProgress, type PdfSupplement, type PdfDelivery } from './pdf-source.js'
+import { parsePdfSectionRegistration, parsePdfReadBatch, parsePdfProgress, parsePdfPosition, parsePdfSupplement, parsePdfDelivery, parsePdfScanPage,
+  type PdfSectionRegistration, type PdfReadBatch, type PdfPosition, type PdfProgress, type PdfSupplement, type PdfDelivery, type PdfScanPage } from './pdf-source.js'
 
 /** Below the installed Gateway's default 256 KiB uplink inbox. Replies are never silently truncated. */
 export const MAX_TOPIC_BRIDGE_REPLY_BYTES = 196_608
@@ -125,6 +125,7 @@ export type TopicBridgeCommand =
   | { readonly kind: 'normal_resolve'; readonly target: DirectUnitTarget; readonly operationId: string }
   | ({ readonly kind: 'image_update' } & ImageUnitUpdate)
   | ({ readonly kind: 'pdf_register'; readonly batch: PdfReadBatch } & PdfSectionRegistration)
+  | ({ readonly kind: 'pdf_scan_page' } & PdfScanPage)
   | { readonly kind: 'pdf_status'; readonly target: import('./normal-translation.js').NormalTranslationMaterialTarget }
   | { readonly kind: 'pdf_delivery'; readonly target: import('./normal-translation.js').NormalTranslationMaterialTarget }
   | { readonly kind: 'pdf_supplement'; readonly target: import('./normal-translation.js').NormalTranslationMaterialTarget; readonly supplement: PdfSupplement }
@@ -346,6 +347,11 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
         if (protocol < 2) throw new TypeError('Command requires topic bridge v2')
         exact(value, ['kind', 'target', 'targetLanguage', 'sections', 'read', 'batch'])
         return { kind: 'pdf_register', ...parsePdfSectionRegistration(value), batch: parsePdfReadBatch(value.batch) }
+      }
+      case 'pdf_scan_page': {
+        if (protocol < 2) throw new TypeError('Command requires topic bridge v2')
+        exact(value, ['kind', 'target', 'requested', 'page', 'targetLanguage', 'text'])
+        return { kind: 'pdf_scan_page', ...parsePdfScanPage(value) }
       }
       case 'pdf_status': case 'pdf_delivery': case 'pdf_supplement': {
         if (protocol < 2) throw new TypeError('Command requires topic bridge v2')

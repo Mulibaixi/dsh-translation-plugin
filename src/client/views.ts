@@ -1,6 +1,6 @@
 import { isDocumentUnit, isFileJobUnit, isImageUnit } from './translation-history.js'
 import { FileOpenMenu, useDirectFileOpen, type DirectFile, type FileOpenAction } from './direct-file-view.js'
-import { isPdfFile, pdfDeliveryComplete, pdfPageLabel, pdfPageNumbers, pdfRepairablePages } from '../shared/pdf-source.js'
+import { isPdfFile, pdfDeliveryComplete, pdfPageLabel, pdfPageNumbers, pdfRepairablePages, pdfScanUnitPage, pendingPdfScanPages } from '../shared/pdf-source.js'
 import { buildPdfExport, capturePdfDelivery } from './pdf-delivery.js'
 import { ImageBackground, ImageExportMenu, ImageOriginalButton } from './image-unit-view.js'
 import { BatchProcessingView, type BatchRemoteCall } from './batch-processing-view.js'
@@ -648,6 +648,8 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const collapsibleSource = Array.from(unit.source).length > 280 || unit.source.split('\n').length > 5
   const latest = unit.revisions.at(-1)
   const image = isImageUnit(unit) ? unit : undefined
+  const scanPage = pdfScanUnitPage(unit.id, unit.material?.materialId)
+  const originalScanPage = scanPage && !unit.source.trim()
   const intake = materials?.getFileUnits(session.id).find(file => file.materialId === unit.material?.materialId)
   const file = image ? undefined : intake
   const fileOpen = useDirectFileOpen({ file, unit, session, materials, viewFiles })
@@ -711,26 +713,31 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
       h('div', { className: 'dsh-tp-actions' }, h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
         h(SourceOpenLink, { unit, session, objects, viewFiles }))),
     h(RecordObjectText, { text: unit.source, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote }),
-    sourceHistory, execution ?? h('p', { className: 'dsh-tp-muted', role: 'status' }, '材料已受理，等待翻译执行。'))
+    scanPage ? fileOpen?.link : null,
+    sourceHistory, execution ?? h('p', { className: 'dsh-tp-muted', role: 'status' }, originalScanPage ? '无待译文字，保留原页。' : '材料已受理，等待翻译执行。'))
   const final = currentFinalRevision(unit), pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
   const finalLabel = final ? `${unit.final?.selection === 'user_fixed' ? '用户固定' : '自动最终'}：版本 ${final.order}` : pointed ? !revisionMatchesCurrentSource(unit, pointed) ? `原最终版本 ${pointed.order}已过时，待新原文定稿` : `最新尝试尚未完整，原自动最终版本 ${pointed.order}保留在历史中` : '待定稿'
   const blocked = session.mode === 'normal' ? !executionOwner ? '请选择本次任务使用的主会话。' : normal?.retranslateBlockedReason(session.id, unit.id) ?? (normal ? undefined : '普通重译入口未就绪。') : quick.retranslateBlockedReason(session, unit.id)
   const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
+  const sourceText = h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined,
+    target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null },
+    objects, objectAssets, quoteSource: sourceQuote })
   return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `${image ? '图片' : file ? '文件' : '文本'} ${unit.order}` },
     imageHeader,
     h('div', { className: 'dsh-tp-source' },
       h('div', { className: 'dsh-tp-unit-header', ref: sourceHeading },
-        h('span', { className: 'dsh-tp-muted', role: 'status' }, image ? `原文 · ${finalLabel}` : `单元 ${unit.order} · ${file ? '文件' : '文本'} · ${finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
+        h('span', { className: 'dsh-tp-muted', role: 'status' }, image ? `原文 · ${finalLabel}` : `单元 ${unit.order} · ${scanPage ? '扫描页' : file ? '文件' : '文本'} · ${originalScanPage ? '保留原页' : finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
         h('div', { className: 'dsh-tp-actions' },
           collapsibleSource && !file ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文${sourceCollapsed ? '展开' : '收起'}`, 'aria-expanded': !sourceCollapsed,
             title: sourceCollapsed ? '展开原文' : '收起原文，只显示前三行', onClick: toggleSource }, sourceCollapsed ? '展开' : '收起') : null,
           sourceEditButton,
-          h('button', { type: 'button', 'aria-label': `重译${image ? '图片' : '文本'} ${unit.order}`, disabled: !!blocked || !!image && !unit.source.trim(), title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
+          h('button', { type: 'button', 'aria-label': `重译${image ? '图片' : '文本'} ${unit.order}`, disabled: !!blocked || !!originalScanPage || !!image && !unit.source.trim(), title: blocked ?? '使用当前模型重译，沿用此段原文、目标语言与翻译要求。', onClick: () => { if (session.mode === 'normal') void normal?.retranslate(session.id, unit.id, executionOwner); else void quick.retranslate(session.id, unit.id) } }, '重译'),
           h(RecordIndexControl, { client: recordIndex, target: indexTarget, mainSessionId: executionOwner, disabled: !final || session.archivedAt !== null }),
           h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor, openFile: fileOpen?.system }),
           file ? null : h(SourceOpenLink, { unit, session, objects, viewFiles })),
       ),
-      sourceEditor ?? (image && !unit.source ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '等待提取文字。') : fileOpen ? fileOpen.link : h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote })),
+      sourceEditor ?? (scanPage ? h('div', null, fileOpen?.link, originalScanPage ? null : sourceText)
+        : image && !unit.source ? h('p', { className: 'dsh-tp-muted', role: 'status' }, '等待提取文字。') : fileOpen?.link ?? sourceText),
       imageBackground,
       imageIntakeStatus,
       sourceHistory,
@@ -757,13 +764,17 @@ function FileUnitView({ file, session, store, materials, viewFiles, ownerId, tra
   react.useEffect(() => { lifetime.current.mounted = true; return () => { lifetime.current.mounted = false; lifetime.current.controller?.abort() } }, [])
   const status = { freezing: file.sourceFrozen ? '原稿已冻结 · 正在交付' : '正在准备 · 原稿尚未冻结', frozen: '原稿已冻结 · 已交付，等待处理', failed: '处理失败', unknown: '提交状态未知', accepted: '原稿已冻结 · 已交付，等待处理' }[file.status]
   const pdf = isPdfFile(file.name), history = pdf ? store.getTranslationHistory(session.id) : undefined
+  const scanned = file.sourceRef?.pdf?.kind === 'image'
   const delivery = history ? capturePdfDelivery(file, history) : undefined
   const progress = file.pdfProgress
   const gaps = [...(progress?.gaps ?? [])].sort((a, b) => a.page - b.page)
   const canRepair = !!delivery && pdfRepairablePages(progress, [...delivery.sections, ...delivery.unfinished]).length > 0
-  const canResume = !!ownerId && (progress ? progress.next !== null || !!delivery?.unfinished.length || canRepair : !delivery?.totalSections) && file.sourceFrozen
+  const scansPending = pendingPdfScanPages(progress).length > 0
+  const canResume = !!ownerId && (progress ? progress.next !== null || !!delivery?.unfinished.length || canRepair || scansPending : !delivery?.totalSections) && file.sourceFrozen
+  const done = (delivery?.sections.length ?? 0) + (delivery?.originalPages?.length ?? 0)
+  const total = scanned && progress ? progress.requested.lastPage - progress.requested.firstPage + 1 : delivery?.totalSections ?? 0
   const pdfStatus = progress ? [pdfPageLabel(progress.requested), progress.next ? `待读第 ${progress.next.page} 页${progress.next.offset ? '剩余正文' : ''}` : '读取结束',
-    `已完成 ${delivery?.sections.length ?? 0}/${delivery?.totalSections ?? 0} 个区段`].join(' · ') : undefined
+    `已完成 ${done}/${total} ${scanned ? '页' : '个区段'}`].join(' · ') : undefined
   async function savePdf(): Promise<void> {
     try {
       const current = materials.getFileUnits(session.id).find(item => item.materialId === file.materialId)
@@ -791,11 +802,11 @@ function FileUnitView({ file, session, store, materials, viewFiles, ownerId, tra
   return h('article', { className: 'dsh-tp-record-unit dsh-tp-file-unit dsh-tp-source', 'data-unit-id': file.unitId, 'data-material-id': file.materialId, 'aria-label': `文件：${file.name}` },
     h('div', { className: 'dsh-tp-unit-header' }, h('span', { role: file.status === 'failed' || file.unknown ? 'alert' : 'status', className: 'dsh-tp-muted' }, pdfStatus ?? `原文 · ${status}`),
       h('div', { className: 'dsh-tp-actions' },
-        pdf && canResume && file.status !== 'freezing' ? button(canRepair && progress?.next === null ? '补译缺页' : '继续翻译',
+        pdf && canResume && file.status !== 'freezing' ? button(canRepair && progress?.next === null ? '补译缺页' : scansPending && progress?.next === null && !delivery?.unfinished.length ? '补译扫描页' : '继续翻译',
           () => { void materials.resumePdf(session.id, file.materialId, ownerId) }, file.busy || file.querying || translating) : null,
         !progress && ['failed', 'frozen'].includes(file.status) ? button('重新发送', () => { void materials.recoverFile(session.id, file.unitId, 'retry') }, file.busy || file.unknown) : null,
         !progress && ['failed', 'frozen'].includes(file.status) ? button('移除', () => { void materials.recoverFile(session.id, file.unitId, 'remove') }, file.busy || file.unknown) : null,
-        delivery && (delivery.sections.length || delivery.supplements.length) ? button(pdfDeliveryComplete(delivery) ? '另存 Markdown' : '另存 Markdown 节选', () => { void savePdf() }) : null,
+        !scanned && delivery && (delivery.sections.length || delivery.supplements.length) ? button(pdfDeliveryComplete(delivery) ? '另存 Markdown' : '另存 Markdown 节选', () => { void savePdf() }) : null,
         file.unknown || file.status === 'frozen' ? button('检查状态', () => { void materials.queryFile(session.id, file.unitId) }, file.querying || file.status === 'freezing') : null,
         h(FileOpenMenu, { label: `${file.name} 操作`, action: { disabled: opening, open: () => { void open('system') } } }))),
     h('div', { className: 'dsh-tp-file-name' }, h('button', { type: 'button', className: 'dsh-tp-object-link', disabled: opening, 'aria-label': `打开原稿：${file.name}`, onClick: () => { void open('preview') } }, file.name)),
@@ -1048,12 +1059,12 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
         h('input', { type: 'file', hidden: true, ref: fileInput, key: `file:${session.id}`, 'aria-label': '待译文件', disabled: session.mode === 'quick',
           onChange: (event: FileEvent) => {
             const file = event.currentTarget.files?.[0]
-            if (file && session.mode === 'normal') materials?.setFileSelected(session.id, file)
+            if (file && session.mode === 'normal') materials?.setFileSelected(session.id, file, ownerId)
             event.currentTarget.value = ''
           },
         }),
         h('button', { type: 'button', className: 'dsh-tp-attach', 'aria-label': '选择待译文件', disabled: session.mode === 'quick',
-          title: session.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择原稿（图片最多 50 MiB，其他文件最多 2 MiB）', onClick: () => fileInput.current?.click(),
+          title: session.mode === 'quick' ? '快译仅支持纯文本，不能选择文件。' : '选择原稿（图片最多 50 MiB，PDF 最多 20 MiB，其他文件最多 2 MiB）', onClick: () => fileInput.current?.click(),
         }, h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
           h('path', { d: 'm8 12 7-7a4 4 0 0 1 6 6L10 22a6 6 0 0 1-8-8L13 3M6 15l9-9a2 2 0 0 1 3 3l-9 9' }),
         )),
@@ -1068,17 +1079,24 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   }
   function renderComposer(session: LocalSession, batchInput?: unknown, batchButton?: unknown): unknown {
     const pdfOutput = session.mode === 'normal' ? materials?.getPdfOutput(session.id) : undefined
+    const preflight = pdfOutput ? materials?.getPdfPreflight(session.id) : undefined
+    const scanned = preflight?.kind === 'image'
+    const pdfTypeLabel = preflight?.kind ? { text: '文字型 PDF', image: '图片型 PDF', mixed: '混合型 PDF' }[preflight.kind] : undefined
     return h('div', { className: 'dsh-tp-composer' },
       session.mode === 'normal' && selectedFile ? h('div', null,
         h('div', { className: 'dsh-tp-attachment' },
           h('span', { className: 'dsh-tp-attachment-name', title: selectedFile.name }, selectedFile.name),
+          pdfTypeLabel ? h('span', { className: 'dsh-tp-muted' }, pdfTypeLabel) : null,
           h('button', { type: 'button', 'aria-label': '移除待译文件', title: '移除待译文件', onClick: () => { materials?.setFileSelected(session.id, undefined) } }, '×'),
         ),
         pdfOutput ? h('div', { className: 'dsh-tp-pdf-output', role: 'group', 'aria-label': 'PDF 译稿输出选项' },
-          h('label', null, h('input', { type: 'checkbox', checked: pdfOutput.combine,
-            onChange: (event: CheckEvent) => materials?.setPdfOutput(session.id, selectedFile, { combine: event.currentTarget.checked }) }), '译稿整合输出'),
-          h('label', null, h('input', { type: 'checkbox', checked: pdfOutput.combine && pdfOutput.keepFigures, disabled: !pdfOutput.combine,
+          h('label', { title: scanned ? '扫描版整合交付待支持' : undefined }, h('input', { type: 'checkbox', checked: pdfOutput.combine, disabled: scanned,
+            onChange: (event: CheckEvent) => materials?.setPdfOutput(session.id, selectedFile, { combine: event.currentTarget.checked }) }), scanned ? '整合文件输出' : '译稿整合输出'),
+          scanned || preflight && !preflight.kind ? null : h('label', null, h('input', { type: 'checkbox', checked: pdfOutput.combine && pdfOutput.keepFigures, disabled: !pdfOutput.combine,
             onChange: (event: CheckEvent) => materials?.setPdfOutput(session.id, selectedFile, { keepFigures: event.currentTarget.checked }) }), '译稿保留图表'),
+          preflight?.kind === 'mixed' ? h('label', null, h('input', { type: 'checkbox', checked: !!pdfOutput.translateScanPages,
+            onChange: (event: CheckEvent) => materials?.setPdfOutput(session.id, selectedFile, { translateScanPages: event.currentTarget.checked }) }), '翻译扫描页') : null,
+          preflight?.checking ? h('span', { role: 'status' }, '正在识别 PDF 类型…') : null,
         ) : null,
       ) : null,
       session.mode === 'normal' && longDraft ? h('div', null,

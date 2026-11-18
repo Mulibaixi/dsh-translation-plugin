@@ -11,8 +11,8 @@ import { sourceCodePointLength } from '../shared/translation-source-read.js'
 import { isDirectPromptVersion, type NormalTranslationTerm } from '../shared/translation-call.js'
 import { assetPriority } from '../memory/asset-priority.js'
 import { languageMatches } from '../shared/language-tag.js'
-import { isPdfFile, isPdfRepairRange, pdfRepairablePages, pdfSectionId, pdfUnitPages, type PdfReadBatch, type PdfSectionRegistration, type PdfSupplement } from '../shared/pdf-source.js'
-import { appendPdfSectionUnit } from '../memory/translation-history.js'
+import { PDF_SCAN_PENDING, isPdfFile, isPdfRepairRange, pdfRepairablePages, pdfSectionId, pdfScanUnitId, pdfUnitPages, type PdfReadBatch, type PdfScanPage, type PdfSectionRegistration, type PdfSupplement } from '../shared/pdf-source.js'
+import { appendPdfScanPageUnit, appendPdfSectionUnit } from '../memory/translation-history.js'
 import { capturePdfDelivery } from './pdf-delivery.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from '../shared/translation-material.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
@@ -135,7 +135,7 @@ export class NormalTranslationClient {
     const context = this.pdfContext(ownerId, target)
     if (!context) return undefined
     const { record, session, units, repairablePages } = context
-    const pending: NormalTranslationUnitTarget[] = units.flatMap(unit => isTextUnit(unit) && unit.sourceVersion && !unit.deletion && !currentFinalRevision(unit)
+    const pending: NormalTranslationUnitTarget[] = units.flatMap(unit => isTextUnit(unit) && unit.source && unit.sourceVersion && !unit.deletion && !currentFinalRevision(unit)
       ? [{ kind: 'unit', mainSessionId: ownerId, translationSessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion }]
       : [])
     const first = units[0]
@@ -165,7 +165,7 @@ export class NormalTranslationClient {
     if (!context) return undefined
     const { envelope, material, session, record, units, repairablePages } = context
     const prior = record.pdfProgress
-    if (session.mode !== 'normal' || session.archivedAt !== null ||
+    if (session.mode !== 'normal' || session.archivedAt !== null || material.sourceRef?.pdf?.kind === 'image' ||
       batch.start.page !== read.start.page || batch.start.offset !== read.start.offset || prior && batch.totalPages !== prior.totalPages ||
       sections.some(section => section.firstPage < batch.start.page || section.lastPage > batch.lastReadPage) ||
       units.some(unit => isTextUnit(unit) && !languageMatches(unit.targetLanguage, targetLanguage))) return undefined
@@ -194,6 +194,38 @@ export class NormalTranslationClient {
     this.materials.consumeSubmittedMaterial(envelope)
     this.emit()
     const targets: NormalTranslationUnitTarget[] = ids.map(unitId => ({ kind: 'unit', mainSessionId: ownerId, translationSessionId: session.id, unitId, sourceVersion: 1 }))
+    return { targets, next }
+  }
+
+  registerPdfScanPage(ownerId: string, input: PdfScanPage) {
+    const { target, requested, page, text, targetLanguage } = input
+    const context = this.pdfContext(ownerId, target)
+    if (!context) return undefined
+    const { envelope, material, session, record, units } = context
+    const pdf = material.sourceRef?.pdf, prior = record.pdfProgress
+    if (!pdf || session.mode !== 'normal' || session.archivedAt !== null || requested.lastPage > pdf.totalPages ||
+      prior && (prior.requested.firstPage !== requested.firstPage || prior.requested.lastPage !== requested.lastPage) ||
+      units.some(unit => isTextUnit(unit) && !languageMatches(unit.targetLanguage, targetLanguage))) return undefined
+    if (pdf.kind === 'mixed') {
+      if (!material.pdfOutput?.translateScanPages || !pdf.scanPages?.includes(page) || prior?.next !== null ||
+        !prior.gaps.some(gap => gap.page === page && gap.message === PDF_SCAN_PENDING)) return undefined
+    } else if (pdf.kind !== 'image' || page !== (prior ? prior.next?.page : requested.firstPage)) return undefined
+    const maxInputChars = Math.min(material.maxInputChars, session.maxInputChars), length = sourceCodePointLength(text)
+    if (length > maxInputChars) return { oversized: length, maxInputChars }
+    const unitId = pdfScanUnitId(target.materialId, page)
+    const existing = units.find(unit => unit.id === unitId)
+    if (existing && (!isTextUnit(existing) || existing.deletion)) return undefined
+    const admission = { ...envelope, material: { ...material, targetLanguage } }
+    if (!existing && !this.store.updateTranslationHistory(session.id, history => appendPdfScanPageUnit(history, admission, page, text, new Date().toISOString())))
+      return undefined
+    const next = pdf.kind === 'mixed' || page === requested.lastPage ? null : { page: page + 1, offset: 0 }
+    const gaps = (prior?.gaps ?? []).filter(gap => gap.page !== page)
+    this.materials.savePdfProgress(this.materials.pdfRecord(session.id, target.materialId) ?? record,
+      { totalPages: pdf.totalPages, requested, next, gaps })
+    this.materials.consumeSubmittedMaterial(envelope)
+    this.emit()
+    const targets: NormalTranslationUnitTarget[] = (existing && isTextUnit(existing) ? existing.source && !currentFinalRevision(existing) : text)
+      ? [{ kind: 'unit', mainSessionId: ownerId, translationSessionId: session.id, unitId, sourceVersion: existing && isTextUnit(existing) ? existing.sourceVersion! : 1 }] : []
     return { targets, next }
   }
 

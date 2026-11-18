@@ -4,7 +4,7 @@ import { MAX_TOPIC_BRIDGE_REPLY_BYTES } from '../shared/topic-bridge.js'
 import { INLINE_TRANSLATION_SOURCE_CODE_POINTS } from '../shared/translation-source-read.js'
 import type { NormalTranslationMaterialTarget } from '../shared/normal-translation.js'
 import { imageFileFormat, MAX_IMAGE_ORIGINAL_BYTES } from '../shared/image-translation.js'
-import { DEFAULT_PDF_OUTPUT, isPdfFile, MAX_PDF_SOURCE_BYTES, type PdfOutputOptions, type PdfProgress, type PdfSupplement } from '../shared/pdf-source.js'
+import { DEFAULT_PDF_OUTPUT, IMAGE_PDF_OUTPUT, isPdfFile, MAX_PDF_SOURCE_BYTES, type PdfOutputOptions, type PdfProgress, type PdfSupplement } from '../shared/pdf-source.js'
 import { appendImageUnit, isImageUnit } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
@@ -51,7 +51,13 @@ interface Options {
   /** A prepared material that the main Session never accepts must not block the panel forever. */
   readonly handoffMs?: number
 }
-interface SelectedFile { readonly file: File; readonly version: number; readonly pdfOutput?: PdfOutputOptions }
+interface PdfPreflight {
+  readonly scope: TranslationSourceScope
+  readonly controller: AbortController
+  checking: boolean
+  source?: TranslationSourceAsset
+}
+interface SelectedFile { readonly file: File; readonly version: number; readonly pdfOutput?: PdfOutputOptions; readonly pdfPreflight?: PdfPreflight }
 interface PastedTextCarrier { readonly kind: 'pasted_text'; readonly text: string; readonly name: string; readonly bytes: number; readonly totalCodePoints: number }
 type SourceCarrier = { readonly kind: 'selected_file'; readonly selected: SelectedFile } | { readonly kind: 'frozen_file'; readonly unitId: string; readonly name: string } | PastedTextCarrier
 interface FrozenDraft { readonly session: LocalSession; readonly draftVersion: number; readonly materialId: string; readonly signature: string; readonly carrier?: SourceCarrier; readonly pdfOutput?: PdfOutputOptions }
@@ -226,13 +232,14 @@ export class MaterialSubmissionsClient {
       const stage = item.consumed ? 'accepted' : item.stage === 'unknown' || item.workflow?.phase === 'unknown' ? 'unknown'
         : ['failed', 'released'].includes(item.stage) || item.workflow?.phase === 'failed' ? 'failed' : ['frozen', 'preparing', 'prepared'].includes(item.stage) ? 'freezing' : 'frozen'
       // The saved scope is part of the original source proof, independent of this submission's entry.
+      const pdfOutput = item.envelope?.kind === 'material' ? item.envelope.material.pdfOutput : draft.pdfOutput
       const record: FileIntakeRecord = { schemaVersion: 1, scope: old?.scope ?? { namespaceId: this.options.store.getNamespaceId(), ownerId: item.identity.mainSessionId, mainSessionId: item.identity.mainSessionId, topicId: session.topicId, translationSessionId: session.id },
         unitId, materialId: draft.materialId, name: carrier!.kind === 'selected_file' ? carrier!.selected.file.name : carrier!.name, createdAt: item.createdAt,
         config: { targetLanguage: session.targetLanguage, instruction: session.instruction, model: session.model, maxInputChars: session.maxInputChars, draftVersion: draft.draftVersion },
         submission: item.identity, stage, hostStarted: item.hostStarted, ...(item.reason ? { message: item.reason } : {}),
         ...(old?.source ? { source: old.source } : {}), ...(old?.historyCommit ? { historyCommit: old.historyCommit } : {}),
         ...(item.consumed ? { documentUnitId: unitId } : old?.documentUnitId ? { documentUnitId: old.documentUnitId } : {}),
-        ...(draft.pdfOutput ? { pdfOutput: draft.pdfOutput } : {}),
+        ...(pdfOutput ? { pdfOutput } : {}),
         ...(old?.pdfProgress ? { pdfProgress: old.pdfProgress } : {}), ...(old?.pdfSupplements ? { pdfSupplements: old.pdfSupplements } : {}) }
       this.fileIntakes.put(record)
     }
@@ -262,7 +269,10 @@ export class MaterialSubmissionsClient {
       this.draftVersion(session)
       if (session.mode === 'normal' && this.live(session) && (session.input.trim() || this.files.has(session.id))) needed.add(owner)
     }
-    for (const sessionId of this.files.keys()) if (!this.options.store.getSession(sessionId)) this.files.delete(sessionId)
+    for (const [sessionId, selected] of this.files) if (!this.options.store.getSession(sessionId)) {
+      selected.pdfPreflight?.controller.abort()
+      this.files.delete(sessionId)
+    }
     for (const file of this.fileIntakes.all()) {
       const session = this.options.store.getSession(file.scope.translationSessionId)
       const accepted = this.options.store.getTranslationHistory(file.scope.translationSessionId)?.units.some(unit => unit.id === file.unitId && isDocumentUnit(unit))
@@ -273,18 +283,35 @@ export class MaterialSubmissionsClient {
     for (const owner of needed) if (!this.retained.has(owner)) this.retained.set(owner, this.options.topics.retain(owner))
     for (const [owner, release] of this.retained) if (!needed.has(owner)) { this.retained.delete(owner); release() }
   }
-  setFileSelected(sessionId: string, file: File | undefined): void {
+  setFileSelected(sessionId: string, file: File | undefined, ownerId?: string): void {
+    this.files.get(sessionId)?.pdfPreflight?.controller.abort()
     const version = (this.fileVersions.get(sessionId) ?? 0) + 1
     this.fileVersions.set(sessionId, version)
-    if (file) this.files.set(sessionId, { file, version, ...(isPdfFile(file.name) ? { pdfOutput: DEFAULT_PDF_OUTPUT } : {}) })
+    const pdf = !!file && isPdfFile(file.name), session = this.options.store.getSession(sessionId)
+    const pdfPreflight: PdfPreflight | undefined = pdf && file.size > 0 && file.size <= MAX_PDF_SOURCE_BYTES && ownerId && session &&
+      ownerId !== this.options.store.getNamespaceId() && this.options.upload && this.options.sources
+      ? { scope: this.fileScope(session, ownerId), controller: new AbortController(), checking: true } : undefined
+    if (file) this.files.set(sessionId, { file, version, ...(pdf ? { pdfOutput: DEFAULT_PDF_OUTPUT } : {}), ...(pdfPreflight ? { pdfPreflight } : {}) })
     else this.files.delete(sessionId)
     this.reconcile(); this.emit()
+    if (file && pdfPreflight) {
+      const { scope, controller } = pdfPreflight
+      void this.importFile(file, scope, id(), controller.signal).then(source => { pdfPreflight.source = source }, () => {})
+        .finally(() => { pdfPreflight.checking = false; this.emitListeners() })
+    }
   }
   getSelectedFile(sessionId: string): File | undefined { return this.files.get(sessionId)?.file }
-  getPdfOutput(sessionId: string): PdfOutputOptions | undefined { return this.files.get(sessionId)?.pdfOutput }
+  getPdfOutput(sessionId: string): PdfOutputOptions | undefined {
+    const selected = this.files.get(sessionId)
+    return selected?.pdfPreflight?.source?.pdf?.kind === 'image' ? IMAGE_PDF_OUTPUT : selected?.pdfOutput
+  }
+  getPdfPreflight(sessionId: string) {
+    const selection = this.files.get(sessionId)?.pdfPreflight
+    return selection ? { checking: selection.checking, kind: selection.source?.pdf?.kind } : undefined
+  }
   setPdfOutput(sessionId: string, file: File, change: Partial<PdfOutputOptions>): void {
     const selected = this.files.get(sessionId)
-    if (selected?.file !== file || !selected.pdfOutput) return
+    if (selected?.file !== file || !selected.pdfOutput || selected.pdfPreflight?.source?.pdf?.kind === 'image') return
     const version = selected.version + 1
     this.fileVersions.set(sessionId, version)
     this.files.set(sessionId, { ...selected, version, pdfOutput: { ...selected.pdfOutput, ...change } })
@@ -629,7 +656,8 @@ export class MaterialSubmissionsClient {
       if (session.input.trim()) return FILE_AND_TEXT
       if (!file.size) return '文件为空，请选择有内容的文件。'
       if (imageFileFormat(file.name)) return file.size > MAX_IMAGE_ORIGINAL_BYTES ? '原图超过 50 MiB 上限；所选文件保留。' : undefined
-      if (isPdfFile(file.name)) return file.size > MAX_PDF_SOURCE_BYTES ? 'PDF 超过 20 MiB 上限；所选文件保留。' : undefined
+      if (isPdfFile(file.name)) return file.size > MAX_PDF_SOURCE_BYTES ? 'PDF 超过 20 MiB 上限；所选文件保留。'
+        : this.files.get(session.id)?.pdfPreflight?.checking ? '正在识别 PDF 类型…' : undefined
       if (file.size > MAX_TRANSLATION_SOURCE_BYTES) return '文件超过 2 MiB 上限；所选文件保留。'
       return undefined
     }
@@ -724,7 +752,8 @@ export class MaterialSubmissionsClient {
     const captured: FrozenDraft | undefined = kind === 'material' && session ? { session: { ...structuredClone(session), ...(sourceText === undefined ? {} : { input: sourceText }) }, draftVersion: this.draftVersion(session),
       materialId: id(), signature: signature(session, this.fileVersions.get(session.id) ?? 0) } : undefined
     const carrier = captured ? selected ? { kind: 'selected_file' as const, selected } : this.pastedCarrier(captured, identity) : undefined
-    const draft = captured && carrier ? { ...captured, carrier, ...(selected?.pdfOutput ? { pdfOutput: selected.pdfOutput } : {}) } : captured
+    const pdfOutput = selected && session ? this.getPdfOutput(session.id) : undefined
+    const draft = captured && carrier ? { ...captured, carrier, ...(pdfOutput ? { pdfOutput } : {}) } : captured
     const envelope = draft ? carrier ? undefined : this.boundedEnvelope({ ...identity, kind: 'material', material: { ...this.config(draft), sourceText: draft.session.input } })
       : this.boundedEnvelope({ ...identity, kind })
     const item: Submission = { identity, createdAt: new Date().toISOString(), kind, draft, generation: this.generation, envelope, sessionId: session?.id, direct,
@@ -799,43 +828,56 @@ export class MaterialSubmissionsClient {
     if (signal.aborted || item.finished || item.withdrawn || item.replacementId || this.disposed || item.generation !== this.generation ||
       item.sessionId && (!this.options.store.getSession(item.sessionId) || this.options.store.isSessionDeleted(item.sessionId) || this.fileAccessBlockedReason(item.sessionId, `unit:${item.draft?.materialId}`))) throw new Error('材料准备已取消。')
   }
-  private async materialEnvelope(item: Submission, signal: AbortSignal, registerBatchFile?: () => void): Promise<TranslationMaterialEnvelope> {
-    this.active(item, signal)
-    if (item.envelope) return item.envelope
-    const draft = item.draft, carrier = draft?.carrier, sources = this.options.sources, upload = this.options.upload
-    if (!draft || !carrier || !sources || !upload) throw new Error('文件上传或导入服务尚未就绪。')
-    // Generated text is a carrier for this frozen body, never a second user-selected material.
-    if (carrier.kind === 'frozen_file') throw new Error('已保存原稿尚未恢复，不能重新上传空材料。')
-    const file = carrier.kind === 'selected_file' ? carrier.selected.file
-      : new File([new TextEncoder().encode(carrier.text)], carrier.name, { type: 'text/plain;charset=utf-8' })
-    item.reason = '正在上传原稿…'; this.emit()
-    const receipt = await upload.upload(item.identity.mainSessionId, file, file.name, signal, () => {})
-    this.active(item, signal)
+  private fileScope(session: LocalSession, ownerId: string): TranslationSourceScope {
+    return { namespaceId: this.options.store.getNamespaceId(), ownerId, mainSessionId: ownerId, topicId: session.topicId, translationSessionId: session.id }
+  }
+  private async importFile(file: File, scope: TranslationSourceScope, key: string, signal: AbortSignal, onUploaded?: () => void): Promise<TranslationSourceAsset> {
+    const { sources, upload } = this.options
+    if (!sources || !upload) throw new Error('文件上传或导入服务尚未就绪。')
+    const receipt = await upload.upload(scope.mainSessionId, file, file.name, signal, () => {})
+    signal.throwIfAborted()
     if (!receipt || typeof receipt !== 'object' || (receipt as { ok?: unknown }).ok !== true) throw new Error('文件上传未完成；草稿与文件保留。')
     const value = (receipt as { value?: { receiptId?: unknown } }).value
     if (!value || typeof value.receiptId !== 'string' || !value.receiptId) throw new Error('文件上传收据无效。')
-    item.reason = '正在导入并校验原稿…'; this.emit()
+    onUploaded?.()
     let originalFilePath: string | undefined
-    if (carrier.kind === 'selected_file' && (/\.md$/iu.test(file.name) || isPdfFile(file.name))) {
+    if (/\.md$/iu.test(file.name) || isPdfFile(file.name)) {
       const bridge = (globalThis as unknown as { __DSH_HOST_PATHS__?: { pathFor(file: File): string } }).__DSH_HOST_PATHS__
       try { originalFilePath = bridge?.pathFor(file) || undefined } catch { /* Web and generated files have no native origin. */ }
     }
-    const source = await sources.importReceipt({ scope: { namespaceId: this.options.store.getNamespaceId(), ownerId: item.identity.mainSessionId, mainSessionId: item.identity.mainSessionId,
-      topicId: draft.session.topicId, translationSessionId: draft.session.id }, receiptId: value.receiptId, idempotencyKey: registerBatchFile ? item.identity.requestId : draft.materialId,
-      ...(originalFilePath ? { originalFilePath } : {}) }, signal)
-    this.active(item, signal)
+    const source = await sources.importReceipt({ scope, receiptId: value.receiptId, idempotencyKey: key, ...(originalFilePath ? { originalFilePath } : {}) }, signal)
     if (!source.ok) throw new MaterialRejected(source.error.message, source.error.code)
-    item.envelope = this.boundedEnvelope({ ...item.identity, kind: 'material', material: { ...this.config(draft), sourceRef: source.value } })
+    return source.value
+  }
+  private async materialEnvelope(item: Submission, signal: AbortSignal, registerBatchFile?: () => void): Promise<TranslationMaterialEnvelope> {
+    this.active(item, signal)
+    if (item.envelope) return item.envelope
+    const draft = item.draft, carrier = draft?.carrier
+    if (!draft || !carrier) throw new Error('文件上传或导入服务尚未就绪。')
+    if (carrier.kind === 'frozen_file') throw new Error('已保存原稿尚未恢复，不能重新上传空材料。')
+    const file = carrier.kind === 'selected_file' ? carrier.selected.file
+      : new File([new TextEncoder().encode(carrier.text)], carrier.name, { type: 'text/plain;charset=utf-8' })
+    const scope = this.fileScope(draft.session, item.identity.mainSessionId)
+    const preflight = carrier.kind === 'selected_file' ? carrier.selected.pdfPreflight : undefined
+    let source = preflight && JSON.stringify(preflight.scope) === JSON.stringify(scope) ? preflight.source : undefined
+    if (!source) {
+      item.reason = '正在上传原稿…'; this.emit()
+      source = await this.importFile(file, scope, registerBatchFile ? item.identity.requestId : draft.materialId, signal, () => {
+        this.active(item, signal); item.reason = '正在导入并校验原稿…'; this.emit()
+      })
+    }
+    this.active(item, signal)
+    item.envelope = this.boundedEnvelope({ ...item.identity, kind: 'material', material: { ...this.config(draft), sourceRef: source } })
     if (fileCarrier(carrier)) {
       registerBatchFile?.()
-      this.fileIntakes.setSource(`unit:${draft.materialId}`, source.value)
+      this.fileIntakes.setSource(`unit:${draft.materialId}`, source)
       this.emit()
       item.reason = '正在缓存原稿…'; this.emit()
       // Save the frozen source before document preparation or acceptance can fail. The managed
       // cache is independent of chat history; a host without storage keeps the runtime original.
       await this.fileIntakes.saveSource(`unit:${draft.materialId}`, this.options.sourceStorage)
       this.active(item, signal)
-      if (source.value.encoding === 'binary' && imageFileFormat(source.value.name) && item.envelope.kind === 'material') {
+      if (source.encoding === 'binary' && imageFileFormat(source.name) && item.envelope.kind === 'material') {
         const envelope = item.envelope
         if (!this.options.store.updateTranslationHistory(draft.session.id, history => appendImageUnit(history, envelope, item.createdAt))) {
           throw new Error('图片单元登记失败，原图仍保留。')
@@ -1030,6 +1072,7 @@ export class MaterialSubmissionsClient {
     this.disposed = true; this.generation++
     for (const item of this.submissions.values()) { this.clearHandoff(item); if (item.stallTimer) clearTimeout(item.stallTimer); item.controller?.abort() }
     for (const release of this.retained.values()) release()
+    for (const selected of this.files.values()) selected.pdfPreflight?.controller.abort()
     this.notices.clear(); this.retained.clear(); this.listeners.clear(); this.files.clear(); this.fileVersions.clear(); this.omitted.clear(); this.submissions.clear(); this.versions.clear(); this.fileIntakes.dispose(); this.fileActions.clear(); this.fileNotices.clear()
   }
 }

@@ -4,23 +4,44 @@ export const MAX_PDF_SOURCE_BYTES = 20 * 1024 * 1024
 export const MAX_PDF_READ_CODE_POINTS = 16000
 export const MAX_PDF_READ_BYTES = 64 * 1024
 const PDF_UNREGISTERED_PAGE = '此页可读内容尚未登记为翻译区段。'
+export const PDF_SCAN_PENDING = '扫描页待翻译。'
+export const PDF_SCAN_SKIPPED = '扫描页未收录译文，请参阅原页。'
 
 export function isPdfFile(name: string): boolean { return /\.pdf$/iu.test(name) }
+
+export interface PdfInspection {
+  readonly kind: 'text' | 'image' | 'mixed'
+  readonly totalPages: number
+  readonly scanPages?: readonly number[]
+}
+
+export function parsePdfInspection(value: unknown): PdfInspection {
+  const { kind, totalPages, scanPages, ...rest } = record(value)
+  if ((kind !== 'text' && kind !== 'image' && kind !== 'mixed') || !integer(totalPages) || Object.keys(rest).length)
+    throw new TypeError('Invalid PDF inspection')
+  if (scanPages !== undefined && (kind !== 'mixed' || !Array.isArray(scanPages) || !scanPages.length ||
+    !scanPages.every((page, index) => integer(page) && page <= totalPages && (index === 0 || page > scanPages[index - 1]))))
+    throw new TypeError('Invalid mixed PDF scan pages')
+  return { kind, totalPages, ...(scanPages === undefined ? {} : { scanPages }) }
+}
 
 export interface PdfOutputOptions {
   readonly combine: boolean
   readonly keepFigures: boolean
+  readonly translateScanPages?: boolean
 }
 
 export const DEFAULT_PDF_OUTPUT: PdfOutputOptions = { combine: true, keepFigures: false }
+export const IMAGE_PDF_OUTPUT: PdfOutputOptions = { combine: false, keepFigures: false }
 
 export const PDF_OBJECT_REFERENCE_GUIDANCE = 'Keep each standalone figure, scheme or table reference such as ［图 1 见原 PDF 第 3 页］ verbatim on its own line in reading order. The export uses the original label and page to insert the visual.'
 
 export function parsePdfOutputOptions(input: unknown): PdfOutputOptions {
-  const { combine, keepFigures, ...rest } = record(input)
-  if (typeof combine !== 'boolean' || typeof keepFigures !== 'boolean' || Object.keys(rest).length)
+  const { combine, keepFigures, translateScanPages, ...rest } = record(input)
+  if (typeof combine !== 'boolean' || typeof keepFigures !== 'boolean' ||
+    translateScanPages !== undefined && typeof translateScanPages !== 'boolean' || Object.keys(rest).length)
     throw new TypeError('Invalid PDF output options')
-  return { combine, keepFigures }
+  return { combine, keepFigures, ...(translateScanPages === undefined ? {} : { translateScanPages }) }
 }
 
 export interface PdfPages {
@@ -48,6 +69,10 @@ export interface PdfReadBatch extends PdfProgress {
   readonly start: PdfPosition
   readonly lastReadPage: number
 }
+
+export function pendingPdfScanPages(progress: PdfProgress | null | undefined): number[] {
+  return (progress?.gaps ?? []).filter(gap => gap.message === PDF_SCAN_PENDING).map(gap => gap.page).sort((a, b) => a - b)
+}
 export interface PdfSupplement {
   readonly page: number
   readonly label: string
@@ -60,12 +85,16 @@ export interface PdfDelivery {
   readonly sections: readonly (PdfPages & { readonly unitId: string; readonly revisionId: string })[]
   readonly unfinished: readonly PdfPages[]
   readonly supplements: readonly PdfSupplement[]
+  readonly originalPages?: readonly number[]
 }
 
 export function parsePdfDelivery(input: unknown): PdfDelivery {
-  const { name, progress, sections, unfinished, supplements } = record(input)
+  const { name, progress, sections, unfinished, supplements, originalPages } = record(input)
   if (typeof name !== 'string' || !isPdfFile(name) || !Array.isArray(sections) || !Array.isArray(unfinished) || !Array.isArray(supplements)) throw new TypeError('Invalid PDF delivery')
+  if (originalPages !== undefined && (!Array.isArray(originalPages) || !originalPages.every(page => integer(page))))
+    throw new TypeError('Invalid untranslated PDF pages')
   return { name, progress: progress === null ? null : parsePdfProgress(progress), unfinished: unfinished.map(parsePdfPages), supplements: supplements.map(parsePdfSupplement),
+    ...(originalPages?.length ? { originalPages: [...new Set<number>(originalPages)] } : {}),
     sections: sections.map(item => {
       const { unitId, revisionId } = record(item)
       if (typeof unitId !== 'string' || !pdfUnitPages(unitId) || typeof revisionId !== 'string' || !revisionId.trim()) throw new TypeError('Invalid PDF delivery section')
@@ -124,6 +153,23 @@ export interface PdfSectionRegistration {
   readonly read: PdfReadRange
 }
 
+export interface PdfScanPage {
+  readonly target: NormalTranslationMaterialTarget
+  readonly requested: PdfPages
+  readonly page: number
+  readonly targetLanguage: string
+  readonly text: string
+}
+
+export function parsePdfScanPage(value: unknown): PdfScanPage {
+  const { target: raw, requested, page, targetLanguage, text } = record(value)
+  const target = parseNormalTranslationTarget(raw), range = parsePdfPages(requested)
+  if (target.kind !== 'material' || !integer(page) || page < range.firstPage || page > range.lastPage ||
+    typeof text !== 'string' || new TextEncoder().encode(text).byteLength > MAX_PDF_READ_BYTES)
+    throw new TypeError('Invalid PDF scan page')
+  return { target, requested: range, page, targetLanguage: parseDirectTargetLanguage(targetLanguage), text: text.trim() }
+}
+
 export function parsePdfSections(input: unknown): Omit<PdfSectionRegistration, 'read'> {
   const { target: reference, targetLanguage, sections } = record(input)
   const target = parseNormalTranslationTarget(reference)
@@ -174,8 +220,19 @@ export function pdfSectionId(materialId: string, pages: PdfPages, index: number)
   return `unit:${materialId}:pdf:${pages.firstPage}-${pages.lastPage}:${index}`
 }
 
+export function pdfScanUnitId(materialId: string, page: number): string { return `unit:${materialId}:pdf-scan:${page}` }
+
+export function pdfScanUnitPage(unitId: string, materialId?: string): number | undefined {
+  const match = /^(unit:.+):pdf-scan:([1-9]\d*)$/u.exec(unitId)
+  if (!match || materialId !== undefined && match[1] !== `unit:${materialId}`) return undefined
+  const page = Number(match[2])
+  return integer(page) ? page : undefined
+}
+
 /** Page ranges belong to the immutable PDF, independently of the editable unit text. */
 export function pdfUnitPages(unitId: string, materialId?: string): PdfPages | undefined {
+  const scan = pdfScanUnitPage(unitId, materialId)
+  if (scan) return { firstPage: scan, lastPage: scan }
   const suffix = /^(unit:.+):pdf:([1-9]\d*)-([1-9]\d*):[1-9]\d*$/u.exec(unitId)
   if (!suffix || materialId !== undefined && suffix[1] !== `unit:${materialId}`) return undefined
   const firstPage = Number(suffix[2]), lastPage = Number(suffix[3])
@@ -193,7 +250,8 @@ export function pdfTranslationMarkdown(text: string, pages: PdfPages): string {
 }
 
 export function pdfDeliveryComplete(delivery: PdfDelivery): boolean {
-  return delivery.sections.length > 0 && !!delivery.progress && delivery.progress.next === null && !delivery.progress.gaps.length && !delivery.unfinished.length
+  return (delivery.sections.length > 0 || !!delivery.originalPages?.length) && !!delivery.progress &&
+    delivery.progress.next === null && !delivery.progress.gaps.length && !delivery.unfinished.length
 }
 
 function rangeLabel(pages: PdfPages): string {
@@ -219,6 +277,7 @@ export function pdfDeliveryHeader(delivery: PdfDelivery): string {
   const lines = [`# ${complete ? 'PDF 译文' : 'PDF 译文节选'}`]
   if (progress) lines.push(`请求范围为 ${pdfPageLabel(progress.requested)}`)
   if (sections.length) lines.push(`已收录译文对应原稿第 ${pageRanges(sections)} 页`)
+  if (delivery.originalPages?.length) lines.push(`原稿第 ${pdfPageNumbers(delivery.originalPages)} 页无待译文字，画面见原 PDF。`)
   if (!progress) lines.push('此记录没有读取进度，覆盖范围待核对。')
   if (progress?.next) lines.push(`原稿第 ${rangeLabel({ firstPage: progress.next.page, lastPage: progress.requested.lastPage })} 页仍有正文待读。`)
   if (unfinished.length) lines.push(`原稿第 ${pageRanges(unfinished)} 页有区段尚无有效定稿。`)

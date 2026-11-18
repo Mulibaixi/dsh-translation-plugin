@@ -89,6 +89,7 @@ type Handle = ReturnType<TopicBridgeRemotePort['connect']>
 interface NormalPort {
   registerPdfSections: import('./normal-translation.js').NormalTranslationClient['registerPdfSections']
   pdfStatus: import('./normal-translation.js').NormalTranslationClient['pdfStatus']
+  registerPdfScanPage: import('./normal-translation.js').NormalTranslationClient['registerPdfScanPage']
   pdfDelivery: import('./normal-translation.js').NormalTranslationClient['pdfDelivery']
   savePdfSupplement: import('./normal-translation.js').NormalTranslationClient['savePdfSupplement']
   updateImage(ownerId: string, request: import('../shared/image-translation.js').ImageUnitUpdate): boolean
@@ -486,8 +487,9 @@ export class TopicBridgeClient {
       if (new TextEncoder().encode(JSON.stringify(success(value))).byteLength > MAX_ANALYSIS_PAGE_BYTES) return error(request.requestId, 'reply_too_large', '完整准备回执超过 32768 字节，未截断字段。')
       return success(value)
     }
-    if (command.kind === 'pdf_register') {
-      const receipt = this.normal?.registerPdfSections(ownerId, command, command.batch)
+    if (command.kind === 'pdf_register' || command.kind === 'pdf_scan_page') {
+      const receipt = command.kind === 'pdf_register' ? this.normal?.registerPdfSections(ownerId, command, command.batch)
+        : this.normal?.registerPdfScanPage(ownerId, command)
       if (!receipt) return error(request.requestId, 'pdf_register_failed', '无法准备 PDF 译文。请核对当前原稿及会话进度。')
       if ('oversized' in receipt) return error(request.requestId, 'pdf_source_too_large', `整理后的正文有 ${receipt.oversized} 码点，当前会话单次上限为 ${receipt.maxInputChars}。`)
       return success({ kind: 'pdf_registered', ...receipt })

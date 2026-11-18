@@ -1,4 +1,4 @@
-import { MAX_PDF_READ_BYTES, MAX_PDF_READ_CODE_POINTS, MAX_PDF_SOURCE_BYTES, type PdfPages, type PdfPosition } from '../shared/pdf-source.js'
+import { MAX_PDF_READ_BYTES, MAX_PDF_READ_CODE_POINTS, MAX_PDF_SOURCE_BYTES, PDF_SCAN_SKIPPED, type PdfInspection, type PdfPages, type PdfPosition } from '../shared/pdf-source.js'
 
 interface PdfPageText { readonly page: number; readonly text: string; readonly issue?: string }
 type ExtractedPage = PdfPageText & { readonly textWithScripts?: string }
@@ -40,7 +40,7 @@ async function withPdf<T>(bytes: Uint8Array, signal: AbortSignal, read: (pdf: Pd
 
 export interface PdfCrop { readonly x: number; readonly y: number; readonly width: number; readonly height: number }
 
-async function withPdfRenderer<T>(bytes: Uint8Array, signal: AbortSignal, use: (pdf: PdfDocument, render: (page: Page, crop?: PdfCrop) => Promise<Uint8Array>) => Promise<T>): Promise<T> {
+export async function withPdfRenderer<T>(bytes: Uint8Array, signal: AbortSignal, use: (pdf: PdfDocument, render: (page: Page, crop?: PdfCrop, maxDimension?: number) => Promise<Uint8Array>) => Promise<T>): Promise<T> {
   let CanvasFactory: PdfCanvasFactory, createCanvas: typeof import('@napi-rs/canvas')['createCanvas']
   try {
     const canvas = await import('@napi-rs/canvas')
@@ -48,10 +48,10 @@ async function withPdfRenderer<T>(bytes: Uint8Array, signal: AbortSignal, use: (
     CanvasFactory = await createIsomorphicCanvasFactory(async () => canvas)
     createCanvas = canvas.createCanvas
   } catch (cause) { throw new PdfReadError('pdf_renderer_unavailable', '当前 Host 没有可用的 PDF 图表渲染组件。', { cause }) }
-  return withPdf(bytes, signal, pdf => use(pdf, async (page, crop) => {
+  return withPdf(bytes, signal, pdf => use(pdf, async (page, crop, maxDimension = 1600) => {
     const base = page.getViewport({ scale: 1 })
     const region = crop ?? { x: 0, y: 0, width: 1, height: 1 }
-    const maxDimension = 1600, scale = Math.min(4, maxDimension / Math.max(region.width * base.width, region.height * base.height))
+    const scale = Math.min(4, maxDimension / Math.max(region.width * base.width, region.height * base.height))
     const viewport = page.getViewport({ scale })
     const size = (value: number): number => Math.min(maxDimension, Math.max(1, Math.ceil(value)))
     const canvas = createCanvas(size(region.width * viewport.width), size(region.height * viewport.height))
@@ -73,10 +73,10 @@ async function withPdfRenderer<T>(bytes: Uint8Array, signal: AbortSignal, use: (
   }), CanvasFactory)
 }
 
-export async function renderPdfSelection(bytes: Uint8Array, pageNumber: number, signal: AbortSignal, crop?: PdfCrop): Promise<Uint8Array> {
+export async function renderPdfSelection(bytes: Uint8Array, pageNumber: number, signal: AbortSignal, crop?: PdfCrop, maxDimension?: number): Promise<Uint8Array> {
   return withPdfRenderer(bytes, signal, async (pdf, render) => {
     checkPageRange(pdf, pageNumber, pageNumber)
-    return render(await pdf.getPage(pageNumber), crop)
+    return render(await pdf.getPage(pageNumber), crop, maxDimension)
   })
 }
 
@@ -151,17 +151,9 @@ function caption(run: Run, page: number): Run | undefined {
 type Bounds = readonly [left: number, bottom: number, right: number, top: number]
 type PdfObject = NonNullable<ReturnType<typeof pdfCaption>> & { readonly page: number; readonly crop?: PdfCrop }
 
-async function objectRegions(page: Page): Promise<PdfObject[]> {
+async function drawingBounds(page: Page) {
   const { getResolvedPDFJS } = await import('unpdf')
-  const { OPS, Util } = await getResolvedPDFJS()
-  const [operators, text] = await Promise.all([page.getOperatorList(), page.getTextContent()])
-  const rows = positionedRows(text.items.filter((item: { str?: string }): item is TextItem => !!item.str?.trim())).map(textRuns)
-  const captions = rows.flatMap(row => row.flatMap(run => {
-    const caption = pdfCaption(run.text, page.pageNumber)
-    return caption ? [{ run, caption }] : []
-  }))
-  if (!captions.length) return []
-
+  const [{ OPS, Util }, operators] = await Promise.all([getResolvedPDFJS(), page.getOperatorList()])
   const images: Bounds[] = [], rules: Bounds[] = [], stack: number[][] = []
   let transform = [1, 0, 0, 1, 0, 0]
   const opBounds = (bounds: ArrayLike<number>): Bounds => {
@@ -180,7 +172,7 @@ async function objectRegions(page: Page): Promise<PdfObject[]> {
       transform = stack.pop() ?? transform
     } else if (op === OPS.transform) {
       transform = Util.transform(transform, args)
-    } else if (op === OPS.paintImageXObject || op === OPS.paintInlineImageXObject) {
+    } else if (op === OPS.paintImageXObject || op === OPS.paintInlineImageXObject || op === OPS.paintImageMaskXObject) {
       const bounds = opBounds([0, 0, 1, 1])
       if (bounds[2] - bounds[0] >= 36 && bounds[3] - bounds[1] >= 24) images.push(bounds)
     } else if (op === OPS.constructPath && args[0] !== OPS.endPath && args[2]?.length === 4) {
@@ -188,6 +180,46 @@ async function objectRegions(page: Page): Promise<PdfObject[]> {
       if (bounds[2] - bounds[0] >= 48 && bounds[3] - bounds[1] <= 2) rules.push(bounds)
     }
   }
+  return { images, rules }
+}
+
+export function inspectPdf(bytes: Uint8Array, signal: AbortSignal): Promise<PdfInspection> {
+  return withPdf(bytes, signal, async pdf => {
+    const scanPages: number[] = []
+    let text = false
+    for (let number = 1; number <= pdf.numPages; number++) {
+      signal.throwIfAborted()
+      const page = await pdf.getPage(number)
+      try {
+        const content = await page.getTextContent()
+        let letters = 0
+        for (const item of content.items) {
+          if ('str' in item) letters += (item.str.match(/[\p{L}\p{N}]/gu) ?? []).length
+          if (letters >= 24) break
+        }
+        if (letters >= 24) { text = true; continue }
+        const { images: boxes } = await drawingBounds(page)
+        const [left, bottom, right, top] = page.view
+        const occupied = boxes.reduce((area, [x0, y0, x1, y1]) => area +
+          Math.max(0, Math.min(x1, right!) - Math.max(x0, left!)) * Math.max(0, Math.min(y1, top!) - Math.max(y0, bottom!)), 0)
+        if (occupied >= (right! - left!) * (top! - bottom!) * 0.5 || !letters && occupied > 0) scanPages.push(number)
+        else if (letters) text = true
+      } finally { page.cleanup() }
+    }
+    if (scanPages.length && text) return { kind: 'mixed', totalPages: pdf.numPages, scanPages }
+    return { kind: scanPages.length ? 'image' : 'text', totalPages: pdf.numPages }
+  })
+}
+
+async function objectRegions(page: Page): Promise<PdfObject[]> {
+  const text = await page.getTextContent()
+  const rows = positionedRows(text.items.filter((item: { str?: string }): item is TextItem => !!item.str?.trim())).map(textRuns)
+  const captions = rows.flatMap(row => row.flatMap(run => {
+    const caption = pdfCaption(run.text, page.pageNumber)
+    return caption ? [{ run, caption }] : []
+  }))
+  if (!captions.length) return []
+  const { images, rules } = await drawingBounds(page)
   const viewport = page.getViewport({ scale: 1 })
   const cropFor = (bounds: Bounds, padding: number): PdfCrop | undefined => {
     const [x0, y0, x1, y1] = viewport.convertToViewportRectangle([...bounds])
@@ -228,13 +260,14 @@ async function objectRegions(page: Page): Promise<PdfObject[]> {
 }
 
 export async function renderPdfObjects(bytes: Uint8Array, ranges: readonly PdfPages[], signal: AbortSignal,
-  save: (object: Omit<PdfObject, 'crop'>, image: Uint8Array) => Promise<void>): Promise<number> {
+  save: (object: Omit<PdfObject, 'crop'>, image: Uint8Array) => Promise<void>, scanPages?: readonly number[]): Promise<number> {
   return withPdfRenderer(bytes, signal, async (pdf, render) => {
     const pages = new Set<number>()
     for (const { firstPage, lastPage } of ranges) {
       checkPageRange(pdf, firstPage, lastPage)
       for (let number = firstPage; number <= lastPage; number++) pages.add(number)
     }
+    for (const page of scanPages ?? []) pages.delete(page)
     let skipped = 0
     for (const number of pages) {
       signal.throwIfAborted()
@@ -366,8 +399,9 @@ async function extractPage(page: Page, number: number): Promise<ExtractedPage> {
     ...(text.includes('\uFFFD') ? { issue: '文字层含无法解码的字符，请核对原页。' } : {}) }
 }
 
-async function loadPage(pdf: PdfDocument, number: number, signal: AbortSignal): Promise<ExtractedPage> {
+async function loadPage(pdf: PdfDocument, number: number, signal: AbortSignal, scanPages?: ReadonlySet<number>): Promise<ExtractedPage> {
   signal.throwIfAborted()
+  if (scanPages?.has(number)) return { page: number, text: '', issue: PDF_SCAN_SKIPPED }
   try { return await extractPage(await pdf.getPage(number), number) }
   catch { signal.throwIfAborted(); return { page: number, text: '', issue: '此页文字层提取失败，请核对原页。' } }
 }
@@ -376,14 +410,14 @@ function checkPageRange(pdf: PdfDocument, first: number, last: number): void {
   if (!Number.isSafeInteger(first) || first < 1 || first > last || last > pdf.numPages) throw new PdfReadError('invalid_pdf_range', `PDF 共 ${pdf.numPages} 页，指定页范围超出原件。`)
 }
 
-async function readWindow(pdf: PdfDocument, start: PdfPosition, end: number, signal: AbortSignal) {
+async function readWindow(pdf: PdfDocument, start: PdfPosition, end: number, signal: AbortSignal, scanPages: ReadonlySet<number>) {
   checkPageRange(pdf, start.page, end)
   const pages: (PdfPageText & { readonly offset: number })[] = []
   const result = (next: PdfPosition | null) => ({ totalPages: pdf.numPages, pages, next, read: { start, endPage: end, next } })
   const encoder = new TextEncoder()
   let remaining = MAX_PDF_READ_CODE_POINTS
   for (let number = start.page; number <= end; number++) {
-    const extracted = await loadPage(pdf, number, signal)
+    const extracted = await loadPage(pdf, number, signal, scanPages)
     signal.throwIfAborted()
     const offset = number === start.page ? start.offset : 0, points = Array.from(extracted.text)
     if (offset > 0 && offset >= points.length) throw new PdfReadError('invalid_pdf_range', '续读位置超出此页文字范围。')
@@ -427,12 +461,12 @@ async function readWindow(pdf: PdfDocument, start: PdfPosition, end: number, sig
 }
 
 /** Each model-visible read is bounded independently of the PDF's size or page count. */
-export function readPdfText(bytes: Uint8Array, start: PdfPosition, lastPage: number | undefined, signal: AbortSignal) {
-  return withPdf(bytes, signal, pdf => readWindow(pdf, start, lastPage ?? pdf.numPages, signal))
+export function readPdfText(bytes: Uint8Array, start: PdfPosition, lastPage: number | undefined, signal: AbortSignal, scanPages?: readonly number[]) {
+  return withPdf(bytes, signal, pdf => readWindow(pdf, start, lastPage ?? pdf.numPages, signal, new Set(scanPages)))
 }
 
 /** Verify coverage using the original pages and their flattened offsets. Only page facts leave this pass. */
-export function readPdfCoverage(bytes: Uint8Array, start: PdfPosition, lastPage: number | undefined, boundary: PdfPosition | null, signal: AbortSignal) {
+export function readPdfCoverage(bytes: Uint8Array, start: PdfPosition, lastPage: number | undefined, boundary: PdfPosition | null, signal: AbortSignal, scanPages?: readonly number[]) {
   return withPdf(bytes, signal, async pdf => {
     const end = lastPage ?? pdf.numPages
     checkPageRange(pdf, start.page, end)
@@ -441,8 +475,9 @@ export function readPdfCoverage(bytes: Uint8Array, start: PdfPosition, lastPage:
     }
     const last = boundary ? boundary.page - (boundary.offset === 0 ? 1 : 0) : end
     const pages: (Pick<PdfPageText, 'page' | 'issue'> & { readonly hasText: boolean })[] = []
+    const scans = new Set(scanPages)
     for (let number = start.page; number <= last; number++) {
-      const { page, text, issue } = await loadPage(pdf, number, signal)
+      const { page, text, issue } = await loadPage(pdf, number, signal, scans)
       signal.throwIfAborted()
       const from = number === start.page ? start.offset : 0
       const to = number === boundary?.page ? boundary.offset : undefined

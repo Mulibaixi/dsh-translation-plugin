@@ -8,7 +8,7 @@ import { advanceDocumentFinal, createDocumentUnit, currentDocumentFinal, parseDo
 import type { DocumentRevision, DocumentUnit, DocumentTaskStatus } from '../shared/translation-batch.js'
 import { parseSourceIdentity, toSourceIdentity, type SourceIdentity } from '../shared/translation-sources.js'
 import { IMAGE_BACKGROUND_LIMIT, imageFileFormat } from '../shared/image-translation.js'
-import { isPdfFile, pdfUnitPages } from '../shared/pdf-source.js'
+import { isPdfFile, pdfScanUnitId, pdfScanUnitPage, pdfUnitPages } from '../shared/pdf-source.js'
 export type { DocumentRevision, DocumentSourceVersion, DocumentSourceHistoryCommit, DocumentUnit } from '../shared/translation-batch.js'
 export type { DocumentMutation, NewDocumentUnit } from '../memory/document-task.js'
 
@@ -363,7 +363,8 @@ export function decodeTranslationHistory(value: unknown): TranslationHistory | u
       if (!Array.isArray(item.sourceVersions) || !item.sourceVersions.length || editable && item.sourceVersions.length !== 1) return undefined
       for (const raw of item.sourceVersions) {
         if (!record(raw) || !exact(raw, ['version', 'text', 'createdAt', 'operationId']) || raw.version !== (editable ? sourceVersion : sourceVersions.length + 1) ||
-          !text(raw.text, 200000, !deletion) || !time(raw.createdAt) || !(raw.operationId === null || identity(raw.operationId))) return undefined
+          !text(raw.text, 200000, !deletion && pdfScanUnitPage(item.id as string, material?.materialId) === undefined) ||
+          !time(raw.createdAt) || !(raw.operationId === null || identity(raw.operationId))) return undefined
         sourceVersions.push({ ...raw } as unknown as TextSourceVersion)
       }
       if ((!editable && sourceVersion !== sourceVersions.length) || (Object.hasOwn(item, 'source') && item.source !== sourceVersions.at(-1)!.text)) return undefined
@@ -894,6 +895,16 @@ export function appendPdfSectionUnit(history: TranslationHistory, envelope: Extr
   const original = envelope.material.sourceRef
   if (original?.encoding !== 'binary' || !isPdfFile(original.name) || !pdfUnitPages(unitId, envelope.material.materialId) ||
     !text(source, 2_000_000) || !time(at) || history.units.some(unit => unit.id === unitId)) throw new Error('Invalid or duplicate PDF section')
+  return appendFileTextUnit(history, envelope, unitId, source, at)
+}
+
+export function appendPdfScanPageUnit(history: TranslationHistory, envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>,
+  page: number, source: string, at: string): TranslationHistory {
+  const { materialId, sourceRef } = envelope.material, unitId = pdfScanUnitId(materialId, page)
+  const pdf = sourceRef?.pdf
+  if (!pdf || !(pdf.kind === 'image' || pdf.scanPages?.includes(page)) || page < 1 || page > pdf.totalPages ||
+    !Number.isSafeInteger(page) || !text(source, 200000) || !time(at) || history.units.some(unit => unit.id === unitId))
+    throw new Error('Invalid or duplicate PDF scan page')
   return appendFileTextUnit(history, envelope, unitId, source, at)
 }
 

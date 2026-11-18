@@ -2,7 +2,7 @@ import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POI
   type TranslationSourceRange } from './translation-source-read.js'
 
 import { imageFileFormat, MAX_IMAGE_ORIGINAL_BYTES } from './image-translation.js'
-import { isPdfFile, MAX_PDF_SOURCE_BYTES } from './pdf-source.js'
+import { isPdfFile, MAX_PDF_SOURCE_BYTES, parsePdfInspection, type PdfInspection } from './pdf-source.js'
 
 export const MAX_TRANSLATION_SOURCE_BYTES = 2 * 1024 * 1024
 
@@ -33,8 +33,9 @@ export interface SourceIdentity {
   readonly encoding: 'utf-8' | 'binary'
   readonly bom: boolean
   readonly sha256: string
-  /** Original desktop location, used only as the base for local Markdown resources. Never a cached-file capability. */
+  /** Desktop origin for local Markdown resources and adjacent PDF delivery. */
   readonly originalFilePath?: string
+  readonly pdf?: PdfInspection
 }
 export interface TranslationSourceAsset extends SourceIdentity { readonly persistence: 'runtime_only' }
 export interface TranslationSourceAssetRead {
@@ -99,7 +100,7 @@ function fileName(value: unknown): asserts value is string {
     /[\\/<>:"|?*\u0000-\u001f\u007f]/u.test(value)) throw new TypeError('Invalid source file name')
 }
 export function parseSourceIdentity(value: unknown): SourceIdentity {
-  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256'], ['originalFilePath'])
+  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256'], ['originalFilePath', 'pdf'])
   sourceId(value.sourceId); fileName(value.name)
   const maxBytes = value.encoding !== 'binary' ? MAX_TRANSLATION_SOURCE_BYTES : isPdfFile(value.name) ? MAX_PDF_SOURCE_BYTES
     : imageFileFormat(value.name) ? MAX_IMAGE_ORIGINAL_BYTES : MAX_TRANSLATION_SOURCE_BYTES
@@ -109,9 +110,11 @@ export function parseSourceIdentity(value: unknown): SourceIdentity {
   integer(value.totalCodePoints, 0, value.bytes)
   // A binary source is only bytes: no decoded text, no BOM fact. A text source keeps its code point count.
   if (value.encoding === 'binary' ? value.bom !== false || value.totalCodePoints !== 0 : value.totalCodePoints < 1) throw new TypeError('Invalid source encoding facts')
+  if (value.pdf !== undefined && (value.encoding !== 'binary' || !isPdfFile(value.name))) throw new TypeError('Invalid PDF inspection source')
   return { sourceId: value.sourceId, version: value.version, name: value.name, bytes: value.bytes, totalCodePoints: value.totalCodePoints,
     encoding: value.encoding, bom: value.bom, sha256: value.sha256,
-    ...(value.originalFilePath === undefined ? {} : { originalFilePath: parseOriginalFilePath(value.originalFilePath) }) }
+    ...(value.originalFilePath === undefined ? {} : { originalFilePath: parseOriginalFilePath(value.originalFilePath) }),
+    ...(value.pdf === undefined ? {} : { pdf: parsePdfInspection(value.pdf) }) }
 }
 export function parseOriginalFilePath(value: unknown): string {
   if (typeof value !== 'string' || value.length > 4096 || /[\u0000-\u001f\u007f]/u.test(value) || !/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(value)) throw new TypeError('Invalid original file path')
@@ -123,7 +126,7 @@ export function toSourceIdentity(value: TranslationSourceAsset): SourceIdentity 
   return parseSourceIdentity(identity)
 }
 export function parseTranslationSourceAsset(value: unknown): TranslationSourceAsset {
-  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256', 'persistence'], ['originalFilePath'])
+  exact(value, ['sourceId', 'version', 'name', 'bytes', 'totalCodePoints', 'encoding', 'bom', 'sha256', 'persistence'], ['originalFilePath', 'pdf'])
   if (value.persistence !== 'runtime_only') throw new TypeError('Invalid runtime source persistence')
   return { ...toSourceIdentity(value as unknown as TranslationSourceAsset), persistence: 'runtime_only' }
 }
