@@ -13,6 +13,7 @@ import { ModelCatalog, type ModelCatalogPort } from './models.js'
 import { QuickTranslationClient } from './quick-translation.js'
 import { adaptQuickRemote, type QuickRemotePort } from './quick-transport.js'
 import { PLUGIN_REMOTE } from '../shared/plugin-remote.js'
+import type { PluginUpdateRemote } from '../shared/plugin-update.js'
 import type { BatchProcessingRemote, BatchRequest } from '../shared/batch-processing.js'
 import { TopicBridgeClient, type TopicBridgeRemotePort } from './topic-bridge.js'
 import { TopicMemoryStore, type TopicTermsRemotePort } from './topic-memory-store.js'
@@ -81,6 +82,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   get(name: 'remote.translationOtherMemoryFiles'): OtherMemoryFilesRemotePort | undefined
   get(name: 'remote.translationReferences'): { clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> } | undefined
   get(name: 'remote.translationLocalData'): LocalDataRemotePort | undefined
+  get(name: 'remote.translationPluginUpdate'): PluginUpdateRemote | undefined
   get(name: 'remote.translationQuick'): QuickRemotePort | undefined
   get(name: 'remote.translationTopics'): TopicBridgeRemotePort | undefined
   get(name: 'remote.translationObjects'): ObjectAssetsRemotePort | undefined
@@ -109,6 +111,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
     readonly session: ModelCatalogPort
     readonly translationReferences?: { clearRemote(request: import('../shared/reference-memory.js').ReferenceScope): Promise<unknown> }
     readonly translationLocalData?: LocalDataRemotePort
+    readonly translationPluginUpdate?: PluginUpdateRemote
     readonly translationQuick?: QuickRemotePort
     readonly translationTopics?: TopicBridgeRemotePort
     readonly translationObjects?: ObjectAssetsRemotePort
@@ -407,6 +410,11 @@ export function apply(ctx: ClientPluginContext): void {
     }, () => store.hasUnsettledWork() || store.getAllSessions().some(session => quick.isBusy(session.id) || normal.isBusy(session.id)))
     ctx.effect(() => () => localData.dispose(), 'translation local data')
 
+    const pluginUpdate = async () => {
+      if (ctx.remote.$mount) await mountedRemote
+      return ctx.get?.('remote.translationPluginUpdate') ?? ctx.remote.translationPluginUpdate
+    }
+
     const onDeleteTerm = (snapshot: { ownerId: string; topicId: string; version: number }, entry: { id: string; version: number }) => terms.deleteEntryAsync(snapshot.ownerId, snapshot.topicId, entry.id, snapshot.version, entry.version)
     const topicDeletion = new TopicDeletionClient({ sessions: store, clearing: memoryClearing, references, viewFiles, localData,
       isSessionBusy: sessionId => quick.isBusy(sessionId) || normal.isBusy(sessionId) || store.hasDocumentLease(sessionId) })
@@ -465,7 +473,7 @@ export function apply(ctx: ClientPluginContext): void {
     const TranslationSettings: ClientComponent = (props = {}) => {
       const frozen = useLocalDataFrozen(localData)
       return frozen ? h(LocalDataClearView, {data:localData}) : h(SettingsView, {
-        store, terms, localData, embedding, memoryIndex, onClose: typeof props.close === 'function' ? props.close : undefined,
+        store, terms, localData, embedding, memoryIndex, pluginUpdate, onClose: typeof props.close === 'function' ? props.close : undefined,
       })
     }
     const MaterialAttachmentMarker: ClientComponent = (props = {}) => {

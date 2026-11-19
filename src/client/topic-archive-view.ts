@@ -132,9 +132,9 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
     if (alive.current) setRetry(result.status === 'save_failed' ? { kind: action, id: entry.id } : undefined)
     return mutationMessage(result)
   }
-  function textField(label: string, key: 'name' | 'aliases' | 'description' | 'title' | 'body' | 'relation', multiline = false): unknown {
-    return h('label', { className: 'dsh-tp-field' }, h('span', null, label), h(multiline ? 'textarea' : 'input', {
-      value: form?.[key] ?? '', disabled: pending, rows: multiline ? 3 : undefined, 'aria-label': label, placeholder: key === 'aliases' ? '一行一个' : undefined,
+  function textField(label: string, key: 'name' | 'aliases' | 'description' | 'title' | 'body' | 'relation', rows?: number): unknown {
+    return h('label', { className: 'dsh-tp-field' }, h('span', null, label), h(rows ? 'textarea' : 'input', {
+      value: form?.[key] ?? '', disabled: pending, rows, 'aria-label': label, placeholder: key === 'aliases' ? '一行一个' : undefined,
       onChange: (event: TextEvent) => { const value = event.currentTarget.value; setForm(current => current ? { ...current, [key]: value } : current) },
     }))
   }
@@ -235,10 +235,10 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
           h('h3', null, `${form.id ? '编辑' : '新增'}${kinds[kind]}`),
           deletedForm ? h('p', { className: 'dsh-tp-message', role: 'status' }, '条目已删除，编辑稿保留供复制。') : null,
           copyNotice ? h('p', { className: 'dsh-tp-muted', role: 'status' }, copyNotice) : null,
-          kind === 'entity' ? [textField('实体名称', 'name'), textField('实体别名', 'aliases', true), textField('描述', 'description', true)] :
-            kind === 'fact' ? [textField('事实标题', 'title'), textField('事实内容', 'body', true), factEntities()] :
+          kind === 'entity' ? [textField('实体名称', 'name'), textField('实体别名', 'aliases', 3), textField('描述', 'description', 5)] :
+            kind === 'fact' ? [textField('事实标题', 'title'), textField('事实内容', 'body', 5), factEntities()] :
               [relationEntities('源实体', 'sourceEntityIds', form.sourceEntityIds), textField('关系', 'relation'),
-                relationEntities('目标实体', 'targetEntityIds', form.targetEntityIds), textField('描述', 'description', true)],
+                relationEntities('目标实体', 'targetEntityIds', form.targetEntityIds), textField('描述', 'description', 5)],
           form.snapshotVersion !== snapshot.version ? h('button', { type: 'button', disabled: pending || (form.id !== null && !all.some(entry => entry.id === form.id)), onClick: () => {
             const current = all.find(entry => entry.id === form.id), baseline = formFrom(snapshot, kind, current)
             setForm({ ...form, expectedEntryVersion: current?.version ?? null, snapshotVersion: snapshot.version }); setOriginal(baseline); setFailure(undefined)

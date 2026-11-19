@@ -76,7 +76,9 @@ export class NumberedUnits {
         const points = Array.from(side === 'source' ? unit.source : revision!.text)
         if (start > points.length) fail('range_out_of_bounds', `单元 ${unit.order} 内容共 ${points.length} 码点，读取起点超出范围。`)
         const end = Math.min(points.length, start + 4000)
-        pages.push({ unit: info, side, revisionNumber: side === 'source' ? null : revision!.order, text: points.slice(start, end).join(''), totalCodePoints: points.length, start, nextStart: end < points.length ? end : null })
+        pages.push({ unit: info, side, revisionNumber: side === 'source' ? null : revision!.order,
+          ...(side === 'translation' ? { revisionId: revision!.id } : {}),
+          text: points.slice(start, end).join(''), totalCodePoints: points.length, start, nextStart: end < points.length ? end : null })
       } else {
         const files = this.files(); if (!files) fail('file_history_unavailable', '文件历史服务尚未就绪。')
         pages.push({ unit: info, side, ...await files.readNumbered({ kind: 'unit', mainSessionId: main, translationSessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion }, request) })

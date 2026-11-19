@@ -2,6 +2,8 @@ import type { DomainResult, FinalizePlan, RuntimeSession, RuntimeSnapshot, Runti
 import { QUICK_TRANSLATION_REMOTE, parseQuickRequest, type QuickTranslationBinding, type QuickTranslationCapability, type QuickTranslationJob, type QuickTranslationOpen, type QuickTranslationQuery, type QuickTranslationSubmit } from '../shared/quick-translation.js'
 import { DshTextExecutionAdapter, type DshExecutionContext, type LlmModuleLoader } from './dsh-text-adapter.js'
 import { TextTranslationRuntime } from './text-runtime.js'
+import { INSTALL_BUSY_MESSAGE } from '../shared/plugin-update.js'
+import { installingTranslationUpdate } from './plugin-update-gate.js'
 
 export interface QuickHostContext extends DshExecutionContext {
   provide(key: string, service: unknown): unknown
@@ -109,6 +111,7 @@ export class QuickTranslationService {
       return ok(this.view(context, prior))
     }
     this.refreshActive(context)
+    if (installingTranslationUpdate(this.ctx)) return bad('busy', INSTALL_BUSY_MESSAGE)
     if (context.active) return bad('busy', '当前快译尚未结算，请等待完成或取消确认。')
     const existing = request.unitId === undefined ? undefined : context.units.get(request.unitId)
     if (existing && (existing.source !== request.sourceText || existing.targetLanguage !== request.targetLanguage || existing.instruction !== request.instruction)) {

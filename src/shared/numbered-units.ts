@@ -22,6 +22,7 @@ export interface UnitContent {
   readonly unit: NumberedUnit
   readonly side: 'source' | 'translation'
   readonly revisionNumber: number | null
+  readonly revisionId?: string
   readonly text: string | null
   readonly totalCodePoints: number
   readonly start: number
@@ -67,11 +68,13 @@ export function parseUnitDirectory(value: unknown): UnitDirectory {
   return { translationSessionId: value.translationSessionId, items: value.items.map(parseNumberedUnit), nextOffset: value.nextOffset as number | null }
 }
 export function parseUnitContent(value: unknown): UnitContent {
-  object(value); fields(value, ['unit', 'side', 'revisionNumber', 'text', 'totalCodePoints', 'start', 'nextStart', 'message'])
+  object(value); fields(value, ['unit', 'side', 'revisionNumber', 'revisionId', 'text', 'totalCodePoints', 'start', 'nextStart', 'message'])
   const unit = parseNumberedUnit(value.unit)
   if (!['source', 'translation'].includes(value.side as string) || value.text !== null && typeof value.text !== 'string' || value.message !== undefined && typeof value.message !== 'string') throw new TypeError('Invalid unit content')
   integer(value.totalCodePoints, 0); integer(value.start, 0)
   if (value.revisionNumber !== null) integer(value.revisionNumber, 1)
+  if (value.revisionId !== undefined && (typeof value.revisionId !== 'string' || !value.revisionId.trim() || Array.from(value.revisionId).length > 2048 ||
+    value.side !== 'translation' || value.text === null || value.revisionNumber === null || !unit.versions.includes(value.revisionNumber))) throw new TypeError('Invalid unit content revision')
   if (value.nextStart !== null) integer(value.nextStart, 0)
   if (typeof value.text === 'string' && (Array.from(value.text).length > 4000 || value.start + Array.from(value.text).length > value.totalCodePoints || value.nextStart !== (value.start + Array.from(value.text).length < value.totalCodePoints ? value.start + Array.from(value.text).length : null))) throw new TypeError('Invalid unit content page')
   return { ...structuredClone(value), unit } as unknown as UnitContent

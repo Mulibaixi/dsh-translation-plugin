@@ -76,7 +76,9 @@ After building, install this directory in DSH's plugin manager or run `pnpm pack
 
 ### Update
 
-Wait for current tasks to finish and confirm that material is saved. Enter the new version's full `.tgz` path or versioned download URL in the plugin manager; **no prior uninstall is required**. Use a new versioned filename or URL. Usually only the changed plugin needs updating. If the release notes require companion updates, install Composer first, then the translation plugin. Hot loading is available when supported by the host; otherwise follow the manager's refresh, reload, or restart instructions.
+Open **Settings → 翻译 (Translation) → 插件更新 (Plugin updates)** to check for new releases. If you installed from a `.tgz`, you can install a newer release in one click. Source or linked installs can view and download the newer package. If a translation or batch job is running, click Update again after it finishes.
+
+To update a distribution package manually, enter the new `.tgz` path or versioned download URL in the plugin manager to replace the installed package. Follow the manager's refresh, reload, or restart instructions. If the release notes require companion updates, install Composer first, then the translation plugin.
 
 Composer requires a normal full exit and reopen when a host patch actually needs replacement. Updating its extension package does not necessarily reinstall that patch. For source installations, update the original directories, rebuild in the order above, and refresh or reload.
 
@@ -92,7 +94,7 @@ For detailed instructions on topics and sessions, material submission, refinemen
 
 ### Submitting sources and instructions
 
-In Normal mode, **put the source in the translation input and your current instructions or revision feedback in the main chat**. When you submit, the main model uses both to coordinate the translation.
+In Normal mode, **put the source in the translation input and your current instructions or revision feedback in the main chat**. When you submit, the main model uses both to coordinate the translation. View the translation in the translation session. The main chat briefly reports the outcome and any issues.
 
 Use **翻译设置 (Translation Preferences)** to set the default mode and target language for new sessions. **翻译要求 (Translation Requirements)** and **单次上限 (Per-translation limit)** are global and apply to future translations and retranslations in all sessions. The requirements field is optional. Use **翻译设定 (Translation Settings)** to manage rules at the topic or user level.
 
@@ -110,12 +112,13 @@ When organizing candidates, file the names of people, places, and organizations 
 
 In **结构化档案 (Structured Archives)**, you can clear unadopted entries in the current category or use **导出 (Export)** to save all archives for the current topic as JSON or Markdown. You can also ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
 
+Markdown exports organize archive content, entry status, and brief source references by category. JSON exports include the complete structured fields.
+
 ## Current limitations and data
 
 - **Context questions**: Translation models with tool support can ask focused questions during Normal translation. The main model answers from available context or asks you, then starts a new translation call. Each call has its own usage; question references remain valid only during the current host run. The selected provider and model must support tool calls; a rejected tool declaration is reported without silently retrying as a translation.
 - **PDF**. Text-layer PDFs default to full-document translation, with an optional page range. When the text exceeds the translation budget, the main model asks before splitting it. Your choice carries over when you resume the same PDF. **译稿整合输出 (Combine translations)** is on by default and saves one Markdown file in original page order, preferably beside the original PDF. **译稿保留图表 (Keep figures and tables)** is off by default and embeds originals when their boundaries can be identified. Other figures and tables retain original page references. Verifiable equations use Markdown LaTeX. Translating a specified figure or table requires an image-capable model and native DSH subagent support. Mixed PDFs also offer **翻译扫描页 (Translate scanned pages)**, off by default. Image-only PDFs deliver page-level translations in the Session. Combined delivery for these files is planned.
 - **Other source formats**. The main model extracts the text with available tools and delivers the result in the Normal translation Session. Markdown is the default when you request a standalone export without specifying a format. If the main model cannot read the requested scope in full, it explains what is missing and asks how to proceed. It needs your approval to install or enable a dedicated parser.
-- **Translation efficiency**: some optimizations have been made, but final completion time is affected by the models and material.
 - **Semantic indexing**: enabling it sends relevant text to the configured embedding service.
 - Restart does not automatically resume model tasks; check the original task when its outcome is unknown. Exports do not replace a complete backup and cannot currently be imported for restoration.
 - Disabling or uninstalling the plugin does not automatically delete local material. Clean up versions, units, sessions, topics, or plugin data as needed.

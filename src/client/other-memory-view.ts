@@ -69,8 +69,11 @@ export function OtherMemoryView({ client, store, topicId, mainSessionId, active 
     if (alive.current) { setDeletion(undefined); if (deletion !== 'topic' && selected === deletion.id) discard(selected) }
     return deletion === 'topic' ? '本主题其他记忆已清空，用户级设定保留。' : '条目已删除。'
   }
+  const deletionDialog = active && deletion ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除其他记忆确认' },
+    h('p', null, deletion === 'topic' ? '清空本主题的全部设定与参考文件登记？用户级设定保留。' : `删除“${deletion.kind === 'setting' ? deletion.title : deletion.source.name}”？${deletion.topicId === null ? '此用户级设定供当前资料库的全部主题共用。' : ''}`),
+    h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending, onClick: () => { void run(confirmDelete) } }, '确认删除'), h('button', { type: 'button', disabled: pending, onClick: () => setDeletion(undefined) }, '取消删除'))) : null
   const editor = form && selected ? h('div', { className: 'dsh-tp-other-memory-form', 'aria-label': form.id ? '编辑翻译设定' : '新建翻译设定' },
-    h('h4', null, form.id ? '编辑设定' : '新建设定'),
+    form.id ? h('h4', null, '编辑设定') : null,
     h('label', null, '作用范围', h('select', { value: form.topicId === null ? 'user' : 'topic', disabled: pending, 'aria-label': '设定作用范围', onChange: (event: { currentTarget: { value: string } }) => update({ topicId: event.currentTarget.value === 'user' ? null : topicId }) },
       h('option', { value: 'topic' }, '当前主题'), h('option', { value: 'user' }, '用户级（当前资料库的所有主题）'))),
     h('label', null, '标题', h('input', { value: form.title, maxLength: 200, disabled: pending, 'aria-label': '设定标题', onChange: (event: { currentTarget: { value: string } }) => update({ title: event.currentTarget.value }) })),
@@ -85,12 +88,14 @@ export function OtherMemoryView({ client, store, topicId, mainSessionId, active 
     h('div', { className: 'dsh-tp-unit-header dsh-tp-other-memory-heading' },
       h('h3', null, '其他记忆'),
       h('div', { className: 'dsh-tp-actions' },
-        h('button', { type: 'button', disabled: pending || status.loading, onClick: () => { void client.refresh(topicId) } }, status.loading ? '正在刷新…' : '刷新'),
+        h('button', { type: 'button', disabled: pending || status.loading, onClick: () => { setFeedback(undefined); void client.refresh(topicId) } }, '刷新'),
         h('button', { type: 'button', disabled: pending || !status.ready || !entries.some(entry => entry.topicId === topicId), onClick: () => setDeletion('topic') }, '清空本主题其他记忆'))),
+    deletion === 'topic' ? deletionDialog : null,
     status.error ? h('p', { role: 'alert', className: 'dsh-tp-message' }, status.error) : null,
     feedback ? h('p', { role: feedback.failure ? 'alert' : 'status', className: 'dsh-tp-message' }, feedback.text) : null,
     h('section', { 'aria-label': '翻译设定' },
       h('div', { className: 'dsh-tp-unit-header' }, h('h3', { title: '翻译设定会在每次普通翻译及重译时完整带入' }, '翻译设定'), h('button', { type: 'button', disabled: pending || !status.ready, onClick: () => edit() }, '新建设定')),
+      selected === NEW ? editor : null,
       ...settings.map(entry => h('div', { key: entry.id, className: 'dsh-tp-other-memory-setting', 'data-memory-id': entry.id },
         h('div', { className: 'dsh-tp-unit-header' }, h('strong', null, entry.title), h('span', { className: 'dsh-tp-muted' }, `${entry.topicId === null ? '用户级' : '主题级'} · ${entry.enabled ? '启用' : '停用'} · ${persistence(entry)}`)),
         h('div', { className: 'dsh-tp-translation-text' }, entry.body),
@@ -98,9 +103,10 @@ export function OtherMemoryView({ client, store, topicId, mainSessionId, active 
           h('button', { type: 'button', disabled: pending, onClick: () => edit(entry) }, '编辑设定'),
           h('button', { type: 'button', disabled: pending, onClick: () => { void run(async () => { await client.putSetting({ ...formOf(entry), enabled: !entry.enabled }); return entry.enabled ? '设定已停用。' : '设定已启用。' }) } }, entry.enabled ? '停用设定' : '启用设定'),
           h('button', { type: 'button', disabled: pending, onClick: () => setDeletion(entry) }, '删除设定')),
-        selected === entry.id ? editor : null)),
+        selected === entry.id ? editor : null,
+        deletion !== 'topic' && deletion?.id === entry.id ? deletionDialog : null)),
       status.ready && !settings.length ? h('p', { className: 'dsh-tp-muted' }, '尚无翻译设定。') : null,
-      settings.some(entry => entry.id === selected) ? null : editor),
+      selected !== NEW && !settings.some(entry => entry.id === selected) ? editor : null),
     h('section', { 'aria-label': '主题参考文件' },
       h('h3', { title: '原文／双语对照文件，用于语义嵌入并建立索引' }, '主题参考文件'),
       h('div', { className: 'dsh-tp-other-memory-upload' },
@@ -116,7 +122,5 @@ export function OtherMemoryView({ client, store, topicId, mainSessionId, active 
           h('button', { type: 'button', disabled: pending, onClick: () => { void run(async () => { try { await client.open(entry) } catch (error) { throw new Error(`原始文件不可用：${(error as Error).message}`) } }) } }, '打开原始文件'),
           h('button', { type: 'button', disabled: pending, onClick: () => setDeletion(entry) }, '删除参考文件')))),
       status.ready && !files.length ? h('p', { className: 'dsh-tp-muted' }, '尚无主题参考文件。') : null),
-    active && deletion ? h('div', { className: 'dsh-tp-dialog', role: 'dialog', 'aria-label': '删除其他记忆确认' },
-      h('p', null, deletion === 'topic' ? '清空本主题的全部设定与参考文件登记？用户级设定保留。' : `删除“${deletion.kind === 'setting' ? deletion.title : deletion.source.name}”？${deletion.topicId === null ? '此用户级设定供当前资料库的全部主题共用。' : ''}`),
-      h('div', { className: 'dsh-tp-actions' }, h('button', { type: 'button', disabled: pending, onClick: () => { void run(confirmDelete) } }, '确认删除其他记忆'), h('button', { type: 'button', disabled: pending, onClick: () => setDeletion(undefined) }, '取消删除'))) : null)
+    deletion !== 'topic' && deletion?.kind === 'reference' ? deletionDialog : null)
 }

@@ -21,13 +21,13 @@ export function TopicEntityChoices({ snapshot, selected, disabled, activeOnly, o
     ...unavailable.map(id => ({ id, available: false }))]
   return h('fieldset', { className: 'dsh-tp-archive-entities', disabled }, h('legend', null, '关联实体'),
     entities.length ? null : h('small', { className: 'dsh-tp-muted' }, '暂无可关联的实体。'),
-    ...choices.map(({ id, available }) => {
+    choices.length ? h('div', { className: 'dsh-tp-archive-entity-choices' }, ...choices.map(({ id, available }) => {
       const label = entityLabel(snapshot, id), checked = selected.includes(id)
       return h('label', { key: id }, h('input', { type: 'checkbox', checked, disabled: !checked && !available,
         'aria-label': `关联实体：${label}`,
         onChange: (event: { currentTarget: { checked: boolean } }) => {
           onChange(event.currentTarget.checked ? [...selected, id] : selected.filter(value => value !== id))
         },
-      }), label)
-    }))
+      }), h('span', null, label))
+    })) : null)
 }

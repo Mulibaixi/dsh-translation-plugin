@@ -1,5 +1,6 @@
 import { BATCH_OPERATION_PREFIX, batchOperationId, parseBatchRequest, parseProcessingBatch, unfinishedBatchItem, type BatchItem, type BatchRequest, type BatchView, type ProcessingBatch } from '../shared/batch-processing.js'
 import type { HistoryScope } from '../shared/history-bundle.js'
+import { INSTALL_BUSY_MESSAGE } from '../shared/plugin-update.js'
 import type { ImageUnitTarget } from '../shared/image-translation.js'
 import { isImageUnit } from '../memory/translation-history.js'
 import type { HistoryService } from './history.js'
@@ -9,6 +10,7 @@ import { sourceSha256 } from './source-storage.js'
 import type { TopicHostContext, TopicToolsService } from './topic-tools.js'
 import type { TranslationMaterialsService } from './translation-materials.js'
 import type { TranslationSourcesService } from './translation-sources.js'
+import { installingTranslationUpdate } from './plugin-update-gate.js'
 
 interface BatchStorage {
   read(key: string): Promise<ProcessingBatch[]>
@@ -142,6 +144,7 @@ export class BatchProcessingService {
       return this.view(key, records, found)
     }
     if (running) throw new Error('此会话已有一个批次在处理当前项。')
+    if (installingTranslationUpdate(this.ctx)) throw new Error(INSTALL_BUSY_MESSAGE)
     const history = await this.history.batchHistory(request, peer)
     if (history.current.session.mode !== 'normal' || history.current.session.archivedAt !== null) throw new Error('请先打开普通翻译会话。')
     const durable = history.saved !== null
@@ -165,6 +168,7 @@ export class BatchProcessingService {
       batch = this.replace(batch, index, { unitId: item.unitId, name: item.name, state: request.kind === 'skip' ? 'skipped' : 'pending' })
       await this.save(key, records, batch, durable)
     }
+    if (installingTranslationUpdate(this.ctx)) throw new Error(INSTALL_BUSY_MESSAGE)
     this.startRun(request, peer, key, records, batch, durable)
     return this.view(key, records, batch)
   }

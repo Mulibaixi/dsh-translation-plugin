@@ -1,4 +1,5 @@
 import { LocalDataService } from './local-data.js'
+import { PluginUpdateService } from './plugin-update.js'
 import { ReferenceFilesService } from './reference-files.js'
 import { OtherMemoryService } from './other-memory.js'
 import { OtherMemoryFilesService } from './other-memory-files.js'
@@ -73,7 +74,7 @@ export type * from '../shared/translation-source-storage.js'
 export type * from '../shared/domain-contracts.js'
 
 export const name = 'deepseek-translation-framework'
-export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationBatchProcessing', 'translationCorrection', 'translationReview', 'translationReferences', 'translationOtherMemory', 'translationOtherMemoryFiles', 'translationArchive', 'translationTerms', 'translationEmbedding', 'translationMemorySearch', 'translationHistory', 'translationRecordIndex', 'translationLocalData', 'translationFileJobs'] as const
+export const provide = ['translationFramework', 'translationQuick', 'translationTopics', 'translationObjects', 'translationViews', 'translationMaterials', 'translationNormal', 'translationNormalV2', 'translationSources', 'translationAnalysis', 'translationPreparation', 'translationPlanning', 'translationBatch', 'translationBatchProcessing', 'translationCorrection', 'translationReview', 'translationReferences', 'translationOtherMemory', 'translationOtherMemoryFiles', 'translationArchive', 'translationTerms', 'translationEmbedding', 'translationMemorySearch', 'translationHistory', 'translationRecordIndex', 'translationLocalData', 'translationFileJobs', 'translationPluginUpdate'] as const
 
 function phaseEvent(exchange: TranslationExchangeService, run: AnalysisRun): TaskPhaseEvent | null {
   if (!['completed', 'failed', 'unknown'].includes(run.status)) return null
@@ -134,6 +135,9 @@ export function installTerminologyAnalysis(ctx: TopicHostContext): TerminologyAn
 }
 
 export function apply(ctx: QuickHostContext): void {
+  const update = new PluginUpdateService(ctx)
+  ctx.provide('translationPluginUpdate', update)
+  ctx.effect?.(() => () => update.dispose(), 'translation plugin update lifetime')
   ctx.provide('translationLocalData', new LocalDataService(ctx as TopicHostContext))
   const embedding = new EmbeddingService(ctx as TopicHostContext)
   ctx.provide('translationEmbedding', embedding)

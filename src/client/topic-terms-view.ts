@@ -210,10 +210,10 @@ export function TopicTermsView({ sessions, terms, archive, ownerId, topicId, top
     preserveForm(); const draft = drafts.current.get(entry?.id ?? null), value = draft?.form ?? formFrom(snapshot, entry, scopedLanguage)
     setForm(value); setOriginal(draft?.original ?? value); setDescriptionOpen(!!value.sense.trim()); setSelected(entry?.id); setFailure(undefined)
   }
-  function formField(label: string, key: 'sourceLanguage' | 'targetLanguage' | 'sourceForms' | 'aliases' | 'sense' | 'preferred' | 'forbidden', multiline = false): unknown {
-    return h('label', { className: 'dsh-tp-field' }, h('span', null, label), h(multiline ? 'textarea' : 'input', {
-      value: form?.[key] ?? '', disabled: pending, rows: multiline ? 2 : undefined, 'aria-label': label,
-      placeholder: multiline && key !== 'sense' ? '一行一个' : undefined,
+  function formField(label: string, key: 'sourceLanguage' | 'targetLanguage' | 'sourceForms' | 'aliases' | 'sense' | 'preferred' | 'forbidden', rows?: number): unknown {
+    return h('label', { className: 'dsh-tp-field' }, h('span', null, label), h(rows ? 'textarea' : 'input', {
+      value: form?.[key] ?? '', disabled: pending, rows, 'aria-label': label,
+      placeholder: rows && key !== 'sense' ? '一行一个' : undefined,
       onChange: (event: { currentTarget: { value: string } }) => { const value = event.currentTarget.value; setForm(current => current ? { ...current, [key]: value } : current) },
     }))
   }
@@ -233,7 +233,7 @@ export function TopicTermsView({ sessions, terms, archive, ownerId, topicId, top
             revisionOrder: revision?.order ?? null, readable: evidenceBody(terms, frozen, ref) !== undefined }
         })),
       }
-      onExport(format === 'json' ? buildTopicTermsJsonExport(input) : buildTopicTermsMarkdownExport(input))
+      onExport(format === 'json' ? buildTopicTermsJsonExport(input) : buildTopicTermsMarkdownExport(input, archiveSnapshot))
     } catch { setFailure('导出失败，当前档案仍保留。') }
   }
   async function run(action: () => Promise<boolean | string>): Promise<void> {
@@ -284,10 +284,10 @@ export function TopicTermsView({ sessions, terms, archive, ownerId, topicId, top
         form ? h('div', { className: 'dsh-tp-term-form', 'aria-label': form.id ? '编辑术语' : '新增术语表单' },
           h('h3', null, form.id ? '编辑术语' : '新增术语'),
           deletedForm ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, '此术语已删除，编辑稿保留供复制，不能覆盖已删除的条目。') : null,
-          formField('原词', 'sourceForms', true), formField('译法', 'preferred'),
+          formField('原词', 'sourceForms', 2), formField('译法', 'preferred'),
           h('small', { className: 'dsh-tp-muted' }, `目标语言：${form.targetLanguage}`),
           h('button', { type: 'button', disabled: pending, 'aria-expanded': descriptionOpen, onClick: () => setDescriptionOpen(value => !value) }, descriptionOpen ? '收起说明' : '添加说明（可选）'),
-          descriptionOpen ? formField('说明', 'sense', true) : null,
+          descriptionOpen ? formField('说明', 'sense', 5) : null,
           archiveSnapshot ? h(TopicEntityChoices, { snapshot: archiveSnapshot, selected: form.entityIds, disabled: pending || archiveState.status !== 'ready',
             onChange: (entityIds: readonly string[]) => setForm(current => current ? { ...current, entityIds } : current) }) : null,
           form.snapshotVersion !== snapshot.version ? h('button', { type: 'button', disabled: pending || (form.id !== null && !snapshot.entries.some(entry => entry.id === form.id)), onClick: () => {

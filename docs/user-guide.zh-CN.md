@@ -176,6 +176,8 @@ Markdown 翻译和审阅要求保留标题、列表、表格、代码及公式�
 
 点击**清除未采用**并确认，可删除当前类别的待确认、待复核、已停用和冲突条目，范围包含筛选隐藏的条目。在**导出**菜单选择 JSON 或 Markdown，可下载当前主题全部结构化档案。
 
+Markdown 按术语、实体、事实和关系分章，保留正文、条目状态和简短来源，省略内部 ID、事件、时间及空字段。JSON 包含完整结构字段。
+
 翻译采用优先级为：**用户指令 = 用户编辑确定的条目 > 用户审阅通过的条目 > 待审条目 = 模型理解**。用户指令与用户编辑条目冲突时请求指示；候选不会自动覆盖已生效资产，模型整理的说明也不会变成用户指令。
 
 ### 翻译设定
@@ -256,13 +258,15 @@ TXT、Markdown 文件的当前原文行提供**嵌入原文**；翻译会话原�
 
 ### 发行包更新
 
+打开「设置 → 翻译 → 插件更新」，点击「检查更新」。发现更高的正式版本后可查看发行说明。通过 `.tgz` 安装时，点击「更新到 vX.Y.Z」即可下载安装。源码或目录链接安装可从此处下载新版安装包，也可更新原目录并重新构建。如果有翻译或批处理任务正在运行，请在任务结束后重新点击更新。需要重启时按页面提示操作。旧版用户可用下文的手动方式安装一次带更新入口的发行包。
+
 选择 `.tgz` 附件，并按 DSH 宿主版本选择带有匹配补丁的 Composer。也可使用本地构建的包。[翻译插件 Releases](https://github.com/Mulibaixi/dsh-translation-plugin/releases) · [Composer Releases](https://github.com/Mulibaixi/dsh-composer-extension/releases)
 
-使用 DSH CLI 时，以下命令先安装 Composer `0.4.8`，再安装翻译插件 `0.27.2`。需要其他版本时，可替换为该版本的 `.tgz` 附件链接或下载后的完整路径。
+使用 DSH CLI 时，以下命令先安装 Composer `0.4.8`，再安装翻译插件 `0.27.3`。需要其他版本时，可替换为该版本的 `.tgz` 附件链接或下载后的完整路径。
 
 ```powershell
 dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-composer-extension/releases/download/v0.4.8/dsh-composer-extension-0.4.8.tgz
-dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.27.2/dsh-translation-plugin-0.27.2.tgz
+dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-plugin/releases/download/v0.27.3/dsh-translation-plugin-0.27.3.tgz
 ```
 
 上述命令使用桌面 `desktop` profile；Web 环境使用自身实际 profile，联动组件支持范围仍以 Composer 说明为准。使用桌面插件管理器安装时无需另装 CLI。
@@ -278,6 +282,8 @@ dsh plugin --profile desktop add https://github.com/Mulibaixi/dsh-translation-pl
 如果管理器提示“已安装”，先确认填写的是新版本包的路径或版本链接，而不是插件包名或同一旧路径。若当前管理器明确要求卸载再安装，可在同一次 DSH 运行中完成重装并启用；Composer 会在重新启用时取消检测到的待执行自动恢复。日常升级不需要重走“卸载 → 退出恢复原包 → 重装 → 再退出安装补丁”的卸载验收循环。
 
 ### 源码更新
+
+测试发行包时，建议使用与源码联调独立的 DSH profile。Windows 下从源码链接切换到 `.tgz` 时，卸载后还要核对该 profile 的 `node_modules/dsh-translation-plugin`。如果它仍是指向源码目录的联接，完全退出 DSH 后移走联接入口，保留源码目录，再安装发行包。
 
 更新原来安装的源码目录，按锁文件安装依赖并重新构建，再通过 DSH 刷新或重载。需要同时构建两包时，先 Composer、后翻译插件。源码目录安装与 `.tgz` 安装是两种方式，发行包用户无需安装 Node.js、pnpm 或执行构建。
 

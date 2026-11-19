@@ -1,5 +1,7 @@
 import { parseTranslationLogRead, parseDirectTranslationLogRead, type TranslationLogRead, type TranslationLogPage } from '../shared/translation-log.js'
 import { SOURCE_LAYOUT_GUIDANCE } from '../shared/translation-call.js'
+import { INSTALL_BUSY_MESSAGE } from '../shared/plugin-update.js'
+import { installingTranslationUpdate } from './plugin-update-gate.js'
 import { isPdfFile, PDF_OBJECT_REFERENCE_GUIDANCE, pdfDeliveryComplete, pdfDeliveryName, pdfScanUnitPage, pdfTranslationMarkdown, pdfUnitPages, pendingPdfScanPages } from '../shared/pdf-source.js'
 import { translationTaskBoundary } from '../shared/translation-task.js'
 import { STYLE_SETTINGS_GUIDANCE } from '../shared/style-settings.js'
@@ -260,7 +262,7 @@ export class NormalTranslationService {
   claimDocumentSession(ownerId: string, translationSessionId: string, taskId: string): boolean {
     const sessionId = translationSessionId, current = this.documentSessions.get(sessionId)
     if (current === taskId) return true
-    if (this.disposed || this.activeSessions.has(sessionId)) return false
+    if (this.disposed || installingTranslationUpdate(this.ctx) || this.activeSessions.has(sessionId)) return false
     this.activeSessions.add(sessionId); this.documentSessions.set(sessionId, taskId)
     return true
   }
@@ -474,6 +476,7 @@ export class NormalTranslationService {
     if (previous) return previous.acceptance.then(() => structuredClone(previous.operation!))
     const sessionId = envelope.material.translationSessionId
     if (!envelope.material.model) throw rejected('model_required', '此提交材料未选择翻译模型，请选择后重新提交；草稿保留。', 'prepare')
+    if (installingTranslationUpdate(this.ctx)) throw rejected('busy', INSTALL_BUSY_MESSAGE, 'prepare')
     if (this.activeSessions.has(sessionId)) throw rejected('busy', '此普通翻译会话仍有未结算操作。', 'prepare')
     this.activeSessions.add(sessionId)
     const job: Job = { namespaceId: this.topics.namespaceForAgent(request.target.mainSessionId), request, envelope, agent: exec.agent!, sessionId, controller: new AbortController(), delivery: new AbortController(),
@@ -551,6 +554,7 @@ export class NormalTranslationService {
     if ((this.ctx.get?.('translationHistory') as { unitBlocked(sessionId: string, unitId: string): boolean } | undefined)?.unitBlocked(envelope.material.translationSessionId, envelope.material.unitReference?.unitId ?? `unit:${envelope.material.materialId}`)) throw rejected('unit_deleted', '此单元已删除或正在删除。', 'accept')
     requireInline(envelope)
     const sessionId = envelope.material.translationSessionId
+    if (installingTranslationUpdate(this.ctx)) throw rejected('busy', INSTALL_BUSY_MESSAGE, 'accept')
     if (!reserved && this.activeSessions.has(sessionId)) throw rejected('busy', '此普通翻译会话仍有未结算操作。', 'accept')
     this.activeSessions.add(sessionId)
     const result = Promise.resolve().then(async (): Promise<Accepted> => {
@@ -650,6 +654,7 @@ export class NormalTranslationService {
       if (!answered) throw rejected('context_request_unavailable', '已关联的补充调用已失效，请重新读取当前内容。', 'prepare')
       return answered.promise.then(view => structuredClone(view))
     }
+    if (installingTranslationUpdate(this.ctx)) throw rejected('busy', INSTALL_BUSY_MESSAGE, 'prepare')
     if (parent) parent.answer = { operationId: request.operationId, signature: answerSignature }
     const attempt: DispatchAttempt = { dispatched: false, resolved: false }
     const promise = this.runDirect(request, exec, attempt, parent?.basis, supplement, parent?.imageInput).finally(async () => {
@@ -962,6 +967,7 @@ export class NormalTranslationService {
     const key = identity(target.mainSessionId, request.operationId), signature = JSON.stringify(request), previous = this.extractions.get(key)
     if (previous && previous.signature !== signature) throw rejected('idempotency_conflict', '同一提取操作 ID 不能更换材料、范围或要求；该 ID 已用于另一次请求，请修正参数后改用新的 operationId 重试。', 'extract_assets')
     if (!previous) {
+      if (installingTranslationUpdate(this.ctx)) throw rejected('busy', INSTALL_BUSY_MESSAGE, 'extract_assets')
       const attempt: DispatchAttempt = { dispatched: false, resolved: false }
       const promise = this.runExtraction(request, target, exec, attempt)
       const entry = { signature, promise, settled: false }; this.extractions.set(key, entry)
@@ -1213,7 +1219,7 @@ export class NormalTranslationService {
         'This is a full user-requested retranslation, not an automatic retry or a request to preserve every old wording. The previous translation is reference data. Read current applicable settings and query the relevant active terms, including disputed expressions. Do not copy earlier model-authored notes or obsolete interpretations as current user requirements. Use organizedNotes for your organization; userRequirements contains only actual current user wording, empty when none.',
         ...(request.target.kind === 'image_unit' ? ['Use the image unit’s current editable text and background. Only revisit the original image if the user asks for a new reading or source correction.'] : []),
         SOURCE_LAYOUT_GUIDANCE,
-        request.fileName ? `Original file: ${request.fileName}. After review, submit any reusable candidates with translation_submit_proposals using the returned target/revisionId. Keep delivery in this file unit and its version entry; briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation. Save a file only when the user explicitly requests a separate export.',
+        request.fileName ? `Original file: ${request.fileName}. After review, submit any reusable candidates with translation_submit_proposals using the returned target/revisionId. Keep delivery in this file unit and its version entry; briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation in the translation Session and briefly report the outcome in the main chat. Save a file only when the user explicitly requests a separate export.',
         STYLE_SETTINGS_GUIDANCE,
         ...(request.fileName ? [FILE_MEMORY_REVIEW_GUIDANCE] : []),
         DIRECT_REVIEW_NEXT_STEP,
@@ -1563,7 +1569,9 @@ export class NormalTranslationService {
     return this.view(job, request.afterSequence)
   }
   hasActiveJobs(ownerId?: string): boolean {
-    if (ownerId === undefined) return this.activeSessions.size > 0 || this.documentSessions.size > 0 || [...this.jobs.values()].some(job => ['accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status))
+    if (ownerId === undefined) return this.activeSessions.size > 0 || this.documentSessions.size > 0 ||
+      [...this.direct.values(), ...this.extractions.values()].some(entry => !entry.settled) ||
+      [...this.jobs.values()].some(job => ['accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status))
     return [...this.jobs.values()].some(job => job.envelope.mainSessionId === ownerId && (['preparing', 'accepted', 'running', 'unknown'].includes(job.status) || ['waiting_context', 'waiting_user'].includes(job.v2Status)))
   }
   historyUnitBusy(scope: HistoryScope, unitId: string): boolean {

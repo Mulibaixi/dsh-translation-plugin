@@ -11,6 +11,8 @@ import { LocalDataClearView, type LocalDataClient } from './local-data.js'
 import { styles, TOPIC_SUBMENU_WIDTH } from './view-styles.js'
 import { h, react } from './react.js'
 import { EmbeddingSettingsView } from './embedding-settings-view.js'
+import { PluginUpdateView } from './plugin-update-view.js'
+import type { PluginUpdateRemote } from '../shared/plugin-update.js'
 import type { EmbeddingClient } from './embedding-client.js'
 import type { MemoryIndexClient } from './memory-index-client.js'
 import { RecordIndexControl, RecordIndexStatus, supportsRecordIndex, type RecordIndexProps } from './record-index-view.js'
@@ -1357,7 +1359,7 @@ function DeleteDialog({ request, onCancel, onConfirm, onTermsChange, sessionDele
     h('div', { className: 'dsh-tp-actions' }, button(pending ? '正在删除…' : sessionDeletion ? '确认删除会话' : '确认删除历史', onConfirm, pending), button('取消', onCancel, pending)),
   )
 }
-export function SettingsView({ store, onClose, terms, localData, embedding, memoryIndex }: StoreProps & { readonly onClose?: (() => void) | undefined; readonly terms?: TopicMemoryStore | undefined; readonly localData?: LocalDataClient | undefined; readonly embedding?: EmbeddingClient | undefined; readonly memoryIndex?: MemoryIndexClient | undefined }): unknown {
+export function SettingsView({ store, onClose, terms, localData, embedding, memoryIndex, pluginUpdate }: StoreProps & { readonly onClose?: (() => void) | undefined; readonly terms?: TopicMemoryStore | undefined; readonly localData?: LocalDataClient | undefined; readonly embedding?: EmbeddingClient | undefined; readonly memoryIndex?: MemoryIndexClient | undefined; readonly pluginUpdate?: (() => Promise<PluginUpdateRemote | undefined>) | undefined }): unknown {
   useStore(store)
   const [pending, setPending] = react.useState<Partial<Omit<SessionSettings, 'schemaVersion'>>>({})
   const [errors, setErrors] = react.useState<readonly string[]>([])
@@ -1413,6 +1415,7 @@ export function SettingsView({ store, onClose, terms, localData, embedding, memo
       field('单次上限', h('input', { type: 'number', value: form.maxInputChars, min: 1, max: 200000, step: 1, onChange: (event: TextEvent) => change({ maxInputChars: Number(event.currentTarget.value) }) }), '原文字符数为 1–200000。修改后适用于所有会话接下来提交的任务。'),
     ),
     embedding ? h(EmbeddingSettingsView, { client: embedding, index: memoryIndex }) : null,
+    pluginUpdate ? h(PluginUpdateView, { remote: pluginUpdate }) : null,
     localData ? h(LocalDataClearView, {data:localData}) : null,
     h(StorageUsageView, { store, localData }),
     errors.length ? h('div', { role: 'alert', className: 'dsh-tp-message' }, ...errors.map(error => h('p', { key: error }, error))) : null,

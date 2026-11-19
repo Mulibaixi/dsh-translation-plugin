@@ -400,12 +400,16 @@ export class NormalTranslationClient {
         return history
       }
       const base = unit.revisions.at(-1)
-      if (!base || base.id !== baseRevisionId || base.status !== 'completed' || !revisionMatchesCurrentSource(unit, base)) {
-        result = failure('stale_revision', '基准已变化或最新译文未完整结束，请读取当前版本后核对。')
+      if (!base || base.status !== 'completed' || !revisionMatchesCurrentSource(unit, base)) {
+        result = failure('stale_revision', '当前没有可局部修订的最新完整译文，请核对单元状态。')
         return history
       }
       if (this.options.canPatchRevision?.(this.store.getTopicStorageScope(session.topicId)!, session.topicId, session.id, unit.id, base.id) === false) {
         result = failure('revision_edit_blocked', '基准译文含原件位置关联，暂不可局部修订。')
+        return history
+      }
+      if (base.id !== baseRevisionId) {
+        result = failure('stale_revision', `基准已变化。请用 translation_read_units 读取同一翻译会话的单元 ${unit.order}，指定 revisionNumber=${base.order}。核对待替换片段后，使用回执中的 revisionId 作为基准重试。`)
         return history
       }
       const applied = applyExactTextEdits(base.text, edits)
