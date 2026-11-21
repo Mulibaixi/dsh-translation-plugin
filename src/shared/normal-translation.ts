@@ -5,7 +5,7 @@ import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } fr
 import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type NormalTranslationTerm, type TranslationCallMetadata } from './translation-call.js'
 import { parseDirectContextResponse, parseDirectContextSupplement, type DirectContextResponse, type DirectContextSupplement } from './direct-context.js'
 import { IMAGE_BACKGROUND_LIMIT, type ImageUnitTarget, type ImageUnitUpdate } from './image-translation.js'
-import type { ExactTextEdit } from './text-edits.js'
+import type { ResultTextEdits } from './text-edits.js'
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
 export interface NormalTranslationMaterialTarget {
   readonly kind: 'material'
@@ -112,7 +112,7 @@ export interface DirectResultPatch {
   readonly target: NormalTranslationUnitTarget
   readonly baseRevisionId: string
   readonly operationId: string
-  readonly edits: readonly ExactTextEdit[]
+  readonly edits: ResultTextEdits
 }
 export interface DirectResultPatchReceipt {
   readonly target: NormalTranslationUnitTarget
@@ -260,7 +260,14 @@ export function parseDirectResultPatch(value: unknown): DirectResultPatch {
   if (!Array.isArray(value.edits) || !value.edits.length || value.edits.length > MAX_DIRECT_RESULT_EDITS) {
     throw new TypeError(`edits must contain 1 to ${MAX_DIRECT_RESULT_EDITS} exact replacements`)
   }
-  const edits = value.edits.map(edit => {
+  const first: unknown = value.edits[0]
+  object(first)
+  const edits = Object.hasOwn(first, 'line') ? value.edits.map(edit => {
+    object(edit); exact(edit, ['line', 'to'])
+    version(edit.line); text(edit.to, 2_000_000, true)
+    if (/[\r\n]/.test(edit.to)) throw new TypeError('Line replacement must not contain a line break')
+    return { line: edit.line, to: edit.to }
+  }) : value.edits.map(edit => {
     object(edit); exact(edit, ['from', 'to'])
     text(edit.from, 2_000_000, true); text(edit.to, 2_000_000, true)
     if (!edit.from.length || edit.from === edit.to) throw new TypeError('Each edit must change a nonempty from fragment')

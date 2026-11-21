@@ -3,8 +3,45 @@ export interface ExactTextEdit {
   readonly to: string
 }
 
+export interface LineTextEdit {
+  readonly line: number
+  readonly to: string
+}
+
+/** Text at even indexes, original separators at odd indexes. A terminal separator does not add a line. */
+export function splitResultLines(text: string): string[] {
+  const parts = text.split(/(\r\n|[\r\n])/)
+  if (parts.length > 1 && parts.at(-1) === '') parts.pop()
+  return parts
+}
+
+type TextEditResult = { readonly ok: true; readonly text: string } | { readonly ok: false; readonly code: string; readonly message: string }
+export type ResultTextEdits = readonly ExactTextEdit[] | readonly LineTextEdit[]
+
+function areLineTextEdits(edits: ResultTextEdits): edits is readonly LineTextEdit[] {
+  return edits[0] !== undefined && 'line' in edits[0]
+}
+
+export function applyResultTextEdits(base: string, edits: ResultTextEdits): TextEditResult {
+  return areLineTextEdits(edits) ? applyLineTextEdits(base, edits) : applyExactTextEdits(base, edits)
+}
+
+function applyLineTextEdits(base: string, edits: readonly LineTextEdit[]): TextEditResult {
+  const parts = splitResultLines(base)
+  const edited = new Set<number>()
+  for (const { line, to } of edits) {
+    const index = (line - 1) * 2
+    if (index < 0 || index >= parts.length) return { ok: false, code: 'line_out_of_bounds', message: `第 ${line} 行超出基准译文范围；请按行回读准确版本。` }
+    if (edited.has(line)) return { ok: false, code: 'duplicate_line', message: `第 ${line} 行重复修改；请为同一行提供一条修改。` }
+    if (parts[index] === to) return { ok: false, code: 'edit_no_change', message: `第 ${line} 行的替换内容没有变化。` }
+    edited.add(line)
+    parts[index] = to
+  }
+  return { ok: true, text: parts.join('') }
+}
+
 /** Locate every edit in the same base, then copy untouched text verbatim. */
-export function applyExactTextEdits(base: string, edits: readonly ExactTextEdit[]): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly code: string; readonly message: string } {
+export function applyExactTextEdits(base: string, edits: readonly ExactTextEdit[]): TextEditResult {
   if (!edits.length) return { ok: false, code: 'edit_empty', message: '至少需要一条精确修改。' }
   const spans: { start: number; end: number; replacement: string }[] = []
   for (const [index, edit] of edits.entries()) {

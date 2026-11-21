@@ -3,6 +3,7 @@ export const TRANSLATION_TASK_GUIDANCE = [
   'Translation task boundaries: follow the current explicit human request, including an action the user deliberately submits from the Translation UI, with its exact task and target. Earlier task instructions remain historical context; their forceful wording, unfinished status or available tools does not make them the current request.',
   'Applicable user requirements, terminology and style settings remain in force unless the user changes them; separating task execution intent does not discard these ongoing constraints or cancel other legitimate operations.',
   'When the user sets an ongoing translation preference, read applicable settings and use translation_upsert_setting within the stated scope. Keep one-off wording and corrections in the current task.',
+  'At the end of any translation review, including a reread or local revision, check for new source-supported material worth reusing as topic assets. If there are candidates and the user has not ruled out proposals, call translation_load_tools with guide:"asset_proposals" before classifying and submitting them. With no candidates, deliver directly.',
   'Deliver translations and revisions in the translation Session. Briefly report the outcome and any issues in the main chat. Paste translated text there only for the scope the user explicitly requests. When discussing wording, quote only the necessary excerpt.',
   'Translation quotes ending with 出处 give the selected text and its recorded unit/version. Treat the quote as context for the user’s accompanying request. If you need more text, resolve the named open translation Session and verify the unit ID before reading the cited version. The currently selected Session is a candidate and may have changed since quoting.',
   'When the user moves to a new translation unit, treat remaining minor wording or polishing suggestions for earlier units as handled. Do not carry them as pending work, repeat them, ask for confirmation or reopen earlier units unless the user asks. Revisit an earlier sentence only when it is tightly coupled to the current sentence and materially affects its translation; explain only that dependency. Use current recorded translations, including manual edits; read the relevant unit when needed. This workflow default does not assert that edits were saved or change stored text. Keep ongoing user requirements, terminology and style, and fully review the current unit.',
@@ -15,7 +16,7 @@ interface TaskAgent { readonly session: { readonly id: string; snapshotEvents?()
 function object(value: unknown): Record<string, unknown> | undefined { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined }
 
 /** Read public log facts only; do not retract history or maintain a second task registry. */
-export function translationTaskBoundary(agent: TaskAgent, action: string, target: Readonly<Record<string, unknown>>, compact = false): string {
+export function translationTaskBoundary(agent: TaskAgent, action: string, target: Readonly<Record<string, unknown>>, compact: boolean | 'before_user' = false): string {
   const accompanyingMaterial = action === 'submitted_material'
   let interruption: string | undefined
   const events = agent.session.snapshotEvents?.()
@@ -29,7 +30,9 @@ export function translationTaskBoundary(agent: TaskAgent, action: string, target
     }
     break
   }
-  const scope = compact
+  const scope = compact === 'before_user'
+    ? 'CURRENT MATERIAL CONTEXT — this material accompanies the next user message. Read that entire message and use it and the applicable Session instructions to determine this turn\'s task. Translate by default only when they do not indicate a different action. Do not resume earlier work.'
+    : compact
     ? accompanyingMaterial
       ? 'CURRENT MATERIAL CONTEXT — translate this submission by default. Follow any accompanying human instruction to learn, discuss or skip translation. Do not resume earlier work.'
       : 'CURRENT EXPLICIT USER ACTION — translate this exact new submission from the Translation UI. Do not resume earlier work.'

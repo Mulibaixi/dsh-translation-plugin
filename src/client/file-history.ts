@@ -9,7 +9,7 @@ import type { MaterialSubmissionsClient } from './material-submissions.js'
 import { currentDocumentFinalRevision, isDocumentUnit } from './translation-history.js'
 import type { TranslationDocumentReader } from './source-reader.js'
 import { readDocumentText, projectDocument } from './document-export.js'
-import type { UnitReadRequest, UnitContent } from '../shared/numbered-units.js'
+import type { UnitReadRequest, UnitTextContent } from '../shared/numbered-units.js'
 import type { TermEvidenceRef } from '../memory/topic-terms.js'
 import type { DirectProposalSubmission, DirectProposalReceipt } from '../shared/direct-proposals.js'
 
@@ -28,7 +28,10 @@ export class FileHistoryClient {
     const record = this.jobs.forUnit(target.translationSessionId, target.unitId)
     return record ? { versions: record.results.map(value => value.version), finalVersion: record.final?.version ?? null, status: record.summary.phase } : undefined
   }
-  async readNumbered(target: NormalTranslationUnitTarget, request: UnitReadRequest): Promise<Omit<UnitContent, 'unit' | 'side'>> {
+  hasFileIntake(sessionId: string, unitId: string, materialId: string | undefined): boolean {
+    return this.materials.getFileUnits(sessionId).some(file => file.unitId === unitId || file.materialId === materialId)
+  }
+  async readNumbered(target: NormalTranslationUnitTarget, request: UnitReadRequest): Promise<Omit<UnitTextContent, 'unit' | 'side'>> {
     const facts = this.unit(target), side = request.side ?? 'translation', start = request.start ?? 0
     const missing = (message: string) => ({ revisionNumber: request.revisionNumber ?? null, text: null, totalCodePoints: 0, start, nextStart: null, message })
     let text: string, total: number, revisionNumber: number | null = null

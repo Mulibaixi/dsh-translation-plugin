@@ -21,6 +21,7 @@ export function PluginUpdateView({ remote }: { readonly remote: () => Promise<Pl
   const [info, setInfo] = react.useState<UpdateInfo | undefined>(undefined)
   const [candidate, setCandidate] = react.useState<string | undefined>(undefined)
   const [message, setMessage] = react.useState<string | undefined>(undefined)
+  const [isLatest, setIsLatest] = react.useState(false)
   const [action, setAction] = react.useState<'check' | 'install' | undefined>(undefined)
   const [offerDownload, setOfferDownload] = react.useState(false)
   const active = react.useRef(false)
@@ -46,7 +47,7 @@ export function PluginUpdateView({ remote }: { readonly remote: () => Promise<Pl
   async function run(kind: 'check' | 'install'): Promise<void> {
     if (active.current || info?.phase) return
     active.current = true
-    setAction(kind); setMessage(undefined); setOfferDownload(false)
+    setAction(kind); setMessage(undefined); setIsLatest(false); setOfferDownload(false)
     try {
       const service = await remote()
       if (!service) throw new Error('Plugin update Host unavailable')
@@ -55,7 +56,8 @@ export function PluginUpdateView({ remote }: { readonly remote: () => Promise<Pl
         const result = unwrap<UpdateCheck>(await service.check())
         if (!mounted.current) return
         if (result.status === 'available') setCandidate(result.version)
-        else setMessage(result.status === 'current' ? '已是最新版本。' : result.message)
+        else if (result.status === 'current') setIsLatest(true)
+        else setMessage(result.message)
       } else if (candidate) {
         const result = unwrap<UpdateResult>(await service.installUpdate(candidate))
         if (!mounted.current) return
@@ -86,14 +88,18 @@ export function PluginUpdateView({ remote }: { readonly remote: () => Promise<Pl
   const stateMessage = info?.state === 'restart-required' ? `已安装 v${installed}，重启 DSH 后生效。`
     : info?.state === 'activation-failed' ? `已安装 v${installed}，但加载失败。请在 DSH 插件管理器中查看状态。` : undefined
   const status = info?.phase ? progress[info.phase] : action === 'install' ? '正在准备更新…'
-    : action === 'check' ? '正在检查更新…' : stateMessage ?? message
+    : action === 'check' ? undefined : stateMessage ?? message
+  const versionStatus = status ? undefined : action === 'check' ? '正在检查更新…' : isLatest ? '已是最新版本' : undefined
 
   return h('section', { className: 'dsh-tp-settings-section', 'aria-label': '插件更新' },
-    h('h3', null, '插件更新'),
-    info ? h('p', null, `当前版本 v${info.currentVersion}${canCheck && candidate ? ` → v${candidate}` : ''}`)
+    h('div', { className: 'dsh-tp-settings-header dsh-tp-settings-section-header' },
+      h('h3', null, '插件更新'),
+      canCheck ? h('div', { className: 'dsh-tp-actions' },
+        h('button', { type: 'button', disabled: busy, onClick: () => void run('check') }, '检查更新')) : null),
+    info ? h('p', null, `当前版本 v${info.currentVersion}${canCheck && candidate ? ` → v${candidate}` : ''}`,
+      h('span', { role: 'status', className: 'dsh-tp-muted' }, versionStatus ? ` · ${versionStatus}` : null))
       : message ? null : h('p', null, '正在读取当前版本…'),
     h('div', { className: 'dsh-tp-actions' },
-      canCheck ? h('button', { type: 'button', disabled: busy, onClick: () => void run('check') }, '检查更新') : null,
       ready && candidate ? h('button', { type: 'button', disabled: busy, onClick: () => void run('install') }, `更新到 v${candidate}`) : null,
       link('发行说明', candidate ? releasePage(candidate) : TRANSLATION_RELEASES),
       (manual || offerDownload) && candidate && !busy ? link('下载安装包', releaseDownload(candidate)) : null),

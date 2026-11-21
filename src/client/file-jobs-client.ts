@@ -52,6 +52,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
   private readonly timer: ReturnType<typeof setInterval>
   private retainOwner: ((ownerId: string) => () => void) | undefined
   private assets: { terms: TopicMemoryStore; archive: TopicArchiveStore } | undefined
+  private proposalTail = Promise.resolve()
   private stopAssets: (() => void)[] = []
   private materials: MaterialSubmissionsClient | undefined
   private assetNamespaceId: (() => string) | undefined
@@ -110,11 +111,18 @@ export class FileJobsClient implements TranslationEvidenceReader {
   }
   /** Candidates go directly to the four ordinary archives, without a separate review batch. */
   async submitDirectProposals(ownerId: string, raw: DirectProposalSubmission): Promise<DirectProposalReceipt> {
-    const request = parseDirectProposalSubmission(raw), target = request.target
+    const request = parseDirectProposalSubmission(raw)
+    // Same-client batches must see each other's term and entity writes before checking cross-category labels.
+    const result = this.proposalTail.then(() => this.saveDirectProposals(ownerId, request))
+    this.proposalTail = result.then(() => {}, () => {})
+    return result
+  }
+  private async saveDirectProposals(ownerId: string, request: DirectProposalSubmission): Promise<DirectProposalReceipt> {
+    const { target } = request
     const session = this.sessions.getSession(target.translationSessionId)
     const unit = this.sessions.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
     const revision = unit && isTextUnit(unit) ? unit.revisions.at(-1) : undefined
-    if (ownerId !== target.mainSessionId || !session || !this.sessions.isSessionOpen(ownerId, session.id) || !unit || !isTextUnit(unit) || unit.deletion ||
+    if (this.disposed || ownerId !== target.mainSessionId || !session || !this.sessions.isSessionOpen(ownerId, session.id) || !unit || !isTextUnit(unit) || unit.deletion ||
       unit.sourceVersion !== target.sourceVersion || !revision || revision.id !== request.revisionId || revision.status !== 'completed' || !revisionMatchesCurrentSource(unit, revision))
       throw Object.assign(new Error('原文或译文版本已变化，或不属于已打开会话，请重新读取后总结提案。'), { code: 'stale_proposals' })
     const proposals: FileJobProposal[] = request.proposals.map(({ quotes, ...proposal }) => ({ ...proposal, origin: 'inferred', disposition: 'pending', evidence: quotes.map((quote, index) => {
@@ -124,13 +132,14 @@ export class FileJobsClient implements TranslationEvidenceReader {
       const start = Array.from(unit.source.slice(0, offset)).length
       return { range: { start, end: start + Array.from(quote).length } }
     }) }))
-    if (!this.assets) throw new Error('主题记忆尚未就绪，请重新打开记忆资产。')
+    const assets = this.assets
+    if (!assets) throw new Error('主题记忆尚未就绪，请重新打开记忆资产。')
     const check = (): void => {
       const current = this.sessions.getTranslationHistory(session.id)?.units.find(item => item.id === unit.id)
-      if (!current || !isTextUnit(current) || current.deletion || current.sourceVersion !== unit.sourceVersion || current.source !== unit.source || current.revisions.at(-1)?.id !== revision.id || !this.sessions.isSessionOpen(ownerId, session.id))
+      if (this.disposed || this.assets !== assets || !current || !isTextUnit(current) || current.deletion || current.sourceVersion !== unit.sourceVersion || current.source !== unit.source || current.revisions.at(-1)?.id !== revision.id || !this.sessions.isSessionOpen(ownerId, session.id))
         throw Object.assign(new Error('原文或译文已变化，请重新总结。'), { code: 'stale_proposals' })
     }
-    const result = await putAssetProposals(this.assets.terms, this.assets.archive, { ownerId, topicId: session.topicId, sessionId: session.id,
+    const result = await putAssetProposals(assets.terms, assets.archive, { ownerId, topicId: session.topicId, sessionId: session.id,
       unitId: unit.id, sourceVersion: unit.sourceVersion, targetLanguage: unit.targetLanguage }, proposals, check)
     return { ...result, persistence: 'saved' }
   }

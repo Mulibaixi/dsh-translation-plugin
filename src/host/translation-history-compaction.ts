@@ -103,6 +103,7 @@ export async function compactTranslationHistory(ctx: TopicHostContext, topics: T
       const loadedGroups = Array.isArray(value.loadedGroups) ? value.loadedGroups
         : Array.isArray(value.groups) ? value.groups.flatMap(group => { const item = object(group); return item?.active === true && typeof item.name === 'string' ? [item.name] : [] }) : undefined
       summary = { kind: 'tool_loading_history',
+        ...(args.guide === 'asset_proposals' ? { guide: args.guide } : {}),
         ...(Array.isArray(args.groups) ? { requestedGroups: args.groups } : {}),
         ...(loadedGroups ? { loadedGroups } : {}),
         ...(value.selectionAfterTurn === undefined ? {} : { selectionAfterTurn: value.selectionAfterTurn }),

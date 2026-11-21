@@ -94,7 +94,7 @@ For detailed instructions on topics and sessions, material submission, refinemen
 
 ### Submitting sources and instructions
 
-In Normal mode, **put the source in the translation input and your current instructions or revision feedback in the main chat**. When you submit, the main model uses both to coordinate the translation. View the translation in the translation session. The main chat briefly reports the outcome and any issues.
+In Normal mode, **put the source in the translation input and use the main chat for instructions, background, reference material, or questions**. When you send a plain-text source with a chat message, the main model reads them together and follows your intent for that turn. View the translation in the translation session. The main chat briefly reports the outcome and any issues.
 
 Use **翻译设置 (Translation Preferences)** to set the default mode and target language for new sessions. **翻译要求 (Translation Requirements)** and **单次上限 (Per-translation limit)** are global and apply to future translations and retranslations in all sessions. The requirements field is optional. Use **翻译设定 (Translation Settings)** to manage rules at the topic or user level.
 
@@ -102,13 +102,17 @@ Use **翻译设置 (Translation Preferences)** to set the default mode and targe
 
 You can ask “What are some other ways to translate this word? Let's discuss it before translating,” then follow up with “Use the second option and refine this unit in the tone we agreed on.” The main model sends your explicit feedback to the translation model, which revises the existing translation.
 
-Before discussing an existing translation, open its translation session in the current main chat so the main model can find the relevant unit and version. Select source text or a completed translation and choose **引用文本 (Quote text)** to add the excerpt and its version details to the main chat draft.
+Before discussing an existing translation, open its translation session in the current main chat so the main model can find the relevant unit and version. Select source text or a completed translation and choose **引用文本 (Quote text)** to add it to the main chat draft. On DSH 0.2.2-rc.3 or later, only the selected text is displayed; its source details are sent to the main model with the message.
+
+For a Normal plain-text translation, you can ask the main model to revise a sentence or line in the chat. It can apply line-numbered changes to the latest complete translation and save a review revision. Exact fragment replacements are also available for small wording changes.
 
 ### Managing memory assets
 
 Save terminology, style requirements, and references for later discussion and translation. For entry adoption, reference-file segmentation, source indexing, and saving rules, see [Memory assets (Simplified Chinese)](docs/user-guide.zh-CN.md#记忆资产).
 
 When organizing candidates, file the names of people, places, and organizations under entities along with their translations. File established translations of specialized concepts under terminology. Keep each referent in one category. You can edit the entities linked to terms, facts, and relations to provide context.
+
+When reviewing a new or existing translation, the main model can look up classification rules for reusable, source-supported material and submit a batch of candidates for adoption. Submission checks for names and aliases shared by terms and entities and reports entries that need review.
 
 In **结构化档案 (Structured Archives)**, you can clear unadopted entries in the current category or use **导出 (Export)** to save all archives for the current topic as JSON or Markdown. You can also ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
 

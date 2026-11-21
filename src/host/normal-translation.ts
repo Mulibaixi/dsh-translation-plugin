@@ -906,7 +906,7 @@ export class NormalTranslationService {
       ? { ...scope, kind: 'image_unit' } : { ...scope, kind: 'unit', sourceVersion: receipt.sourceVersion })
     const assetReview = (material.sourceText === undefined || request.target.kind === 'image_unit') && status === 'completed' && receipt && target ? { assetReview: {
       tool: 'translation_submit_proposals' as const, target, revisionId: receipt.revisionId,
-      nextStep: 'After review, submit reusable candidates for this revision only if there are any. Use exact unique source quotes. Deliver the recorded result in the translation Session.' } } : {}
+      nextStep: 'If review finds reusable candidates, read the asset_proposals guide. Submit for the latest completed reviewed revision.' } } : {}
     const handoff = target ? { target, nextStep: DIRECT_REVIEW_NEXT_STEP } : {}
     const withText = { ...base, ...assetReview, ...handoff, text, truncated: false }
     if (new TextEncoder().encode(JSON.stringify(withText)).byteLength <= 60_000) return withText
@@ -1219,7 +1219,7 @@ export class NormalTranslationService {
         'This is a full user-requested retranslation, not an automatic retry or a request to preserve every old wording. The previous translation is reference data. Read current applicable settings and query the relevant active terms, including disputed expressions. Do not copy earlier model-authored notes or obsolete interpretations as current user requirements. Use organizedNotes for your organization; userRequirements contains only actual current user wording, empty when none.',
         ...(request.target.kind === 'image_unit' ? ['Use the image unit’s current editable text and background. Only revisit the original image if the user asks for a new reading or source correction.'] : []),
         SOURCE_LAYOUT_GUIDANCE,
-        request.fileName ? `Original file: ${request.fileName}. After review, submit any reusable candidates with translation_submit_proposals using the returned target/revisionId. Keep delivery in this file unit and its version entry; briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation in the translation Session and briefly report the outcome in the main chat. Save a file only when the user explicitly requests a separate export.',
+        request.fileName ? `Original file: ${request.fileName}. Keep delivery in this file unit and its version entry. Briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation in the translation Session and briefly report the outcome in the main chat. Save a file only when the user explicitly requests a separate export.',
         STYLE_SETTINGS_GUIDANCE,
         ...(request.fileName ? [FILE_MEMORY_REVIEW_GUIDANCE] : []),
         DIRECT_REVIEW_NEXT_STEP,

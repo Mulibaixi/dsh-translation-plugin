@@ -4,6 +4,7 @@ import type { LocalDataRemotePort } from '../shared/local-data.js'
 import { ReferenceStore } from './reference-store.js'
 import { OtherMemoryClient, type OtherMemoryRemotePort, type OtherMemoryFilesRemotePort } from './other-memory-client.js'
 import { h, react } from './react.js'
+import { QuotedTranslationText, type InsertTranslationQuote } from './translation-quote.js'
 import { materialAttachmentStyles } from './view-styles.js'
 import { PanelRouter, SettingsView, MemoryAssetsView } from './views.js'
 import { createSessionStore } from './session-store.js'
@@ -131,7 +132,7 @@ type ClientPluginContext = Parameters<ComposerExtensionService['register']>[0] &
   readonly sidebarRight: MemoryAssetsSidebar & { openResource?(address: string): void }
   readonly slots: {
     register(
-      target: { readonly name: string; readonly key?: string; readonly id?: string; readonly order?: number; readonly label?: string },
+      target: { readonly name: string; readonly key?: string; readonly id?: string; readonly order?: number; readonly label?: string; readonly priority?: number },
       component: ClientComponent,
     ): Disposer
     inject(name: string, register: () => Disposer): Disposer
@@ -426,7 +427,7 @@ export function apply(ctx: ClientPluginContext): void {
       react.useEffect(() => store.subscribe(() => historyChanged(value => value + 1)), [])
       const sessionId = typeof props.sessionId === 'string' ? props.sessionId : undefined
       const tabInfo = typeof props.useTabInfo === 'function' ? (props.useTabInfo as () => MemoryAssetsTabInfo)() : undefined
-      const inputActions = props.inputActions as { insertQuote?(text: string): boolean } | undefined
+      const inputActions = props.inputActions as { readonly insertQuote?: InsertTranslationQuote } | undefined
       if (frozen) return h(ClearedDataView, null)
       if (!store.isHistoryReady()) return historyLoading()
       return h(PanelRouter, {
@@ -490,6 +491,10 @@ export function apply(ctx: ClientPluginContext): void {
         attachment.available ? h('button', { type: 'button', className: 'dsh-translation-material-toggle', 'aria-pressed': attachment.omitted,
           onClick: () => materials.setOmit(ownerId, !attachment.omitted) }, attachment.omitted ? '恢复附带' : '本次不附带') : null)
     }
+    ctx.effect(() => ctx.slots.inject('conversation.user.text.node', () => ctx.slots.register(
+      { name: 'conversation.user.text.node', key: 'quote', priority: -10 }, props => h(QuotedTranslationText, props ?? null),
+    )), 'translation quote presentation')
+
     ctx.effect(() => ctx.slots.inject('conversation.input.left', () => ctx.slots.register(
       { name: 'conversation.input.left', id: `${CLIENT_ID}-material`, order: 40 }, MaterialAttachmentMarker,
     )), 'translation material marker')

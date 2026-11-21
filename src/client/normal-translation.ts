@@ -6,7 +6,7 @@ import { parseTranslationLogResult, type TranslationLogRead } from '../shared/tr
 import { parseNormalTranslationAcceptance, parseNormalTranslationUpdate, parseNormalTranslationJob, parseNormalTranslationTarget, parseNormalTranslationSourceCorrection, parseDirectTranslationCommit, type NormalTranslationAcceptance,
   type NormalTranslationOperation, type NormalTranslationUpdate, type NormalTranslationQuery, type NormalTranslationUnitTarget, type NormalTranslationTarget, type NormalTranslationSourceCorrection, type NormalTranslationUnitRequest,
   type DirectTranslationCommit, type DirectTranslationReceipt, type NormalTranslationExportSegment, draftTranslationTerms, parseDirectResultPatch, type DirectResultPatch } from '../shared/normal-translation.js'
-import { applyExactTextEdits } from '../shared/text-edits.js'
+import { applyResultTextEdits } from '../shared/text-edits.js'
 import { sourceCodePointLength } from '../shared/translation-source-read.js'
 import { isDirectPromptVersion, type NormalTranslationTerm } from '../shared/translation-call.js'
 import { assetPriority } from '../memory/asset-priority.js'
@@ -409,10 +409,10 @@ export class NormalTranslationClient {
         return history
       }
       if (base.id !== baseRevisionId) {
-        result = failure('stale_revision', `基准已变化。请用 translation_read_units 读取同一翻译会话的单元 ${unit.order}，指定 revisionNumber=${base.order}。核对待替换片段后，使用回执中的 revisionId 作为基准重试。`)
+        result = failure('stale_revision', `基准已变化。请用 translation_read_units 读取同一翻译会话的单元 ${unit.order}，指定 revisionNumber=${base.order}。重新核对待修改的行或片段，使用回执中的 revisionId 作为基准重试。`)
         return history
       }
-      const applied = applyExactTextEdits(base.text, edits)
+      const applied = applyResultTextEdits(base.text, edits)
       if (!applied.ok) {
         result = failure(applied.code, applied.message)
         return history

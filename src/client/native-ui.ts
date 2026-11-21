@@ -5,7 +5,7 @@ export const {
   Menu, MenuGroup, MenuItemButton,
   IconChevronDownOutlineRegular, IconChevronRightOutlineRegular,
   IconPanelLeftOutlineRegular, IconSendOutlineMedium,
-  MarkdownText, Toast,
+  MarkdownText, Toast, QuotePreview,
 } = primitives
 /**
  * DSH 0.2.2 起原语改为在子菜单行自绘右箭头，并接管 ArrowRight／Tab 进入子菜单；

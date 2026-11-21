@@ -1,6 +1,18 @@
 import { h, react } from './react.js'
+import { QuotePreview } from './native-ui.js'
 
-export type InsertTranslationQuote = (text: string) => boolean
+/** DSH's quote summary changes presentation; `text` remains the model payload. */
+export type InsertTranslationQuote = (text: string, summary?: {
+  readonly label: string
+  readonly title: string
+  readonly body: string
+}) => boolean
+
+/** Keep the native quote presentation, hiding only a recorded translation source suffix. */
+export function QuotedTranslationText({ node }: { readonly node: { readonly data: { readonly text: string } } }): unknown {
+  const text = node.data.text.replace(/\n\n出处：[^\n]+ · 单元 \d+ · [^\n]+（单元 ID [^\n]+）$/u, '')
+  return h(QuotePreview, { text })
+}
 
 /** The action belongs to the transcript, while insertion belongs to the main chat. */
 export function TranslationQuote({ transcript, insertQuote }: {
@@ -96,7 +108,9 @@ export function TranslationQuote({ transcript, insertQuote }: {
     onPointerDown: (event: PointerEvent) => event.preventDefault(),
     onClick: () => {
       const selected = readSelection()
-      if (selected && !insertQuote(`${selected.text}\n\n出处：${selected.source}`)) { setBlocked(true); return }
+      if (selected && !insertQuote(`${selected.text}\n\n出处：${selected.source}`, {
+        label: '', title: '', body: selected.text,
+      })) { setBlocked(true); return }
       // Insertion can move focus and the DOM selection into the main composer.
       const selection = selected?.selection
       if (selection?.anchorNode && transcript.current?.contains(selection.anchorNode)) selection.removeAllRanges()

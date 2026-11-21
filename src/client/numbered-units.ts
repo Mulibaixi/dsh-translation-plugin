@@ -1,11 +1,32 @@
-import { isEditableTextUnit, isFileJobUnit, isImageUnit } from './translation-history.js'
+import { isEditableTextUnit, isFileJobUnit, isImageUnit, revisionMatchesCurrentSource } from './translation-history.js'
 import type { SessionStore } from './session-store.js'
 import { currentFinalRevision, currentDocumentFinalRevision, isTextUnit, type TranslationUnit } from './translation-history.js'
-import { parseUnitRequest, type NumberedUnit, type UnitContent, type UnitDirectory, type UnitReadRequest } from '../shared/numbered-units.js'
+import { parseUnitRequest, type NumberedUnit, type UnitContent, type UnitDirectory, type UnitLineContent, type UnitReadRequest } from '../shared/numbered-units.js'
 import type { FileHistoryClient } from './file-history.js'
 import { parseHistoryTextRead, parseHistoryTextPage, HISTORY_TEXT_PAGE_POINTS, type HistoryTextPage } from '../shared/history-text.js'
+import { splitResultLines } from '../shared/text-edits.js'
 
 function fail(code: string, message: string): never { throw Object.assign(new Error(message), { code }) }
+
+function linePage(text: string, startLine: number): Pick<UnitLineContent, 'lines' | 'nextLine'> {
+  const parts = splitResultLines(text)
+  const lineCount = Math.ceil(parts.length / 2)
+  if (startLine > lineCount) fail('line_out_of_bounds', `此译文共 ${lineCount} 行，起始行号超出范围。`)
+  const lines: { line: number; text: string }[] = []
+  let points = 0, line = startLine
+  for (; line <= lineCount; line++) {
+    const text = parts[(line - 1) * 2]!
+    const cost = Array.from(text).length + (lines.length ? 1 : 0)
+    if (points + cost > HISTORY_TEXT_PAGE_POINTS) {
+      if (!lines.length) fail('line_too_long', `第 ${line} 行超过 ${HISTORY_TEXT_PAGE_POINTS} 码点，请用正文分页回读并按片段修订此行。`)
+      break
+    }
+    points += cost
+    lines.push({ line, text })
+  }
+  return { lines, nextLine: line <= lineCount ? line : null }
+}
+
 /** The existing open set is the content scope; numbers resolve to immutable unit identities. */
 export class NumberedUnits {
   constructor(private readonly sessions: SessionStore, private readonly files: () => FileHistoryClient | undefined) {}
@@ -68,14 +89,28 @@ export class NumberedUnits {
     const pages: UnitContent[] = []
     for (const unit of units) {
       const info = this.summary(main, session.id, unit), side = request.side ?? 'translation', start = request.start ?? 0
-      if (isTextUnit(unit)) {
+      if (request.format === 'lines') {
+        if (session.mode !== 'normal' || session.archivedAt !== null || !isTextUnit(unit) || isImageUnit(unit) || unit.sourceVersion === undefined ||
+          this.files()?.hasFileIntake(session.id, unit.id, unit.material?.materialId)) {
+          fail('unsupported_target', '按行修订视图仅支持已打开的普通纯文本单元。')
+        }
+        const base = unit.revisions.at(-1)
+        if (!base || base.status !== 'completed' || !revisionMatchesCurrentSource(unit, base)) {
+          fail('stale_revision', '当前没有可局部修订的最新完整译文，请核对单元状态。')
+        }
+        if (request.revisionNumber !== undefined && request.revisionNumber !== base.order) {
+          fail('stale_revision', `基准已变化，请从最新译文版本 ${base.order} 重新按行回读。`)
+        }
+        pages.push({ unit: info, side: 'translation', revisionNumber: base.order, revisionId: base.id,
+          ...linePage(base.text, request.startLine ?? 1) })
+      } else if (isTextUnit(unit)) {
         const revision = request.revisionNumber === undefined ? currentFinalRevision(unit) : unit.revisions.find(revision => revision.order === request.revisionNumber)
         if (side === 'translation' && (!revision || revision.status === 'deleted')) {
           pages.push({ unit: info, side, revisionNumber: request.revisionNumber ?? null, text: null, totalCodePoints: 0, start, nextStart: null, message: request.revisionNumber ? '此译文版本不存在或已删除。' : '当前没有有效定稿，可指定目录中的译文版本。' }); continue
         }
         const points = Array.from(side === 'source' ? unit.source : revision!.text)
         if (start > points.length) fail('range_out_of_bounds', `单元 ${unit.order} 内容共 ${points.length} 码点，读取起点超出范围。`)
-        const end = Math.min(points.length, start + 4000)
+        const end = Math.min(points.length, start + HISTORY_TEXT_PAGE_POINTS)
         pages.push({ unit: info, side, revisionNumber: side === 'source' ? null : revision!.order,
           ...(side === 'translation' ? { revisionId: revision!.id } : {}),
           text: points.slice(start, end).join(''), totalCodePoints: points.length, start, nextStart: end < points.length ? end : null })

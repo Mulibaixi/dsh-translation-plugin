@@ -5,6 +5,7 @@ import type { FileJobProposal } from '../shared/file-jobs.js'
 import type { TopicTerm, TermEvidenceRef } from '../memory/topic-terms.js'
 import type { TopicArchiveEntry, TopicArchivePut } from '../memory/topic-archive.js'
 import { namesEntity } from '../shared/asset-classification.js'
+import { languageMatches } from '../shared/language-tag.js'
 
 const label = (s: string): string => s.normalize('NFC').trim().replace(/\s+/gu, ' ')
 const overlap = (a: readonly string[], b: readonly string[]): boolean => a.some(x => b.some(y => label(x) === label(y)))
@@ -18,7 +19,8 @@ export async function putAssetProposals(terms: TopicMemoryStore, archive: TopicA
   proposals: readonly FileJobProposal[], check: () => void): Promise<{ count: number; skipped: string[] }> {
   await terms.ensureLoaded(scope.ownerId, scope.topicId); await archive.ensureLoaded(scope.ownerId, scope.topicId)
   const entities = new Map<string, string>(), saved = new Set<string>(), skipped: string[] = []
-  for (const p of [...proposals.filter(p => p.kind === 'entity'), ...proposals.filter(p => p.kind === 'term'), ...proposals.filter(p => p.kind === 'fact'), ...proposals.filter(p => p.kind === 'relation')]) {
+  const entityProposals = proposals.filter(p => p.kind === 'entity')
+  for (const p of [...entityProposals, ...proposals.filter(p => p.kind === 'term'), ...proposals.filter(p => p.kind === 'fact'), ...proposals.filter(p => p.kind === 'relation')]) {
     check()
     const title = p.kind === 'term' ? p.sourceForms.join('、') : p.kind === 'entity' ? p.name : p.kind === 'fact' ? p.title : p.relation
     const evidence: TermEvidenceRef[] = (scope.sourceVersion === undefined ? p.evidence.slice(0, 1) : p.evidence).map(e => ({
@@ -28,8 +30,8 @@ export async function putAssetProposals(terms: TopicMemoryStore, archive: TopicA
     }))
     if (p.kind === 'term') {
       const entitiesInTopic = archive.getSnapshot(scope.ownerId, scope.topicId).entries.filter(entry => entry.kind === 'entity')
-      if (namesEntity(p.sourceForms, p.preferred, entitiesInTopic)) {
-        skipped.push(`${title}：匹配实体名称或别名，请在实体档案中审阅`)
+      if (namesEntity(p.sourceForms, p.preferred, [...entitiesInTopic, ...entityProposals])) {
+        skipped.push(`${title}：匹配已有实体或同批实体候选的名称或别名，请核对指代与义项`)
         continue
       }
       const snapshot = terms.getSnapshot(scope.ownerId, scope.topicId), matches = snapshot.entries.filter(e => e.targetLanguage === scope.targetLanguage && overlap([...e.sourceForms, ...e.aliases], p.sourceForms))
@@ -55,8 +57,20 @@ export async function putAssetProposals(terms: TopicMemoryStore, archive: TopicA
           e.targetEntityIds.length === 1 && e.targetEntityIds[0] === related[1] && label(e.relation) === label(p.relation))
     if (matches.length > 1) { skipped.push(`${title}：匹配多个既有条目`); continue }
     const old = matches[0], id = old?.id ?? `archive:${crypto.randomUUID()}`
-    if (p.kind === 'entity') entities.set(p.candidateId, id)
+    if (p.kind === 'entity' && old) entities.set(p.candidateId, old.id)
     if (old && !['proposal', 'review_required'].includes(old.status)) { skipped.push(`${title}：保留既有${old.status === 'active' ? '生效' : '待处理'}条目`); continue }
+    if (p.kind === 'entity') {
+      const existingLabels = old?.kind === 'entity' ? [old.name, ...old.aliases] : []
+      const addedLabels = [p.name, ...p.aliases].filter(name => !overlap([name], existingLabels))
+      const term = terms.getSnapshot(scope.ownerId, scope.topicId).entries.find(term => overlap(addedLabels, [
+        ...term.sourceForms, ...term.aliases, ...(languageMatches(term.targetLanguage, scope.targetLanguage) ? [term.preferred] : []),
+      ]))
+      if (term) {
+        skipped.push(`${title}：名称或别名与既有术语「${term.sourceForms[0] ?? term.preferred}」重名，请核对指代与义项`)
+        continue
+      }
+      entities.set(p.candidateId, id)
+    }
     const semantic = p.kind === 'entity' ? { kind: p.kind, name: p.name, aliases: p.aliases, description: p.description }
       : p.kind === 'fact' ? { kind: p.kind, title: p.title, body: p.body, entityIds: related as string[] }
         : { kind: p.kind, sourceEntityIds: [related[0]!], relation: p.relation, targetEntityIds: [related[1]!], description: p.description }
