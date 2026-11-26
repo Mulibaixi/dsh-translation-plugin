@@ -90,19 +90,20 @@ export function PluginUpdateView({ remote }: { readonly remote: () => Promise<Pl
   const status = info?.phase ? progress[info.phase] : action === 'install' ? '正在准备更新…'
     : action === 'check' ? undefined : stateMessage ?? message
   const versionStatus = status ? undefined : action === 'check' ? '正在检查更新…' : isLatest ? '已是最新版本' : undefined
+  const install = ready && candidate ? h('button', { type: 'button', disabled: busy, onClick: () => void run('install') }, `更新到 v${candidate}`) : null
+  const download = (manual || offerDownload) && candidate && !busy ? link('下载安装包', releaseDownload(candidate)) : null
 
   return h('section', { className: 'dsh-tp-settings-section', 'aria-label': '插件更新' },
     h('div', { className: 'dsh-tp-settings-header dsh-tp-settings-section-header' },
       h('h3', null, '插件更新'),
       canCheck ? h('div', { className: 'dsh-tp-actions' },
         h('button', { type: 'button', disabled: busy, onClick: () => void run('check') }, '检查更新')) : null),
-    info ? h('p', null, `当前版本 v${info.currentVersion}${canCheck && candidate ? ` → v${candidate}` : ''}`,
-      h('span', { role: 'status', className: 'dsh-tp-muted' }, versionStatus ? ` · ${versionStatus}` : null))
-      : message ? null : h('p', null, '正在读取当前版本…'),
-    h('div', { className: 'dsh-tp-actions' },
-      ready && candidate ? h('button', { type: 'button', disabled: busy, onClick: () => void run('install') }, `更新到 v${candidate}`) : null,
-      link('发行说明', candidate ? releasePage(candidate) : TRANSLATION_RELEASES),
-      (manual || offerDownload) && candidate && !busy ? link('下载安装包', releaseDownload(candidate)) : null),
+    h('div', { className: 'dsh-tp-settings-header dsh-tp-settings-section-header' },
+      info ? h('p', null, `当前版本 v${info.currentVersion}${canCheck && candidate ? ` → v${candidate}` : ''}`,
+        h('span', { role: 'status', className: 'dsh-tp-muted' }, versionStatus ? ` · ${versionStatus}` : null))
+        : message ? null : h('p', null, '正在读取当前版本…'),
+      h('div', { className: 'dsh-tp-actions' }, link('发行说明', candidate ? releasePage(candidate) : TRANSLATION_RELEASES))),
+    install || download ? h('div', { className: 'dsh-tp-actions' }, install, download) : null,
     manual ? h('p', { className: 'dsh-tp-muted' }, '当前安装需手动更新。源码或目录链接安装请更新源码并重新构建。一键更新适用于通过 .tgz 安装的插件。') : null,
     status ? h('p', { role: 'status', className: 'dsh-tp-muted' }, status) : null)
 }

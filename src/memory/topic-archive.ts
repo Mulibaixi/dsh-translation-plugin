@@ -127,19 +127,23 @@ export function emptyTopicArchive(ownerId: string, topicId: string, at: string):
 export function referencedEntityIds(value: TopicArchiveSemantic): readonly string[] {
   return value.kind === 'entity' ? [] : value.kind === 'fact' ? value.entityIds : [...new Set([...value.sourceEntityIds, ...value.targetEntityIds])]
 }
-function validBasis(snapshot: TopicArchiveSnapshot, entry: TopicArchiveContent, resolver: TermEvidenceResolver, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
-  return sourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined || isUnloaded(ref))
+function validBasis(snapshot: TopicArchiveSnapshot, entry: TopicArchiveContent, resolver: TermEvidenceResolver): boolean {
+  return sourceBasis(entry) && entry.evidence.filter(ref => ref.role === 'basis').every(ref => resolveTermEvidence(snapshot, ref, resolver) !== undefined)
 }
-function effectiveOwn(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
-  return entry.status === 'active' && (entry.origin === 'user_explicit' || ((!!entry.acceptance || ['source_checked'].includes(entry.origin)) && validBasis(snapshot, entry, resolver, isUnloaded)))
+function effectiveOwn(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver): boolean {
+  return entry.status === 'active' && (entry.origin === 'user_explicit' || ((!!entry.acceptance || ['source_checked'].includes(entry.origin)) && validBasis(snapshot, entry, resolver)))
 }
-function validReferences(snapshot: TopicArchiveSnapshot, value: TopicArchiveSemantic, resolver: TermEvidenceResolver, active: boolean, isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): boolean {
+function validReferences(snapshot: TopicArchiveSnapshot, value: TopicArchiveSemantic, acceptEntity?: (entity: TopicArchiveEntry) => boolean): boolean {
   return referencedEntityIds(value).every(id => {
     const entity = snapshot.entries.find(entry => entry.id === id)
-    return entity?.kind === 'entity' && (!active || effectiveOwn(snapshot, entity, resolver, isUnloaded))
+    return entity?.kind === 'entity' && (acceptEntity?.(entity) ?? true)
   })
 }
-function effective(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, resolver: TermEvidenceResolver): boolean { return effectiveOwn(snapshot, entry, resolver) && validReferences(snapshot, entry, resolver, true) }
+function activeReferences(snapshot: TopicArchiveSnapshot, value: TopicArchiveSemantic, resolver: TermEvidenceResolver): boolean {
+  return validReferences(snapshot, value, entity => effectiveOwn(snapshot, entity, resolver))
+}
+// An existing fact or relation keeps its own authority while the linked entity is edited or reviewed.
+function availableEntity(entity: TopicArchiveEntry): boolean { return entity.status !== 'disabled' }
 function activeProjection(entry: TopicArchiveEntry | undefined): unknown {
   return entry?.status === 'active' ? { id: entry.id, ...copySemantic(entry), origin: entry.origin, basis: entry.evidence.filter(ref => ref.role === 'basis') } : null
 }
@@ -155,10 +159,6 @@ function reviewDependents(snapshot: TopicArchiveSnapshot, entityIds: ReadonlySet
   }
   return next
 }
-function replaceAndReview(snapshot: TopicArchiveSnapshot, entry: TopicArchiveEntry, at: string): TopicArchiveSnapshot {
-  const old = snapshot.entries.find(item => item.id === entry.id), next = replace(snapshot, entry, at)
-  return old?.kind === 'entity' && (JSON.stringify(copySemantic(old)) !== JSON.stringify(copySemantic(entry)) || (old.status === 'active' && entry.status !== 'active')) ? reviewDependents(next, new Set([entry.id]), at) : next
-}
 function result(snapshot: TopicArchiveSnapshot, status: ArchiveMutationResult['status'], entry: TopicArchiveEntry | null): ArchiveMutationResult { return { status, snapshot, entry } }
 
 /** Model edits are allowed; changed content must be reviewed again without inherited adoption. */
@@ -169,16 +169,16 @@ export function putTopicArchive(snapshot: TopicArchiveSnapshot, input: TopicArch
   if (old) input = { ...input, status: 'proposal' }
   if (!text(input.id, 2048) || !time(at) || !content(input) || (old && old.kind !== input.kind) || !['inferred', 'source_checked'].includes(input.origin) ||
     !['proposal', 'active'].includes(input.status) || (input.status === 'active' && (input.origin !== 'source_checked' || !validBasis(snapshot, input, resolver))) ||
-    !validReferences(snapshot, input, resolver, input.status === 'active')) return result(snapshot, 'invalid', old)
+    !(input.status === 'active' ? activeReferences(snapshot, input, resolver) : validReferences(snapshot, input))) return result(snapshot, 'invalid', old)
   const entry: TopicArchiveEntry = { ...copyContent(input), id: input.id, version: (old?.version ?? 0) + 1, status: input.status, origin: input.origin,
     confirmation: null, createdAt: old?.createdAt ?? at, updatedAt: at }
   if (old && old.origin === entry.origin && old.status === entry.status && JSON.stringify(copyContent(old)) === JSON.stringify(copyContent(entry))) return result(snapshot, 'unchanged', old)
-  return result(replaceAndReview(snapshot, entry, at), 'updated', entry)
+  return result(replace(snapshot, entry, at), 'updated', entry)
 }
 export function putUserTopicArchive(snapshot: TopicArchiveSnapshot, input: TopicArchiveUserPut, resolver: TermEvidenceResolver, action: { readonly eventId: string; readonly at: string }): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === input.id) ?? null
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
-  if (!text(input.id, 2048) || !semantic(input) || (old && old.kind !== input.kind) || !text(action.eventId, 2048) || !time(action.at) || !validReferences(snapshot, input, resolver, true)) return result(snapshot, 'invalid', old)
+  if (!text(input.id, 2048) || !semantic(input) || (old && old.kind !== input.kind) || !text(action.eventId, 2048) || !time(action.at) || !activeReferences(snapshot, input, resolver)) return result(snapshot, 'invalid', old)
   const fields: TopicArchiveContent = { ...copySemantic(input), evidence: old?.evidence.map(ref => ({ ...ref, range: ref.range ? { ...ref.range } : null, role: 'example' as const })) ?? [] }
   if (old?.origin === 'user_explicit' && old.status === 'active' && JSON.stringify(copyContent(old)) === JSON.stringify(fields)) return result(snapshot, 'unchanged', old)
   if (!old) {
@@ -187,12 +187,12 @@ export function putUserTopicArchive(snapshot: TopicArchiveSnapshot, input: Topic
   }
   const entry: TopicArchiveEntry = { ...fields, id: old.id, createdAt: old.createdAt, updatedAt: action.at, version: old.version + 1,
     origin: 'user_explicit', status: 'active', confirmation: { ...action, adoptedEntryVersion: old.version, edited: true } }
-  return result(replaceAndReview(snapshot, entry, action.at), 'updated', entry)
+  return result(replace(snapshot, entry, action.at), 'updated', entry)
 }
 export function adoptTopicArchive(snapshot: TopicArchiveSnapshot, id: string, expectedEntryVersion: number, resolver: TermEvidenceResolver, action: { readonly eventId: string; readonly at: string; readonly edited?: boolean }): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === id) ?? null
   if (!old || old.version !== expectedEntryVersion) return result(snapshot, 'stale', old)
-  if (!text(action.eventId, 2048) || !time(action.at) || !validReferences(snapshot, old, resolver, true)) return result(snapshot, 'invalid', old)
+  if (!text(action.eventId, 2048) || !time(action.at) || !activeReferences(snapshot, old, resolver)) return result(snapshot, 'invalid', old)
   if (old.origin === 'user_explicit' && old.status === 'active') return result(snapshot, 'unchanged', old)
   const { acceptance: _acceptance, ...previous } = old
   const entry: TopicArchiveEntry = { ...previous, origin: 'user_explicit', status: 'active', version: old.version + 1, updatedAt: action.at,
@@ -207,16 +207,16 @@ export function acceptTopicArchiveProposal(snapshot: TopicArchiveSnapshot, input
   if ((old?.version ?? null) !== input.expectedEntryVersion) return result(snapshot, 'stale', old)
   if (revision ? !old : old?.origin === 'user_explicit' || old?.acceptance) return result(snapshot, 'requires_user_action', old)
   if ((old && old.kind !== input.kind) || !decodeTopicArchivePut({ ...input, status: 'proposal' }) || !fileProposalAcceptance(action) || !validBasis(snapshot, input, resolver) ||
-    !validReferences(snapshot, input, resolver, true)) return result(snapshot, 'invalid', old)
+    !activeReferences(snapshot, input, resolver)) return result(snapshot, 'invalid', old)
   if (old?.origin === 'user_explicit') {
     const entry: TopicArchiveEntry = { ...copyContent(input), evidence: input.evidence.map(ref => ({ ...ref, role: 'example' })), id: old.id,
       origin: 'user_explicit', status: 'active', confirmation: { eventId: action.eventId, at: action.at, adoptedEntryVersion: old.version, edited: old.confirmation?.edited !== false || action.edited },
       version: old.version + 1, createdAt: old.createdAt, updatedAt: action.at }
-    return result(replaceAndReview(snapshot, entry, action.at), 'updated', entry)
+    return result(replace(snapshot, entry, action.at), 'updated', entry)
   }
   const entry: TopicArchiveEntry = { ...copyContent(input), id: input.id, origin: input.origin, status: 'active', confirmation: null,
     acceptance: { ...action, edited: action.edited || !!old?.acceptance?.edited }, version: (old?.version ?? 0) + 1, createdAt: old?.createdAt ?? action.at, updatedAt: action.at }
-  return result(replaceAndReview(snapshot, entry, action.at), 'updated', entry)
+  return result(replace(snapshot, entry, action.at), 'updated', entry)
 }
 export function disableTopicArchive(snapshot: TopicArchiveSnapshot, id: string, expectedEntryVersion: number, at: string): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === id) ?? null
@@ -224,7 +224,8 @@ export function disableTopicArchive(snapshot: TopicArchiveSnapshot, id: string, 
   if (!time(at)) return result(snapshot, 'invalid', old)
   if (old.status === 'disabled') return result(snapshot, 'unchanged', old)
   const entry: TopicArchiveEntry = { ...old, status: 'disabled', version: old.version + 1, updatedAt: at }
-  return result(replaceAndReview(snapshot, entry, at), 'updated', entry)
+  const next = replace(snapshot, entry, at)
+  return result(entry.kind === 'entity' ? reviewDependents(next, new Set([id]), at) : next, 'updated', entry)
 }
 export function deleteTopicArchiveEntry(snapshot: TopicArchiveSnapshot, id: string, expectedEntryVersion: number, at: string): ArchiveMutationResult {
   const old = snapshot.entries.find(entry => entry.id === id) ?? null
@@ -245,22 +246,20 @@ export function reconcileTopicArchive(snapshot: TopicArchiveSnapshot, resolver: 
   isUnloaded: (ref: TermEvidenceRef) => boolean = () => false): TopicArchiveSnapshot {
   if (!time(at)) throw new Error('Invalid topic archive reconciliation time')
   let next = snapshot
-  for (const original of snapshot.entries) {
-    const entry = next.entries.find(entry => entry.id === original.id)!
-    if (entry.status === 'disabled' || entry.status === 'review_required' || entry.origin === 'user_explicit') continue
-    if (entry.evidence.some(ref => ref.role === 'basis' && resolveTermEvidence(snapshot, ref, resolver) === undefined && !isUnloaded(ref)) || (entry.status === 'active' && !sourceBasis(entry))) {
-      next = replaceAndReview(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
-    }
+  for (const entry of snapshot.entries) {
+    if (entry.status === 'disabled' || entry.status === 'review_required') continue
+    const lostBasis = entry.origin !== 'user_explicit' && (entry.evidence.some(ref => ref.role === 'basis' && resolveTermEvidence(snapshot, ref, resolver) === undefined && !isUnloaded(ref)) ||
+      (entry.status === 'active' && !sourceBasis(entry)))
+    const valid = validReferences(snapshot, entry, entry.status === 'active' ? availableEntity : undefined)
+    if (lostBasis || !valid) next = replace(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
   }
-  for (const entry of next.entries) if (entry.status !== 'disabled' && entry.status !== 'review_required' &&
-    !validReferences(next, entry, resolver, entry.status === 'active', isUnloaded)) next = replace(next, { ...entry, status: 'review_required', version: entry.version + 1, updatedAt: at }, at)
   return next
 }
 /** Normal retrieval matches caller-supplied exact labels; Quick never reads archives. */
 export function queryTopicArchive(snapshot: TopicArchiveSnapshot, query: TopicArchiveQuery, resolver: TermEvidenceResolver): readonly TopicArchiveEntry[] {
   if (query.mode !== 'normal' || query.ownerId !== snapshot.ownerId || query.topicId !== snapshot.topicId) return []
   return snapshot.entries.filter(entry => {
-    if (!query.kinds.includes(entry.kind) || !effective(snapshot, entry, resolver)) return false
+    if (!query.kinds.includes(entry.kind) || !effectiveOwn(snapshot, entry, resolver) || !validReferences(snapshot, entry, availableEntity)) return false
     const labels = entry.kind === 'entity' ? [entry.name, ...entry.aliases] : entry.kind === 'fact' ? [entry.title] : [entry.relation]
     for (const id of referencedEntityIds(entry)) {
       const entity = snapshot.entries.find(item => item.id === id)

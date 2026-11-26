@@ -54,7 +54,7 @@ export function ImageOriginalButton({ unit, session, materials, viewFiles }: Ima
       h('img', { src: preview, alt: original?.name ?? '原图', style: { display: 'block', maxWidth: '100%', maxHeight: '65vh', objectFit: 'contain' } })) : null)
 }
 
-export function ImageBackground({ unit, session, normal }: ImageViewProps & { readonly normal?: NormalTranslationClient | undefined }): unknown {
+export function ImageBackground({ unit, session, store, normal }: ImageViewProps & { readonly store: import('./session-store.js').SessionStore; readonly normal?: NormalTranslationClient | undefined }): unknown {
   const [editing, setEditing] = react.useState(false)
   const blocked = normal?.sourceEditBlockedReason(session.id, unit.id)
   return h('details', { className: 'dsh-tp-muted dsh-tp-image-background' },
@@ -62,7 +62,7 @@ export function ImageBackground({ unit, session, normal }: ImageViewProps & { re
     !editing && normal && session.archivedAt === null ? h('button', {
       type: 'button', className: 'dsh-tp-image-background-edit', disabled: !!blocked, title: blocked, onClick: () => setEditing(true),
     }, '编辑背景') : null,
-    editing && normal ? h(SourceTextEditor, { unit, session, normal, field: 'background', close: () => setEditing(false) }) :
+    editing && normal ? h(SourceTextEditor, { unit, session, store, normal, field: 'background', close: () => setEditing(false) }) :
       h('div', { className: 'dsh-tp-translation-text' }, unit.backgroundDescription || '暂无背景描述'))
 }
 

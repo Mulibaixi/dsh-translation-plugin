@@ -110,6 +110,7 @@ export class QuickTranslationClient {
     })
   }
   manualEditBlockedReason(id: string, unitId: string, revisionId: string): string | undefined {
+    if (this.store.isPruningOldRevisions(id)) return '正在清理旧译文，请稍后再编辑。'
     const session = this.store.getSession(id)
     const unit = this.getUnits(id).find(unit => unit.id === unitId)
     if (unit && !isTextUnit(unit)) return '文档译文编辑尚未接通。'

@@ -31,8 +31,8 @@ For example, say “this sentence is too literal” or “make this character's 
 | Source editing and final selection | Edit the current source in a Normal translation unit, retranslate it, or select a final. Existing translation revisions remain available after source edits. |
 | Quick translation | Translate independent plain text directly for short passages and occasional lookups. |
 | File delivery | Translate TXT, Markdown, text-layer PDFs, scanned PDFs, and mixed PDFs. Click a filename to preview it in the DSH sidebar, use **操作 → 打开 (Actions → Open)** to open it in the system default app, or use **操作 → 另存为…… (Actions → Save as…)** to save a specific translation version. |
-| Single-image translation | The main model reads one PNG, JPEG, or static WebP. Edit the extracted source, copy the lettering prompt, or export a text PNG, the prompt, or a ZIP with the original and the prompt. When available, the prompt includes the original pixel dimensions. The generated image may differ in size. |
-| Batch processing | In a Normal session, click the icon to the right of the file button to select multiple images. Confirm their order and translate them one at a time. Each image keeps its own unit. The batch bar above the input shows progress and lets you pause, resume, or retry a failed item. |
+| Single-image translation | A vision subagent uses the lowest available reasoning effort to read a full PNG, JPEG, or static WebP and records dialogue speakers by balloon. By default, it omits hard-to-read text when confidence is low. The recognition prompt receives the transcription scope and character clues. The main model interprets the request, checks relevant topic terms and names, calls the translation model, and reviews and delivers the result in the translation session. It uses neutral wording for unidentified speakers. Edit the source, copy the lettering prompt, or export lettering assets. |
+| Batch processing | Select several images in a Normal session to process them in order. The main model can polish the current page, revise earlier pages, and review the batch at the end. Pause lets the current task settle. Terminate batch ends further processing and keeps saved work. |
 | Topic memory | Share terms, entities, facts, relations, settings, and references across topic sessions, with optional semantic retrieval. |
 
 ## A translation and refinement workflow
@@ -106,15 +106,23 @@ Before discussing an existing translation, open its translation session in the c
 
 For a Normal plain-text translation, you can ask the main model to revise a sentence or line in the chat. It can apply line-numbered changes to the latest complete translation and save a review revision. Exact fragment replacements are also available for small wording changes.
 
+Enable source and translation line numbers under **设置 → 翻译 → 全局翻译设置 (Settings → Translation → Global Translation Settings)**. Saving or canceling an edit returns you to approximately where you were reading in the editor.
+
+Global Translation Settings also lets you enable automatic cleanup. It keeps the five latest completed versions of each unit, the current final and its direct base, versions referenced by the main chat, and versions linked to an original file.
+
 ### Managing memory assets
 
 Save terminology, style requirements, and references for later discussion and translation. For entry adoption, reference-file segmentation, source indexing, and saving rules, see [Memory assets (Simplified Chinese)](docs/user-guide.zh-CN.md#记忆资产).
 
+The main model can search translation records across the topic, including closed or archived sessions, and read the current source and effective final translation as examples.
+
 When organizing candidates, file the names of people, places, and organizations under entities along with their translations. File established translations of specialized concepts under terminology. Keep each referent in one category. You can edit the entities linked to terms, facts, and relations to provide context.
 
-When reviewing a new or existing translation, the main model can look up classification rules for reusable, source-supported material and submit a batch of candidates for adoption. Submission checks for names and aliases shared by terms and entities and reports entries that need review.
+When reviewing a new or existing translation, the main model can look up classification rules for reusable, source-supported material and submit a batch of candidates for adoption. Submission checks for overlaps between terms and entities, including names with honorifics and kana spelling variants, and reports skipped entries. Routine phrases stay in the translation.
 
 In **结构化档案 (Structured Archives)**, you can clear unadopted entries in the current category or use **导出 (Export)** to save all archives for the current topic as JSON or Markdown. You can also ask the main model to delete a specific pending or disabled term, entity, fact, or relation.
+
+Linked facts and relations keep their status when you edit an entity. Disabling or deleting the entity marks those entries for review.
 
 Markdown exports organize archive content, entry status, and brief source references by category. JSON exports include the complete structured fields.
 

@@ -14,7 +14,7 @@ import { SESSION_MODEL_PREFIX, OWNER_MODEL_PREFIX, sessionModelKey, ownerModelKe
 import { SESSION_ORDER_PREFIX, sessionOrderKey, encodeSessionOrder, decodeSessionOrder, moveSessionOrder } from './session-order.js'
 import { decodeTranslationHistory, emptyTranslationHistory, isDocumentUnit, isTextUnit, deleteTextRevision, textRevisionDeletionBlockedReason,
   deleteUnit, unitDeletionBlockedReason, isDeletedUnit,
-  restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
+  expiringTextRevisions, restoreTranslationHistory, type TranslationHistory } from './translation-history.js'
 import { parseTranslationSourceReference, parseTranslationSourceStorageRequest, type TranslationSourceQueryReference, type TranslationSourceStoredRead } from '../shared/translation-source-storage.js'
 import { parseTranslationSourceScope, type TranslationSourceScope } from '../shared/translation-sources.js'
 import type { TranslationSourceHistoryCallbacks, TranslationSourceHistoryCommit } from './source-storage-client.js'
@@ -142,6 +142,8 @@ export class SessionStore {
   private readonly workspaces = new Map<string, Workspace>()
   private readonly listeners = new Set<Disposer>()
   private readonly executionLeases = new Map<string, string>()
+  private readonly historyEdits = new Map<string, number>()
+  private readonly pruningRevisions = new Set<string>()
   private readonly revisionDeletions = new Map<string, PendingRevisionDeletion>()
   private readonly unitDeletions = new Map<string, PendingUnitDeletion>()
   private notice: string | undefined
@@ -270,6 +272,42 @@ export class SessionStore {
     return () => { if (!released && this.executionLeases.get(sessionId) === taskId) { released = true; this.executionLeases.delete(sessionId); this.emit() } }
   }
   hasDocumentLease(sessionId: string): boolean { return this.executionLeases.has(sessionId) }
+  hasHistoryEdit(sessionId: string): boolean { return this.historyEdits.has(sessionId) }
+  isPruningOldRevisions(sessionId: string): boolean { return this.pruningRevisions.has(sessionId) }
+  holdHistoryEdit(sessionId: string): () => void {
+    this.historyEdits.set(sessionId, (this.historyEdits.get(sessionId) ?? 0) + 1)
+    this.emit()
+    return () => {
+      const remaining = (this.historyEdits.get(sessionId) ?? 1) - 1
+      if (remaining) this.historyEdits.set(sessionId, remaining)
+      else { this.historyEdits.delete(sessionId); this.emit() }
+    }
+  }
+
+  async pruneOldRevisions(id: string, busy: () => boolean, held: (unitId: string, revisionId: string) => boolean): Promise<void> {
+    if (!this.historyBackend || !this.settings.autoPruneOldRevisions || !this.seats.get(id)?.translationHistory.units.some(unit => expiringTextRevisions(unit).length)) return
+    await this.withStructureLock(undefined, async () => {
+      const seat = this.seats.get(id)
+      if (!seat || seat.status !== 'saved' || this.isDeleted(id) || this.disposed || !this.readSettings() ||
+        !this.settings.autoPruneOldRevisions || this.historyEdits.has(id) || busy()) return
+      const units = seat.translationHistory.units.flatMap(unit => {
+        const revisionIds = expiringTextRevisions(unit).map(revision => revision.id).filter(revisionId => !held(unit.id, revisionId))
+        return revisionIds.length ? [{ unitId: unit.id, revisionIds }] : []
+      })
+      if (!units.length) return
+      const operationId = deletionOperationId('revision'), release = this.claimDocumentLease(id, operationId)
+      if (!release) return
+      this.pruningRevisions.add(id)
+      try {
+        const receipt = await this.historyBackend!.pruneOldRevisions(seat.session, { kind: 'prune_text_revisions', units }, operationId)
+        if (!receipt?.current || this.seats.get(id) !== seat || this.disposed) return
+        seat.translationHistory = receipt.current.history
+        seat.savedTranslationHistory = receipt.saved?.history ?? emptyTranslationHistory()
+        seat.stored = this.historyBackend!.snapshot(id)
+      } catch { /* A later saved history or reopening the session can retry cleanup. */ }
+      finally { this.pruningRevisions.delete(id); release() }
+    })
+  }
   /** Await the current history write without treating queued work as saved. */
   async saveTranslationHistoryAsync(sessionId: string): Promise<boolean> {
     if (!this.readSettings()) return false
@@ -1210,7 +1248,7 @@ export class SessionStore {
   updateTranslationHistory(id: string, update: (history: TranslationHistory) => TranslationHistory): boolean {
     if (this.unloadedHistory.has(id)) { void this.ensureSessionHistory(id); return false }
     const seat = this.seats.get(id)
-    if (!seat || this.disposed) return false
+    if (!seat || this.disposed || this.pruningRevisions.has(id)) return false
     if ([...this.revisionDeletions.values(), ...this.unitDeletions.values()].some(item => item.plan.sessionId === id)) {
       this.notice = '此会话的删除回执尚未确认，请先查询本次删除结果。'; this.emit(); return false
     }

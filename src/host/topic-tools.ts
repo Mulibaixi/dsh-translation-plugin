@@ -6,6 +6,8 @@ import { PdfReadError, readPdfCoverage, readPdfText, renderPdfSelection, withPdf
 import { hasPdfUserDecision, PDF_SPLIT_QUESTION_GUIDANCE } from './pdf-user-decision.js'
 import { diagnosticSpan } from './diagnostics.js'
 import { FileWorkerRuntime, FileWorkerRuntimeError } from './file-worker-runtime.js'
+import { IMAGE_BACKGROUND_LIMIT, imageBlockNumber, imageFileFormat } from '../shared/image-translation.js'
+import { imageRecognitionContext } from './image-recognition-context.js'
 import { registerReferenceTools, type ReferenceFilesService } from './reference-files.js'
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, TOPIC_BRIDGE_REMOTE, parseTopicBridgeOpen, parseTopicBridgeCommand, type TopicBridgeCapability, type TopicBridgeCommand, type TopicBridgeDown, type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import type { DshExecutionContext } from './dsh-text-adapter.js'
@@ -49,10 +51,12 @@ export interface MainAgent {
       section(section: { readonly name: string; readonly order: number; readonly text: string; readonly interpolate: false }): () => void
     }
   }
-  readonly inbox?: { readonly nextTurn: readonly ToolNotice[]; readonly nextStep: readonly ToolNotice[] }
+  readonly inbox?: { readonly nextTurn: readonly ToolNotice[]; readonly nextStep: readonly ToolNotice[]; remove?(messageId: string): boolean }
+  readonly status?: 'idle' | 'running'
+  cancel?(cause: { readonly kind: 'user' } | { readonly kind: 'hook'; readonly reason: string }, options: { readonly keepInbox: true }): void
   whenIdle?(): Promise<void>
 }
-interface ToolNotice { readonly source: { readonly kind: string; readonly eventId?: string } }
+interface ToolNotice { readonly id: string; readonly source: { readonly kind: string; readonly eventId?: string } }
 export interface TopicHostContext extends DshExecutionContext {
   provide(key: string, service: unknown): unknown
   readonly invocation?: { readonly peer: { readonly id: string }; uplink(): AsyncIterable<TopicBridgeReply> }
@@ -81,7 +85,7 @@ const imageTargetParameter = { type: 'object', additionalProperties: false, prop
   translationSessionId: sessionParameter, unitId: { type: 'string', required: true },
 } }
 const topicParameter = { type: 'string', required: true, description: 'Exact topic id from translation_list_topics or translation_list_sessions.' }
-const WRITE_RECEIPT_GUIDANCE = ' Returns a compact write receipt. Use version as the next expectedVersion for this same collection, and entry.id/version to edit that entry. State, priority and term languages are actual results; archive affected lists changed dependents. Do not re-list after each write; query only to inspect content or other versions. Errors do not authorize automatic retries.'
+const WRITE_RECEIPT_GUIDANCE = ' Returns a compact write receipt. Use version as the next expectedVersion for this same collection, and entry.id/version to edit that entry. State, priority and term languages are actual results. Do not re-list after each write; query only to inspect content or other versions. Errors do not authorize automatic retries.'
 /** Translation-facing term projection: the model copies `ref` verbatim into termReferences instead of rebuilding `{id, entryVersion}` out of a full management snapshot. */
 function projectTermQuery(value: TopicBridgeValue, mintHandle?: (entry: { readonly id: string; readonly version: number }) => string): unknown {
   if (value.kind !== 'terms_query') return value
@@ -185,7 +189,7 @@ class ManagementConnection {
     const pending = this.pending
     if (!pending || reply.requestId !== pending.frame.requestId) throw bridgeError('invalid_reply', '主题管理回执与请求不一致。')
     if (reply.ok) {
-      const expected = { pdf_register: 'pdf_registered', pdf_scan_page: 'pdf_registered', pdf_status: 'pdf_status', pdf_delivery: 'pdf_delivery', pdf_supplement: 'pdf_supplemented', image_update: 'image_updated', normal_call_finished: 'normal_call_finished', normal_patch_result: 'normal_result_patched', direct_proposals: 'direct_proposals', settings_scope: 'settings_scope', list_units: 'unit_directory', read_units: 'unit_contents', read_history: 'history_text', reference_assets: 'reference_facts', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
+      const expected = { pdf_register: 'pdf_registered', pdf_scan_page: 'pdf_registered', pdf_status: 'pdf_status', pdf_delivery: 'pdf_delivery', pdf_supplement: 'pdf_supplemented', image_update: 'image_updated', image_state: 'image_state', image_memory: 'image_memory', normal_call_finished: 'normal_call_finished', normal_patch_result: 'normal_result_patched', direct_proposals: 'direct_proposals', settings_scope: 'settings_scope', list_units: 'unit_directory', read_units: 'unit_contents', read_history: 'history_text', reference_assets: 'reference_assets', reference_bind: 'reference_facts', reference_scope: 'reference_facts', reference_sync: 'reference_facts', list_sessions: 'sessions', list_topics: 'topics', create_session: 'session_created', rename_topic: 'sessions',
         file_history: 'file_history', document_review_page: 'document_review_page', document_review_read: 'document_review_text', document_review_begin: 'document_review_receipt', document_review_submit: 'document_review_receipt', document_review_manual: 'document_review_receipt', document_review_observe: 'document_review_observed', document_task_terms: 'document_task_terms',
         set_session_remark: 'sessions', archive_session: 'sessions', read_unit: 'unit', list_terms: 'terms', list_topic_terms: 'terms', query_terms: 'terms_query', upsert_term: 'term_write', remove_memory_asset: 'memory_asset_removed',
         list_topic_archive: 'archive', query_archive: 'archive_query', upsert_archive: 'archive_write', normal_accept: 'normal_operation', normal_prepare: 'normal_prepared', normal_commit: 'normal_committed', normal_export: 'normal_exported', normal_update: 'normal_updated', normal_v2_update: 'normal_v2_updated', normal_exchange_resolve: 'normal_exchange_resolved', normal_observe: 'normal_observed', normal_resolve: 'normal_resolved', normal_correct_source: 'normal_source_corrected',
@@ -242,7 +246,7 @@ export class TopicToolsService {
     }
   }
   private disposed = false
-  private pdfWorkers?: FileWorkerRuntime
+  private imageWorkers?: FileWorkerRuntime
   constructor(readonly ctx: TopicHostContext, private readonly loadTools: TopicToolLoader = hostToolLoader(ctx), private readonly timeoutMs = 15_000) {
     Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationTopics', property: 'ctx' } })
     this.typertRemote = Object.freeze({ service: this, serviceKey: 'translationTopics', namespace: 'translationTopics' })
@@ -362,6 +366,56 @@ export class TopicToolsService {
   /** Shared with the normal translation service; absent in isolated fixtures, where queries expose only the full ref. */
   private termHandles(): TermHandleRegistry | undefined { return this.ctx.get?.('translationTermHandles') as TermHandleRegistry | undefined }
   /** Host services use this existing owner channel; the browser remains the sole record authority. */
+  async recognizeImage(name: string, bytes: Uint8Array, requirements: string, exec: ToolExecution): Promise<{
+      sourceText: string; backgroundDescription: string; speakers: readonly import('../shared/image-translation.js').ImageSpeaker[]; unclear?: string
+    }> {
+    const agent = exec.agent
+    if (!agent || !this.ownsAgent(agent.id, agent)) throw bridgeError('scope_mismatch', '识图不属于已连接的主 Agent。')
+    const attachments = this.ctx.get?.('attachments') as { saveImage?(input: { data: Uint8Array; mediaType: string; name: string }): Promise<unknown> } | undefined
+    if (!attachments?.saveImage) throw bridgeError('image_recognition_unavailable', '宿主未提供图片识读附件能力。')
+    const workers = this.imageWorkers ??= new FileWorkerRuntime(this.ctx)
+    const capability = await workers.capabilities(agent.id)
+    if (!capability.available) throw bridgeError('image_recognition_unavailable', capability.reason ?? '宿主未提供识图子代理。')
+    exec.signal.throwIfAborted()
+    const format = imageFileFormat(name)
+    if (!format) throw bridgeError('unsupported_file', '此图片格式无法识读。')
+    const image = await attachments.saveImage({ data: bytes, mediaType: format === 'jpg' ? 'image/jpeg' : 'image/' + format, name })
+    const context = imageRecognitionContext(requirements)
+    const result = await workers.structuredTask(exec.callId, agent.id, {
+      label: 'Image transcription', image, briefImageRead: true,
+      persona: 'Read the entire image once and transcribe confidently readable text in its original language and wording.',
+      prompt: [
+        'Return readable original text in order, one block per region. Preserve punctuation and honor the requested scope.',
+        'By default, omit hard-to-read words or regions when confidence is low. Keep any reliably readable portions. Skip wholly unreadable blocks. Leave guesses, reconstructed wording, and placeholder text out of the transcription. If an omission matters, use unclear to name its location briefly.',
+        'Classify blocks as dialogue, narration, sound or other. For dialogue, give a speaker only when immediately apparent from the image or supplied clues. Use null if uncertain. Do not spend time inferring identities. Briefly describe only visible context helpful for reading.',
+        'Use status text with nonempty blocks when any text is reliably readable. Use empty when the requested area has no text, and unreadable when it contains text but none can be read reliably.',
+        ...(context.transcriptionScope || context.characterClues ? [JSON.stringify(context)] : []),
+      ].join('\n'),
+      schema: { type: 'object', additionalProperties: false, required: ['status', 'blocks'], properties: {
+        status: { type: 'string', enum: ['text', 'empty', 'unreadable'] }, blocks: { type: 'array', items: {
+          type: 'object', additionalProperties: false, required: ['text', 'type', 'speaker'], properties: {
+            text: { type: 'string' }, type: { type: 'string', enum: ['dialogue', 'narration', 'sound', 'other'] },
+            speaker: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+          },
+        } },
+        backgroundDescription: { type: 'string' }, unclear: { type: 'string' },
+      } },
+    }, exec.signal) as { status?: string; blocks?: unknown; backgroundDescription?: string; unclear?: string } | undefined
+    const blocks = result?.blocks
+    if (result?.status === 'empty' && Array.isArray(blocks) && !blocks.length) return { sourceText: '', backgroundDescription: '', speakers: [] }
+    if (result?.status !== 'text' || !Array.isArray(blocks) || !blocks.length || blocks.length > 250 ||
+      blocks.some(block => !block || typeof block.text !== 'string' || !block.text.trim() || !['dialogue', 'narration', 'sound', 'other'].includes(block.type) ||
+        !(block.speaker === null || typeof block.speaker === 'string'))) {
+      throw bridgeError('image_unreadable', '整图识读未能取得可用文字，可重试或补充原文。')
+    }
+    const speakers = blocks.flatMap((block, index) => block.type === 'dialogue'
+      ? [{ block: index + 1, speaker: block.speaker?.trim().slice(0, 160) || null }] : [])
+    const backgroundDescription = (result.backgroundDescription?.trim() ?? '').slice(0, IMAGE_BACKGROUND_LIMIT)
+    const unclear = (result.unclear?.trim() ?? '').slice(0, 900)
+    return { sourceText: blocks.map((block, index) => '【' + imageBlockNumber(index) + '】' + block.text.trim()).join('\n\n'), backgroundDescription, speakers,
+      ...(unclear ? { unclear } : {}) }
+  }
+
   requestOwned(ownerId: string, command: TopicBridgeCommand, exec: ToolExecution): Promise<TopicBridgeValue> {
     if (!this.ownsAgent(ownerId, exec.agent)) throw bridgeError('scope_mismatch', '翻译操作不属于已连接的主 Agent。')
     const parsed = parseTopicBridgeCommand(command, this.connections.get(ownerId)!.protocol)
@@ -723,7 +777,7 @@ export class TopicToolsService {
               const scans = mixed ? pendingPdfScanPages(status.progress)
                 : start === undefined ? [] : Array.from({ length: requested.lastPage - start + 1 }, (_, index) => start + index)
               if (!scans.length) return finish()
-              const workers = this.pdfWorkers ??= new FileWorkerRuntime(this.ctx)
+              const workers = this.imageWorkers ??= new FileWorkerRuntime(this.ctx)
               const capability = await workers.capabilities(target.mainSessionId)
               if (!capability.available) throw bridgeError('native_subagent_unavailable', capability.reason ?? '原生子代理不可用。')
               const attachments = this.ctx.get?.('attachments') as { saveImage?(input: { data: Uint8Array; mediaType: 'image/png'; name: string }): Promise<unknown> } | undefined
@@ -892,7 +946,7 @@ export class TopicToolsService {
             }
             const attachmentStore = this.ctx.get?.('attachments') as { saveImage?(input: { data: Uint8Array; mediaType: 'image/png'; name: string }): Promise<unknown> } | undefined
             if (!attachmentStore?.saveImage) throw bridgeError('pdf_supplement_unavailable', '宿主图像附件服务不可用。')
-            const bytes = pdfBytes(target, exec), workers = this.pdfWorkers ??= new FileWorkerRuntime(this.ctx)
+            const bytes = pdfBytes(target, exec), workers = this.imageWorkers ??= new FileWorkerRuntime(this.ctx)
             try {
               const capability = await workers.capabilities(target.mainSessionId)
               if (!capability.available) throw bridgeError('native_subagent_unavailable', capability.reason ?? '原生子代理不可用。')
@@ -1053,9 +1107,10 @@ export class TopicToolsService {
         extractAssets(args: unknown, exec: ToolExecution): Promise<unknown>; saveArtifact(args: unknown, exec: ToolExecution): Promise<unknown>;
         openArtifact(args: unknown, exec: ToolExecution): Promise<unknown>; readCallLog(args: unknown, exec: ToolExecution): import('../shared/translation-log.js').TranslationLogPage } | undefined
       if (normal) disposers.push(register(define({
-        name: 'translation_update_image_unit', description: 'Register the extracted text of a submitted image, or explicitly edit its current text or background. Read the original using read_image. Supply only fields to change. Keep background concise and grounded in visible details. This action does not translate.',
+        name: 'translation_update_image_unit', description: 'Update confirmed image transcription, background or dialogue speaker annotations. The recognition child reads the image; the main model works from the recorded source and user evidence. Supply only fields to change. Speaker updates provide block numbers and a confirmed name or visible feature (null if unresolved).',
         parameters: { target: { ...imageTargetParameter, required: true }, operationId: { type: 'string', required: true },
-          sourceText: { type: 'string' }, backgroundDescription: { type: 'string' } },
+          sourceText: { type: 'string' }, backgroundDescription: { type: 'string' }, speakers: { type: 'array', items: { type: 'object', additionalProperties: false,
+            properties: { block: { type: 'integer', required: true }, speaker: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] } } } } },
         output: { schema: { type: 'json' }, render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }] },
         execute: (args: unknown, exec: ToolExecution) => normal.updateImageUnit(args, exec),
       })))
@@ -1065,7 +1120,7 @@ export class TopicToolsService {
           'For each new text/file material, resolve its target language before querying terms or calling this tool. Use the latest explicit choice, then the applicable mutual-translation agreement, then the Session default. Under Chinese–English mutual translation, independently translate Chinese main text into English and English main text into Chinese; names and brief quotations do not change direction. Read the agreement in material.instruction or the active chat. If no applicable agreement is visible and the direction is unclear or the source matches the default, check applicable translation_list_settings. Ask only when the direction is still genuinely unclear. Use the same target language for translation_query_terms and this call. Revisions and later file ranges keep the recorded direction.',
           'Pass current user-specified wording and terminology verbatim in userRequirements. Skip unrelated terms and omit any saved term the user explicitly overrides for this task. Do not load memory_write or create formal terms just to apply current-task wording.',
           'For a source-specific ambiguity, read relevant topic or reference evidence and pass a referenceContextRef from translation_reference_select when useful.',
-          'Read paged source with translation_read_source; inline sourceText is already complete. When the full source and page bounds are known, request independent pages together. Use exact contiguous translation ranges for oversized TXT or Markdown originals. For formats without a dedicated plugin workflow, pass the extracted and organized source as body. Register image text with translation_update_image_unit before translating an image_unit.',
+          'Read paged source with translation_read_source; inline sourceText is already complete. When the full source and page bounds are known, request independent pages together. Use exact contiguous translation ranges for oversized TXT or Markdown originals. For formats without a dedicated plugin workflow, pass the extracted and organized source as body. For an image unit, use the source already saved by the recognition child. Before translating, apply relevant active topic terms and verified character names. Carry applicable termReferences and referenceContextRef into a later same-unit revision. Save confirmed source corrections before translating.',
           SOURCE_LAYOUT_GUIDANCE,
           'On needs_context, use existing facts or ask the user, then use a fresh operationId and contextResponse with the same target and language. Make at most one automatic supplemented call; ask the user if it still needs context. A rejected call before model dispatch translated nothing; correct the arguments and use a new operationId if the old one is reserved.',
           'For a completed result, read the whole body, using translation_read_result if it returns resultRef. Evaluate any terminology checks against the source. Report the recorded result and material caveats briefly; context injection alone does not establish that a reference was applied correctly. For PDF, report the actual file path or save error when pdfOutput is present.',
@@ -1230,7 +1285,7 @@ export class TopicToolsService {
     }
   }
   dispose(): void {
-    void this.pdfWorkers?.dispose()
+    void this.imageWorkers?.dispose()
     this.disposed = true
     this.toolStops.splice(0).forEach(stop => stop())
     for (const installed of this.toolDirectories.values()) installed.directory.dispose()

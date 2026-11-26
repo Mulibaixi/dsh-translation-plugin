@@ -1,7 +1,7 @@
 import { diagnosticSpan } from './diagnostics.js'
 import { parseHistoryBundle, encodeHistoryBundle, persistableHistoryBundle, historyUnsettled, type HistoryBundle, type HistoryScope } from '../shared/history-bundle.js'
 import { parseHistoryRequest, HISTORY_BUNDLE_BYTES, type HistoryBegin, type HistoryRead, type HistoryPartUpload, type HistoryTransfer, type HistoryMutation, type HistoryStatus, type CurrentHistoryRead, type HistoryCurrentPage } from '../shared/history-remote.js'
-import { deleteTextRevision, deleteUnit, isTextUnit, isEditableTextUnit, isImageUnit, isDocumentUnit, isFileJobUnit, isDeletedUnit, appendTranslationEvent, type TranslationHistory } from '../memory/translation-history.js'
+import { deleteTextRevision, deleteUnit, expiringTextRevisions, pruneTextRevisions, isTextUnit, isEditableTextUnit, isImageUnit, isDocumentUnit, isFileJobUnit, isDeletedUnit, appendTranslationEvent, type TranslationHistory } from '../memory/translation-history.js'
 import { fileResultDeletionBlockedReason, deleteFileResult, fileSourceDeletionBlockedReason, deleteFileSource } from '../memory/file-job-deletion.js'
 import { fileResultSourceVersion } from '../memory/file-job-current.js'
 import { documentRevisionDeletionBlockedReason, deleteDocumentRevision, documentSourceDeletionBlockedReason, deleteDocumentSource, documentOrphanChunks, documentChunkCleanupBlockedReason, deleteDocumentChunks } from '../memory/document-deletion.js'
@@ -18,6 +18,7 @@ import { referenceBytes } from '../shared/reference-memory.js'
 import type { HistoryList, HistoryListing } from '../shared/history-remote.js'
 import type { HistoryTextSearch, HistoryTextMatches } from '../shared/history-remote.js'
 import { applyHistoryPatch, historySessionMetadata } from '../shared/history-patch.js'
+import { HistoryRevisionReferences } from './history-revision-references.js'
 
 interface Seat { readonly scope: HistoryScope; current: HistoryBundle | null; saved: HistoryBundle | null; token: string }
 interface Guard { readonly scope: HistoryScope; readonly peer: string; readonly generation: number }
@@ -43,11 +44,15 @@ export class HistoryService {
   private readonly encoded = new WeakMap<HistoryBundle, { readonly text: string; point: number; offset: number }>()
   private readonly transfers = new Map<string, Transfer>()
   private readonly deletingUnits = new Map<string, { scope: HistoryScope; unitId: string }>()
+  private readonly revisionReferences: HistoryRevisionReferences
   private tail: Promise<unknown> = Promise.resolve()
   private pending = 0
   private disposed = false
   private generation = 0
-  constructor(private readonly ctx: TopicHostContext, private readonly memory: OtherMemoryService) { Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationHistory', property: 'ctx' } }) }
+  constructor(private readonly ctx: TopicHostContext, private readonly memory: OtherMemoryService) {
+    this.revisionReferences = new HistoryRevisionReferences(ctx)
+    Object.defineProperty(this, Symbol.for('cordis.tracker'), { value: { associate: 'translationHistory', property: 'ctx' } })
+  }
   private get topics(): TopicToolsService | undefined { return this.ctx.get?.('translationTopics') as TopicToolsService | undefined }
   private authorize(scope: HistoryScope): Guard {
     const peer = this.ctx.invocation?.peer.id
@@ -110,7 +115,7 @@ export class HistoryService {
     if (candidates.length && !sessions.length) throw failure('history_page', '单条历史元数据超过读取预算。')
     return { sessions, next: sessions.length < candidates.length ? sessions.at(-1)!.sessionId : null }
   }
-  /** Filter scope and opened-session ids before loading any history body. Index builds omit the id filter. */
+  /** Read the current history of one exact session in its library and topic. */
   async recordSnapshot(scope: HistoryScope, peer: string): Promise<{ readonly bundle: HistoryBundle; readonly token: string; readonly isCurrent: () => boolean }> {
     const guard: Guard = { scope, peer, generation: this.generation }
     this.check(guard); await this.tail
@@ -142,6 +147,7 @@ export class HistoryService {
       catch { return false }
     } }
   }
+  /** Filter by topic before loading bodies. Record-specific index operations also pass session IDs. */
   async retrievalSnapshots(namespaceId: string, peer: string, topicId?: string, sessionIds?: readonly string[]): Promise<readonly { readonly scope: HistoryScope; readonly token: string; readonly current: HistoryBundle; readonly saved: HistoryBundle | null }[]> {
     const guard: Guard = { scope: { namespaceId, topicId: topicId ?? '*', sessionId: '*' }, peer, generation: this.generation }
     this.check(guard); await this.tail
@@ -390,11 +396,45 @@ export class HistoryService {
     for (const previous of db?.historyCleanups() ?? []) if (key(previous.scope) === key(scope)) task = mergeHistoryCleanup(previous, task)
     return { ...task, unitId: '*' }
   }
+  private async pruneOldRevisions(guard: Guard, seat: Seat, expected: string, operationId: string,
+    command: Extract<HistoryMutation['command'], { kind: 'prune_text_revisions' }>): ReturnType<import('../shared/history-remote.js').HistoryRemotePort['mutate']> {
+    if (seat.token !== expected) return { status: 'stale', state: this.describe(seat) }
+    const bundle = seat.current!
+    if (!seat.saved || !same(bundle, seat.saved) || historyUnsettled(bundle)) return { status: 'blocked', state: this.describe(seat), reason: '会话尚未保存或仍有任务待结算。' }
+    const allowed = new Map(command.units.map(unit => [unit.unitId, new Set(unit.revisionIds)]))
+    const candidates = bundle.history.units.filter(isTextUnit).flatMap(unit => {
+      const ids = allowed.get(unit.id)
+      if (!ids) return []
+      const revisions = expiringTextRevisions(unit).filter(revision => ids.has(revision.id))
+      return revisions.length ? [{ unit, revisions }] : []
+    })
+    // The compactor only creates these exact read references for machine translations.
+    const held = await this.revisionReferences.read(guard.scope.sessionId, candidates.flatMap(({ unit, revisions }) =>
+      revisions.filter(revision => revision.kind === 'machine').map(revision => ({ unitId: unit.id, revisionId: revision.id }))))
+    const at = new Date().toISOString()
+    let history = bundle.history
+    for (const { unit, revisions } of candidates) {
+      const expired = revisions.filter(revision => !held.has(revision.id))
+      if (expired.length) history = pruneTextRevisions(history, unit, expired, `${operationId}:${unit.order}`, at)
+    }
+    if (history === bundle.history) return { status: 'updated', state: this.describe(seat) }
+    const saved = parseHistoryBundle({ ...bundle, history }, guard.scope, 'saved')
+    const next = { ...seat, current: saved, saved, token: token() }
+    const db = await this.memory.databaseForArchives(true); this.check(guard)
+    const { namespaceId, topicId, sessionId } = guard.scope
+    db!.transaction(() => {
+      if (db!.historyState(namespaceId, sessionId)?.token !== expected) throw failure('history_stale', '保存副本已变化，旧译文未清理。')
+      db!.historySave(namespaceId, topicId, sessionId, next.token, saved)
+    })
+    this.seats.set(key(guard.scope), next)
+    return { status: 'updated', state: this.describe(next) }
+  }
   mutate(raw: HistoryMutation): ReturnType<import('../shared/history-remote.js').HistoryRemotePort['mutate']> {
     const request = parseHistoryRequest('mutate', raw) as HistoryMutation, guard = this.authorize(request)
     return this.serial(guard, () => this.writer(async () => {
       const seat = await this.seat(guard)
       if (!seat?.current) throw failure('history_unavailable', '历史尚未迁入宿主或已删除。')
+      if (request.command.kind === 'prune_text_revisions') return this.pruneOldRevisions(guard, seat, request.token, request.operationId, request.command)
       const repeated = seat.current.history.events.find(event => event.id === request.operationId)
       if (repeated) {
         const types = request.command.kind === 'delete_unit' ? ['unit.deleted', 'document.deleted'] : request.command.kind === 'delete_document_chunks' ? ['chunks.deleted'] : request.command.kind === 'delete_file_result' ? ['file_result.deleted'] : request.command.kind === 'delete_document_source' || request.command.kind === 'delete_file_source' ? ['source.deleted'] : request.command.kind === 'delete_document_revision' ? ['manifest.deleted'] : ['revision.deleted']
@@ -534,7 +574,7 @@ export class HistoryService {
         if (command.kind !== 'delete_unit') return { ...bundle, session, history }
         const references = new Set(history.units.filter(isDocumentUnit).filter(unit => !isDeletedUnit(unit)).flatMap(unit => unit.preparations.map(ref => ref.id)))
         const owned = new Set([...(isDocumentUnit(target) ? target.preparations.map(ref => ref.id) : []), ...bundle.preparations.filter(item => item.versions.some(version => historyTargetMatches(guard.scope, command.unitId, { ...version.scope, ...version.target }))).map(item => item.versions[0]!.id)])
-        return { ...bundle, session, history, intakes: bundle.intakes.filter(item => item.unitId !== request.command.unitId), fileJobs: bundle.fileJobs.filter(item => item.summary.unitId !== request.command.unitId), preparations: bundle.preparations.filter(item => !owned.has(item.versions[0]!.id) || references.has(item.versions[0]!.id)) }
+        return { ...bundle, session, history, intakes: bundle.intakes.filter(item => item.unitId !== command.unitId), fileJobs: bundle.fileJobs.filter(item => item.summary.unitId !== command.unitId), preparations: bundle.preparations.filter(item => !owned.has(item.versions[0]!.id) || references.has(item.versions[0]!.id)) }
       }
       const fenceKey = JSON.stringify([guard.scope.namespaceId, guard.scope.sessionId, command.unitId])
       if (cleanup) this.deletingUnits.set(fenceKey, { scope: guard.scope, unitId: command.unitId })
@@ -546,7 +586,7 @@ export class HistoryService {
           if (cleanup) {
             const previous = db!.historyCleanups().find(task => key(task.scope) === key(cleanup.scope) && task.unitId === cleanup.unitId)
             db!.historyCleanupSave(mergeHistoryCleanup(previous, cleanup))
-            if (command.kind === 'delete_unit') historyIndexSourceIds(guard.scope.sessionId, request.command.unitId).forEach(id => db!.indexRemoveSource(guard.scope.namespaceId, guard.scope.topicId, id))
+            if (command.kind === 'delete_unit') historyIndexSourceIds(guard.scope.sessionId, command.unitId).forEach(id => db!.indexRemoveSource(guard.scope.namespaceId, guard.scope.topicId, id))
           }
         }) }
         this.seats.set(key(guard.scope), next)

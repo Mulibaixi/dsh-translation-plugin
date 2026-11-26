@@ -296,14 +296,20 @@ export class TranslationSourcesService {
     if (source.encoding !== 'binary' || !isPdfFile(source.name)) return bad('unsupported_file', '请选择 PDF 原稿。', 'read_pdf')
     return { ok: true, value: found.value.bytes.slice() }
   }
-  /** Batch targets are taken from authorized history and may outlive an imported runtime source. */
-  async batchImagePath(scope: HistoryScope, source: import('../shared/translation-sources.js').SourceIdentity, peer: string): Promise<string> {
+  readSubmittedImage(scope: TranslationSourceScope, source: TranslationSourceAsset, peerId: string, agent: Agent): Uint8Array {
+    if (!this.owns(scope, peerId, agent)) throw new Error('受管原图不属于当前主会话。')
+    const result = this.referenceRecord(scope, source, peerId, agent)
+    if (!result.ok) throw new Error(result.error.message)
+    return result.value.bytes.slice()
+  }
+  /** Read an immutable image already authorized by the current history target. */
+  async readManagedImage(scope: HistoryScope, source: import('../shared/translation-sources.js').SourceIdentity, peer: string): Promise<Uint8Array> {
     const owns = () => !this.disposed && !this.storageCleanup &&
       (this.ctx.get?.('translationTopics') as { ownsLibrary(namespaceId: string, peerId: string): boolean } | undefined)?.ownsLibrary(scope.namespaceId, peer)
     if (!owns()) throw new Error('原图读取不属于当前资料库。')
     const storage = await this.storagePort(), bytes = await storage.readContent(source)
     if (!bytes || bytes.byteLength !== source.bytes || await sourceSha256(bytes) !== source.sha256 || !owns()) throw new Error('此图片的受管原图不可读取或校验失败。')
-    return storage.originalPath(source)
+    return bytes
   }
   private storageOwns(scope: TranslationSourceScope, peerId: string | undefined, agent?: Agent, namespaceId?: string): boolean {
     if (!namespaceId) return this.owns(scope, peerId, agent)

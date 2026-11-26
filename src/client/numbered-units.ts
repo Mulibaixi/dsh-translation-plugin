@@ -112,7 +112,10 @@ export class NumberedUnits {
         if (start > points.length) fail('range_out_of_bounds', `单元 ${unit.order} 内容共 ${points.length} 码点，读取起点超出范围。`)
         const end = Math.min(points.length, start + HISTORY_TEXT_PAGE_POINTS)
         pages.push({ unit: info, side, revisionNumber: side === 'source' ? null : revision!.order,
-          ...(side === 'translation' ? { revisionId: revision!.id } : {}),
+          ...(side === 'translation' ? { revisionId: revision!.id } : isImageUnit(unit) ? {
+            ...(unit.speakers ? { speakers: unit.speakers } : {}),
+            ...(unit.recognition?.unclear ? { unclearTranscription: unit.recognition.unclear } : {}),
+          } : {}),
           text: points.slice(start, end).join(''), totalCodePoints: points.length, start, nextStart: end < points.length ? end : null })
       } else {
         const files = this.files(); if (!files) fail('file_history_unavailable', '文件历史服务尚未就绪。')

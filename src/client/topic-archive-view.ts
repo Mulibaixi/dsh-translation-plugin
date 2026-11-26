@@ -86,7 +86,7 @@ export function TopicArchiveView({ sessions, terms, archive, ownerId, topicId, k
   const snapshot = readState.snapshot, all = snapshot.entries.filter(entry => entry.kind === kind)
   const pending = actionPending || !!batchStatus || readState.status !== 'ready'
   const note = [
-    '同主题共用；快译不使用。关联实体须为生效条目。',
+    '同主题共用；快译不使用。采用时，关联实体须已生效。',
     `保存状态：${readState.status === 'error' ? '读取失败' : batchStatus ?? (readState.status === 'loading' ? '正在刷新' : storageLabels[archive.getStatus(ownerId, topicId)])}`,
   ].join(' ')
   const entities = snapshot.entries.filter(entry => entry.kind === 'entity'), needle = query.trim().toLocaleLowerCase()

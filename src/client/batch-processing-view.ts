@@ -1,4 +1,4 @@
-import { BATCH_FILE_LIMIT, parseBatchView, unfinishedBatchItem, type BatchRequest, type BatchView } from '../shared/batch-processing.js'
+import { BATCH_FILE_LIMIT, parseBatchView, unfinishedBatch, unfinishedBatchItem, type BatchRequest, type BatchView } from '../shared/batch-processing.js'
 import { imageFileFormat, MAX_IMAGE_ORIGINAL_BYTES } from '../shared/image-translation.js'
 import { DIRECT_REQUIREMENTS_CODE_POINTS } from '../shared/normal-translation.js'
 import { h, react } from './react.js'
@@ -62,7 +62,7 @@ export function BatchProcessingView({ session, ownerId, namespaceId, libraryRead
           const next = unwrap(await remote({ ...scope, kind: 'read', ...(selection ? { batchId: selection } : {}) }))
           if (!closed && version === action.current.version) {
             setView(next); setReadError('')
-            if (!selection && next.batch && (next.running || next.batch.items.some(unfinishedBatchItem))) setSelection(next.batch.id)
+            if (!selection && next.batch && (next.running || unfinishedBatch(next.batch))) setSelection(next.batch.id)
           }
         } catch (error) {
           if (!closed && version === action.current.version) setReadError(error instanceof Error ? error.message : '读取批次失败。')
@@ -93,7 +93,7 @@ export function BatchProcessingView({ session, ownerId, namespaceId, libraryRead
       return next
     })
   }
-  async function perform(kind: 'start' | 'pause' | 'continue' | 'retry' | 'skip'): Promise<void> {
+  async function perform(kind: 'start' | 'pause' | 'continue' | 'retry' | 'skip' | 'terminate'): Promise<void> {
     if (action.current.running || !lifetime.current || lifetime.current.signal.aborted) return
     const signal = lifetime.current.signal
     action.current.running = true; action.current.version++; setBusy(true); setNotice('')
@@ -129,16 +129,19 @@ export function BatchProcessingView({ session, ownerId, namespaceId, libraryRead
   const batch = selection && view?.batch?.id === selection ? view.batch : undefined
   const first = batch?.items.find(unfinishedBatchItem)
   const canManage = !!batch && batch.mainSessionId === ownerId
-  const finished = !!batch && !first && !running
+  const unfinished = !!batch && unfinishedBatch(batch)
+  const finished = !!batch && !unfinished && !running
   const skipped = batch?.items.filter(item => item.state === 'skipped').length ?? 0
   const completed = batch?.items.filter(item => item.state === 'completed').length ?? 0
-  const message = notice || readError || (batch ? view?.message : undefined) || (!running ? first?.message : undefined)
+  const message = notice || readError || (batch ? view?.message : undefined) || (!running && !batch?.terminated ? first?.message : undefined)
   let progress = ''
   if (registration !== undefined) progress = `正在登记 ${registration}/${images.length}`
   else if (batch && (running || !images.length)) {
     progress = `已完成 ${completed}/${batch.items.length}`
     if (skipped) progress += ` · 已跳过 ${skipped}`
-    if (!running && first?.state === 'pending' && !message) progress += ' · 已暂停'
+    if (batch.terminated) progress += ' · 已终止 · 未完成 ' + (batch.items.length - completed - skipped)
+    if (!first && batch.reviewPending) progress += running ? ' · 整体审查中' : ' · 待整体审查'
+    if (!batch.terminated && !running && first?.state === 'pending' && !message) progress += ' · 已暂停'
   } else if (images.length) progress = `已选 ${images.length} 张`
 
   let primaryAction: unknown = null
@@ -148,7 +151,7 @@ export function BatchProcessingView({ session, ownerId, namespaceId, libraryRead
     if (!images.length) setOpen(false)
   }, busy)
   else if (canManage) {
-    if (running) primaryAction = view?.pausing ? button('暂停中', () => {}, true) : button('暂停', () => { void perform('pause') }, busy)
+    if (running) primaryAction = view?.pausing ? button('暂停中', () => {}, true) : button('暂停', () => { void perform('pause') }, busy, '当前任务处理完毕后暂停，不再派发后续任务。')
     else if (first?.state === 'failed') primaryAction = button('重试本项', () => { void perform('retry') }, busy)
     else primaryAction = button('继续', () => { void perform('continue') }, busy)
   }
@@ -172,15 +175,15 @@ export function BatchProcessingView({ session, ownerId, namespaceId, libraryRead
       h('textarea', { value: requirements, rows: 2, placeholder: '共同翻译要求（选填）', 'aria-label': '共同翻译要求', disabled: busy,
         onChange: (event: { currentTarget: HTMLTextAreaElement }) => setRequirements(event.currentTarget.value) }),
       button('开始翻译', () => { void perform('start') }, busy || running)) : null,
-    view && view.batches.length > (first ? 1 : 0) ? h('select', { value: first ? batch?.id : '', 'aria-label': '切换待处理批次', disabled: busy || running,
+    view && view.batches.length > (unfinished ? 1 : 0) ? h('select', { value: unfinished ? batch?.id : '', 'aria-label': '切换待处理批次', disabled: busy || running,
       onChange: (event: { currentTarget: HTMLSelectElement }) => { action.current.version++; setSelection(event.currentTarget.value) } },
-      first ? null : h('option', { value: '', disabled: true }, '切换待处理批次'),
+      unfinished ? null : h('option', { value: '', disabled: true }, '切换待处理批次'),
       ...view.batches.map(item => h('option', { key: item.id, value: item.id }, `${item.name} · ${item.completed}/${item.total}`))) : null,
     batch ? h('div', null,
       h('ol', { className: 'dsh-tp-batch-list' }, ...batch.items.map(item => h('li', { key: item.unitId },
         button(item.name, () => onOpenUnit(item.unitId), false, `查看单元 ${item.name}`),
         h('small', { className: 'dsh-tp-muted' }, item.message ?? statusText[item.state])))),
-      canManage && !running && (first?.state === 'failed' || first?.state === 'pending')
+      canManage && unfinished && !running && (first?.state === 'failed' || first?.state === 'pending')
         ? button('跳过本项', () => { void perform('skip') }, busy) : null,
     ) : null,
   ) : null
@@ -190,7 +193,8 @@ export function BatchProcessingView({ session, ownerId, namespaceId, libraryRead
         h('button', { type: 'button', 'aria-label': '批次清单', 'aria-expanded': open, onClick: () => setOpen(!open) },
           h('span', { 'aria-hidden': true }, open ? '▾ ' : '▸ '), '批次清单'),
         progress ? h('span', { role: 'status', className: 'dsh-tp-muted' }, progress) : null,
-        primaryAction ? h('div', { className: 'dsh-tp-batch-action' }, primaryAction) : null,
+        primaryAction || canManage && unfinished ? h('div', { className: 'dsh-tp-batch-action' }, primaryAction,
+          canManage && unfinished ? button('终止批次', () => { void perform('terminate') }, busy, '结束本批次，保留已写入的内容。') : null) : null,
       ),
       message ? h('p', { role: 'status', className: 'dsh-tp-batch-notice dsh-tp-muted', title: message }, message) : null,
       list,

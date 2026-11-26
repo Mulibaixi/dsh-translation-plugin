@@ -4,7 +4,8 @@ import { parseReferenceContextRef, type ReferenceContextRef } from './reference-
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope } from './translation-material.js'
 import { isNormalTranslationPromptVersion, parseTranslationCallMetadata, type NormalTranslationTerm, type TranslationCallMetadata } from './translation-call.js'
 import { parseDirectContextResponse, parseDirectContextSupplement, type DirectContextResponse, type DirectContextSupplement } from './direct-context.js'
-import { IMAGE_BACKGROUND_LIMIT, type ImageUnitTarget, type ImageUnitUpdate } from './image-translation.js'
+import { parseBatchRevision, type BatchRevision } from './batch-processing.js'
+import { IMAGE_BACKGROUND_LIMIT, parseImageRecognition, parseImageSpeakers, type ImageUnitTarget, type ImageUnitUpdate } from './image-translation.js'
 import type { ResultTextEdits } from './text-edits.js'
 /** A main Agent refers to delivered material; it never supplies a replacement body. */
 export interface NormalTranslationMaterialTarget {
@@ -124,6 +125,7 @@ export interface DirectResultPatchReceipt {
 }
 /** The Client writes the admitted unit and its completed body in one transaction. */
 export interface DirectTranslationCommit {
+  readonly batchRevision?: BatchRevision
   readonly envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>
   readonly operationId: string
   readonly targetLanguage?: string
@@ -236,14 +238,19 @@ export function parseNormalTranslationTarget(value: unknown): NormalTranslationT
 }
 export function parseImageUnitUpdate(value: unknown): ImageUnitUpdate {
   object(value)
-  exact(value, ['target', 'operationId', ...['sourceText', 'backgroundDescription'].filter(field => Object.hasOwn(value, field))])
+  exact(value, ['target', 'operationId', ...['sourceText', 'backgroundDescription', 'speakers', 'expectedInputId', 'recognition'].filter(field => Object.hasOwn(value, field))])
   const target = parseDirectTranslationTarget(value.target)
-  if (target.kind !== 'image_unit' || value.sourceText === undefined && value.backgroundDescription === undefined) throw new TypeError('An image unit update needs text or background')
+  if (target.kind !== 'image_unit' || value.sourceText === undefined && value.backgroundDescription === undefined && value.speakers === undefined) throw new TypeError('An image unit update needs text, dialogue or background')
   text(value.operationId)
   if (value.sourceText !== undefined) text(value.sourceText, 200000, true)
   if (value.backgroundDescription !== undefined) text(value.backgroundDescription, IMAGE_BACKGROUND_LIMIT, true)
+  if (value.expectedInputId !== undefined) text(value.expectedInputId, 64)
+  if (value.recognition !== undefined && value.expectedInputId === undefined) throw new TypeError('Recognition requires the input version')
   return { target, operationId: value.operationId, ...(value.sourceText === undefined ? {} : { sourceText: value.sourceText }),
-    ...(value.backgroundDescription === undefined ? {} : { backgroundDescription: value.backgroundDescription }) }
+    ...(value.backgroundDescription === undefined ? {} : { backgroundDescription: value.backgroundDescription }),
+    ...(value.speakers === undefined ? {} : { speakers: parseImageSpeakers(value.speakers) }),
+    ...(typeof value.expectedInputId === 'string' ? { expectedInputId: value.expectedInputId } : {}),
+    ...(value.recognition === undefined ? {} : { recognition: parseImageRecognition(value.recognition) }) }
 }
 export function parseNormalTranslationSourceCorrection(value: unknown): NormalTranslationSourceCorrection {
   object(value); exact(value, ['target', 'operationId', 'sourceText', 'reason'])
@@ -407,7 +414,7 @@ function parseDirectRange(value: unknown): DirectTranslationRange {
 }
 export function parseDirectTranslationCommit(value: unknown): DirectTranslationCommit {
   object(value)
-  const optional = ['targetLanguage', 'organizedNotes', 'auxiliaryContext', 'range', 'sourceText', 'body', 'draftTerms', 'contextSupplement'].filter(field => Object.hasOwn(value, field))
+  const optional = ['targetLanguage', 'organizedNotes', 'auxiliaryContext', 'range', 'sourceText', 'body', 'draftTerms', 'contextSupplement', 'batchRevision'].filter(field => Object.hasOwn(value, field))
   exact(value, ['envelope', 'operationId', 'userRequirements', 'termReferences', 'revisionId', 'status', 'text', 'message', 'callRecord', ...optional,
     ...(Object.hasOwn(value, 'referenceContextRef') ? ['referenceContextRef'] : [])])
   const envelope = parseTranslationMaterialEnvelope(value.envelope)
@@ -437,7 +444,8 @@ export function parseDirectTranslationCommit(value: unknown): DirectTranslationC
   // A file material has no inline text: the Client can only admit the unit when it receives the exact body.
   if (envelope.material.sourceText === undefined && value.sourceText === undefined) throw new TypeError('File results require the exact source body')
   if (envelope.material.sourceText === undefined && !range && !body) throw new TypeError('File results require a source range or an organized body flag')
-  return { envelope, operationId: value.operationId, userRequirements: value.userRequirements, organizedNotes, auxiliaryContext,
+  if (value.batchRevision !== undefined && !envelope.material.unitReference?.imageInputId) throw new TypeError('Batch revision requires an image unit')
+  return { envelope, operationId: value.operationId, ...(value.batchRevision === undefined ? {} : { batchRevision: parseBatchRevision(value.batchRevision) }), userRequirements: value.userRequirements, organizedNotes, auxiliaryContext,
     ...(value.targetLanguage === undefined ? {} : { targetLanguage: parseDirectTargetLanguage(value.targetLanguage) }),
     termReferences: structuredClone(value.termReferences), revisionId: value.revisionId,
     status: value.status as DirectTranslationCommit['status'], text: value.text, message: value.message,

@@ -6,10 +6,13 @@ import {
   type TopicBridgeOpen, type TopicBridgeReply, type TopicBridgeRequest, type TopicBridgeValue, type TopicUnitFact, type TopicSessionSummary,
 } from '../shared/topic-bridge.js'
 import type { TopicTermSnapshot, TermMutationResult, TermEvidenceRef, TopicTermQuery, TopicTerm } from '../memory/topic-terms.js'
-import { referencedEntityIds, type TopicArchiveSnapshot, type ArchiveMutationResult, type TopicArchiveQuery, type TopicArchiveEntry } from '../memory/topic-archive.js'
+import type { TopicArchiveSnapshot, ArchiveMutationResult, TopicArchiveQuery, TopicArchiveEntry } from '../memory/topic-archive.js'
 import type { TopicTermCommand } from './topic-memory-store.js'
 import type { TopicArchiveCommand } from './topic-archive-store.js'
-import { assetPriority } from '../memory/asset-priority.js'
+import { assetPriority, isAdoptedAsset } from '../memory/asset-priority.js'
+import { compactMatches, imageMemoryMatcher } from './image-memory.js'
+import type { ImageTranslationMemory } from '../shared/image-translation.js'
+import { languageMatches } from '../shared/language-tag.js'
 import type { SessionStore } from './session-store.js'
 import type { LocalSession } from './sessions.js'
 import type { NormalTranslationAcceptance, NormalTranslationUpdate, DirectTranslationCommit, NormalTranslationTarget } from '../shared/normal-translation.js'
@@ -87,6 +90,7 @@ export interface DocumentTermSedimentResult {
 }
 type Handle = ReturnType<TopicBridgeRemotePort['connect']>
 interface NormalPort {
+  readImage: import('./normal-translation.js').NormalTranslationClient['readImage']
   registerPdfSections: import('./normal-translation.js').NormalTranslationClient['registerPdfSections']
   pdfStatus: import('./normal-translation.js').NormalTranslationClient['pdfStatus']
   registerPdfScanPage: import('./normal-translation.js').NormalTranslationClient['registerPdfScanPage']
@@ -506,11 +510,25 @@ export class TopicBridgeClient {
       return this.normal?.savePdfSupplement(ownerId, command.target, command.supplement) ? success({ kind: 'pdf_supplemented' })
         : error(request.requestId, 'out_of_scope', 'PDF 补译无法保存到当前材料。')
     }
+    if (command.kind === 'image_memory') {
+      const state = this.normal?.readImage(ownerId, command.target)
+      const unit = this.sessions.getTranslationHistory(command.target.translationSessionId)?.units.find(unit => unit.id === command.target.unitId)
+      if (!state || !unit || !isImageUnit(unit)) return error(request.requestId, 'not_found', '此图片单元不可用。')
+      const memory = await this.imageMemory(ownerId, state.topicId, state.source, unit.targetLanguage)
+      if (this.normal?.readImage(ownerId, command.target)?.inputId !== state.inputId) return error(request.requestId, 'stale_version', '匹配记忆时图片原文已更新。')
+      return success({ kind: 'image_memory', memory })
+    }
+    if (command.kind === 'image_state') {
+      const state = this.normal?.readImage(ownerId, command.target)
+      return state ? success({ kind: 'image_state', state }) : error(request.requestId, 'not_found', '此图片单元不可用。')
+    }
     if (command.kind === 'image_update') {
       const { kind: _kind, ...update } = command
-      return this.normal?.updateImage(ownerId, update)
-        ? success({ kind: 'image_updated', unitId: command.target.unitId })
-        : error(request.requestId, 'image_update_failed', '图片单元不可编辑，或当前内容超过单次上限。')
+      const before = this.normal?.readImage(ownerId, command.target)
+      if (!this.normal?.updateImage(ownerId, update)) return error(request.requestId, 'image_update_failed', '图片单元不可编辑、输入已变化或内容超过单次上限。')
+      // A confirmed empty image can settle without a subsequent translation commit.
+      if (command.recognition?.status === 'empty') await this.sessions.saveTranslationHistoryAsync(command.target.translationSessionId).catch(() => false)
+      return success({ kind: 'image_updated', unitId: command.target.unitId, inputChanged: before?.inputId !== this.normal.readImage(ownerId, command.target)?.inputId })
     }
     if (command.kind === 'normal_call_finished') {
       this.normal?.finishUnitCall(ownerId, command.operationId)
@@ -542,7 +560,7 @@ export class TopicBridgeClient {
       if (envelope.mainSessionId !== ownerId) return error(request.requestId, 'out_of_scope', '译文结果不属于当前主会话。')
       await this.terms.reconcileAsync?.(ownerId, envelope.material.topicId)
       const result = this.normal?.commitResult(ownerId, payload as DirectTranslationCommit)
-      if (result?.ok && payload.status === 'completed' && batchOperationId(payload.operationId, payload.callRecord.context?.contextSupplement)) {
+      if (result?.ok && (payload.batchRevision || payload.status === 'completed' && batchOperationId(payload.operationId, payload.callRecord.context?.contextSupplement))) {
         // Batch advancement needs saved history. The ordinary direct receipt keeps its own semantics.
         await this.sessions.saveTranslationHistoryAsync(envelope.material.translationSessionId).catch(() => false)
       }
@@ -632,18 +650,13 @@ export class TopicBridgeClient {
       if (!this.sessions.getTopics(ownerId).some(topic => topic.id === command.topicId)) return error(request.requestId, 'out_of_scope', '主题不存在或已删除。')
       if (command.kind === 'list_topic_archive') return success({ kind: 'archive', snapshot: await (this.archive.reconcileAsync?.(ownerId, command.topicId) ?? this.archive.getSnapshot(ownerId, command.topicId)) })
       if (!command.entry.evidence.every(ref => this.accessibleEvidence(ownerId, command.topicId, ref))) return error(request.requestId, 'reference_not_published', '档案依据不在用户明确提供的历史范围中。')
-      const before = await this.archive.ensureLoaded(ownerId, command.topicId)
       const result = await this.archive.apply(ownerId, command.topicId, command.expectedVersion, { kind: 'put', input: command.entry })
       if (result.status === 'save_failed') return error(request.requestId, result.status, '当前档案内容可能已更新但未保存，请先查询当前版本后明确重试。')
       if (result.status !== 'updated' && result.status !== 'unchanged') return error(request.requestId, result.status, '档案提交未完成，请核对当前版本及依据。')
       if (!result.entry) return error(request.requestId, 'invalid_reply', '档案写入缺少准确条目回执，请查询当前记录。')
-      const entry = result.entry, previous = new Map(before.entries.map(item => [item.id, item]))
-      const affected = result.status === 'updated' && entry.kind === 'entity' ? result.snapshot.entries
-        .filter(item => item.id !== entry.id && item.status === 'review_required' && referencedEntityIds(item).includes(entry.id)
-          && previous.get(item.id)?.status !== 'review_required' && previous.get(item.id)?.version !== item.version)
-        .map(item => ({ id: item.id, version: item.version, status: 'review_required' as const })) : []
+      const entry = result.entry
       return success({ kind: 'archive_write', status: result.status, topicId: result.snapshot.topicId, version: result.snapshot.version,
-        entry: { ...writeEntry(entry), kind: entry.kind }, ...(affected.length ? { affected } : {}) })
+        entry: { ...writeEntry(entry), kind: entry.kind } })
     }
     if (command.kind === 'create_session') {
       const result = await this.sessions.createManagedSessionAsync(ownerId, command.start)
@@ -697,11 +710,39 @@ export class TopicBridgeClient {
       }
     }
   }
+  private async imageMemory(ownerId: string, topicId: string, source: string, targetLanguage: string): Promise<ImageTranslationMemory> {
+    const matches = imageMemoryMatcher(source)
+    const [terms, archive] = await Promise.all([
+      this.terms.ensureLoaded(ownerId, topicId), this.archive.ensureLoaded(ownerId, topicId),
+    ])
+    const termForms = [...new Set(terms.entries.filter(entry => isAdoptedAsset(entry) && languageMatches(entry.targetLanguage, targetLanguage))
+      .flatMap(entry => [...entry.sourceForms, ...entry.aliases].filter(matches)))].slice(0, 100)
+    const entityNames = [...new Set(archive.entries.flatMap(entry => entry.kind === 'entity' && isAdoptedAsset(entry) &&
+      [entry.name, ...entry.aliases, ...entry.name.trim().split(/\s+/u).filter(part => part.length >= 2)].some(matches) ? [entry.name] : []))].slice(0, 100)
+    const termQuery = { mode: 'normal' as const, sourceLanguage: null, targetLanguage, forms: termForms }
+    const entityQuery = { mode: 'normal' as const, kinds: ['entity' as const], forms: entityNames }
+    const [effectiveTerms, effectiveEntities] = await Promise.all([
+      termForms.length ? this.terms.queryAsync?.(ownerId, topicId, termQuery) ?? this.terms.query(ownerId, topicId, termQuery) : undefined,
+      entityNames.length ? this.archive.queryAsync?.(ownerId, topicId, entityQuery) ?? this.archive.query(ownerId, topicId, entityQuery) : undefined,
+    ])
+    return { topicId, targetLanguage,
+      terms: compactMatches((effectiveTerms?.entries ?? []).filter(isAdoptedAsset).map(entry => ({
+        ref: { id: entry.id, entryVersion: entry.version }, forms: [...entry.sourceForms, ...entry.aliases].filter(matches).slice(0, 20),
+        preferred: entry.preferred, sourceLanguage: entry.sourceLanguage,
+      }))),
+      entities: compactMatches((effectiveEntities?.entries ?? []).flatMap(entry => entry.kind === 'entity' && isAdoptedAsset(entry) ? [{
+        ref: { kind: 'entity' as const, id: entry.id, version: entry.version, purpose: 'translation_guidance' as const },
+        name: entry.name, aliases: entry.aliases.slice(0, 20),
+      }] : [])),
+    }
+  }
+
   /** Build the current authoritative text unit only when a caller requests its body. */
   private unitFact(history: TranslationHistory, unit: TextUnit): TopicUnitFact {
     const event = [...history.events].reverse().find(event => event.type === 'final.selected' && event.unitId === unit.id)
     const final = currentFinalRevision(unit)
-    return { id: unit.id, order: unit.order, source: unit.source, ...(isImageUnit(unit) ? { backgroundDescription: unit.backgroundDescription } : { sourceVersion: unit.sourceVersion }),
+    return { id: unit.id, order: unit.order, source: unit.source, ...(isImageUnit(unit) ? { backgroundDescription: unit.backgroundDescription,
+      ...(unit.speakers ? { speakers: unit.speakers } : {}), ...(unit.recognition?.unclear ? { unclearTranscription: unit.recognition.unclear } : {}) } : { sourceVersion: unit.sourceVersion }),
       targetLanguage: unit.targetLanguage, instruction: unit.instruction,
       revisions: unit.revisions.flatMap(revision => revision.status === 'deleted' ? [] : [{ id: revision.id, order: revision.order, kind: revision.kind, status: revision.status, text: revision.text, baseRevisionId: revision.baseRevisionId, ...(revision.sourceVersion === undefined ? {} : { sourceVersion: revision.sourceVersion }) }]),
       final: final && unit.final && event?.revisionId === final.id ? { revisionId: final.id, selection: unit.final.selection, selectionEventId: event.id } : null }

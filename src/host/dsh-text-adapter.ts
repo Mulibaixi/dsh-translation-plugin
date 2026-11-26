@@ -27,7 +27,7 @@ export interface DshDetachedSession {
 export interface DshExecutionContext extends DiagnosticContext {
   readonly llm?: {
     listModels(provider: string): Promise<readonly { provider: string; id: string }[]>
-    resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{ provider: string; id: string; reasoning?: { efforts: readonly { id: string }[]; defaultEffort?: string } }>
+    resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{ provider: string; id: string; defaultMaxTokens?: number; reasoning?: { efforts: readonly { id: string }[]; defaultEffort?: string } }>
     prepareCall(config: Record<string, unknown>, signal?: AbortSignal): Promise<DshPreparedCall>
   }
   readonly sessions?: { prepare(id: string): DshDetachedSession }

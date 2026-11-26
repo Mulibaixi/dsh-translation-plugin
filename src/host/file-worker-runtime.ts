@@ -347,13 +347,13 @@ export class FileWorkerRuntime {
     catch (error) { this.loading = undefined; throw error }
   }
   /** One complete structured task on a fresh native child, using the same routing and teardown as file workers. */
-  structuredTask(jobId: string, mainSessionId: string, task: { readonly label: string; readonly persona: string; readonly prompt: string; readonly schema: Schema; readonly image?: unknown }, signal: AbortSignal): Promise<unknown> {
+  structuredTask(jobId: string, mainSessionId: string, task: { readonly label: string; readonly persona: string; readonly prompt: string; readonly schema: Schema; readonly image?: unknown; readonly briefImageRead?: true }, signal: AbortSignal): Promise<unknown> {
     const key = `structured:${jobId}`
     if (this.active.has(key)) return Promise.reject(new FileWorkerRuntimeError('native_subagent_already_running', 'worker_start', '同一子任务已在运行。'))
     const controller = new AbortController(), abort = (): void => controller.abort(signal.reason)
     signal.addEventListener('abort', abort, { once: true }); if (signal.aborted) abort()
     const result = (async () => {
-      const report = diagnosticSpan(this.ctx, task.image ? 'pdf.supplement.worker' : 'memory.segmentation.worker', { phase: task.label, promptBytes: new TextEncoder().encode(task.prompt).byteLength }, jobId)
+      const report = diagnosticSpan(this.ctx, task.briefImageRead ? 'image.recognition.worker' : task.image ? 'pdf.supplement.worker' : 'memory.segmentation.worker', { phase: task.label, promptBytes: new TextEncoder().encode(task.prompt).byteLength }, jobId)
       let run: NativeRun | undefined, error: unknown, value: unknown
       let facts = { modelCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }
       try {
@@ -365,9 +365,12 @@ export class FileWorkerRuntime {
         controller.signal.throwIfAborted()
         const prompt: NativeStartRequest['prompt'] = [{ type: 'text', text: task.prompt }]
         if (task.image) prompt.push({ type: 'image', attachment: task.image })
+        const inherited = sdk.parentAgentOptionsForDelegation(parent)
+        const agentOptions = task.briefImageRead ? await this.imageReadOptions(inherited, controller.signal) : inherited
+        controller.signal.throwIfAborted()
         run = await this.startWorker({ parent, label: task.label, prompt, signal: controller.signal,
           outputSchema: task.schema, persona: task.persona, toolFilter: { allow: [] }, maxDepth: sdk.delegationDepthOf(parent) + 1,
-          agentOptions: sdk.parentAgentOptionsForDelegation(parent) })
+          agentOptions })
         const outcome = await run.result
         controller.signal.throwIfAborted()
         if (outcome.stopReason !== 'completed' || outcome.structured === undefined) throw new FileWorkerRuntimeError(
@@ -388,6 +391,16 @@ export class FileWorkerRuntime {
     })().finally(() => { signal.removeEventListener('abort', abort); this.active.delete(key) })
     this.active.set(key, { jobId, controller, result }); return result
   }
+  private async imageReadOptions(inherited: NativeAgentOptions, signal: AbortSignal): Promise<NativeAgentOptions> {
+    const llm = this.ctx.get?.('llm') as DshExecutionContext['llm']
+    if (!inherited.provider || !inherited.model || !llm?.resolveModelInfo) return inherited
+    const info = await llm.resolveModelInfo(inherited.provider, inherited.model, signal)
+    // DSH lists supported efforts from least to greatest.
+    const effort = info.reasoning?.efforts[0]?.id
+    return { ...inherited, ...(effort ? { reasoningEffort: effort } : {}),
+      maxTokens: Math.min(inherited.maxTokens ?? info.defaultMaxTokens ?? 8192, 8192) }
+  }
+
   async capabilities(mainSessionId?: string): Promise<FileWorkerCapability> {
     const unavailable = (reason: string): FileWorkerCapability => ({ available: false, provider: this.providerName, reason })
     if (this.disposed) return unavailable('原生子任务运行时已关闭。')

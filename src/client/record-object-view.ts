@@ -17,12 +17,13 @@ function RecordObjectFormula({ source }: { readonly source: string }): unknown {
     h('details', null, h('summary', null, '公式源'), h('pre', null, source)),
     h('small', { className: 'dsh-tp-muted' }, '公式源和原件可查看。'))
 }
-export function RecordObjectText({ text, target, objects, objectAssets, references, range, totalCodePoints, hideUnavailable = false, className, renderText, quoteSource, transcriptBody }: RecordObjectsProps & {
+export function RecordObjectText({ text, target, objects, objectAssets, references, range, totalCodePoints, hideUnavailable = false, className, renderText, quoteSource, transcriptBody, showLineNumbers }: RecordObjectsProps & {
   readonly text: string; readonly target: RecordObjectTarget; readonly references?: readonly RecordObjectReference[] | undefined
   readonly range?: TranslationSourceRange | undefined; readonly totalCodePoints?: number | undefined; readonly hideUnavailable?: boolean
   readonly className?: string | undefined
   readonly quoteSource?: string | undefined
   readonly transcriptBody?: boolean
+  readonly showLineNumbers?: boolean | undefined
   readonly renderText?: ((text: string, offset: number) => unknown) | undefined
 }): unknown {
   const [failures, setFailures] = react.useState<ReadonlyMap<string, string>>(() => new Map())
@@ -43,13 +44,30 @@ export function RecordObjectText({ text, target, objects, objectAssets, referenc
     reference.asset.kind === 'formula' && reference.formulaSource ? h(RecordObjectFormula, { source: reference.formulaSource }) : null)
   }
   let offset = 0
-  return h('div', { className: className ? `dsh-tp-translation-text ${className}` : 'dsh-tp-translation-text', 'data-translation-quote': quoteSource,
-    'data-translation-edit-body': transcriptBody ? '' : undefined }, ...projected.segments.map(segment => {
+  let line = 1, lineStart = true
+  const numbered = !!showLineNumbers && !!text.length
+  function label(): unknown {
+    if (!lineStart) return null
+    lineStart = false
+    const number = String(line++).padStart(3, '0')
+    return h('span', { key: `line-${number}`, className: 'dsh-tp-line-number', 'data-line-number': number, 'aria-hidden': true })
+  }
+  const contents = numbered ? projected.segments.flatMap(segment => {
+    if (segment.kind === 'object') return [label(), object(segment.reference)]
+    return (segment.text.match(/[^\r\n]*(?:\r\n?|\n)|[^\r\n]+/gu) ?? []).flatMap(part => {
+      const marker = label()
+      lineStart = /[\r\n]$/u.test(part)
+      return [marker, part]
+    })
+  }) : projected.segments.map(segment => {
     if (segment.kind !== 'text') return object(segment.reference)
     const start = offset
     for (const _ of segment.text) offset++
     return renderText ? renderText(segment.text, start) : segment.text
-  }),
+  })
+  return h('div', { className: ['dsh-tp-translation-text', className, numbered ? 'dsh-tp-numbered-text' : undefined].filter(Boolean).join(' '),
+    'data-translation-quote': quoteSource, 'data-translation-edit-body': transcriptBody ? '' : undefined,
+    ...(numbered ? { style: { '--dsh-tp-line-digits': String(Math.max(3, String(line - 1).length)) } } : {}) }, contents,
     !hideUnavailable && projected.unavailableRefs.length ? h('div', { className: 'dsh-tp-object-unavailable', 'aria-label': '关联位置不可用' }, ...projected.unavailableRefs.map(reference => object(reference, true))) : null)
 }
 

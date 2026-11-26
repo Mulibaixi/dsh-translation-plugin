@@ -129,6 +129,10 @@ export const styles = `
 .dsh-tp-translation + .dsh-tp-translation { border-top: 1px solid var(--dsw-alias-border-l2, #8883); padding-top: 18px; }
 .dsh-tp-translation > button:last-child { margin-bottom: 18px; }
 .dsh-tp-translation-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 5px 0 12px; }
+.dsh-tp-numbered-text { padding-left: calc(var(--dsh-tp-line-digits) * 1ch + 12px); }
+.dsh-tp-line-number { position: relative; user-select: none; pointer-events: none; }
+.dsh-tp-line-number::before { content: attr(data-line-number); position: absolute; right: 8px; top: 0;
+  color: var(--dsw-alias-label-secondary, GrayText); font-size: 0.85em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .dsh-tp-image-background { position: relative; }
 .dsh-tp button.dsh-tp-image-background-edit { position: absolute; inset-block-start: 0; inset-inline-end: 0; padding-block: 0; white-space: nowrap; }
 .dsh-tp-image-background:not([open]) > .dsh-tp-image-background-edit { display: none; }

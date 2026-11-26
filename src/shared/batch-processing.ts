@@ -12,6 +12,21 @@ export function batchOperationId(operationId: string, context?: DirectContextSup
     .find(id => id?.startsWith(BATCH_OPERATION_PREFIX))
 }
 
+export interface BatchRevision {
+  readonly dispatchId: string
+  readonly inputDigest: string
+  readonly turn: number
+}
+
+export function parseBatchRevision(value: unknown): BatchRevision {
+  referenceObject(value)
+  referenceExact(value, ['dispatchId', 'inputDigest', 'turn'])
+  if (typeof value.dispatchId !== 'string' || !value.dispatchId.startsWith(BATCH_OPERATION_PREFIX) || value.dispatchId.length > 128 ||
+    typeof value.turn !== 'number' || !Number.isSafeInteger(value.turn) || value.turn < 0 ||
+    typeof value.inputDigest !== 'string' || !/^[0-9a-f]{64}$/u.test(value.inputDigest)) throw new TypeError('批次译文归属无效。')
+  return { dispatchId: value.dispatchId, inputDigest: value.inputDigest, turn: value.turn }
+}
+
 export interface BatchItem {
   readonly unitId: string
   readonly name: string
@@ -27,16 +42,22 @@ export interface ProcessingBatch {
   readonly action: 'translate_images'
   readonly requirements: string
   readonly items: readonly BatchItem[]
+  readonly reviewPending?: true
+  readonly terminated?: true
 }
 
 export function unfinishedBatchItem(item: BatchItem): boolean {
   return item.state !== 'completed' && item.state !== 'skipped'
 }
 
+export function unfinishedBatch(batch: ProcessingBatch): boolean {
+  return !batch.terminated && (batch.reviewPending === true || batch.items.some(unfinishedBatchItem))
+}
+
 export type BatchRequest = HistoryScope & { readonly mainSessionId: string } & (
   | { readonly kind: 'read'; readonly batchId?: string }
   | { readonly kind: 'start'; readonly batchId: string; readonly action: ProcessingBatch['action']; readonly unitIds: readonly string[]; readonly requirements: string }
-  | { readonly kind: 'pause' | 'continue' | 'retry' | 'skip'; readonly batchId: string }
+  | { readonly kind: 'pause' | 'continue' | 'retry' | 'skip' | 'terminate'; readonly batchId: string }
 )
 export interface BatchView {
   readonly batches: readonly { readonly id: string; readonly name: string; readonly completed: number; readonly total: number }[]
@@ -67,7 +88,7 @@ export function parseBatchRequest(value: unknown): BatchRequest {
     requirements(value.requirements)
   } else {
     referenceExact(value, [...base, 'batchId'])
-    if (!['pause', 'continue', 'retry', 'skip'].includes(String(value.kind))) throw new TypeError('批次操作无效。')
+    if (!['pause', 'continue', 'retry', 'skip', 'terminate'].includes(String(value.kind))) throw new TypeError('批次操作无效。')
   }
   if (value.kind !== 'read' || value.batchId !== undefined) referenceString(value.batchId)
   return value as unknown as BatchRequest
@@ -75,8 +96,10 @@ export function parseBatchRequest(value: unknown): BatchRequest {
 
 export function parseProcessingBatch(value: unknown): ProcessingBatch {
   referenceObject(value)
-  referenceExact(value, ['id', 'mainSessionId', 'action', 'requirements', 'items'])
+  referenceExact(value, ['id', 'mainSessionId', 'action', 'requirements', 'items'], ['reviewPending', 'terminated'])
   referenceString(value.id); referenceString(value.mainSessionId); requirements(value.requirements)
+  if (value.terminated !== undefined && (value.terminated !== true || value.reviewPending !== undefined)) throw new TypeError('批次终态无效。')
+  if (value.reviewPending !== undefined && value.reviewPending !== true) throw new TypeError('批次审查状态无效。')
   if (value.action !== 'translate_images' || !Array.isArray(value.items) || !value.items.length || value.items.length > BATCH_FILE_LIMIT) throw new TypeError('批次记录无效。')
   const unitIds = new Set<unknown>()
   for (const item of value.items) {

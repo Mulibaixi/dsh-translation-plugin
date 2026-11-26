@@ -1,6 +1,8 @@
 import { parseDirectTranslationTarget, type DirectUnitTarget } from './normal-translation.js'
 import { HISTORY_TEXT_PAGE_POINTS } from './history-text.js'
 
+import { parseImageSpeakers, type ImageSpeaker } from './image-translation.js'
+
 export interface UnitDirectoryRequest { readonly translationSessionId?: string; readonly offset?: number; readonly limit?: number }
 export interface UnitReadRequest {
   readonly translationSessionId?: string
@@ -22,6 +24,8 @@ export interface NumberedUnit {
   readonly finalSelection?: 'automatic' | 'user_fixed'
 }
 export interface UnitTextContent {
+  readonly speakers?: readonly ImageSpeaker[]
+  readonly unclearTranscription?: string
   readonly unit: NumberedUnit
   readonly side: 'source' | 'translation'
   readonly revisionNumber: number | null
@@ -110,7 +114,7 @@ export function parseUnitContent(value: unknown): UnitContent {
     if (points > HISTORY_TEXT_PAGE_POINTS || value.nextLine !== null && value.nextLine !== lines.at(-1)!.line + 1) throw new TypeError('Invalid translation lines page bounds')
     return { unit, side: 'translation', revisionNumber: value.revisionNumber, revisionId: value.revisionId, lines, nextLine: value.nextLine as number | null }
   }
-  fields(value, ['unit', 'side', 'revisionNumber', 'revisionId', 'text', 'totalCodePoints', 'start', 'nextStart', 'message'])
+  fields(value, ['unit', 'side', 'revisionNumber', 'revisionId', 'text', 'totalCodePoints', 'start', 'nextStart', 'message', 'speakers', 'unclearTranscription'])
   if (!['source', 'translation'].includes(value.side as string) || value.text !== null && typeof value.text !== 'string' || value.message !== undefined && typeof value.message !== 'string') throw new TypeError('Invalid unit content')
   integer(value.totalCodePoints, 0); integer(value.start, 0)
   if (value.revisionNumber !== null) integer(value.revisionNumber, 1)
@@ -118,5 +122,7 @@ export function parseUnitContent(value: unknown): UnitContent {
     value.side !== 'translation' || value.text === null || value.revisionNumber === null || !unit.versions.includes(value.revisionNumber))) throw new TypeError('Invalid unit content revision')
   if (value.nextStart !== null) integer(value.nextStart, 0)
   if (typeof value.text === 'string' && (Array.from(value.text).length > HISTORY_TEXT_PAGE_POINTS || value.start + Array.from(value.text).length > value.totalCodePoints || value.nextStart !== (value.start + Array.from(value.text).length < value.totalCodePoints ? value.start + Array.from(value.text).length : null))) throw new TypeError('Invalid unit content page')
-  return { ...structuredClone(value), unit } as unknown as UnitTextContent
+  if ((value.speakers !== undefined || value.unclearTranscription !== undefined) && (unit.kind !== 'image' || value.side !== 'source')) throw new TypeError('Image annotations require a source page')
+  if (value.unclearTranscription !== undefined && (typeof value.unclearTranscription !== 'string' || value.unclearTranscription.length > 900)) throw new TypeError('Invalid image transcription note')
+  return { ...structuredClone(value), unit, ...(value.speakers === undefined ? {} : { speakers: parseImageSpeakers(value.speakers) }) } as unknown as UnitTextContent
 }

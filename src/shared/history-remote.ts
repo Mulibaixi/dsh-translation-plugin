@@ -11,7 +11,8 @@ export interface HistoryBegin extends HistoryScope { readonly purpose: 'create' 
 export interface HistoryTransfer extends HistoryScope { readonly transferId: string }
 export interface HistoryPartUpload extends HistoryTransfer { readonly layer: 'current' | 'saved'; readonly offset: number; readonly text: string }
 export interface HistoryRead extends HistoryScope { readonly token: string; readonly layer: 'current' | 'saved'; readonly offset: number }
-export interface HistoryMutation extends HistoryScope { readonly token: string; readonly operationId: string; readonly command: { readonly kind: 'delete_text_revision' | 'delete_document_revision'; readonly unitId: string; readonly revisionId: string } | { readonly kind: 'delete_file_result' | 'delete_document_source' | 'delete_file_source'; readonly unitId: string; readonly version: number } | { readonly kind: 'delete_unit' | 'delete_document_chunks'; readonly unitId: string } }
+export interface PruneTextRevisions { readonly kind: 'prune_text_revisions'; readonly units: readonly { readonly unitId: string; readonly revisionIds: readonly string[] }[] }
+export interface HistoryMutation extends HistoryScope { readonly token: string; readonly operationId: string; readonly command: { readonly kind: 'delete_text_revision' | 'delete_document_revision'; readonly unitId: string; readonly revisionId: string } | { readonly kind: 'delete_file_result' | 'delete_document_source' | 'delete_file_source'; readonly unitId: string; readonly version: number } | { readonly kind: 'delete_unit' | 'delete_document_chunks'; readonly unitId: string } | PruneTextRevisions }
 export interface HistoryRetire extends HistoryScope { readonly token: string; readonly operationId: string }
 export interface CurrentHistoryRead extends HistoryScope { readonly token: string; readonly unitId: string; readonly side: 'source' | 'translation'; readonly start: number }
 export interface HistoryTextSearch extends CurrentHistoryRead { readonly query: string }
@@ -65,6 +66,16 @@ export function parseHistoryRequest(method: keyof HistoryRemotePort, value: unkn
     referenceExact(value, [...base, 'token', 'operationId']); referenceString(value.token); referenceString(value.operationId)
   } else if (method === 'mutate') {
     referenceExact(value, [...base, 'token', 'operationId', 'command']); referenceString(value.token); referenceString(value.operationId); referenceObject(value.command)
+    if (value.command.kind === 'prune_text_revisions') {
+      referenceExact(value.command, ['kind', 'units'])
+      if (!Array.isArray(value.command.units) || !value.command.units.length) throw new TypeError('Missing history retention targets')
+      for (const unit of value.command.units) {
+        referenceObject(unit); referenceExact(unit, ['unitId', 'revisionIds']); referenceString(unit.unitId)
+        if (!Array.isArray(unit.revisionIds) || !unit.revisionIds.length) throw new TypeError('Missing history retention versions')
+        for (const id of unit.revisionIds) referenceString(id, 2048)
+      }
+      return structuredClone(value)
+    }
     referenceExact(value.command, ['kind', 'unitId', ...(['delete_text_revision', 'delete_document_revision'].includes(String(value.command.kind)) ? ['revisionId'] : ['delete_file_result', 'delete_document_source', 'delete_file_source'].includes(String(value.command.kind)) ? ['version'] : [])]); referenceString(value.command.unitId)
     if (value.command.kind === 'delete_text_revision' || value.command.kind === 'delete_document_revision') referenceString(value.command.revisionId)
     else if (value.command.kind === 'delete_file_result' || value.command.kind === 'delete_document_source' || value.command.kind === 'delete_file_source') referenceInteger(value.command.version, 1)

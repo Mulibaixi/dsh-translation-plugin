@@ -251,13 +251,12 @@ export class NormalTranslationClient {
     const maxInputChars = submitted?.maxInputChars ?? settings.maxInputChars
     const instruction = submitted ? unit.instruction : settings.defaultInstruction
     if (sourceCodePointLength(unit.source) > maxInputChars) return failure('input_too_large', '当前原文超过单次上限，未截断。')
-    const imageInputId = image ? this.imageInputs.get(unit.id) ?? crypto.randomUUID() : undefined
-    if (imageInputId) this.imageInputs.set(unit.id, imageInputId)
+    const imageInputId = image ? this.imageInputId(unit.id) : undefined
     const envelope = parseTranslationMaterialEnvelope({  mainSessionId: ownerId, requestId: `unit-request:${input.operationId}`, operationId: input.operationId, kind: 'material', material: {
       materialId: unit.material?.materialId ?? unit.id, sourceVersion: image?.original?.version ?? target.sourceVersion, topicId: session.topicId, translationSessionId: session.id,
       draftVersion: unit.material?.draftVersion ?? 1, sourceText: unit.source, targetLanguage: unit.targetLanguage, instruction,
       model: session.model, maxInputChars, unitReference: image
-        ? { unitId: unit.id, backgroundDescription: image.backgroundDescription, imageInputId }
+        ? { unitId: unit.id, backgroundDescription: image.backgroundDescription, imageInputId, ...(image.speakers ? { speakers: image.speakers } : {}) }
         : { unitId: unit.id, sourceVersion: target.sourceVersion },
     } }) as Extract<TranslationMaterialEnvelope, { kind: 'material' }>
     this.unitSnapshots.set(key, envelope)
@@ -288,14 +287,39 @@ export class NormalTranslationClient {
     return this.store.updateTranslationHistory(sessionId, history => appendSourceCorrection(history, unitId, edit))
   }
 
+  private imageInputId(unitId: string): string {
+    const id = this.imageInputs.get(unitId) ?? crypto.randomUUID()
+    this.imageInputs.set(unitId, id)
+    return id
+  }
+
+  readImage(ownerId: string, target: ImageUnitTarget): ImageUnitState | undefined {
+    if (target.mainSessionId !== ownerId || !this.store.canAccessUnit(ownerId, target.translationSessionId, target.unitId)) return undefined
+    const unit = this.store.getTranslationHistory(target.translationSessionId)?.units.find(unit => unit.id === target.unitId)
+    if (!unit || !isImageUnit(unit) || !unit.original || unit.deletion) return undefined
+    const { original, source, backgroundDescription, speakers, recognition } = unit
+    const session = this.store.getSession(target.translationSessionId)
+    if (!session) return undefined
+    return { inputId: this.imageInputId(unit.id), topicId: session.topicId, original, source, backgroundDescription,
+      ...(speakers ? { speakers } : {}), ...(recognition ? { recognition } : {}) }
+  }
+
   updateImage(ownerId: string, input: ImageUnitUpdate): boolean {
-    const { target, sourceText, backgroundDescription } = parseImageUnitUpdate(input)
+    const { target, sourceText, backgroundDescription, speakers, expectedInputId, recognition } = parseImageUnitUpdate(input)
     const session = this.store.getSession(target.translationSessionId)
     if (target.mainSessionId !== ownerId || !session || session.mode !== 'normal' || session.archivedAt !== null ||
       !this.store.canAccessUnit(ownerId, session.id, target.unitId)) return false
     const unit = this.store.getTranslationHistory(session.id)?.units.find(unit => unit.id === target.unitId)
-    const submitted = unit && isImageUnit(unit) && !unit.revisions.length ? unit.material : undefined
-    const updated = this.editImage(session.id, target.unitId, { sourceText, backgroundDescription }, submitted?.maxInputChars)
+    if (!unit || !isImageUnit(unit) || expectedInputId !== undefined && this.imageInputId(unit.id) !== expectedInputId) return false
+    const submitted = !unit.revisions.length ? unit.material : undefined
+    let changedSpeakers = speakers
+    if (speakers && expectedInputId === undefined) {
+      const entries = retainImageSpeakers(unit.source, sourceText ?? unit.source, unit.speakers ?? [])
+      const merged = new Map(entries.map(entry => [entry.block, entry]))
+      for (const speaker of speakers) merged.set(speaker.block, speaker)
+      changedSpeakers = [...merged.values()].sort((a, b) => a.block - b.block)
+    }
+    const updated = this.editImage(session.id, target.unitId, { sourceText, backgroundDescription, speakers: changedSpeakers, recognition }, submitted?.maxInputChars)
     if (updated && sourceText !== undefined && unit && isImageUnit(unit) && unit.material && unit.original) {
       const submission = this.materials.resolveSubmittedTarget({ kind: 'material', mainSessionId: ownerId,
         requestId: unit.material.requestId, materialId: unit.material.materialId, sourceVersion: unit.original.version })
@@ -304,15 +328,25 @@ export class NormalTranslationClient {
     return updated
   }
 
-  editImage(sessionId: string, unitId: string, edits: { sourceText?: string | undefined; backgroundDescription?: string | undefined }, maxInputChars = this.store.getSettings().maxInputChars): boolean {
+  editImage(sessionId: string, unitId: string, edits: { sourceText?: string | undefined; backgroundDescription?: string | undefined; speakers?: ImageUnitUpdate['speakers']; recognition?: ImageUnitUpdate['recognition'] }, maxInputChars = this.store.getSettings().maxInputChars): boolean {
     const session = this.store.getSession(sessionId)
     if (!session || session.archivedAt !== null || this.store.getStatus(sessionId) === 'conflict' || this.sourceEditBlockedReason(sessionId, unitId) ||
       edits.sourceText !== undefined && sourceCodePointLength(edits.sourceText) > maxInputChars) return false
     const previousInput = this.imageInputs.get(unitId)
-    if (previousInput) this.imageInputs.set(unitId, crypto.randomUUID())
-    const updated = this.store.updateTranslationHistory(sessionId, history => updateImageUnit(history, unitId,
-      { ...(edits.sourceText === undefined ? {} : { sourceText: edits.sourceText }),
-        ...(edits.backgroundDescription === undefined ? {} : { backgroundDescription: edits.backgroundDescription }) }))
+    const before = this.store.getTranslationHistory(sessionId)?.units.find(unit => unit.id === unitId)
+    const updated = this.store.updateTranslationHistory(sessionId, history => {
+      const next = updateImageUnit(history, unitId, {
+        ...(edits.sourceText === undefined ? {} : { sourceText: edits.sourceText }),
+        ...(edits.backgroundDescription === undefined ? {} : { backgroundDescription: edits.backgroundDescription }),
+        ...(edits.speakers === undefined ? {} : { speakers: edits.speakers }),
+        ...(edits.recognition === undefined ? {} : { recognition: edits.recognition }),
+      })
+      const after = next.units.find(unit => unit.id === unitId)
+      if (previousInput && before && after && isImageUnit(before) && isImageUnit(after) && imageInputKey(before) !== imageInputKey(after)) {
+        this.imageInputs.set(unitId, crypto.randomUUID())
+      }
+      return next
+    })
     if (!updated && previousInput) this.imageInputs.set(unitId, previousInput)
     return updated
   }
@@ -435,7 +469,7 @@ export class NormalTranslationClient {
       : failure('idempotency_conflict', '此业务操作已用于其他材料或要求，未重复准备。')
     if (this.store.getAllSessions().some(session => {
       const history = this.store.getTranslationHistory(session.id)
-      return history?.schemaVersion === 13 && history.events.some(event => event.type === 'revision.review_saved' && event.operationId === request.operationId)
+      return history?.events.some(event => event.type === 'revision.review_saved' && event.operationId === request.operationId)
     })) return failure('idempotency_conflict', '此操作 ID 已用于审阅修订，请使用新的 operationId。')
     const envelope = request.envelope, material = envelope.material, session = this.store.getSession(material.translationSessionId)
     // A session opened from another main Session keeps its original owner for content and memory.
@@ -448,7 +482,10 @@ export class NormalTranslationClient {
       if (!cached || JSON.stringify(cached) !== JSON.stringify(envelope) || !unit || unit.deletion) return failure('out_of_scope', '历史处理材料未由当前 Client 冻结，或对应单元已删除。')
       if (unit && !isTextUnit(unit)) return failure('requires_batch', '文档单元需整篇分批处理，执行尚未接通。')
       if (!unit || (isImageUnit(unit)
-        ? unit.source !== material.sourceText || unit.backgroundDescription !== material.unitReference.backgroundDescription
+        ? this.imageInputId(unit.id) !== material.unitReference.imageInputId || imageInputKey(unit) !== imageInputKey({
+          source: material.sourceText ?? '', backgroundDescription: material.unitReference.backgroundDescription ?? '',
+          ...(material.unitReference.speakers ? { speakers: material.unitReference.speakers } : {}),
+        })
         : unit.sourceVersion !== material.sourceVersion || material.unitReference.sourceVersion !== unit.sourceVersion)) return failure('stale_version', '准备后原文已变化，请使用新操作重新准备。')
     } else {
       if (!this.materials.resolveSubmittedMaterial(envelope)) return failure('material_not_submitted', '未找到完全一致的已提交材料，草稿未受理。')
@@ -585,6 +622,7 @@ export class NormalTranslationClient {
     if (recorded && existing) {
       if (recorded.operationId !== request.operationId || recorded.text !== request.text || recorded.status !== request.status ||
         request.targetLanguage !== undefined && !languageMatches(request.targetLanguage, existing.targetLanguage) ||
+        JSON.stringify(recorded.batchRevision) !== JSON.stringify(request.batchRevision) ||
         JSON.stringify(recorded.callRecord?.context?.contextSupplement) !== JSON.stringify(request.contextSupplement) ||
         JSON.stringify(request.callRecord.context?.contextSupplement) !== JSON.stringify(request.contextSupplement)) {
         return failure('idempotency_conflict', '此业务操作已记录不同的译文，未覆盖。')
@@ -636,7 +674,7 @@ export class NormalTranslationClient {
           : appendAdmittedFileUnit(current, admission, unitId, request.sourceText!, request.operationId, at)
       const recorded = appendTextRevision(admitted, unitId, { id: request.revisionId, operationId: request.operationId, model,
         draftVersion: material.draftVersion, createdAt: at, updatedAt: at, accepted: true, status: request.status,
-        text: request.text, callRecord: metadata, message: request.message || null })
+        text: request.text, callRecord: metadata, message: request.message || null, ...(request.batchRevision ? { batchRevision: request.batchRevision } : {}) })
       return request.status === 'completed' ? finalizeCompletedUnit(recorded, unitId, at) : recorded
     })
     if (!updated) return failure('history_update_failed', '译文记录未完成，请查询当前单元。')
@@ -1181,4 +1219,4 @@ export class NormalTranslationClient {
 }
 import { isImageUnit, updateImageUnit } from './translation-history.js'
 import { parseImageUnitUpdate, parseDirectTranslationTarget, type DirectUnitTarget, type DirectUnitRequest, type DirectTranslationTarget } from '../shared/normal-translation.js'
-import type { ImageUnitUpdate } from '../shared/image-translation.js'
+import { imageInputKey, retainImageSpeakers, type ImageUnitUpdate, type ImageUnitTarget, type ImageUnitState } from '../shared/image-translation.js'

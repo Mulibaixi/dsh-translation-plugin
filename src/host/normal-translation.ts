@@ -9,7 +9,8 @@ import { historyContextRefs, type DirectHistoryRefs } from '../shared/direct-his
 import { diagnosticSpan } from '../shared/diagnostics.js'
 import { historyTargetMatches } from './history-resources.js'
 import type { HistoryScope } from '../shared/history-bundle.js'
-import { BATCH_OPERATION_PREFIX, batchOperationId } from '../shared/batch-processing.js'
+import type { BatchRevision } from '../shared/batch-processing.js'
+import { sourceSha256 } from './source-storage.js'
 import type { BatchProcessingService } from './batch-processing.js'
 import { languageMatches } from '../shared/language-tag.js'
 import type { ReferenceFilesService } from './reference-files.js'
@@ -27,6 +28,7 @@ import { NORMAL_TRANSLATION_V2_REMOTE, NormalTranslationAttemptJournal, type Nor
 import { MAX_TOPIC_BRIDGE_REPLY_BYTES, type TopicBridgeValue } from '../shared/topic-bridge.js'
 import { sourceAnnotationChecks, type TranslationCheck } from '../shared/translation-quality.js'
 import { MAX_TRANSLATION_SOURCE_PAGE_BYTES, MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS, sourceCodePointLength } from '../shared/translation-source-read.js'
+import { imageInputKey, imageTextBlocks, type ImageInput, type ImageUnitState, type ImageTranslationMemory } from '../shared/image-translation.js'
 import type { TranslationMaterialEnvelope, TranslationMaterialSnapshot } from '../shared/translation-material.js'
 import { isNormalExchangePromptVersion, translationCallFacts, type NormalTranslationContext, type TranslationCallMetadata } from '../shared/translation-call.js'
 import type { RequestContextInput } from '../shared/request-context.js'
@@ -43,7 +45,7 @@ import type { NormalTranslationResolution } from '../shared/normal-translation-v
 import type { FileJobConflict, FileJobMechanicalIssue, FileJobProposal, FileJobTerm, FileJobWorker } from '../shared/file-jobs.js'
 import { FileWorkerRuntime } from './file-worker-runtime.js'
 import { artifactExtension, parseArtifactOpen, parseArtifactSave, type TranslationArtifactCheck, type TranslationArtifactSaved } from '../shared/translation-artifact.js'
-import { DIRECT_REVIEW_NEXT_STEP, FILE_MEMORY_REVIEW_GUIDANCE, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
+import { DIRECT_REVIEW_NEXT_STEP, FILE_MEMORY_REVIEW_GUIDANCE, IMAGE_RESULT_REVIEW_GUIDANCE, IMAGE_TRANSLATION_WORKFLOW, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
 import { resolveMarkdownImages } from './markdown-files.js'
 import { loadArtifactStorage, type ArtifactStorage } from './translation-delivery.js'
 import { writePdfExport } from './pdf-export.js'
@@ -157,6 +159,8 @@ type PdfOutputResult = {
   readonly figuresUnavailable?: boolean
 } | { readonly error: string }
 interface DirectEntry {
+  readonly dispatch?: Pick<BatchRevision, 'dispatchId' | 'turn'>
+  batchRevision?: BatchRevision
   readonly signature: string
   readonly promise: Promise<DirectTranslationResult>
   settled: boolean
@@ -166,7 +170,9 @@ interface DirectEntry {
   historyContext?: { readonly translationSessionId: string; readonly topicId: string; readonly refs: DirectHistoryRefs }
   basis?: DirectContextBasis
   imageInput?: string
+  imageSource?: ImageInput
   question?: DirectContextQuestionView
+  imageSourceChanged?: true
   supplement?: DirectContextSupplement
   answer?: { readonly operationId: string; readonly signature: string }
 }
@@ -416,13 +422,29 @@ export class NormalTranslationService {
     }
     return this.resolved.get(key)!.result
   }
-  async updateImageUnit(input: unknown, exec: ToolExecution): Promise<{ readonly unitId: string }> {
+  async readImageUnit(target: import('../shared/image-translation.js').ImageUnitTarget, exec: ToolExecution): Promise<ImageUnitState> {
+    this.owned(target, exec)
+    const value = await this.topics.requestOwned(target.mainSessionId, { kind: 'image_state', target }, exec)
+    if (value.kind !== 'image_state') throw rejected('invalid_reply', '未读取到准确图片输入。', 'image_read')
+    return value.state
+  }
+  async readImageMemory(target: import('../shared/image-translation.js').ImageUnitTarget, exec: ToolExecution): Promise<ImageTranslationMemory | undefined> {
+    try {
+      this.owned(target, exec)
+      const value = await this.topics.requestOwned(target.mainSessionId, { kind: 'image_memory', target }, exec)
+      return value.kind === 'image_memory' ? value.memory : undefined
+    } catch {
+      exec.signal.throwIfAborted()
+      // The main model can still perform the ordinary scoped lookups.
+      return undefined
+    }
+  }
+
+  async updateImageUnit(input: unknown, exec: ToolExecution, hostRecognition = false): Promise<{ readonly unitId: string }> {
     const update = parseImageUnitUpdate(input)
+    if (!hostRecognition && (update.expectedInputId !== undefined || update.recognition !== undefined)) throw rejected('invalid_input', '图片识读回执由宿主登记。', 'image_update')
     this.owned(update.target, exec)
     const { target, operationId } = update, key = identity(target.mainSessionId, operationId)
-    const batchId = operationId.startsWith(BATCH_OPERATION_PREFIX) && operationId.endsWith(':image') ? operationId.slice(0, -6) : undefined
-    const batches = batchId ? this.ctx.get?.('translationBatchProcessing') as BatchProcessingService | undefined : undefined
-    if (batchId && !batches?.allows(batchId, target)) throw rejected('batch_item_inactive', '此图片批次操作已停止。', 'image_update')
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(update)))
     const signature = JSON.stringify({ target, hash: Array.from(new Uint8Array(digest)).join(',') })
     const previous = this.imageUpdates.get(key)
@@ -434,9 +456,13 @@ export class NormalTranslationService {
     if (this.activeSessions.has(target.translationSessionId)) throw rejected('busy', '此会话正在翻译，等本次调用结束后再编辑。', 'image_update')
     const result = this.topics.requestOwned(target.mainSessionId, { kind: 'image_update', ...update }, exec).then(value => {
       if (value.kind !== 'image_updated' || value.unitId !== target.unitId) throw rejected('invalid_reply', '图片单元更新未确认。', 'image_update')
-      if (batchId && update.sourceText === '') batches?.markNoText(batchId)
+      if (value.inputChanged === false) return { unitId: value.unitId }
       for (const entry of this.direct.values()) if (entry.question?.target.kind === 'image_unit' &&
-        entry.question.target.translationSessionId === target.translationSessionId && entry.question.target.unitId === target.unitId) delete entry.question
+        entry.question.target.mainSessionId === target.mainSessionId && entry.question.target.translationSessionId === target.translationSessionId &&
+        entry.question.target.unitId === target.unitId) {
+        delete entry.question
+        entry.imageSourceChanged = true
+      }
       return { unitId: value.unitId }
     })
     this.imageUpdates.set(key, { signature, result })
@@ -605,6 +631,7 @@ export class NormalTranslationService {
     if (request.contextResponse) {
       const response = request.contextResponse
       parent = this.direct.get(identity(request.target.mainSessionId, response.operationId))
+      if (parent?.imageSourceChanged) throw this.imageSourceChanged()
       if (!parent?.settled || !parent.question || !parent.basis) throw rejected('context_request_unavailable', '原补充问题不存在或已失效；请读取当前单元，或重新提交未保存的材料。', 'prepare')
       if (parent.scope && parent.scope.namespaceId !== this.topics.namespaceForAgent(request.target.mainSessionId)) throw rejected('context_request_unavailable', '原补充问题不属于当前资料库连接。', 'prepare')
       const original = JSON.parse(parent.signature) as DirectTranslationRequest
@@ -632,15 +659,10 @@ export class NormalTranslationService {
         originalUserRequirements,
         ...(earlier.length ? { previous: earlier } : {}) })
     }
-    const batchId = batchOperationId(request.operationId, supplement)
-    const batches = this.ctx.get?.('translationBatchProcessing') as BatchProcessingService | undefined
-    if (batchId) {
-      if (request.target.kind !== 'image_unit' || !batches?.allows(batchId, request.target)) throw rejected('batch_item_inactive', '此图片批次操作已停止。', 'prepare')
-    } else if (request.target.kind === 'image_unit' && batches?.ownsActiveTarget(request.target)) {
-      throw rejected('batch_operation_required', '此图正在批次中处理，请使用本项通知给出的操作 ID。', 'prepare')
-    }
     const key = identity(request.target.mainSessionId, request.operationId), signature = JSON.stringify(request)
     const previous = this.direct.get(key)
+    if (previous?.imageSourceChanged && previous.scope?.namespaceId === this.topics.namespaceForAgent(request.target.mainSessionId))
+      throw this.imageSourceChanged()
     if (previous) {
       if (previous.signature !== signature) throw rejected('idempotency_conflict', '同一业务操作 ID 不能更换材料、目标语言、要求或术语；该 ID 已用于另一次请求，请修正参数后改用新的 operationId 重试。', 'prepare')
       return previous.promise.then(view => structuredClone(view))
@@ -656,6 +678,10 @@ export class NormalTranslationService {
     }
     if (installingTranslationUpdate(this.ctx)) throw rejected('busy', INSTALL_BUSY_MESSAGE, 'prepare')
     if (parent) parent.answer = { operationId: request.operationId, signature: answerSignature }
+    const batches = this.ctx.get?.('translationBatchProcessing') as BatchProcessingService | undefined
+    const currentTurn = parent?.dispatch && batches?.currentTurn(exec.agent)
+    const dispatch = request.target.kind !== 'image_unit' || !exec.agent ? undefined : parent?.dispatch && currentTurn !== undefined
+      ? { dispatchId: parent.dispatch.dispatchId, turn: currentTurn } : batches?.dispatchFor(request.target, exec.agent)
     const attempt: DispatchAttempt = { dispatched: false, resolved: false }
     const promise = this.runDirect(request, exec, attempt, parent?.basis, supplement, parent?.imageInput).finally(async () => {
       if (request.target.kind !== 'material') {
@@ -666,26 +692,44 @@ export class NormalTranslationService {
         } catch { /* Connection teardown also drops the Client operation. */ }
       }
     })
-    const entry: DirectEntry = { signature, promise, settled: false, ...(supplement ? { supplement } : {}) }; this.direct.set(key, entry)
+    const entry: DirectEntry = { signature, promise, settled: false, ...(dispatch ? { dispatch } : {}), ...(supplement ? { supplement } : {}) }; this.direct.set(key, entry)
     void promise.then(() => { entry.settled = true }, () => { entry.settled = true })
-    return promise.then(view => structuredClone(view), error => {
+    return promise.then(view => {
+      if (dispatch) batches?.noteTranslationOutcome(dispatch.dispatchId, view.status === 'failed' || view.status === 'cancelled')
+      return structuredClone(view)
+    }, error => {
+      if (dispatch) batches?.noteTranslationOutcome(dispatch.dispatchId, true)
       // Nothing was dispatched and no business fact exists, so the placeholder only blocks the corrected retry.
       // A dispatched, unknown or recorded attempt keeps its reservation so the same ID replays its real outcome.
       if (!attempt.dispatched && this.direct.get(key)?.promise === promise) {
         this.direct.delete(key)
         if (attempt.resolved) this.resolved.delete(key)
         if (parent?.answer?.operationId === request.operationId) delete parent.answer
+        if (parent?.imageSource && (error as { code?: string })?.code === 'context_target_changed') {
+          delete parent.question
+          parent.imageSourceChanged = true
+        }
       }
       throw error
     })
   }
   isSessionExecuting(sessionId: string): boolean { return this.activeSessions.has(sessionId) }
 
-  async batchDirectStatus(ownerId: string, operationId: string): Promise<DirectTranslationResult['status'] | 'running' | undefined> {
-    let entry = this.direct.get(identity(ownerId, operationId))
+  private imageSourceChanged(): Error {
+    return rejected('image_source_changed', '图片原文、背景或说话人已修改，旧补充问题已失效。请使用新的操作 ID 从当前图片单元发起翻译。', 'prepare')
+  }
+
+  async batchDirectStatus(ownerId: string, operationId: string, currentImage?: ImageInput): Promise<DirectTranslationResult['status'] | 'running' | 'source_changed' | undefined> {
+    let entry = [...this.direct.values()].reverse().find(value => value.dispatch?.dispatchId === operationId)
+      ?? this.direct.get(identity(ownerId, operationId))
     while (entry?.answer) entry = this.direct.get(identity(ownerId, entry.answer.operationId))
     if (!entry) return undefined
     if (!entry.settled) return 'running'
+    if (entry.imageSource && currentImage && imageInputKey(entry.imageSource) !== imageInputKey(currentImage)) {
+      delete entry.question
+      entry.imageSourceChanged = true
+    }
+    if (entry.imageSourceChanged) return 'source_changed'
     try {
       const result = await entry.promise
       return result.status === 'needs_context' && !entry.question ? 'failed' : result.status
@@ -730,6 +774,7 @@ export class NormalTranslationService {
     const material = envelope.material, route = material.model
     const imageBackground = material.unitReference?.backgroundDescription
     const imageInput = material.unitReference?.imageInputId
+    const speakers = material.unitReference?.speakers
     if (imageBackground !== undefined) {
       if (expectedImageInput !== undefined && imageInput !== expectedImageInput) throw rejected('context_target_changed', '图片原文或背景已编辑，请按当前内容发起翻译。', 'prepare')
       const auxiliaryContext = [imageBackground, request.auxiliaryContext].filter(Boolean).join('\n\n')
@@ -790,7 +835,10 @@ export class NormalTranslationService {
         ...(contextRef ? { referenceContextRef: contextRef } : {}) }
       const pdfUnit = request.target.kind === 'unit' && pdfUnitPages(request.target.unitId, material.materialId)
       const scanned = request.target.kind === 'unit' && pdfScanUnitPage(request.target.unitId, material.materialId)
-      const instruction = scanned ? [material.instruction,
+      const instruction = request.target.kind === 'image_unit' && imageTextBlocks(sourceText) ? [material.instruction,
+        'Translate the numbered image text blocks in context. Keep every 【01】-style label exactly once, in source order, at the start of its corresponding translated block. Read across adjacent blocks for meaning, then put each part back into its original block. Keep even short interjections and punctuation-only blocks. Leave out unreadable text omitted during transcription. Use neutral wording when the page does not identify the speaker. Do not ask for context just to identify a speaker.',
+        ...(speakers?.length ? ['Dialogue speaker evidence by source block (null means unresolved). Use neutral wording or omit uncertain subjects. Do not request clarification just to identify a speaker. ' + JSON.stringify(speakers)] : [])].filter(Boolean).join('\n')
+        : scanned ? [material.instruction,
         'Translate the transcribed text of one scanned page. Keep its headings, lists, numbers and reading order. Use plain text and separate paragraphs with a blank line.'].filter(Boolean).join('\n')
         : pdfUnit ? [material.instruction,
         'Preserve the registered Markdown math and equation numbers in place. Copy inline $...$ and display $$ blocks with their LaTeX unchanged, and retain original-page references for uncertain formulas. Translate the surrounding prose.',
@@ -801,6 +849,12 @@ export class NormalTranslationService {
         ...(referenceContext ? { referenceContext, referenceContextCurrent: () => (this.ctx.get?.('translationReferences') as ReferenceFilesService).contextCurrent(referenceContext) } : {}) }
       const entry = this.direct.get(identity(request.target.mainSessionId, request.operationId))
       if (entry) {
+        if (entry.dispatch && imageBackground !== undefined) {
+          const inputDigest = await sourceSha256(new TextEncoder().encode(imageInputKey({
+            source: sourceText, backgroundDescription: imageBackground, ...(speakers ? { speakers } : {}),
+          })))
+          entry.batchRevision = { ...entry.dispatch, inputDigest }
+        }
         entry.callId = callId
         entry.translationSessionId = sessionId
         const namespaceId = this.topics.namespaceForAgent?.(request.target.mainSessionId)
@@ -846,7 +900,10 @@ export class NormalTranslationService {
             ' Then call translation_translate with the SAME target, a NEW operationId and ' + JSON.stringify({ contextResponse: { operationId: request.operationId, answerText: '...' } }) +
             '. Target language, frozen range/body and earlier question answers/background are inherited. Keep actual user wording in userRequirements and inferred answers as background. Question ranges are Unicode code points local to this call\'s source; add the outer range.start for a text-file location. Do not review partial output as a translation, poll, or replay this operation to continue.',
           log: { tool: 'translation_read_call_log', operationId: request.operationId, callId, start: 0 } }
-        if (entry) entry.question = structuredClone(view)
+        if (entry) {
+          entry.question = structuredClone(view)
+          if (imageBackground !== undefined) entry.imageSource = { source: sourceText, backgroundDescription: imageBackground, ...(speakers ? { speakers } : {}) }
+        }
         return view
       }
       const complete = terminal.reason === 'stop' && terminal.provider_state === 'finished' && terminal.completeness === 'complete' &&
@@ -904,10 +961,12 @@ export class NormalTranslationService {
     const scope = receipt && { mainSessionId: request.target.mainSessionId, translationSessionId: material.translationSessionId, unitId: receipt.unitId }
     const target: DirectUnitTarget | undefined = scope && (receipt?.sourceVersion === undefined
       ? { ...scope, kind: 'image_unit' } : { ...scope, kind: 'unit', sourceVersion: receipt.sourceVersion })
-    const assetReview = (material.sourceText === undefined || request.target.kind === 'image_unit') && status === 'completed' && receipt && target ? { assetReview: {
+    const assetReview = material.sourceText === undefined && status === 'completed' && receipt && target ? { assetReview: {
       tool: 'translation_submit_proposals' as const, target, revisionId: receipt.revisionId,
       nextStep: 'If review finds reusable candidates, read the asset_proposals guide. Submit for the latest completed reviewed revision.' } } : {}
-    const handoff = target ? { target, nextStep: DIRECT_REVIEW_NEXT_STEP } : {}
+    const handoff = target ? { target, nextStep: target.kind === 'image_unit'
+      ? IMAGE_RESULT_REVIEW_GUIDANCE
+      : DIRECT_REVIEW_NEXT_STEP } : {}
     const withText = { ...base, ...assetReview, ...handoff, text, truncated: false }
     if (new TextEncoder().encode(JSON.stringify(withText)).byteLength <= 60_000) return withText
     return { ...base, ...assetReview, ...handoff, textPreview: Array.from(text).slice(0, 4000).join(''), truncated: true,
@@ -922,13 +981,15 @@ export class NormalTranslationService {
     const receipt = value.receipt
     if (receipt.operationId !== request.operationId || receipt.mainSessionId !== request.target.mainSessionId ||
       receipt.translationSessionId !== envelope.material.translationSessionId || receipt.revisionId !== callId ||
+      (request.target.kind === 'image_unit' && receipt.unitId !== request.target.unitId) ||
       receipt.targetLanguage !== undefined && !languageMatches(receipt.targetLanguage, request.targetLanguage ?? envelope.material.targetLanguage) ||
       receipt.sourceVersion !== (request.target.kind === 'image_unit' ? undefined : envelope.material.sourceVersion)) throw rejected('invalid_reply', '译文提交回执身份不一致。', 'record_result')
     return receipt
   }
   private directCommitPayload(request: DirectTranslationRequest, envelope: Envelope, callId: string, status: DirectTranslationCommit['status'],
     text: string, message: string, metadata: TranslationCallMetadata, sourceText: string, range: DirectTranslationRange | undefined, bodyMode: boolean): DirectTranslationCommit {
-    return { envelope, operationId: request.operationId, userRequirements: request.userRequirements,
+    const batchRevision = this.direct.get(identity(request.target.mainSessionId, request.operationId))?.batchRevision
+    return { envelope, operationId: request.operationId, userRequirements: request.userRequirements, ...(batchRevision ? { batchRevision } : {}),
       ...(request.targetLanguage === undefined ? {} : { targetLanguage: request.targetLanguage }),
       organizedNotes: request.organizedNotes, auxiliaryContext: request.auxiliaryContext, termReferences: request.termReferences,
       revisionId: callId, status, text, message, callRecord: metadata,
@@ -1210,6 +1271,8 @@ export class NormalTranslationService {
         unitId: request.target.unitId }, { agent, callId: request.operationId, signal })
       if (value.kind !== 'unit' || value.unit.id !== request.target.unitId || value.unit.sourceVersion !== request.target.sourceVersion ||
         (request.target.kind === 'image_unit') !== (value.unit.backgroundDescription !== undefined)) return bad('stale_version', '原文版本已变化，请读取当前单元再重译。', 'resolve_unit')
+      const imageMemory = request.target.kind === 'image_unit'
+        ? await this.readImageMemory(request.target, { agent, callId: request.operationId, signal }) : undefined
       if (!this.topics.ownsConnection(request.target.mainSessionId, peerId)) return bad('scope_mismatch', '所属主会话连接已变化。', 'main_admission')
       const directive = uiLanguageDirective(request.uiLocale)
       this.topics.activateForMaterial(agent, request.fileName ? 'file' : 'short')
@@ -1217,14 +1280,14 @@ export class NormalTranslationService {
         translationTaskBoundary(agent, 'retranslate', { ...request.target, operationId: request.operationId, ...(request.fileName ? { fileName: request.fileName } : {}) }),
         'The user explicitly requests a new translation of this exact unit. Use the declared translation_translate directly without reloading direct, with the target and operationId below; wait for its actual complete result, review and deliver it in this turn. This is not an asynchronous acceptance/handoff. Do not call retired execution or file-job tools. The program reads the authoritative source and current Session model; do not change the editable draft.',
         'This is a full user-requested retranslation, not an automatic retry or a request to preserve every old wording. The previous translation is reference data. Read current applicable settings and query the relevant active terms, including disputed expressions. Do not copy earlier model-authored notes or obsolete interpretations as current user requirements. Use organizedNotes for your organization; userRequirements contains only actual current user wording, empty when none.',
-        ...(request.target.kind === 'image_unit' ? ['Use the image unit’s current editable text and background. Only revisit the original image if the user asks for a new reading or source correction.'] : []),
+        ...(request.target.kind === 'image_unit' ? [IMAGE_TRANSLATION_WORKFLOW, 'Use the image unit’s current editable text and background. Apply user-supplied source corrections without reopening the image.'] : []),
         SOURCE_LAYOUT_GUIDANCE,
         request.fileName ? `Original file: ${request.fileName}. Keep delivery in this file unit and its version entry. Briefly report completion in the main chat. Do not call translation_save_result, open a standalone copy or rewrite the same translation into another file unless the user explicitly requests a separate export.` : 'Deliver the reviewed translation in the translation Session and briefly report the outcome in the main chat. Save a file only when the user explicitly requests a separate export.',
         STYLE_SETTINGS_GUIDANCE,
         ...(request.fileName ? [FILE_MEMORY_REVIEW_GUIDANCE] : []),
-        DIRECT_REVIEW_NEXT_STEP,
+        ...(request.target.kind === 'image_unit' ? [] : [DIRECT_REVIEW_NEXT_STEP]),
         ...(request.fileName && /\.md$/iu.test(request.fileName) ? [MARKDOWN_REVIEW_GUIDANCE] : []),
-        JSON.stringify({ target: request.target, operationId: request.operationId, userRequirements: '', organizedNotes: '', termReferences: [] }),
+        JSON.stringify({ target: request.target, operationId: request.operationId, userRequirements: '', organizedNotes: '', ...(request.target.kind === 'image_unit' ? (imageMemory ? { topicId: imageMemory.topicId, imageMemory } : {}) : { termReferences: [] }) }),
         ...(directive ? [directive] : []),
       ].join('\n') }], source: { kind: 'translation-unit', form: 'notice', summary: '重译单元', plugin: 'dsh-translation-plugin', mainSessionId: request.target.mainSessionId,
         translationSessionId: request.target.translationSessionId, unitId: request.target.unitId, operationId: request.operationId,

@@ -9,6 +9,8 @@ export interface SessionSettings {
   /** Stored under this name for compatibility with existing plugin settings. */
   readonly defaultInstruction: string
   readonly maxInputChars: number
+  readonly showLineNumbers?: boolean
+  readonly autoPruneOldRevisions?: boolean
 }
 export interface ModelRoute {
   readonly provider: string
@@ -64,11 +66,14 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): boolean
 export function validateSessionSettings(value: unknown): readonly string[] {
   if (!record(value)) return ['设置格式无效。']
   const errors: string[] = []
-  if (!exact(value, ['schemaVersion', 'defaultMode', 'targetLanguage', 'defaultInstruction', 'maxInputChars']) || value.schemaVersion !== 2) errors.push('设置版本或字段无效。')
+  if (!exact(value, ['schemaVersion', 'defaultMode', 'targetLanguage', 'defaultInstruction', 'maxInputChars',
+    ...['showLineNumbers', 'autoPruneOldRevisions'].filter(key => Object.hasOwn(value, key))]) || value.schemaVersion !== 2) errors.push('设置版本或字段无效。')
   if (!mode(value.defaultMode)) errors.push('翻译模式无效。')
   if (!text(value.targetLanguage, 80, true)) errors.push('目标语言不能为空，且最多 80 个字符。')
   if (!text(value.defaultInstruction, 4000)) errors.push('翻译要求最多 4000 个字符。')
   if (!limit(value.maxInputChars)) errors.push('单次上限须为 1–200000 的整数。')
+  if (Object.hasOwn(value, 'showLineNumbers') && typeof value.showLineNumbers !== 'boolean') errors.push('行号显示设置无效。')
+  if (Object.hasOwn(value, 'autoPruneOldRevisions') && typeof value.autoPruneOldRevisions !== 'boolean') errors.push('旧译文清理设置无效。')
   return errors
 }
 

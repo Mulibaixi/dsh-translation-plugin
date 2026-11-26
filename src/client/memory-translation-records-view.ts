@@ -1,4 +1,4 @@
-import { SourceTextEditor } from './source-text-editor.js'
+import { SourceTextEditor, useHoldHistoryEdits } from './source-text-editor.js'
 import { ImageOriginalButton } from './image-unit-view.js'
 import { isEditableTextUnit, isFileJobUnit, isImageUnit, hasUnitBody } from './translation-history.js'
 import { h, react } from './react.js'
@@ -50,6 +50,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
   const [expanded, setExpanded] = react.useState(() => new Set<string>())
   const [sourceEditKey, setSourceEditKey] = react.useState<string | undefined>(undefined)
   const [drafts, setDrafts] = react.useState(() => new Map<string, EditDraft>())
+  useHoldHistoryEdits(store, Array.from(drafts.keys(), key => (JSON.parse(key) as [string, string])[0]))
   const [message, setMessage] = react.useState<string | undefined>(undefined)
   const [query, setQuery] = react.useState(''), [searchRetry, setSearchRetry] = react.useState(0)
   const [search, setSearch] = react.useState<{ readonly key: string; readonly bodies: readonly RecordSearchBody[]; readonly result: RecordSearchResult } | undefined>(undefined)
@@ -230,6 +231,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
           const sourceBlocked = sourceEditable ? normal?.sourceEditBlockedReason(session.id, unit.id) : undefined
           const target = { ownerId: store.getTopicStorageScope(session.topicId)!, topicId, sessionId: session.id, unitId: unit.id, side: 'source' as const, revisionId: null }
           function startEditing(revision: TextRevision): void {
+            if (quick.manualEditBlockedReason(session.id, unit.id, revision.id)) return
             setDrafts(current => {
               const existing = current.get(key)
               if (existing) return current
@@ -311,7 +313,7 @@ export function MemoryTranslationRecordsView({ store, quick, objects, objectAsse
                     sourceEditable && normal ? h('button', { type: 'button', 'aria-label': '编辑原文', disabled: !!sourceBlocked || sourceEditKey === key,
                       title: sourceBlocked, onClick: () => setSourceEditKey(key) }, '编辑') : null,
                     h(SourceOpenLink, { unit, session, objects, viewFiles, visible, navigationRevision }))),
-                sourceEditable && normal && sourceEditKey === key ? h(SourceTextEditor, { unit, session, normal,
+                sourceEditable && normal && sourceEditKey === key ? h(SourceTextEditor, { unit, session, store, normal,
                   executionOwner: mainSessionId && store.isSessionOpen(mainSessionId, session.id) ? mainSessionId : undefined, close: () => setSourceEditKey(undefined) }) :
                   h(RecordObjectText, { text: unit.source, target, objects, objectAssets, renderText: highlight(session.id, unit.id, 'source') }),
                 open && unit.sourceVersions.length > 1 ? h('div', null, ...unit.sourceVersions.slice(0, -1).map(source => h('section', { key: source.version },

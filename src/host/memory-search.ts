@@ -349,12 +349,12 @@ export class MemorySearchService {
       if (topicId === scope.topicId && sourceIds.has(sourceId!)) seat.vectors.delete(id)
     }
   }
-  async search(namespaceId: string, topicId: string, query: string, peer: string, signal: AbortSignal, sessionIds: readonly string[] = [], targetLanguage?: string) {
-    const report = diagnosticSpan(this.ctx, 'memory.search', { queryCodePoints: Array.from(query).length, openedSessions: sessionIds.length }, topicId)
+  async search(namespaceId: string, topicId: string, query: string, peer: string, signal: AbortSignal, targetLanguage?: string) {
+    const report = diagnosticSpan(this.ctx, 'memory.search', { queryCodePoints: Array.from(query).length }, topicId)
     this.searches++
     try {
       const seat = await this.seat(namespaceId, peer)
-      let collection = await this.collect(namespaceId, peer, signal, topicId, sessionIds), queryVector: readonly number[] | undefined, reason: string | undefined, space = ''
+      let collection = await this.collect(namespaceId, peer, signal, topicId), queryVector: readonly number[] | undefined, reason: string | undefined, space = ''
       try {
         const config = await this.embedding.configuration()
         if (config && seat.enabled) {
@@ -368,7 +368,7 @@ export class MemorySearchService {
           if (!current || current.revision !== config.revision) { queryVector = undefined; reason = '嵌入配置已变化，本次仅使用词面匹配。' }
         } else reason = '尚未建立记忆索引，本次仅使用词面匹配。'
       } catch (error) { report('degraded', { fallback: 'keyword' }, error); signal.throwIfAborted(); queryVector = undefined; reason = '语义服务暂不可用，本次仅使用词面匹配；仍可按引用读取。' }
-      collection = await this.collect(namespaceId, peer, signal, topicId, sessionIds); this.check(namespaceId, peer)
+      collection = await this.collect(namespaceId, peer, signal, topicId); this.check(namespaceId, peer)
       const words = [...new Set(query.toLowerCase().trim().split(/\s+/u))]
       const keyword = collection.chunks.map(row => ({ row, score: words.reduce((sum, word) => sum + ((row.keywordText ?? row.text).toLowerCase().includes(word) ? 1 : 0), 0) })).filter(item => item.score > 0).sort((a, b) => b.score - a.score)
       let dimensionsChanged = false
@@ -406,8 +406,8 @@ export class MemorySearchService {
     if (seat) for (const id of seat.vectors.keys()) if ((JSON.parse(id) as string[])[0] === topicId) seat.vectors.delete(id)
     this.contentChanged()
   }
-  async verify(namespaceId: string, topicId: string, peer: string, matches: readonly { readonly ref: Chunk['ref']; readonly excerpt: string }[], signal: AbortSignal, sessionIds: readonly string[] = []): Promise<boolean> {
-    const current = await this.collect(namespaceId, peer, signal, topicId, sessionIds)
+  async verify(namespaceId: string, topicId: string, peer: string, matches: readonly { readonly ref: Chunk['ref']; readonly excerpt: string }[], signal: AbortSignal): Promise<boolean> {
+    const current = await this.collect(namespaceId, peer, signal, topicId)
     return matches.every(match => current.chunks.some(row => JSON.stringify(row.ref) === JSON.stringify(match.ref) && row.text === match.excerpt))
   }
   hasActiveJobs(): boolean { return this.searches > 0 || this.recordJobs.size > 0 || [...this.seats.values()].some(seat => !!seat.job) }

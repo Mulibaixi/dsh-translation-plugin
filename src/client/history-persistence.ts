@@ -1,6 +1,6 @@
 import { HistorySessionTransport, type HistoryTransferReceipt } from './history-transport.js'
 import { encodeHistoryBundle, encodeLegacySessionSnapshot, parseHistoryBundle, type HistoryBundle, type HistoryScope } from '../shared/history-bundle.js'
-import type { HistoryRemoteClientPort, HistoryMutation } from '../shared/history-remote.js'
+import type { HistoryRemoteClientPort, HistoryMutation, PruneTextRevisions } from '../shared/history-remote.js'
 import type { LocalSession } from './sessions.js'
 import type { TranslationHistory } from './translation-history.js'
 import { fileJobsSessionPrefix } from '../shared/file-job-record.js'
@@ -15,6 +15,7 @@ export interface SessionHistoryBackend {
   snapshot(id: string): string | null
   save(session: LocalSession, history: TranslationHistory): Promise<HistoryTransferReceipt>
   mutate(session: LocalSession, history: TranslationHistory, command: HistoryMutation['command'], operationId: string): Promise<HistoryTransferReceipt>
+  pruneOldRevisions(session: LocalSession, command: PruneTextRevisions, operationId: string): Promise<HistoryTransferReceipt | undefined>
   retire(session: LocalSession, history: TranslationHistory, operationId: string): Promise<import('../shared/history-cleanup.js').HistoryCleanupResult | undefined>
   reload(session: LocalSession): Promise<HistoryTransferReceipt>
   search(session: LocalSession, unitId: string, side: 'source' | 'translation', query: string, start: number, signal: AbortSignal): Promise<import('../shared/history-remote.js').HistoryTextMatches>
@@ -117,6 +118,22 @@ export class HistoryPersistenceClient implements SessionHistoryBackend {
     if (result.status !== 'updated') throw new Error(result.reason ?? '会话已变化，请重新读取后删除。')
     const receipt = { ...await this.transport.load(this.scope(session)), ...(result.resourceCleanup ? { resourceCleanup: result.resourceCleanup } : {}) }; this.check(); this.seats.set(session.id, receipt)
     this.restoreRecords(session.id)
+    return receipt
+  }
+  async pruneOldRevisions(session: LocalSession, command: PruneTextRevisions, operationId: string): Promise<HistoryTransferReceipt | undefined> {
+    const scope = this.scope(session), token = this.seats.get(session.id)?.state.token
+    if (!token) return
+    let receipt: HistoryTransferReceipt
+    try {
+      const result = await this.transport.mutate({ ...scope, token, command, operationId })
+      if (result.status !== 'updated' || result.state.token === token) return
+      receipt = await this.transport.load(scope)
+    } catch {
+      // A lost reply can follow a committed transaction. Reread instead of repeating a cleanup.
+      receipt = await this.transport.load(scope)
+      if (!receipt.current?.history.events.some(event => event.reason === 'retention' && event.id.startsWith(`${operationId}:`))) return
+    }
+    this.check(); this.seats.set(session.id, receipt)
     return receipt
   }
   async reload(session: LocalSession): Promise<HistoryTransferReceipt> {

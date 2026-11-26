@@ -517,7 +517,7 @@ export class FileJobsClient implements TranslationEvidenceReader {
         visiting.delete(id); visited.add(id); ordered.push(proposal)
       }
       for (const id of selected) visit(id)
-      const approvals = { ...(reviewed ?? this.proposalReviews(initial)) }
+      const approvals = reviewed ?? this.proposalReviews(initial)
       let adopted = 0, failed = 0
       for (const proposal of ordered) {
         await this.assets.terms.refresh(initial.summary.mainSessionId, initial.summary.topicId)
@@ -561,13 +561,6 @@ export class FileJobsClient implements TranslationEvidenceReader {
             if (semantic.kind === 'entity' && existing?.kind === 'entity') semantic.aliases = [...new Set([...existing.aliases, ...(existing.name === semantic.name ? [] : [existing.name]), ...semantic.aliases])].filter(name => name !== semantic.name)
             const input: TopicArchivePut = { ...semantic, id: assetId, expectedEntryVersion: review.kind === 'update' ? review.entry.version : null, evidence, origin: proposal.origin, status: 'proposal' }
             const result = await this.assets.archive.apply(record.summary.mainSessionId, record.summary.topicId, snapshot.version, { kind: review.kind === 'update' ? 'revise_file_proposal' : 'accept_file_proposal', input, acceptance })
-            // Updating an entity may mark dependent entries for review. Keep this action's
-            // approvals only for that status-only cascade, never for concurrent content edits.
-            if (result.status === 'updated') for (const [id, approval] of Object.entries(approvals)) if (approval.kind === 'update') {
-              const before = snapshot.entries.find(entry => entry.id === approval.entry.id), after = result.snapshot.entries.find(entry => entry.id === approval.entry.id)
-              if (before && after && before.id !== assetId && before.version === approval.entry.version && after.version === before.version + 1 && after.status === 'review_required' &&
-                same({ ...before, status: null, version: null, updatedAt: null }, { ...after, status: null, version: null, updatedAt: null })) approvals[id] = { kind: 'update', entry: after }
-            }
             status = result.status; active = result.entry?.status === 'active' && !['error', 'conflict'].includes(this.assets.archive.getStatus(record.summary.mainSessionId, record.summary.topicId))
           } catch (cause) { status = cause instanceof Error ? cause.message : '依赖实体不可用' }
         }

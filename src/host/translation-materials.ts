@@ -1,9 +1,11 @@
 import { TranslationMaterialStore } from '../memory/translation-material-store.js'
 import { translationTaskBoundary } from '../shared/translation-task.js'
-import { FILE_MEMORY_REVIEW_GUIDANCE, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
+import { FILE_MEMORY_REVIEW_GUIDANCE, IMAGE_TRANSLATION_WORKFLOW, MARKDOWN_REVIEW_GUIDANCE } from '../shared/translation-review.js'
 import { diagnosticSpan } from '../shared/diagnostics.js'
 import { historyTargetMatches } from './history-resources.js'
 import type { HistoryScope } from '../shared/history-bundle.js'
+import { batchNotice, batchNoticeSource, batchTurns } from './batch-notices.js'
+import type { BatchProcessingService } from './batch-processing.js'
 import { TRANSLATION_MATERIAL_REMOTE, type TranslationMaterialCapability, type TranslationMaterialFinish,
   type TranslationMaterialQuery, type TranslationMaterialReceipt, type TranslationMaterialResult, type TranslationMaterialStage, type TranslationMaterialWorkflow } from '../shared/translation-material-remote.js'
 import { parseTranslationMaterialEnvelope, type TranslationMaterialEnvelope, type TranslationMaterialScope } from '../shared/translation-material.js'
@@ -14,10 +16,11 @@ import { hostLlmLoader, type DshExecutionContext } from './dsh-text-adapter.js'
 import { uiLanguageDirective } from './ui-language.js'
 import type { TranslationSourceScope } from '../shared/translation-sources.js'
 import type { TranslationSourcesService } from './translation-sources.js'
-import type { MainAgent as ToolAgent } from './topic-tools.js'
+import type { MainAgent as ToolAgent, TopicToolsService, ToolExecution } from './topic-tools.js'
+import type { NormalTranslationService } from './normal-translation.js'
 import { MATERIAL_TOOL_GROUPS, type TranslationToolGroup } from './on-demand-tools.js'
 import type { FileJobsService } from './file-jobs.js'
-import type { ImageUnitTarget } from '../shared/image-translation.js'
+import type { ImageRecognition, ImageSpeaker, ImageTranslationMemory, ImageUnitTarget } from '../shared/image-translation.js'
 import { isPdfFile, PDF_OBJECT_REFERENCE_GUIDANCE } from '../shared/pdf-source.js'
 import { PDF_SPLIT_QUESTION_GUIDANCE } from './pdf-user-decision.js'
 
@@ -27,10 +30,10 @@ interface Message {
   readonly source: { readonly kind: string; readonly rpcId?: string; readonly requestId?: string }
   readonly content: readonly unknown[]
 }
-interface MainAgent {
+interface MainAgent extends ToolAgent {
   readonly id: string
   readonly session: { readonly id: string; snapshotEvents?(): readonly unknown[] }
-  readonly inbox: { readonly nextTurn: readonly Message[]; readonly nextStep: readonly Message[] }
+  readonly inbox: { readonly nextTurn: readonly Message[]; readonly nextStep: readonly Message[]; remove?(messageId: string): boolean }
   followup(message: Message): void
   steer?(message: Message): void
   whenIdle?(): Promise<void>
@@ -50,6 +53,7 @@ export interface TranslationMaterialHostContext extends DshExecutionContext {
 interface Connections {
   ownsConnection(ownerId: string, peerId: string): boolean
   activateForMaterial?(agent: Pick<ToolAgent, 'id' | 'session'>, kind: keyof typeof MATERIAL_TOOL_GROUPS): void
+  recognizeImage?: TopicToolsService['recognizeImage']
 }
 type AgentResolution = { readonly agent: MainAgent } | { readonly error: unknown }
 interface Controller { resolveAgent(id: string): Promise<AgentResolution> }
@@ -62,6 +66,7 @@ interface Submission {
   stage: Exclude<TranslationMaterialStage, 'released'>
   mainMessageId?: string
   direct?: Promise<TranslationMaterialResult<TranslationMaterialReceipt>>
+  imageRead?: AbortController
 }
 function ok<T>(value: T): TranslationMaterialResult<T> { return { ok: true, value: structuredClone(value) } }
 function bad<T>(code: string, message: string, stage: string): TranslationMaterialResult<T> { return { ok: false, error: { code, message, stage } } }
@@ -69,8 +74,28 @@ function key(scope: Pick<TranslationMaterialScope, 'mainSessionId' | 'requestId'
 function materialToolKind(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): keyof typeof MATERIAL_TOOL_GROUPS {
   const source = envelope.material.sourceRef
   if (!source) return 'short'
-  return isPdfFile(source.name) ? 'pdf' : 'file'
+  return imageFileFormat(source.name) ? 'short' : isPdfFile(source.name) ? 'pdf' : 'file'
 }
+function imageMaterial(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): boolean {
+  return envelope.material.sourceRef?.encoding === 'binary' && !!imageFileFormat(envelope.material.sourceRef.name)
+}
+function messageText(message: { readonly content: readonly unknown[] }): string {
+  return (message.content ?? []).flatMap(part => {
+    const block = part as { type?: string; text?: string }
+    return block?.type === 'text' && typeof block.text === 'string' ? [block.text] : []
+  }).join('\n')
+}
+const BATCH_QUEUE_WAKE = 'translation-batch-queue-wake'
+const IMAGE_TRANSLATION_GUIDANCE = 'Work from the saved whole-image text. Use neutral wording for uncertain speakers. Translate and review only the recorded text. Mention significant omissions briefly outside the translation.'
+interface PreparedImage extends ImageRecognition {
+  readonly sourcePreview?: string
+  readonly speakers?: readonly ImageSpeaker[]
+}
+
+function preparedImage(recognition: ImageRecognition, source: string, speakers?: readonly ImageSpeaker[]): PreparedImage {
+  return { ...recognition, ...(sourceCodePointLength(source) <= 4000 ? { sourcePreview: source, ...(speakers ? { speakers } : {}) } : {}) }
+}
+
 function materialBeforeUser(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>): boolean {
   const source = envelope.material.sourceRef
   return !source || source.encoding === 'utf-8' && /\.txt$/iu.test(source.name)
@@ -281,6 +306,7 @@ export class TranslationMaterialsService {
     const { start, end } = request.range
     if (end - start > MAX_TRANSLATION_SOURCE_PAGE_CODE_POINTS) return bad('page_too_large', '原文分页每次最多读取 4000 个 Unicode 码点，未截断。', 'read_source')
     const material = delivered.value.material
+    if (imageMaterial(delivered.value)) return bad('unsupported_file', '请通过图片单元读取已保存的识读原文。', 'read_source')
     if (material.sourceRef !== undefined && material.sourceRef.encoding !== 'utf-8') return bad('unsupported_file', '此原稿是二进制文件，不能按文本范围读取；请直接读取缓存原件。', 'read_source')
     const totalCodePoints = material.sourceRef !== undefined ? material.sourceRef.totalCodePoints : sourceCodePointLength(material.sourceText)
     // A model that asks for the documented maximum on a short source reads the whole source instead
@@ -410,29 +436,126 @@ export class TranslationMaterialsService {
     if (record.stage !== 'attached') record.stage = 'submitted'
     return ok(this.receipt(record))
   }
-  async runBatchImage(item: { readonly target: ImageUnitTarget; readonly operationId: string; readonly path: string | undefined;
-    readonly name: string; readonly position: number; readonly total: number; readonly requirements: string }, peer: string, signal: AbortSignal): Promise<void> {
+  private async prepareImage(target: ImageUnitTarget, name: string, requirements: string, image: (sha256: string) => Uint8Array | Promise<Uint8Array>,
+    exec: { agent: MainAgent; callId: string; signal: AbortSignal }, peer: string, isCurrent = () => true): Promise<PreparedImage> {
+    const normal = this.ctx.get?.('translationNormal') as NormalTranslationService
+    const connection = this.connections()
+    const current = () => !this.disposed && !exec.signal.aborted && isCurrent() && !!connection?.ownsConnection(target.mainSessionId, peer)
+    if (!current()) throw new Error('图片提交或连接已失效。')
+    const before = await normal.readImageUnit(target, exec)
+    if (before.recognition?.requirements === requirements) return preparedImage(before.recognition, before.source, before.speakers)
+    if (before.source.trim() && !before.recognition) return preparedImage({ status: 'text', requirements }, before.source, before.speakers)
+    if (!connection?.recognizeImage || !current()) throw new Error('宿主识图子代理不可用或图片提交已失效。')
+    const recognized = await connection.recognizeImage(name, await image(before.original.sha256), requirements, exec)
+    if (!current()) throw new Error('图片提交或连接已失效。')
+    const latest = await normal.readImageUnit(target, exec)
+    if (!current() || JSON.stringify(latest.original) !== JSON.stringify(before.original)) throw new Error('识读期间图片原稿或连接已变化。')
+    if (latest.inputId !== before.inputId) {
+      if (latest.source.trim()) return preparedImage(latest.recognition ?? { status: 'text', requirements }, latest.source, latest.speakers)
+      throw new Error('识读期间原文已更新，请核对当前内容。')
+    }
+    const recognition: ImageRecognition = { status: recognized.sourceText ? 'text' : 'empty', requirements,
+      ...(recognized.unclear ? { unclear: recognized.unclear } : {}) }
+    await normal.updateImageUnit({ target, operationId: 'image-recognition:' + crypto.randomUUID(), expectedInputId: before.inputId,
+      sourceText: recognized.sourceText, backgroundDescription: recognized.backgroundDescription, speakers: recognized.speakers, recognition }, exec, true)
+    return preparedImage(recognition, recognized.sourceText, recognized.speakers)
+  }
+
+  /** DSH retains old inbox entries on cancellation but needs a fresh wake to process them. */
+  async wakeBatchQueue(agent: ToolAgent): Promise<void> {
+    const actual = (this.ctx.get?.('agents') as { get(id: string): MainAgent | undefined } | undefined)?.get(agent.id)
+    if (actual !== agent || !actual.inbox.nextTurn.length) return
+    const messages = await this.messages()
+    if (this.disposed || !actual.inbox.nextTurn.length) return
+    const wake = messages.createUserMessage({ source: { kind: BATCH_QUEUE_WAKE }, content: [] })
+    actual.followup(wake)
+    // The wake is now latched. Only remove our own marker; ordinary entries keep their IDs and order.
+    actual.inbox.remove?.(wake.id)
+  }
+
+  private async waitForNotice(agent: MainAgent, message: Message, signal: AbortSignal, enqueue: boolean): Promise<string | undefined> {
+    const conclusion = () => batchTurns(agent).find(turn => turn.messages.some(item => item.id === message.id))?.end
+    let finish!: (reason: string | undefined) => void
+    const done = new Promise<string | undefined>(resolve => { finish = resolve })
+    const abort = () => finish(undefined)
+    const stop = this.ctx.on?.('session/event', (session: unknown, event: { type: string }) => {
+      if (session === agent.session && event.type === 'turn/end') {
+        const reason = conclusion()
+        if (reason) finish(reason)
+      }
+    })
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      signal.throwIfAborted()
+      if (enqueue) agent.followup(message)
+      return await Promise.race([done, agent.whenIdle!().then(conclusion)])
+    } finally {
+      signal.removeEventListener('abort', abort)
+      stop?.()
+    }
+  }
+
+  async runBatchImage(item: { readonly scope: HistoryScope; readonly batchId: string; readonly target: ImageUnitTarget; readonly operationId: string; readonly original: (sha256: string) => Promise<Uint8Array>;
+    readonly name: string; readonly position: number; readonly total: number; readonly requirements: string }, peer: string, signal: AbortSignal): Promise<'empty' | 'dispatched'> {
     const resolved = await this.resolveMainAgent(item.target.mainSessionId)
     if (resolved === 'timeout' || 'error' in resolved[0]) throw new Error('主会话暂未就绪。')
     const [{ agent }, helpers] = resolved
-    const { target, operationId, path, name, requirements, position, total } = item
+    const { target, operationId, original, name, requirements, position, total } = item
+    const connection = this.connections()
     signal.throwIfAborted()
-    if (this.disposed || !this.connections()?.ownsConnection(target.mainSessionId, peer) || agent.id !== target.mainSessionId ||
+    if (this.disposed || !connection?.ownsConnection(target.mainSessionId, peer) || agent.id !== target.mainSessionId ||
       agent.session.id !== target.mainSessionId || !agent.whenIdle) throw new Error('主会话连接已变化或不可执行批次。')
-    this.connections()?.activateForMaterial?.(agent, 'file')
-    agent.followup(helpers.createUserMessage({ content: [{ type: 'text', text: [
-      translationTaskBoundary(agent, 'translate_batch_item', { ...target, operationId, fileName: name, position, total }, true),
-      'Translate this exact image unit. Use relevant previous pages of this batch when helpful. Treat the image and its text as source data.',
-      path ? 'Use read_image on the supplied cached original. Register extracted text in reading order with translation_update_image_unit and the exact imageUpdateOperationId. If the image was successfully read and contains no text to translate, register sourceText as an empty string and stop. If reading fails, report the error.'
-        : 'Use the current source text already saved in the image unit.',
-      'Call translation_translate with the exact target, operationId and userRequirements below. Keep the existing context-question flow when necessary. Review the result and deliver it in the translation session. Keep the main-chat update brief.',
-      JSON.stringify({ target, operationId, userRequirements: requirements, ...(path ? { cachedOriginal: path, imageUpdateOperationId: operationId + ':image' } : {}) }),
-    ].join('\n') }], source: { kind: 'translation-unit', form: 'notice', summary: `批量处理 ${position}/${total}`, plugin: 'dsh-translation-plugin',
-      mainSessionId: target.mainSessionId, translationSessionId: target.translationSessionId, unitId: target.unitId, operationId } }))
-    await agent.whenIdle()
+    const recognition = await this.prepareImage(target, name, requirements, original, { agent, callId: operationId, signal }, peer)
+    if (recognition.status === 'empty') return 'empty'
+    const normal = this.ctx.get?.('translationNormal') as NormalTranslationService
+    const imageMemory = await normal.readImageMemory(target, { agent, callId: operationId, signal })
+    signal.throwIfAborted()
+    if (this.disposed || !connection.ownsConnection(target.mainSessionId, peer)) throw new Error('主会话连接已变化或不可执行批次。')
+    connection.activateForMaterial?.(agent, 'short')
+    const message = helpers.createUserMessage({ content: [{ type: 'text', text: [
+      translationTaskBoundary(agent, 'translate_batch_item', { ...target, fileName: name, position, total }, true),
+      IMAGE_TRANSLATION_GUIDANCE,
+      IMAGE_TRANSLATION_WORKFLOW,
+      'If a correction invalidates a question, read the new input and start a fresh translation in this turn. If the page clarifies an earlier unit, correct that unit using its usual tools. Preserve user-fixed selections. Give a brief report and end the turn.',
+      JSON.stringify({ target, topicId: item.scope.topicId, userRequirements: requirements, ...(imageMemory ? { imageMemory } : {}), ...(recognition.sourcePreview ? { sourcePreview: recognition.sourcePreview, speakers: recognition.speakers } : {}), ...(recognition.unclear ? { unclearTranscription: recognition.unclear } : {}) }),
+    ].join('\n') }], source: { ...batchNoticeSource(item.scope, target.mainSessionId, item.batchId, operationId, target.unitId),
+      form: 'notice', summary: '批量处理 ' + position + '/' + total } })
+    await this.waitForNotice(agent, message, signal, true)
+    return 'dispatched'
+  }
+
+  async runBatchReview(review: { readonly scope: HistoryScope; readonly batchId: string; readonly mainSessionId: string; readonly translationSessionId: string;
+    readonly requirements: string; readonly targets: readonly { unitId: string; unitNumber: number; position: number }[];
+    readonly skipped: readonly number[]; readonly empty: readonly number[] }, peer: string, signal: AbortSignal, canDispatch: () => boolean): Promise<boolean> {
+    const resolved = await this.resolveMainAgent(review.mainSessionId)
+    signal.throwIfAborted()
+    if (!canDispatch()) return false
+    if (resolved === 'timeout' || 'error' in resolved[0]) throw new Error('主会话暂未就绪，整体审查待继续。')
+    const [{ agent }, helpers] = resolved, connection = this.connections()
+    if (this.disposed || !connection?.ownsConnection(review.mainSessionId, peer) || agent.id !== review.mainSessionId ||
+      agent.session.id !== review.mainSessionId || !agent.whenIdle || !agent.session.snapshotEvents) throw new Error('主会话连接已变化或不可执行整体审查。')
+    const { batchId, mainSessionId, translationSessionId, requirements, targets, skipped, empty } = review
+    if (batchTurns(agent).some(turn => turn.end === 'completed' &&
+      turn.messages.some(message => batchNotice(message.source, mainSessionId)?.operationId === batchId))) return true
+    const message = helpers.createUserMessage({ content: [{ type: 'text', text: [
+      translationTaskBoundary(agent, 'review_image_batch', { batchId, mainSessionId, translationSessionId }, true),
+      'Review the effective translations of these exact batch image units once, in the given position order. Read their source and translation with translation_read_units using the given unit numbers and verify every returned target against its unit ID. Review continuity, tone, names, omissions, and repetition across pages. Keep speaker claims limited to already confirmed evidence.',
+      'Review the saved text only. Keep unconfirmed speakers anonymous or omit the subject.',
+      'Make only evidenced corrections. Check applicable topic terms and established character names when wording needs correction. Use translation_translate with the exact image target, a fresh operationId, the actual user requirements, relevant termReferences and referenceContextRef, and focused correction instructions in organizedNotes. Preserve unaffected text and any human-fixed final selection. Do not re-extract, translate new pages, or retry a rejected correction in a loop.',
+      'Conclude with one brief report of actual corrections, unresolved issues, and any skipped pages or pages without translatable text. Keep the revised text in the translation Session.',
+      JSON.stringify({ translationSessionId, userRequirements: requirements, targets, skipped, empty }),
+    ].join('\n') }], source: { ...batchNoticeSource(review.scope, mainSessionId, batchId, batchId), form: 'notice', summary: '批量译文整体审查' } })
+    connection.activateForMaterial?.(agent, 'short')
+    const queued = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].find(item =>
+      batchNotice(item.source, mainSessionId)?.operationId === batchId)
+    const reason = await this.waitForNotice(agent, queued ?? message, signal, !queued)
+    signal.throwIfAborted()
+    if (reason === 'completed') return true
+    throw new Error('整体审查未完成，可继续审查已保存的译文。')
   }
 
   private materialMessage(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>, helpers: Messages, direct = false, agent?: MainAgent): Message {
+    if (imageMaterial(envelope)) return this.imageMaterialMessage(envelope, helpers, agent)
     if (envelope.material.sourceRef) return this.fileMaterialMessage(envelope, helpers, direct, agent)
     const { sourceText, ...configuration } = envelope.material
     const total = sourceCodePointLength(sourceText), paged = total > INLINE_TRANSLATION_SOURCE_CODE_POINTS
@@ -453,6 +576,28 @@ export class TranslationMaterialsService {
       topicId: envelope.material.topicId, translationSessionId: envelope.material.translationSessionId,
       materialId: envelope.material.materialId, sourceVersion: envelope.material.sourceVersion, draftVersion: envelope.material.draftVersion } })
   }
+  private imageMaterialMessage(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>, helpers: Messages, agent?: MainAgent,
+    result?: PreparedImage | { error: string }, accompanying = false, imageMemory?: ImageTranslationMemory): Message {
+    const { material, mainSessionId, operationId, requestId } = envelope
+    const target: ImageUnitTarget = { kind: 'image_unit', mainSessionId, translationSessionId: material.translationSessionId, unitId: 'unit:' + material.materialId }
+    const instructions = !result ? ['Image material is queued for recognition.'] : 'error' in result
+      ? ['Image recognition did not complete. Report the issue briefly. The user can resubmit the image or provide source text.', result.error]
+      : result.status === 'empty' ? ['The child confirmed that the requested scope has no translatable text. Report this.']
+        : [IMAGE_TRANSLATION_WORKFLOW]
+    const transcribed = result && 'status' in result ? result : undefined
+    return helpers.createUserMessage({ content: [{ type: 'text', text: [
+      translationTaskBoundary(agent ?? { session: { id: mainSessionId } }, accompanying ? 'submitted_material' : 'translate_image', { ...target, fileName: material.sourceRef?.name }, true),
+      IMAGE_TRANSLATION_GUIDANCE, ...instructions,
+      JSON.stringify({ target, topicId: material.topicId, translationInstruction: material.instruction, targetLanguage: material.targetLanguage,
+        ...(imageMemory ? { imageMemory } : {}),
+        ...(transcribed?.sourcePreview ? { sourcePreview: transcribed.sourcePreview, speakers: transcribed.speakers } : {}),
+        ...(transcribed?.unclear ? { unclearTranscription: transcribed.unclear } : {}) }),
+      uiLanguageDirective(envelope.uiLocale),
+    ].filter(Boolean).join('\n') }], source: { kind: 'translation-material', form: 'notice', summary: '待译图片', plugin: 'dsh-translation-plugin',
+      mainSessionId, requestId, operationId, topicId: material.topicId, translationSessionId: material.translationSessionId,
+      materialId: material.materialId, sourceVersion: material.sourceVersion, draftVersion: material.draftVersion } })
+  }
+
   private fileMaterialMessage(envelope: Extract<TranslationMaterialEnvelope, { kind: 'material' }>, helpers: Messages, direct = false, agent?: MainAgent): Message {
     const { sourceText: _sourceText, ...configuration } = envelope.material
     const target: NormalTranslationMaterialTarget = { kind: 'material', mainSessionId: envelope.mainSessionId, requestId: envelope.requestId,
@@ -460,20 +605,13 @@ export class TranslationMaterialsService {
     const source = envelope.material.sourceRef!
     const beforeUser = !direct && materialBeforeUser(envelope)
     const path = this.sources()?.cachedOriginalPath(source)
-    const image = source.encoding === 'binary' && imageFileFormat(source.name)
     const nativeText = source.encoding === 'utf-8' && /\.(?:txt|md)$/iu.test(source.name)
-    const imageTarget = { kind: 'image_unit', mainSessionId: envelope.mainSessionId, translationSessionId: envelope.material.translationSessionId, unitId: `unit:${envelope.material.materialId}` }
     return helpers.createUserMessage({ content: [{ type: 'text', text: [
       translationTaskBoundary(agent ?? { session: { id: envelope.mainSessionId } }, direct ? 'translate_material' : 'submitted_material', { ...target, topicId: envelope.material.topicId,
         translationSessionId: envelope.material.translationSessionId, deliveryOperationId: envelope.operationId, fileName: source.name }, beforeUser ? 'before_user' : true),
       `File: ${source.name} (${source.bytes} bytes; ${source.encoding === 'binary' ? 'binary, cached byte-for-byte' : `${source.totalCodePoints} code points of UTF-8 text`}).`,
       path ? `Cached original: ${path}` : 'Cached original: no readable cache path in this session; use the material reference.',
-      ...(image ? [
-        'When the user requests translation, use read_image on the cached original and extract the text in a sensible reading order. Put only the text to translate in sourceText. Use backgroundDescription only for short, clearly visible details useful for translation.',
-        'Call translation_update_image_unit with the image target below and a fresh operationId. Then call translation_translate with the same image target and a fresh operationId. The program reads the current text and background. Use the Session model and target language, and pass the actual user requirements verbatim.',
-        'Deliver reviewed translated text in the same image unit. If the image cannot be read, report the issue and leave the original available.',
-        JSON.stringify({ target: imageTarget, fileName: source.name, ...(path ? { cachePath: path } : {}) }),
-      ] : source.pdf?.kind === 'image' ? [
+      ...(source.pdf?.kind === 'image' ? [
         'This PDF contains scanned images. Check translation_pdf_status for the page count, saved cursor and pending page units. Use the full range unless the user asks for specific pages.',
         'Use translation_translate_scanned_pdf with the actual user requirements and resolved target language. The Host reads one page at a time in an isolated native child and translates it in the Session model. A page with no translatable text keeps its original image. For a needs_context result, use translation_translate with a fresh operationId and the returned question before resuming this PDF.',
         'Keep progress receipts internal. Stop on a failed page or unavailable bridge and report the original page number. Resume from the recorded cursor after a connection is restored.',
@@ -517,8 +655,19 @@ export class TranslationMaterialsService {
   private async preStep(event: PreStep, next: () => Promise<StepDecision>): Promise<StepDecision> {
     let decision = await next()
     if (decision.kind === 'reject' || this.disposed || event.signal.aborted || event.agent.id !== event.agent.session.id) return decision
-    decision = { ...decision, messages: decision.messages.filter(message => message.source.kind !== 'translation-material' ||
-      !message.source.requestId || !this.revoked.has(key({ mainSessionId: event.agent.id, requestId: message.source.requestId }))) }
+    decision = { ...decision, messages: decision.messages.filter(message => message.source.kind !== BATCH_QUEUE_WAKE &&
+      (message.source.kind !== 'translation-material' || !message.source.requestId ||
+        !this.revoked.has(key({ mainSessionId: event.agent.id, requestId: message.source.requestId })))) }
+    const batches = this.ctx.get?.('translationBatchProcessing') as BatchProcessingService | undefined
+    if (batches) {
+      batches.recordNoticeStep(event.agent, decision.messages)
+      const admitted: Message[] = []
+      for (const message of decision.messages) {
+        const source = batchNotice(message.source, event.agent.id)
+        if (!source || await batches.admitNotice(source)) admitted.push(message)
+      }
+      decision = { ...decision, messages: admitted }
+    }
     const additions = new Map<string, readonly Message[]>(), claimed = new Set<Submission>()
     for (const message of decision.messages) {
       const requestId = requestOf(message)
@@ -528,7 +677,36 @@ export class TranslationMaterialsService {
       const envelope = this.snapshots.get(record.scope.mainSessionId, requestId)
       if (!envelope) continue
       claimed.add(record)
-      if (message.source.kind === 'user' && envelope.kind === 'material') {
+      if (envelope.kind === 'material' && imageMaterial(envelope)) {
+        const { agent, signal } = event, source = envelope.material.sourceRef!
+        const target: ImageUnitTarget = { kind: 'image_unit', mainSessionId: agent.id, translationSessionId: envelope.material.translationSessionId,
+          unitId: 'unit:' + envelope.material.materialId }
+        const requirements = message.source.kind === 'user' ? messageText(message).slice(0, 8000) : ''
+        this.connections()?.activateForMaterial?.(agent, 'short')
+        const stillOwned = () => this.submissions.get(key(record.scope)) === record
+        let result: PreparedImage | { error: string }
+        let memory: ImageTranslationMemory | undefined
+        const imageRead = new AbortController()
+        record.imageRead = imageRead
+        const exec = { agent, callId: envelope.operationId, signal: AbortSignal.any([signal, imageRead.signal]) }
+        try {
+          result = await this.prepareImage(target, source.name, requirements, sha256 => {
+            const sources = this.sources()
+            if (!sources || sha256 !== source.sha256) throw new Error('图片单元的原图身份已变化。')
+            return sources.readSubmittedImage(sourceScope(envelope), source, record.peerId, agent)
+          }, exec, record.peerId, stillOwned)
+          if (result.status === 'text' && stillOwned() && !exec.signal.aborted) {
+            const normal = this.ctx.get?.('translationNormal') as NormalTranslationService
+            memory = await normal.readImageMemory(target, exec)
+          }
+        } catch (error) {
+          result = { error: error instanceof Error ? error.message.slice(0, 350) : '整图识读未完成。' }
+        } finally { delete record.imageRead }
+        if (stillOwned() && !signal.aborted) {
+          const notice = this.imageMaterialMessage(envelope, await this.messages(), agent, result, message.source.kind === 'user', memory)
+          additions.set(message.id, message.source.kind === 'user' ? [message, notice] : [{ ...message, content: notice.content }])
+        }
+      } else if (message.source.kind === 'user' && envelope.kind === 'material') {
         // Synchronously expose this material's tool groups before the SDK assembles this step.
         this.connections()?.activateForMaterial?.(event.agent, materialToolKind(envelope))
         const notice = this.materialMessage(envelope, await this.messages(), false, event.agent)
@@ -537,17 +715,25 @@ export class TranslationMaterialsService {
     }
     if (this.disposed || event.signal.aborted) return decision
     for (const record of claimed) if (this.submissions.get(key(record.scope)) === record) record.stage = 'attached'
-    if (!additions.size) return decision
-    return { ...decision, messages: decision.messages.flatMap(message => {
+    const messages = decision.messages.flatMap(message => {
       const requestId = requestOf(message), record = requestId === undefined ? undefined : this.submissions.get(key({ mainSessionId: event.agent.id, requestId }))
+      if (message.source.kind === 'translation-material' && requestId && this.revoked.has(key({ mainSessionId: event.agent.id, requestId }))) return []
       return record && claimed.has(record) ? additions.get(message.id) ?? [message] : [message]
-    }) }
+    })
+    if (!batches) return { ...decision, messages }
+    const stillAdmitted: Message[] = []
+    for (const message of messages) {
+      const source = batchNotice(message.source, event.agent.id)
+      if (!source || await batches.admitNotice(source)) stillAdmitted.push(message)
+    }
+    return { ...decision, messages: stillAdmitted }
   }
   private receipt(record: Submission): TranslationMaterialReceipt {
     return { ...record.scope, kind: record.kind, stage: record.stage, ...(record.mainMessageId === undefined ? {} : { mainMessageId: record.mainMessageId }) }
   }
   private drop(scope: TranslationMaterialScope): boolean {
     this.snapshots.release(scope.mainSessionId, scope.requestId)
+    this.submissions.get(key(scope))?.imageRead?.abort()
     return this.submissions.delete(key(scope))
   }
   forgetHistoryUnit(scope: HistoryScope, unitId: string, sourceVersion?: number): void {

@@ -1,6 +1,8 @@
 import { parseTranslationSourceAsset, type TranslationSourceAsset } from './translation-sources.js'
 import { IMAGE_PDF_OUTPUT, isPdfFile, parsePdfOutputOptions, type PdfOutputOptions } from './pdf-source.js'
 
+import { parseImageSpeakers, type ImageSpeaker } from './image-translation.js'
+
 /** Frozen plugin material for one main-session submission, independent of its transport. */
 export interface TranslationMaterialScope {
   readonly mainSessionId: string
@@ -20,6 +22,7 @@ export interface TranslationMaterialUnitReference {
   readonly sourceVersion?: number
   readonly backgroundDescription?: string
   readonly imageInputId?: string
+  readonly speakers?: readonly ImageSpeaker[]
 }
 
 /** A reference only. Applying a source correction requires a separate business operation. */
@@ -131,10 +134,10 @@ export function parseTranslationMaterialEnvelope(value: unknown): TranslationMat
     const reference = material.unitReference
     text(reference.unitId, 2048)
     if (Object.hasOwn(reference, 'backgroundDescription')) {
-      fields(reference, ['unitId', 'backgroundDescription', 'imageInputId'])
+      fields(reference, ['unitId', 'backgroundDescription', 'imageInputId'], ['speakers'])
       text(reference.imageInputId, 64)
       text(reference.backgroundDescription, 2000, true)
-      unitReference = { unitId: reference.unitId, backgroundDescription: reference.backgroundDescription, imageInputId: reference.imageInputId }
+      unitReference = { unitId: reference.unitId, backgroundDescription: reference.backgroundDescription, imageInputId: reference.imageInputId, ...(reference.speakers === undefined ? {} : { speakers: parseImageSpeakers(reference.speakers) }) }
     } else {
       fields(reference, ['unitId', 'sourceVersion'])
       integer(reference.sourceVersion)

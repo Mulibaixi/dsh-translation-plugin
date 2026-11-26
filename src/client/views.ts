@@ -4,7 +4,7 @@ import { isPdfFile, pdfDeliveryComplete, pdfPageLabel, pdfPageNumbers, pdfRepair
 import { buildPdfExport, capturePdfDelivery } from './pdf-delivery.js'
 import { ImageBackground, ImageExportMenu, ImageOriginalButton } from './image-unit-view.js'
 import { BatchProcessingView, type BatchRemoteCall } from './batch-processing-view.js'
-import { SourceTextEditor } from './source-text-editor.js'
+import { SourceTextEditor, useHoldHistoryEdits } from './source-text-editor.js'
 import { TranslationQuote, type InsertTranslationQuote } from './translation-quote.js'
 import { MemoryAssetsView } from './memory-assets-view.js'
 import { LocalDataClearView, type LocalDataClient } from './local-data.js'
@@ -41,7 +41,7 @@ import type { NormalTranslationClient } from './normal-translation.js'
 import type { TopicTermSnapshot, TopicTerm } from '../memory/topic-terms.js'
 import type { TopicMemoryStore, TopicTermVersion } from './topic-memory-store.js'
 import { createSessionReorder, type SessionDrop, type SessionPointerEvent } from './session-reorder.js'
-import { captureTranscriptEdit, TranscriptPosition, type TranscriptEditPosition } from './transcript-position.js'
+import { captureTranscriptEdit, captureTranscriptExit, TranscriptPosition, type TranscriptEditPosition, type TranscriptReadingPosition } from './transcript-position.js'
 import type { TopicDeletionClient, TopicDeletionPreview } from './topic-deletion.js'
 export { MemoryAssetsView } from './memory-assets-view.js'
 
@@ -197,7 +197,7 @@ interface RevisionEditor {
   readonly drafts: ReadonlyMap<string, RevisionEdit>
   start(sessionId: string, unitId: string, baseRevisionId: string, text: string): void
   change(key: string, text: string): void
-  save(key: string, finalize?: boolean): void
+  save(key: string, finalize?: boolean): string | undefined
   cancel(key: string): void
 }
 function editKey(sessionId: string, unitId: string, revisionId: string): string { return JSON.stringify([sessionId, unitId, revisionId]) }
@@ -205,6 +205,7 @@ function editKey(sessionId: string, unitId: string, revisionId: string): string 
 export function PanelRouter({ store, models, quick, normal, sessionId, topics, materials, batchRemote, terms, archive, otherMemory, memoryIndex, recordIndex, memoryClearing, topicDeletion, objects, objectAssets, viewFiles, documents, documentTasks, documentReviews, fileJobs, onDeleteTerm, onOpenAssets, insertQuote }: StoreProps & TopicUiProps & QuoteProps & { readonly models: ModelCatalog; readonly quick: QuickTranslationClient; readonly sessionId?: string | undefined }): unknown {
   const [assetTopic, setAssetTopic] = react.useState<string | undefined>(undefined)
   const [drafts, setDrafts] = react.useState<ReadonlyMap<string, RevisionEdit>>(() => new Map())
+  useHoldHistoryEdits(store, Array.from(drafts.values(), draft => draft.sessionId))
   react.useEffect(() => {
     const reconcile = (): void => setDrafts(current => {
       const kept = [...current].filter(([, edit]) => store.getSession(edit.sessionId) && store.getTranslationHistory(edit.sessionId)?.units
@@ -236,6 +237,8 @@ export function PanelRouter({ store, models, quick, normal, sessionId, topics, m
         else next.set(key, { ...draft, failure: '保存失败，编辑内容仍保留。' })
         return next
       })
+      const unit = saved ? store.getTranslationHistory(draft.sessionId)?.units.find(unit => unit.id === draft.unitId) : undefined
+      if (unit && isTextUnit(unit)) return unit.revisions.at(-1)?.id
     },
   }
   if (assetTopic && terms && archive) return h('section', { className: 'dsh-tp dsh-tp-panel' }, button('返回翻译资料库', () => setAssetTopic(undefined)),
@@ -553,11 +556,15 @@ function TextUnitDeletionControl({ store, session, unit, quick, normal, material
     message ? h('p', { className: 'dsh-tp-muted', role: 'status' }, message) : null)
 }
 
-interface TranscriptEditProps { readonly onEditHeading: (heading: HTMLElement | null, text: string) => void }
+interface TranscriptEditProps {
+  readonly onEditHeading: (heading: HTMLElement | null, text: string) => void
+  readonly onRestoreReading: (position: TranscriptReadingPosition) => void
+}
 
-function TranslationRevision({ store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, resultOpen, versionsToggle, executionOwner, file, viewFiles, onEditHeading }: StoreProps & TopicUiProps & TranscriptEditProps & { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly resultOpen?: unknown; readonly versionsToggle?: unknown; readonly file?: DirectFile | undefined }): unknown {
+function TranslationRevision({ store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, resultOpen, versionsToggle, executionOwner, file, viewFiles, onEditHeading, onRestoreReading }: StoreProps & TopicUiProps & TranscriptEditProps & { readonly unit: TextUnit; readonly revision: TextRevision; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly resultOpen?: unknown; readonly versionsToggle?: unknown; readonly file?: DirectFile | undefined }): unknown {
   const fileOpen = useDirectFileOpen({ file: revision.text ? file : undefined, unit, revision, session, materials, viewFiles })
   const heading = react.useRef<HTMLElement | null>(null)
+  const textarea = react.useRef<HTMLTextAreaElement | null>(null)
   const [details, setDetails] = react.useState(false)
   const [copyState, setCopyState] = react.useState<'idle' | 'copied' | 'failed'>('idle')
   const status = { submitting: '正在提交…', running: '正在翻译…', completed: '译文', failed: '翻译失败', cancelled: '已取消', unknown: '执行结果未知', interrupted: '重启前未确认／已中断', context_requested: '等待补充背景', deleted: '已删除' }[revision.status]
@@ -574,11 +581,19 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
   const metadata = revision.callRecord ?? revision.deletion?.callFacts
   const model = metadata?.model ?? revision.model
   const usage = (count: number | null | undefined): string => count === null || count === undefined ? '未提供' : String(count)
+  function exitEdit(action: 'cancel' | 'save' | 'finalize'): void {
+    const text = action === 'cancel' ? revision.text : draft?.text
+    const anchor = textarea.current && text !== undefined ? captureTranscriptExit(textarea.current, text) : undefined
+    let revisionId: string | undefined
+    if (action === 'cancel') { editor.cancel(key); revisionId = revision.id }
+    else revisionId = editor.save(key, action === 'finalize')
+    if (anchor && revisionId) onRestoreReading({ sessionId: session.id, unitId: unit.id, revisionId, anchor })
+  }
   async function copy(): Promise<void> {
     try { const target = { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision' as const, revisionId: revision.id }; await navigator.clipboard.writeText(recordObjectPlainText(revision.text, target, objects?.getReferences(target) ?? [])); setCopyState('copied') }
     catch { setCopyState('failed') }
   }
-  return h('section', { className: 'dsh-tp-version', 'aria-label': label },
+  return h('section', { className: 'dsh-tp-version', 'aria-label': label, 'data-transcript-revision': revision.id },
     h('div', { className: 'dsh-tp-version-header', ref: heading },
       h('span', { className: 'dsh-tp-muted', role: 'status' }, `版本 ${revision.order} · ${revision.status === 'deleted' ? status : editLabel ?? status} · ${unit.targetLanguage}${base ? ` · 基于版本 ${base.order}` : ''}${revisionMatchesCurrentSource(unit, revision) ? '' : ` · 已过时（原文版本 ${revision.sourceVersion}）`}`),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
@@ -607,15 +622,15 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
     revision.text && revision.status !== 'completed' ? h('div', { className: 'dsh-tp-muted' }, '未完成输出') : null,
     draft ? h('div', { className: 'dsh-tp-version-editor' },
       h('small', { className: 'dsh-tp-muted' }, `基于版本 ${revision.order}保存为新版本`),
-      h('textarea', { 'aria-label': `编辑${label}译文`, value: draft.text, rows: 4, onChange: (event: TextEvent) => { const text = event.currentTarget.value; editor.change(key, text) } }),
+      h('textarea', { ref: textarea, 'aria-label': `编辑${label}译文`, value: draft.text, rows: 4, onChange: (event: TextEvent) => { const text = event.currentTarget.value; editor.change(key, text) } }),
       h('div', { className: 'dsh-tp-actions dsh-tp-version-actions' },
-        h('button', { type: 'button', 'aria-label': `保存${label}编辑`, disabled: !!editBlocked || !draft.text.trim(), title: editBlocked, onClick: () => editor.save(key) }, '保存最新版本'),
-        h('button', { type: 'button', 'aria-label': `保存${label}并定稿`, disabled: !!editBlocked || !draft.text.trim() || !currentSource, title: editBlocked ?? (!currentSource ? '原文版本已变化，不能将此修订设为最终。' : undefined), onClick: () => editor.save(key, true) }, '保存并定稿'),
-        h('button', { type: 'button', 'aria-label': `取消${label}编辑`, onClick: () => editor.cancel(key) }, '取消'),
+        h('button', { type: 'button', 'aria-label': `保存${label}编辑`, disabled: !!editBlocked || !draft.text.trim(), title: editBlocked, onClick: () => exitEdit('save') }, '保存最新版本'),
+        h('button', { type: 'button', 'aria-label': `保存${label}并定稿`, disabled: !!editBlocked || !draft.text.trim() || !currentSource, title: editBlocked ?? (!currentSource ? '原文版本已变化，不能将此修订设为最终。' : undefined), onClick: () => exitEdit('finalize') }, '保存并定稿'),
+        h('button', { type: 'button', 'aria-label': `取消${label}编辑`, onClick: () => exitEdit('cancel') }, '取消'),
       ),
       draft.failure ? h('p', { role: 'alert', className: 'dsh-tp-muted' }, draft.failure) : null,
     ) : revision.text ? fileOpen ? fileOpen.link : h(RecordObjectText, {
-      text: revision.text, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id }, objects, objectAssets, transcriptBody: true,
+      text: revision.text, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'revision', revisionId: revision.id }, objects, objectAssets, transcriptBody: true, showLineNumbers: store.getSettings().showLineNumbers,
       quoteSource: revision.status === 'completed'
         ? quoteSource(session, unit, `译文 v${revision.order} · 译文版本 ID ${revision.id}${revision.sourceVersion === undefined ? '' : ` · 原文版本 ${revision.sourceVersion}`}`) : undefined,
     }) : null,
@@ -626,7 +641,7 @@ function TranslationRevision({ store, unit, revision, quick, normal, materials, 
   )
 }
 
-function TranslationUnit({ store, unit, quick, normal, materials, session, editor, topics, objects, objectAssets, viewFiles, executionOwner, recordIndex, onEditHeading }: StoreProps & TopicUiProps & TranscriptEditProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly executionOwner?: string }): unknown {
+function TranslationUnit({ store, unit, quick, normal, materials, session, editor, pruned, topics, objects, objectAssets, viewFiles, executionOwner, recordIndex, onEditHeading, onRestoreReading }: StoreProps & TopicUiProps & TranscriptEditProps & { readonly unit: TextUnit; readonly quick: QuickTranslationClient; readonly session: LocalSession; readonly editor: RevisionEditor; readonly pruned: ReadonlySet<string>; readonly executionOwner?: string }): unknown {
   const [expanded, setExpanded] = react.useState(false)
   const [sourceEditing, setSourceEditing] = react.useState(false)
   const [sourcesExpanded, setSourcesExpanded] = react.useState(false)
@@ -655,6 +670,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   }
   const collapsibleSource = Array.from(unit.source).length > 280 || unit.source.split('\n').length > 5
   const latest = unit.revisions.at(-1)
+  const oldRevisions = unit.revisions.slice(0, -1).filter(revision => !pruned.has(revision.id))
   const image = isImageUnit(unit) ? unit : undefined
   const scanPage = pdfScanUnitPage(unit.id, unit.material?.materialId)
   const originalScanPage = scanPage && !unit.source.trim()
@@ -673,8 +689,16 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
       onEditHeading(sourceHeading.current, unit.source)
       setSourceEditing(true)
     } }, '编辑') : null
-  const sourceEditor = sourceEditable && normal && sourceEditing ? h(SourceTextEditor, { unit, session, normal, maxInputChars: store.getSettings().maxInputChars, executionOwner, close: () => setSourceEditing(false) }) : null
-  const imageBackground = image ? h(ImageBackground, { unit: image, session, normal }) : null
+  function closeSourceEditor(textarea?: HTMLTextAreaElement, text?: string): void {
+    const anchor = textarea && text !== undefined ? captureTranscriptExit(textarea, text) : undefined
+    if (anchor && (!fileOpen || scanPage)) {
+      setSourceCollapsed(false)
+      onRestoreReading({ sessionId: session.id, unitId: unit.id, revisionId: null, anchor })
+    }
+    setSourceEditing(false)
+  }
+  const sourceEditor = sourceEditable && normal && sourceEditing ? h(SourceTextEditor, { unit, session, store, normal, maxInputChars: store.getSettings().maxInputChars, executionOwner, close: closeSourceEditor }) : null
+  const imageBackground = image ? h(ImageBackground, { unit: image, session, store, normal }) : null
   const imageIntakeStatus = image && intake && materials && (!unit.source.trim() || intake.storageError) ? h('div', { className: 'dsh-tp-muted' },
     intake.storageError ? h('p', { role: 'status' }, intake.storageError) : null,
     intake.status === 'failed' ? h('div', null,
@@ -687,7 +711,9 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
     h('button', { type: 'button', 'aria-label': `文本 ${unit.order}原文版本`, 'aria-expanded': sourcesExpanded, onClick: () => setSourcesExpanded(value => !value) }, sourcesExpanded ? '收起原文版本' : '查看原文版本'),
     sourcesExpanded ? h('div', { className: 'dsh-tp-old-versions' }, ...unit.sourceVersions.map(source => h('section', { key: source.version },
       h('small', { className: 'dsh-tp-muted' }, `原文版本 ${source.version}${source.version === unit.sourceVersion ? '（当前）' : '（历史）'}`),
-      h('div', { className: 'dsh-tp-translation-text', 'data-translation-quote': sourceQuote ? quoteSource(session, unit, `原文 v${source.version}`) : undefined }, source.text)))) : null) : null
+      h(RecordObjectText, { text: source.text, references: [], showLineNumbers: store.getSettings().showLineNumbers,
+        target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null },
+        quoteSource: sourceQuote ? quoteSource(session, unit, `原文 v${source.version}`) : undefined })))) : null) : null
   const operation = normal?.getUnitStatus(session.id, unit.id)
   const exchange = operation ? store.getTranslationHistory(session.id)?.exchanges.filter(item => item.unitId === unit.id && item.operationId === operation.operationId).at(-1) : undefined
   const operationStatus: Record<string, string> = {
@@ -723,7 +749,7 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
       h('span', { className: 'dsh-tp-muted' }, '原文'),
       h('div', { className: 'dsh-tp-actions' }, h(TextUnitDeletionControl, { store, session, unit, quick, normal, materials, topics, editor }),
         h(SourceOpenLink, { unit, session, objects, viewFiles }))),
-    h(RecordObjectText, { text: unit.source, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote }),
+    h(RecordObjectText, { text: unit.source, target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null }, objects, objectAssets, quoteSource: sourceQuote, showLineNumbers: store.getSettings().showLineNumbers }),
     scanPage ? fileOpen?.link : null,
     sourceHistory, execution ?? h('p', { className: 'dsh-tp-muted', role: 'status' }, originalScanPage ? '无待译文字，保留原页。' : '材料已受理，等待翻译执行。'))
   const final = currentFinalRevision(unit), pointed = unit.revisions.find(revision => revision.id === unit.final?.revisionId)
@@ -732,10 +758,10 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
   const indexTarget = file && supportsRecordIndex(file.name) ? { namespaceId: store.getNamespaceId(), topicId: session.topicId, sessionId: session.id, unitId: unit.id, sourceVersion: unit.sourceVersion } : undefined
   const sourceText = h(RecordObjectText, { text: unit.source, className: sourceCollapsed ? 'dsh-tp-source-collapsed' : undefined,
     target: { ownerId: store.getTopicStorageScope(session.topicId)!, topicId: session.topicId, sessionId: session.id, unitId: unit.id, side: 'source', revisionId: null },
-    objects, objectAssets, quoteSource: sourceQuote, transcriptBody: true })
+    objects, objectAssets, quoteSource: sourceQuote, transcriptBody: true, showLineNumbers: store.getSettings().showLineNumbers })
   return h('article', { className: 'dsh-tp-translation', 'data-unit-id': unit.id, 'aria-label': `${image ? '图片' : file ? '文件' : '文本'} ${unit.order}` },
     imageHeader,
-    h('div', { className: 'dsh-tp-source' },
+    h('div', { className: 'dsh-tp-source', 'data-transcript-source': '' },
       h('div', { className: 'dsh-tp-unit-header', ref: sourceHeading },
         h('span', { className: 'dsh-tp-muted', role: 'status' }, image ? `原文 · ${finalLabel}` : `单元 ${unit.order} · ${scanPage ? '扫描页' : file ? '文件' : '文本'} · ${originalScanPage ? '保留原页' : finalLabel}`, h(RecordIndexStatus, { client: recordIndex, target: indexTarget, prefix: ' · ' })),
         h('div', { className: 'dsh-tp-actions' },
@@ -755,11 +781,11 @@ function TranslationUnit({ store, unit, quick, normal, materials, session, edito
       retranslation ? h('p', { className: 'dsh-tp-muted', role: 'status' }, retranslation.message) : null,
       execution,
     ),
-    latest ? h(TranslationRevision, { executionOwner, key: latest.id, store, unit, revision: latest, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles, onEditHeading,
+    latest ? h(TranslationRevision, { executionOwner, key: latest.id, store, unit, revision: latest, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles, onEditHeading, onRestoreReading,
       resultOpen: file ? null : h(ResultOpenLink, { unit, session, objects, viewFiles, revision: image ? latest : undefined }),
-      versionsToggle: unit.revisions.length > 1 ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, title: expanded ? '收起旧版本' : '展开旧版本', onClick: () => setExpanded(value => !value) }, `旧版(${unit.revisions.length - 1})`) : null }) : null,
-    expanded ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
-      ...unit.revisions.slice(0, -1).reverse().map(revision => h(TranslationRevision, { key: revision.id, store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles, onEditHeading,
+      versionsToggle: oldRevisions.length ? h('button', { type: 'button', 'aria-label': `文本 ${unit.order}旧版本`, 'aria-expanded': expanded, title: expanded ? '收起旧版本' : '展开旧版本', onClick: () => setExpanded(value => !value) }, `旧版(${oldRevisions.length})`) : null }) : null,
+    expanded && oldRevisions.length ? h('div', { className: 'dsh-tp-old-versions', 'aria-label': `文本 ${unit.order}旧版本列表` },
+      ...oldRevisions.reverse().map(revision => h(TranslationRevision, { key: revision.id, store, unit, revision, quick, normal, materials, topics, session, editor, objects, objectAssets, file, viewFiles, onEditHeading, onRestoreReading,
         resultOpen: image ? h(ResultOpenLink, { unit, session, objects, viewFiles, revision }) : undefined })),
     ) : null,
   )
@@ -904,6 +930,22 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const topicTarget = topicContext ? store.getTopics(ownerId).find(topic => topic.id === topicContext.id) : undefined
   const topicOpenable = topicTarget ? store.getTopicSessions(topicTarget.id).filter(session => session.archivedAt === null) : []
   const status = current ? store.getStatus(current.id) : 'memory'
+  const history = current && store.getTranslationHistory(current.id)
+  const pruned = react.useMemo(() => new Set(history?.events.flatMap(event => event.reason === 'retention' && event.revisionId ? [event.revisionId] : [])), [history])
+  const pruningEnabled = store.getSettings().autoPruneOldRevisions === true
+  const historyEditing = !!current && store.hasHistoryEdit(current.id)
+  function hasActiveWork(id: string): boolean {
+    const material = materials?.getStatus(id, ownerId)
+    return !!(quick.isBusy(id) || normal?.isBusy(id) || material?.busy || material?.unknown)
+  }
+  const historyBusy = !!current && hasActiveWork(current.id)
+  react.useEffect(() => {
+    if (!pruningEnabled || status !== 'saved' || !current || historyEditing || historyBusy) return
+    const id = current.id, topicId = current.topicId, storageOwner = store.getTopicStorageScope(topicId)
+    if (!storageOwner) return
+    void store.pruneOldRevisions(id, () => store.getActiveSession(ownerId)?.id !== id || hasActiveWork(id),
+      (unitId, revisionId) => !!objects?.revisionDeletionBlockedReason({ ownerId: storageOwner, topicId, sessionId: id, unitId, side: 'revision', revisionId }))
+  }, [store, current?.id, current?.topicId, ownerId, pruningEnabled, status, history, historyEditing, historyBusy, quick, normal, materials, objects])
   const records = current ? quick.getRecords(current.id) : []
   const units = current ? quick.getUnits(current.id).filter(unit => !materials?.isFileRemoved(current.id, unit.id)) : []
   const represented = new Set(units.flatMap(unit => isTextUnit(unit) ? unit.revisions.map(revision => revision.operationId) : isDocumentUnit(unit) ? unit.tasks.map(task => task.operationId) : []))
@@ -914,12 +956,17 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   const transcript = react.useRef<HTMLElement | null>(null)
   const transcriptPosition = react.useRef(new TranscriptPosition())
   const editPosition = react.useRef<TranscriptEditPosition | undefined>(undefined)
+  const readingPosition = react.useRef<TranscriptReadingPosition | undefined>(undefined)
   const [, refreshEditPosition] = react.useState(0)
   function onEditHeading(heading: HTMLElement | null, text: string): void {
     if (!heading || !transcript.current) return
     const position = captureTranscriptEdit(transcript.current, heading, text)
     if (!position) return
     editPosition.current = position
+    refreshEditPosition(value => value + 1)
+  }
+  function onRestoreReading(position: TranscriptReadingPosition): void {
+    readingPosition.current = position
     refreshEditPosition(value => value + 1)
   }
   const unitPositions = new Map(units.map(unit => {
@@ -942,7 +989,7 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
       view: isFileJobUnit(unit) ? h('article', { className: 'dsh-tp-record-unit', 'data-unit-id': unit.id, 'aria-label': `单元 ${unit.order} · 文件` },
         h('span', { role: 'status' }, `单元 ${unit.order} · 文件 · ${unit.deletion ? '已删除' : '文件记录暂不可用'}`),
         unit.deletion?.calls ? h('p', { className: 'dsh-tp-muted' }, `保留 ${unit.deletion.calls} 次实际调用统计。`) : null)
-        : isTextUnit(unit) ? h(TranslationUnit, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, store, unit, quick, normal, materials, session: current, editor, objects, objectAssets, viewFiles, recordIndex, onEditHeading, topics: current.mode === 'normal' ? topics : undefined })
+        : isTextUnit(unit) ? h(TranslationUnit, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, store, unit, quick, normal, materials, session: current, editor, pruned, objects, objectAssets, viewFiles, recordIndex, onEditHeading, onRestoreReading, topics: current.mode === 'normal' ? topics : undefined })
         : h(DocumentUnitView, { executionOwner: ownerId === store.getNamespaceId() ? undefined : ownerId, key: unit.id, unit, session: current, store, documents, documentTasks, documentReviews, objects, objectAssets, viewFiles, materials, recordIndex, topics: current.mode === 'normal' ? topics : undefined }) })),
     ...fileJobRecords.map(record => ({ id: `u:${record.summary.unitId}`, events: [`operation:${record.summary.operationId}`, ...record.results.filter(result => !result.deletion && result.text).map(result => `result:${result.version}`)],
       active: !['completed', 'failed', 'cancelled'].includes(record.summary.phase), createdAt: fileUnits.find(file => file.materialId === record.summary.materialId || file.unitId === record.summary.unitId)?.createdAt ?? record.summary.createdAt,
@@ -965,8 +1012,10 @@ function WorkspaceView({ store, models, quick, normal, editor, ownerId, topics, 
   ].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)) : []
   react.useLayoutEffect(() => {
     const position = editPosition.current
+    const reading = readingPosition.current
     editPosition.current = undefined
-    transcriptPosition.current.update(current?.id, timeline.filter(entry => entry.id), transcript.current, position)
+    readingPosition.current = undefined
+    transcriptPosition.current.update(current?.id, timeline.filter(entry => entry.id), transcript.current, position, reading)
   }, [current?.id, timeline])
   const materialStatus = current?.mode === 'normal' ? materials?.getStatus(current.id, ownerId) : undefined
   const blocked = current?.mode === 'normal' ? materialStatus?.blocked ?? (materials ? undefined : '普通模式暂不可用：当前 DSH 缺少同步发送材料接口。') : current ? quick.blockedReason(current) : undefined
@@ -1435,6 +1484,11 @@ export function SettingsView({ store, onClose, terms, localData, embedding, memo
       h('h3', null, '全局翻译设置'),
       field('翻译要求', h('textarea', { value: form.defaultInstruction, rows: 3, placeholder: '可留空', onChange: (event: TextEvent) => change({ defaultInstruction: event.currentTarget.value }) })),
       field('单次上限', h('input', { type: 'number', value: form.maxInputChars, min: 1, max: 200000, step: 1, onChange: (event: TextEvent) => change({ maxInputChars: Number(event.currentTarget.value) }) }), '原文字符数为 1–200000。修改后适用于所有会话接下来提交的任务。'),
+      h('label', { className: 'dsh-tp-history-row' }, h('input', { type: 'checkbox', 'aria-label': '显示原文和译文行号', checked: form.showLineNumbers ?? false,
+        onChange: (event: CheckEvent) => change({ showLineNumbers: event.currentTarget.checked }) }), '显示原文和译文行号'),
+      store.usesHostHistory() ? h('label', { className: 'dsh-tp-history-row', title: '启用后仅保留最近 5 个旧版译文。被清理的旧版译文无法恢复。' },
+        h('input', { type: 'checkbox', 'aria-label': '自动清理旧译文', checked: form.autoPruneOldRevisions ?? false,
+          onChange: (event: CheckEvent) => change({ autoPruneOldRevisions: event.currentTarget.checked }) }), '自动清理旧译文') : null,
     ),
     embedding ? h(EmbeddingSettingsView, { client: embedding, index: memoryIndex }) : null,
     pluginUpdate ? h(PluginUpdateView, { remote: pluginUpdate }) : null,

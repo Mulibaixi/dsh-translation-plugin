@@ -4,7 +4,7 @@ import type { TopicArchiveStore } from './topic-archive-store.js'
 import type { FileJobProposal } from '../shared/file-jobs.js'
 import type { TopicTerm, TermEvidenceRef } from '../memory/topic-terms.js'
 import type { TopicArchiveEntry, TopicArchivePut } from '../memory/topic-archive.js'
-import { namesEntity } from '../shared/asset-classification.js'
+import { namesEntity, overlapsAssetLabels } from '../shared/asset-classification.js'
 import { languageMatches } from '../shared/language-tag.js'
 
 const label = (s: string): string => s.normalize('NFC').trim().replace(/\s+/gu, ' ')
@@ -31,7 +31,7 @@ export async function putAssetProposals(terms: TopicMemoryStore, archive: TopicA
     if (p.kind === 'term') {
       const entitiesInTopic = archive.getSnapshot(scope.ownerId, scope.topicId).entries.filter(entry => entry.kind === 'entity')
       if (namesEntity(p.sourceForms, p.preferred, [...entitiesInTopic, ...entityProposals])) {
-        skipped.push(`${title}：匹配已有实体或同批实体候选的名称或别名，请核对指代与义项`)
+        skipped.push(`${title}：已匹配实体名称、别名或带敬称的称呼，请沿用对应实体`)
         continue
       }
       const snapshot = terms.getSnapshot(scope.ownerId, scope.topicId), matches = snapshot.entries.filter(e => e.targetLanguage === scope.targetLanguage && overlap([...e.sourceForms, ...e.aliases], p.sourceForms))
@@ -62,11 +62,11 @@ export async function putAssetProposals(terms: TopicMemoryStore, archive: TopicA
     if (p.kind === 'entity') {
       const existingLabels = old?.kind === 'entity' ? [old.name, ...old.aliases] : []
       const addedLabels = [p.name, ...p.aliases].filter(name => !overlap([name], existingLabels))
-      const term = terms.getSnapshot(scope.ownerId, scope.topicId).entries.find(term => overlap(addedLabels, [
+      const term = terms.getSnapshot(scope.ownerId, scope.topicId).entries.find(term => overlapsAssetLabels(addedLabels, [
         ...term.sourceForms, ...term.aliases, ...(languageMatches(term.targetLanguage, scope.targetLanguage) ? [term.preferred] : []),
       ]))
       if (term) {
-        skipped.push(`${title}：名称或别名与既有术语「${term.sourceForms[0] ?? term.preferred}」重名，请核对指代与义项`)
+        skipped.push(`${title}：名称或别名与既有术语「${term.sourceForms[0] ?? term.preferred}」重合，请沿用既有条目或人工核对义项`)
         continue
       }
       entities.set(p.candidateId, id)

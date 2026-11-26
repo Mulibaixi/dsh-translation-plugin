@@ -234,17 +234,12 @@ export class ReferenceFilesService {
     const context = {scope:manifest.scope,manifestRef:ref,assets:manifest.assets, ...(manifest.files === undefined ? {} : { files }), ...(manifest.records === undefined ? {} : { records })}
     this.recordChecks.set(context, checks); return context
   }
-  private async openedHistory(topicId: string, exec: ToolExecution): Promise<readonly string[]> {
-    const reply = await this.topics.requestOwned(this.authorize(exec).id, { kind: 'list_sessions' }, exec)
-    if (reply.kind !== 'sessions') throw failure('history_scope', '无法核对当前已打开的翻译会话。')
-    return reply.sessions.filter(session => session.topicId === topicId && !session.archived).map(session => session.id)
-  }
   private async recordContent(topicId: string, selection: TranslationRecordSelection, exec: ToolExecution, page?: { readonly side: 'source' | 'translation'; readonly start: number }) {
     const facts = await this.facts(topicId, exec), agent = this.authorize(exec), peer = this.topics.ownerPeer(agent.id, agent), history = this.ctx.get?.('translationHistory') as HistoryService | undefined
-    if (!peer || !history || !(await this.openedHistory(topicId, exec)).includes(selection.sessionId)) throw failure('history_scope', '译例不属于当前主题已打开的翻译会话。')
+    if (!peer || !history) throw failure('history_unavailable', '译文记录读取服务尚未就绪。')
     const result = await history.recordExcerpt({ namespaceId: facts.index.scope.namespaceId, topicId, sessionId: selection.sessionId }, selection, peer, exec.signal, page)
     const current = await this.facts(topicId, exec)
-    if (key(current.index.scope) !== key(facts.index.scope) || !(await this.openedHistory(topicId, exec)).includes(selection.sessionId)) throw failure('history_scope', '译例读取期间会话或主题访问范围已变化。')
+    if (key(current.index.scope) !== key(facts.index.scope) || !result.isCurrent()) throw failure('history_stale', '译例读取期间记录或主题访问范围已变化。')
     return result
   }
   async readRecord(raw: unknown, exec: ToolExecution): Promise<unknown> {
@@ -266,8 +261,7 @@ export class ReferenceFilesService {
     const facts = await this.facts(raw.topicId, exec), agent = this.authorize(exec), peer = this.topics.ownerPeer(agent.id, agent)
     const history = this.ctx.get?.('translationHistory') as HistoryService | undefined
     if (!peer || !history) throw failure('history_unavailable', '译文记录读取服务尚未就绪。')
-    const sessionIds = await this.openedHistory(raw.topicId, exec)
-    const snapshots = await history.retrievalSnapshots(facts.index.scope.namespaceId, peer, raw.topicId, sessionIds)
+    const snapshots = await history.retrievalSnapshots(facts.index.scope.namespaceId, peer, raw.topicId)
     const sides: readonly ('source' | 'translation')[] = side === 'both' ? ['source', 'translation'] : [side]
     const tasks = snapshots.flatMap(snapshot => snapshot.current.history.units.flatMap(unit => {
       if (isDeletedUnit(unit) || isTextUnit(unit) && !currentFinalRevision(unit) || isDocumentUnit(unit) && !currentDocumentFinal(unit) ||
@@ -283,7 +277,7 @@ export class ReferenceFilesService {
       if (!Array.isArray(cursor) || cursor.length !== 8 || cursor[0] !== raw.topicId || cursor[1] !== raw.query || cursor[2] !== side || !Number.isSafeInteger(cursor[6]) || cursor[6] < 0)
         throw failure('history_cursor', '记录查找游标不属于本次查询，请重新查找。')
       index = tasks.findIndex(task => task.snapshot.scope.sessionId === cursor[3] && task.unitId === cursor[4] && task.side === cursor[5])
-      if (index < 0 || tasks[index]!.snapshot.token !== cursor[7]) throw failure('history_stale', '记录或已打开会话已变化，请重新查找。')
+      if (index < 0 || tasks[index]!.snapshot.token !== cursor[7]) throw failure('history_stale', '译文记录已变化，请重新查找。')
       start = cursor[6] as number
     }
     const fold = (text: string): string => text.replace(/[A-Z]/g, letter => letter.toLowerCase()), needle = fold(raw.query), queryPoints = Array.from(raw.query).length
@@ -336,9 +330,9 @@ export class ReferenceFilesService {
         index++; start = 0
       }
     }
-    const current = await this.facts(raw.topicId, exec), opened = await this.openedHistory(raw.topicId, exec)
-    if (key(current.index.scope) !== key(facts.index.scope) || key([...opened].sort()) !== key([...sessionIds].sort())) throw failure('history_scope', '查找期间主题或已打开会话已变化，请重新查找。')
-    const latest = await history.retrievalSnapshots(facts.index.scope.namespaceId, peer, raw.topicId, opened)
+    const current = await this.facts(raw.topicId, exec)
+    if (key(current.index.scope) !== key(facts.index.scope)) throw failure('history_scope', '查找期间主题访问范围已变化，请重新查找。')
+    const latest = await history.retrievalSnapshots(facts.index.scope.namespaceId, peer, raw.topicId)
     this.authorize(exec)
     if ([...examined].some(([sessionId, token]) => latest.find(snapshot => snapshot.scope.sessionId === sessionId)?.token !== token))
       throw failure('history_stale', '记录在查找期间已变化，请重新查找。')
@@ -354,8 +348,7 @@ export class ReferenceFilesService {
     const facts = await this.facts(raw.topicId, exec), agent = this.authorize(exec), peer = this.topics.ownerPeer(agent.id, agent)
     const search = this.ctx.get?.('translationMemorySearch') as MemorySearchService | undefined
     if (!peer || !search) throw failure('memory_search_unavailable', '记忆检索服务尚未就绪。')
-    const sessionIds = await this.openedHistory(raw.topicId, exec)
-    const result = await search.search(facts.index.scope.namespaceId, raw.topicId, raw.query, peer, exec.signal, sessionIds, raw.targetLanguage as string | undefined)
+    const result = await search.search(facts.index.scope.namespaceId, raw.topicId, raw.query, peer, exec.signal, raw.targetLanguage as string | undefined)
     const matches = []
     for (const match of result.matches) {
       if (match.ref.kind !== 'reference_file' && match.ref.kind !== 'translation_record') {
@@ -367,7 +360,7 @@ export class ReferenceFilesService {
       matches.push(match)
     }
     const current = await this.facts(raw.topicId, exec); this.authorize(exec)
-    if (key(current.index.scope) !== key(facts.index.scope) || !await search.verify(facts.index.scope.namespaceId, raw.topicId, peer, matches, exec.signal, await this.openedHistory(raw.topicId, exec)))
+    if (key(current.index.scope) !== key(facts.index.scope) || !await search.verify(facts.index.scope.namespaceId, raw.topicId, peer, matches, exec.signal))
       throw failure('memory_search_stale', '检索内容在核对期间已变化，请重新检索。')
     const excluded = matches.length !== result.matches.length
     return { ...result, matches, ...(excluded ? { reason: result.reason ?? '部分候选的依据不可用或版本已变化，已排除；可按准确编号进一步核对。' } : {}),
@@ -449,11 +442,11 @@ export function registerReferenceTools(service: ReferenceFilesService, topics: T
     sourceVersion: { type: 'integer', description: 'Copy the returned sourceVersion for versioned records. Omit it for image records.' },
     finalId: text, sourceRange: range, translationRange: range, sha256: text } }
   const definitions: { name: string; description: string; parameters: object; run(args: Record<string, unknown>, exec: ToolExecution): Promise<unknown> }[] = [
-    { name: 'translation_search_memory', description: 'Find current-topic archive, registered original/bilingual files and current translation records by keyword plus available semantic vectors. Records are filtered to Sessions currently opened by this main Agent BEFORE ranking. File records contribute only manually selected current originals with complete main-model segmentation/exclusion plans; translated file bodies, excluded code/Markdown structure/metadata, unselected files and incomplete plans are not semantic inputs. Ordinary text records retain their existing current-source/effective-final search. Supply topicId, a short source-meaning query and optional targetLanguage. For a remembered translation phrase, use translation_record_find to locate its record and translation_record_read to verify its actual source; an inferred search wording is not a source quote. Returns at most 8 excerpts, at most 2 per object, with exact refs for translation_reference_select assets/files/records. Units without an effective final are excluded without counting as read failures. Use translation_record_read for context or the same record current translation; never guess sentence alignment or treat a final version as a quality endorsement. Queries reach the embedding service only after indexing is enabled. Report incomplete coverage honestly.',
+    { name: 'translation_search_memory', description: 'Find current-topic archive, registered original/bilingual files and current translation records by keyword plus available semantic vectors. Records are searched across all Sessions in the specified topic, including closed and archived Sessions. File records contribute only manually selected current originals with complete main-model segmentation/exclusion plans; translated file bodies, excluded code/Markdown structure/metadata, unselected files and incomplete plans are not semantic inputs. Ordinary text records retain their existing current-source/effective-final search. Supply topicId, a short source-meaning query and optional targetLanguage. For a remembered translation phrase, use translation_record_find to locate its record and translation_record_read to verify its actual source; an inferred search wording is not a source quote. Returns at most 8 excerpts, at most 2 per object, with exact refs for translation_reference_select assets/files/records. Units without an effective final are excluded without counting as read failures. Use translation_record_read for context or the same record current translation; never guess sentence alignment or treat a final version as a quality endorsement. Queries reach the embedding service only after indexing is enabled. Report incomplete coverage honestly.',
       parameters: { ...topic, query: text, targetLanguage: { type: 'string' } }, run: (args, exec) => service.searchMemory(args, exec) },
-    { name: 'translation_record_find', description: 'Find an exact literal phrase in untouched current originals and effective final translations of Sessions opened by this main Agent in this topic. ASCII English case is ignored; no fuzzy/regex search, model call or embedding request. Includes full code, Markdown structure and metadata, regardless of embedding selection, segmentation or exclusions. Supply topicId, query (1-300 code points), optional side source/translation/both (default both), and copy returned next as after to continue. Each call scans at most 20 windows of 1000 code points and returns at most 8 exact matches within 32768 bytes. matches contain side and excerpt.selection, including current source/final versions and exact range; use translation_record_read to expand or read the SAME record other side. A translation match identifies its record, not an aligned source sentence. Changed records or access reject stale cursors. Follow pagination and report unavailable bodies; incomplete zero hits do not prove absence.',
+    { name: 'translation_record_find', description: 'Find an exact literal phrase in untouched current originals and effective final translations across all Sessions in the specified topic, including closed and archived Sessions. ASCII English case is ignored; no fuzzy/regex search, model call or embedding request. Includes full code, Markdown structure and metadata, regardless of embedding selection, segmentation or exclusions. Supply topicId, query (1-300 code points), optional side source/translation/both (default both), and copy returned next as after to continue. Each call scans at most 20 windows of 1000 code points and returns at most 8 exact matches within 32768 bytes. matches contain side and excerpt.selection, including current source/final versions and exact range; use translation_record_read to expand or read the SAME record other side. A translation match identifies its record, not an aligned source sentence. Changed records or access reject stale cursors. Follow pagination and report unavailable bodies; incomplete zero hits do not prove absence.',
       parameters: { ...topic, query: text, side: { type: 'string', enum: ['source', 'translation', 'both'] }, after: { type: 'string' } }, run: (args, exec) => service.findRecords(args, exec) },
-    { name: 'translation_record_read', description: 'Read an exact translation_record selection from memory search or translation_record_find in an opened current-topic Session. By default returns the verified selected source/translation excerpts. To page either side of the SAME sourceVersion and effective finalId, add side source/translation and optional start (Unicode code points, default 0); up to 4000 points and next. Returned excerpt.selection can be passed to translation_reference_select records. Source and translation ranges are independent, never sentence-aligned. Changed final/source, deletion, missing originals or a closed Session reject old selections. Old revisions require an explicit historical request through existing numbered-unit tools.',
+    { name: 'translation_record_read', description: 'Read an exact translation_record selection from memory search or translation_record_find in the specified topic, including closed and archived Sessions. By default returns the verified selected source/translation excerpts. To page either side of the SAME sourceVersion and effective finalId, add side source/translation and optional start (Unicode code points, default 0); up to 4000 points and next. Returned excerpt.selection can be passed to translation_reference_select records. Source and translation ranges are independent, never sentence-aligned. Changed final/source, deletion and missing originals reject old selections. Old revisions require an explicit historical request through existing numbered-unit tools.',
       parameters: { ...topic, selection: { ...recordSelection, required: true }, side: { type: 'string', enum: ['source', 'translation'] }, start: { type: 'integer' } }, run: (args, exec) => service.readRecord(args, exec) },
     { name: 'translation_reference_files', description: 'List only independently registered current-topic original/bilingual files, 20 per page. Other-reference files are closed and excluded. textReadable is format eligibility, not successful extraction; non-text originals remain available through the UI original-file link. Use exact returned IDs, versions and digests. Does not search settings, chats or old translations.',
       parameters: { ...topic, after: { type: 'string' } }, run: (args, exec) => service.fileQuery('list', args, exec) },
@@ -469,7 +462,7 @@ export function registerReferenceTools(service: ReferenceFilesService, topics: T
         { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['existing_topic'], required: true }, topicId: text } },
         { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['parent_session'], required: true }, translationSessionId: text } },
       ] } }, run: async (args, exec) => { referenceExact(args, ['operationId', 'start']); return topics.requestOwned(agent.id, { kind: 'reference_bind', operationId: args.operationId as string, start: args.start as never }, exec) } },
-    { name: 'translation_reference_select', description: 'Freeze exact relevant active archive backgrounds, reference-file excerpts and current translation-record selections for one later translation task. Use records for translation_record selections; at most 8, only from opened Sessions of this topic, with current source/final and digest rechecked. No source text is translated. User-fixed requirements remain authoritative. Supply the returned referenceContextRef to translation_translate for current files/text; that request must use this same topic. Irrelevant or uncertain excerpts are excluded, budgets are checked during actual translation preflight.',
+    { name: 'translation_reference_select', description: 'Freeze exact relevant active archive backgrounds, reference-file excerpts and current translation-record selections for one later translation task. Use records for translation_record selections; at most 8, from any Session in this topic, with current source/final and digest rechecked. No source text is translated. User-fixed requirements remain authoritative. Supply the returned referenceContextRef to translation_translate for current files/text; that request must use this same topic. Irrelevant or uncertain excerpts are excluded, budgets are checked during actual translation preflight.',
       parameters: { ...operation, assets: { type:'array', required:true, items:{type:'object',additionalProperties:false,properties:{kind:{type:'string',enum:['entity','fact','relation'],required:true},id:text,version:integer,purpose:{type:'string',enum:['background','translation_guidance'],required:true}}}}, files: { type: 'array', items: fileSelection, description: 'Optional exact UTF-8 original selections returned by file_read or file_search; at most 8.' }, records: { type: 'array', items: recordSelection, description: 'Optional exact current translation-record selections returned by memory search or record_read; at most 8.' } }, run:(args,exec)=>service.selectContext(args,exec) },
   ]
   return definitions.map(definition => register(define({ name: definition.name, description: definition.description, parameters: definition.parameters,

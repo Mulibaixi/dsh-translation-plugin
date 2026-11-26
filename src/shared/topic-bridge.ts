@@ -77,6 +77,8 @@ export interface TopicUnitFact {
   readonly source: string
   readonly sourceVersion?: number | undefined
   readonly backgroundDescription?: string
+  readonly speakers?: readonly ImageSpeaker[]
+  readonly unclearTranscription?: string
   readonly targetLanguage: string
   readonly instruction: string
   readonly revisions: readonly {
@@ -124,6 +126,8 @@ export type TopicBridgeCommand =
   | { readonly kind: 'preparation_capture'; readonly request: TranslationPreparationQuery; readonly relevantFixedIds: readonly string[]; readonly topicTermsVersion: number }
   | { readonly kind: 'normal_resolve'; readonly target: DirectUnitTarget; readonly operationId: string }
   | ({ readonly kind: 'image_update' } & ImageUnitUpdate)
+  | { readonly kind: 'image_state'; readonly target: ImageUnitTarget }
+  | { readonly kind: 'image_memory'; readonly target: ImageUnitTarget }
   | ({ readonly kind: 'pdf_register'; readonly batch: PdfReadBatch } & PdfSectionRegistration)
   | ({ readonly kind: 'pdf_scan_page' } & PdfScanPage)
   | { readonly kind: 'pdf_status'; readonly target: import('./normal-translation.js').NormalTranslationMaterialTarget }
@@ -172,7 +176,9 @@ export type TopicWriteReceipt = {
       readonly affected?: readonly { readonly id: string; readonly version: number; readonly status: 'review_required' }[] })
 export type TopicBridgeValue =
   | TopicWriteReceipt
-  | { readonly kind: 'image_updated'; readonly unitId: string }
+  | { readonly kind: 'image_updated'; readonly unitId: string; readonly inputChanged?: boolean }
+  | { readonly kind: 'image_state'; readonly state: ImageUnitState }
+  | { readonly kind: 'image_memory'; readonly memory: ImageTranslationMemory }
   | { readonly kind: 'pdf_registered'; readonly targets: readonly NormalTranslationUnitTarget[]; readonly next: PdfPosition | null }
   | { readonly kind: 'pdf_status'; readonly progress: PdfProgress | null; readonly pending: readonly NormalTranslationUnitTarget[]; readonly targetLanguage: string | null;
       readonly repairablePages: readonly number[]; readonly maxInputChars?: number }
@@ -339,6 +345,12 @@ export function parseTopicBridgeCommand(value: unknown, protocol: 1 | 2 | 3 | 4 
         if (target.kind === 'material') throw new TypeError('Normal resolve requires a unit')
         return { kind: 'normal_resolve', target, operationId: value.operationId }
       }
+      case 'image_memory':
+      case 'image_state': {
+        exact(value, ['kind', 'target'])
+        const { target } = parseImageUnitUpdate({ target: value.target, operationId: 'image-state', sourceText: '' })
+        return { kind: value.kind, target }
+      }
       case 'image_update': {
         const { kind: _kind, ...update } = value
         return { kind: 'image_update', ...parseImageUnitUpdate(update) }
@@ -478,8 +490,12 @@ export function parseTopicBridgeDown(value: unknown, protocol: 1 | 2 | 3 | 4 = 1
 function parseUnit(value: unknown, protocol: 1 | 2 | 3 | 4): TopicUnitFact {
   object(value)
   const image = Object.hasOwn(value, 'backgroundDescription')
-  exact(value, ['id', 'order', 'source', 'targetLanguage', 'instruction', 'revisions', 'final', ...(value.sourceVersion === undefined ? [] : ['sourceVersion']), ...(image ? ['backgroundDescription'] : [])])
-  if (image) text(value.backgroundDescription, 2000, true)
+  exact(value, ['id', 'order', 'source', 'targetLanguage', 'instruction', 'revisions', 'final', ...(value.sourceVersion === undefined ? [] : ['sourceVersion']), ...(image ? ['backgroundDescription', ...['speakers', 'unclearTranscription'].filter(field => Object.hasOwn(value, field))] : [])])
+  if (image) {
+    text(value.backgroundDescription, 2000, true)
+    if (value.speakers !== undefined) parseImageSpeakers(value.speakers)
+    if (value.unclearTranscription !== undefined) text(value.unclearTranscription, 900)
+  }
   const sourceVersion = value.sourceVersion ?? 1; integer(sourceVersion, 1)
   text(value.id); integer(value.order, 1); text(value.source, 2_000_000, image); text(value.targetLanguage, 200); text(value.instruction, 20_000, true)
   if (!Array.isArray(value.revisions)) throw new TypeError('Invalid topic unit versions')
@@ -587,7 +603,14 @@ function parseValue(value: unknown, protocol: 1 | 2 | 3 | 4): TopicBridgeValue {
       if (envelope.kind !== 'material' || !envelope.material.unitReference) throw new TypeError('Invalid unit resolution')
       return { kind: 'normal_resolved', envelope }
     }
-    case 'image_updated': exact(value, ['kind', 'unitId']); text(value.unitId); return { kind: 'image_updated', unitId: value.unitId }
+    case 'image_memory': exact(value, ['kind', 'memory']); return { kind: 'image_memory', memory: parseImageTranslationMemory(value.memory) }
+    case 'image_state': exact(value, ['kind', 'state']); return { kind: 'image_state', state: parseImageUnitState(value.state) }
+    case 'image_updated': {
+      exact(value, ['kind', 'unitId', ...(Object.hasOwn(value, 'inputChanged') ? ['inputChanged'] : [])])
+      text(value.unitId)
+      if (value.inputChanged !== undefined) boolean(value.inputChanged)
+      return { kind: 'image_updated', unitId: value.unitId, ...(value.inputChanged === undefined ? {} : { inputChanged: value.inputChanged }) }
+    }
     case 'pdf_registered': {
       exact(value, ['kind', 'targets', 'next'])
       if (protocol < 2 || !Array.isArray(value.targets) || value.targets.length > 32) throw new TypeError('Invalid PDF targets')
@@ -751,4 +774,4 @@ export const TOPIC_BRIDGE_REMOTE = { package: packageName, descriptors: [
     result: codec('downV3', value => parseTopicBridgeDown(value, 3)), uplink: { codec: codec('replyV3', value => parseTopicBridgeReply(value, 3)) } }
 ] }
 import { parseImageUnitUpdate, parseDirectTargetLanguage, parseDirectTranslationTarget, type DirectUnitTarget, type DirectTranslationTarget } from './normal-translation.js'
-import type { ImageUnitUpdate } from './image-translation.js'
+import { parseImageSpeakers, parseImageUnitState, parseImageTranslationMemory, type ImageTranslationMemory, type ImageSpeaker, type ImageUnitState, type ImageUnitTarget, type ImageUnitUpdate } from './image-translation.js'
